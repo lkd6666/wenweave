@@ -1,0 +1,41 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Node / Vite
+node_modules/
+dist/
+*.tsbuildinfo
+vite.config.*.timestamp-*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local application state
+backend/data/
+backend/uploads/
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime output
+*.log
+*.pid
+*.seed
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

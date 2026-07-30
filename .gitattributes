@@ -1,0 +1,3 @@
+# Local Vue reference files are retained in source control but excluded from release archives.
+/AiChat.vue export-ignore
+/AssistantTurnTimeline.vue export-ignore

@@ -4,7 +4,7 @@ import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from langchain_core.messages import AIMessageChunk
 from pydantic import ValidationError
@@ -293,13 +293,16 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_due_user_question_timeout_retries_after_an_activity_race(self) -> None:
         """A timer that wakes during activity must use the refreshed deadline."""
         resume = AsyncMock(side_effect=[False])
+        sleep = AsyncMock()
         with (
             patch.object(chat_module, "_user_question_timeout_delay", side_effect=[0.0, 0.001, None]),
             patch.object(chat_module, "_auto_answer_timed_out_user_question", resume),
+            patch.object(chat_module.asyncio, "sleep", sleep),
         ):
             await chat_module._wait_for_user_question_timeout("question-1")
 
         resume.assert_awaited_once_with("question-1")
+        sleep.assert_any_await(chat_module.USER_QUESTION_TIMEOUT_RETRY_DELAY_SECONDS)
 
     async def test_resolving_a_question_cancels_its_local_timeout_task(self) -> None:
         task = asyncio.create_task(asyncio.sleep(60))
@@ -326,14 +329,35 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             created_at=datetime.now(timezone.utc) - timedelta(seconds=2),
         )
         owner = SimpleNamespace(id=7)
+        run = SimpleNamespace(status=AgentRunStatus.WAITING_FOR_INPUT)
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def with_for_update(self):
+                return self
+
+            def one_or_none(self):
+                return question
 
         class FakeSession:
+            committed = False
+
+            def query(self, _model):
+                return FakeQuery()
+
             def get(self, model, _identifier):
                 if model is ChatUserQuestion:
                     return question
+                if model is AgentRun:
+                    return run
                 if model is User:
                     return owner
                 return None
+
+            def commit(self) -> None:
+                self.committed = True
 
             def close(self) -> None:
                 pass
@@ -350,6 +374,111 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         payload = resume.await_args.args[3]
         self.assertEqual(payload.action, "timeout")
         self.assertEqual(payload.client_request_id, "system-timeout:question-1")
+
+    async def test_due_question_for_a_terminal_run_is_cancelled_without_retrying(self) -> None:
+        question = SimpleNamespace(
+            id="question-orphaned",
+            run_id="run-terminal",
+            document_id=3,
+            session_id=2,
+            user_id=7,
+            status=ChatUserQuestionStatus.WAITING,
+            timeout_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            last_activity_at=None,
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+            answer_json="{}",
+            answered_at=None,
+        )
+        run = SimpleNamespace(status=AgentRunStatus.FAILED)
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def with_for_update(self):
+                return self
+
+            def one_or_none(self):
+                return question
+
+        class FakeSession:
+            committed = False
+
+            def query(self, _model):
+                return FakeQuery()
+
+            def get(self, model, _identifier):
+                return run if model is AgentRun else None
+
+            def commit(self) -> None:
+                self.committed = True
+
+            def close(self) -> None:
+                pass
+
+        session = FakeSession()
+        resume = AsyncMock()
+        with (
+            patch.object(chat_module, "SessionLocal", return_value=session),
+            patch.object(chat_module, "answer_chat_user_question", resume),
+        ):
+            completed = await chat_module._auto_answer_timed_out_user_question(question.id)
+
+        self.assertTrue(completed)
+        self.assertTrue(session.committed)
+        self.assertEqual(question.status, ChatUserQuestionStatus.CANCELLED)
+        self.assertIn("run_not_waiting_for_input", question.answer_json)
+        resume.assert_not_awaited()
+
+    async def test_startup_restoration_cancels_orphaned_questions_and_schedules_valid_ones(self) -> None:
+        orphaned = SimpleNamespace(
+            id="question-orphaned",
+            run_id="run-failed",
+            status=ChatUserQuestionStatus.WAITING,
+            answer_json="{}",
+            answered_at=None,
+        )
+        valid = SimpleNamespace(
+            id="question-valid",
+            run_id="run-waiting",
+            status=ChatUserQuestionStatus.WAITING,
+        )
+        failed_run = SimpleNamespace(status=AgentRunStatus.FAILED)
+        waiting_run = SimpleNamespace(status=AgentRunStatus.WAITING_FOR_INPUT)
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def all(self):
+                return [orphaned, valid]
+
+        class FakeSession:
+            committed = False
+
+            def query(self, _model):
+                return FakeQuery()
+
+            def get(self, _model, run_id):
+                return failed_run if run_id == "run-failed" else waiting_run
+
+            def commit(self) -> None:
+                self.committed = True
+
+            def close(self) -> None:
+                pass
+
+        session = FakeSession()
+        schedule = Mock()
+        with (
+            patch.object(chat_module, "SessionLocal", return_value=session),
+            patch.object(chat_module, "schedule_user_question_timeout", schedule),
+        ):
+            await chat_module.restore_waiting_user_question_timeouts()
+
+        self.assertTrue(session.committed)
+        self.assertEqual(orphaned.status, ChatUserQuestionStatus.CANCELLED)
+        schedule.assert_called_once_with(valid.id)
 
     def test_user_question_activity_refreshes_the_durable_deadline(self) -> None:
         run = SimpleNamespace(

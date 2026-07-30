@@ -187,6 +187,7 @@ CONTEXT_LIMIT_ERROR_PATTERN = re.compile(
 CHAT_IMAGE_PREVIEW_SCOPE = "chat-image-preview"
 CHAT_IMAGE_PREVIEW_TOKEN_MINUTES = 5
 USER_QUESTION_TIMEOUT_CLIENT_REQUEST_PREFIX = "system-timeout:"
+USER_QUESTION_TIMEOUT_RETRY_DELAY_SECONDS = 0.5
 _user_question_timeout_tasks: dict[str, asyncio.Task[None]] = {}
 
 
@@ -2275,23 +2276,80 @@ def _user_question_timeout_delay(question_id: str) -> float | None:
         question = db.get(ChatUserQuestion, question_id)
         if question is None or question.status != ChatUserQuestionStatus.WAITING:
             return None
+        run = db.get(AgentRun, question.run_id)
+        if run is None or run.status != AgentRunStatus.WAITING_FOR_INPUT:
+            _cancel_inconsistent_waiting_question(db, question, run)
+            db.commit()
+            return None
         return max(0.0, (_utc_question_deadline(question) - datetime.now(timezone.utc)).total_seconds())
     finally:
         db.close()
+
+
+def _cancel_inconsistent_waiting_question(
+    db: Session,
+    question: ChatUserQuestion,
+    run: AgentRun | None,
+) -> None:
+    """Close a question that cannot ever be resumed by the answer endpoint."""
+    run_status = run.status.value if run is not None else "missing"
+    question.status = ChatUserQuestionStatus.CANCELLED
+    question.answer_json = json.dumps(
+        {
+            "action": "cancelled",
+            "reason": "run_not_waiting_for_input",
+            "run_status": run_status,
+        },
+        ensure_ascii=False,
+    )
+    question.answered_at = datetime.now(timezone.utc)
+    logger.warning(
+        "user_question_cancelled_inconsistent question=%s run=%s run_status=%s",
+        question.id,
+        question.run_id,
+        run_status,
+    )
+
+
+def _cancel_waiting_questions_for_terminal_run(db: Session, run: AgentRun) -> None:
+    """Keep terminal runs from leaving a resumable-looking question behind."""
+    questions = (
+        db.query(ChatUserQuestion)
+        .filter(
+            ChatUserQuestion.run_id == run.id,
+            ChatUserQuestion.status == ChatUserQuestionStatus.WAITING,
+        )
+        .with_for_update()
+        .all()
+    )
+    for question in questions:
+        _cancel_inconsistent_waiting_question(db, question, run)
 
 
 async def _auto_answer_timed_out_user_question(question_id: str) -> bool:
     """Resume a due question as its original user after an atomic deadline check."""
     db = SessionLocal()
     try:
-        question = db.get(ChatUserQuestion, question_id)
+        question = (
+            db.query(ChatUserQuestion)
+            .filter(ChatUserQuestion.id == question_id)
+            .with_for_update()
+            .one_or_none()
+        )
         if question is None or question.status != ChatUserQuestionStatus.WAITING:
             return True
         if _utc_question_deadline(question) > datetime.now(timezone.utc):
             return False
+        run = db.get(AgentRun, question.run_id)
+        if run is None or run.status != AgentRunStatus.WAITING_FOR_INPUT:
+            _cancel_inconsistent_waiting_question(db, question, run)
+            db.commit()
+            return True
         owner = db.get(User, question.user_id)
         if owner is None:
             logger.warning("user_question_timeout_owner_missing question=%s", question_id)
+            _cancel_inconsistent_waiting_question(db, question, run)
+            db.commit()
             return True
         try:
             await answer_chat_user_question(
@@ -2334,7 +2392,9 @@ async def _wait_for_user_question_timeout(question_id: str) -> None:
                 return
             # The deadline was refreshed while this timer woke up. The next
             # iteration reads its durable value before scheduling another wait.
-            await asyncio.sleep(0)
+            # Never spin the event loop if an inconsistent external caller
+            # keeps returning a conflict.
+            await asyncio.sleep(USER_QUESTION_TIMEOUT_RETRY_DELAY_SECONDS)
     except asyncio.CancelledError:
         raise
     finally:
@@ -2357,16 +2417,25 @@ def cancel_user_question_timeout(question_id: str) -> None:
 
 
 async def restore_waiting_user_question_timeouts() -> None:
-    """Reinstall local timers after a worker restart without changing run state."""
+    """Reinstall timers only for pauses that still have a waiting Agent run."""
     def waiting_ids() -> list[str]:
         db = SessionLocal()
         try:
-            return [
-                question_id
-                for (question_id,) in db.query(ChatUserQuestion.id)
+            questions = (
+                db.query(ChatUserQuestion)
                 .filter(ChatUserQuestion.status == ChatUserQuestionStatus.WAITING)
                 .all()
-            ]
+            )
+            runnable_question_ids: list[str] = []
+            for question in questions:
+                run = db.get(AgentRun, question.run_id)
+                if run is not None and run.status == AgentRunStatus.WAITING_FOR_INPUT:
+                    runnable_question_ids.append(question.id)
+                else:
+                    _cancel_inconsistent_waiting_question(db, question, run)
+            if len(runnable_question_ids) != len(questions):
+                db.commit()
+            return runnable_question_ids
         finally:
             db.close()
 
@@ -3042,6 +3111,7 @@ async def _execute_agent_run(
                     run.error_message = error_message
                     run.assistant_message_id = assistant_message.id
                     run.finished_at = datetime.now(timezone.utc)
+                    _cancel_waiting_questions_for_terminal_run(terminal_db, run)
                     started_at = run.created_at
                     duration_ms = 0
                     if started_at is not None:
@@ -3335,7 +3405,12 @@ async def _execute_agent_run(
             await agent_run_manager.publish(
                 run_id,
                 "tool_result",
-                {"name": reference_tool["name"], "result": reference_tool["result"], "activity": reference_tool["activity"]},
+                {
+                    "id": reference_tool["id"],
+                    "name": reference_tool["name"],
+                    "result": reference_tool["result"],
+                    "activity": reference_tool["activity"],
+                },
             )
         if theme_application and not resume_state:
             theme_tool = {
@@ -3373,7 +3448,12 @@ async def _execute_agent_run(
             await agent_run_manager.publish(
                 run_id,
                 "tool_result",
-                {"name": theme_tool["name"], "result": theme_tool["result"], "activity": theme_tool["activity"]},
+                {
+                    "id": theme_tool["id"],
+                    "name": theme_tool["name"],
+                    "result": theme_tool["result"],
+                    "activity": theme_tool["activity"],
+                },
             )
         completed = False
         resume_messages = resume_state.get("messages") if isinstance(resume_state, dict) else None
@@ -3534,7 +3614,6 @@ async def _execute_agent_run(
                             item
                             for item in reversed(tool_trace)
                             if item.get("id") == result_tool_id
-                            and item.get("status") in {"running", "waiting"}
                         ),
                         None,
                     ) if result_tool_id else next(

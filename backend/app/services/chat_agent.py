@@ -2335,6 +2335,14 @@ def _build_editor_graph(
 ):
     """建立单次编辑图。工具闭包隔离了不同 SSE 请求的 HTML 状态。"""
 
+    # Tool functions do not receive LangChain's provider tool-call ID. Keep
+    # their rich presentation data until ToolNode returns the corresponding
+    # ToolMessage, then publish one canonical event with that ID.  Without
+    # this bridge, tools that only return a ToolMessage leave the live UI in
+    # the "running" state even though the graph has already continued.
+    reported_tool_results: list[dict[str, Any]] = []
+    reported_tool_results_lock = threading.Lock()
+
     def emit_tool_result(
         name: str,
         result: str,
@@ -2342,17 +2350,36 @@ def _build_editor_graph(
         html: str | None = None,
         tool_call_id: str | None = None,
     ) -> None:
-        writer = get_stream_writer()
         data: Dict[str, Any] = {"name": name, "result": result, "activity": activity}
         if tool_call_id:
             data["id"] = tool_call_id
         if html is not None:
             data["html"] = html
-        payload: Dict[str, Any] = {
-            "event": "tool_result",
-            "data": data,
+        with reported_tool_results_lock:
+            reported_tool_results.append(dict(data))
+        # Error recovery paths already know the provider call ID and can be
+        # surfaced immediately. Normal tool functions are published once the
+        # ToolNode result supplies that ID below.
+        if tool_call_id:
+            get_stream_writer()({"event": "tool_result", "data": data})
+
+    def fallback_tool_presentation(name: str, content: str) -> tuple[str, Dict[str, Any]]:
+        """Create a compact terminal UI state for tools without custom activity."""
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            reason = _short(str(payload.get("error") or "工具执行失败"), 600)
+            return f"错误：{reason}", {"kind": "error", "summary": reason}
+
+        labels = {
+            "search_session_history": ("已检索会话历史", "search"),
+            "read_session_detail": ("已读取会话详情", "read"),
+            "read_tool_output": ("已读取完整工具结果", "read"),
         }
-        writer(payload)
+        summary, kind = labels.get(name, ("工具执行完成", "reference"))
+        return summary, {"kind": kind, "summary": summary}
 
     def tool_error(name: str, exc: Exception) -> str:
         details = exc.details if isinstance(exc, WorkspaceError) else {}
@@ -3841,6 +3868,8 @@ def _build_editor_graph(
         session.set_effective_tool_result_limit(dynamic_limit)
         if history_workspace is not None:
             history_workspace.set_tool_result_limit(dynamic_limit)
+        with reported_tool_results_lock:
+            reported_result_start = len(reported_tool_results)
         try:
             result = await base_tool_node.ainvoke(state)
         except Exception as exc:  # noqa: BLE001 - model can recover from a failed tool operation.
@@ -3856,12 +3885,30 @@ def _build_editor_graph(
                 history_workspace.set_tool_result_limit(previous_history_limit)
 
         raw_messages = result.get("messages", []) if isinstance(result, dict) else []
+        with reported_tool_results_lock:
+            reports_from_this_batch = [dict(item) for item in reported_tool_results[reported_result_start:]]
+        tool_messages = [message for message in raw_messages if isinstance(message, ToolMessage)]
+        tool_message_counts: dict[str, int] = {}
+        for message in tool_messages:
+            name = str(message.name or "unknown")
+            tool_message_counts[name] = tool_message_counts.get(name, 0) + 1
+        reports_by_name: dict[str, list[dict[str, Any]]] = {}
+        for report in reports_from_this_batch:
+            # Explicit-ID errors were already delivered immediately. Rich
+            # normal-tool updates are only safe to pair by name when that
+            # tool was called once in this ToolNode batch.
+            if report.get("id"):
+                continue
+            reports_by_name.setdefault(str(report.get("name") or "unknown"), []).append(report)
+
         bound_messages: list[BaseMessage] = []
         for message in raw_messages:
             if not isinstance(message, ToolMessage):
                 bound_messages.append(message)
                 continue
             content = _message_content(message.content)
+            tool_name = str(message.name or "unknown")
+            tool_call_id = str(message.tool_call_id or "")
             if str(message.status or "success") == "error":
                 # ToolNode owns schema and unexpected-exception errors.  They
                 # already travel to the model in this ToolMessage; also expose
@@ -3870,21 +3917,45 @@ def _build_editor_graph(
                 summary = _short(content or "工具调用未能执行", 600)
                 display_result = summary if summary.startswith("错误") else f"错误：{summary}"
                 emit_tool_result(
-                    str(message.name or "unknown"),
+                    tool_name,
                     display_result,
                     {
                         "kind": "error",
                         "summary": "工具调用失败，可由模型修正",
                         "details": {
-                            "tool_call_id": str(message.tool_call_id or ""),
+                            "tool_call_id": tool_call_id,
                             "recoverable": True,
                         },
                     },
-                    tool_call_id=str(message.tool_call_id or "") or None,
+                    tool_call_id=tool_call_id or None,
                 )
+            else:
+                reports = reports_by_name.get(tool_name, [])
+                report = reports.pop(0) if tool_message_counts.get(tool_name) == 1 and reports else None
+                if report is None:
+                    display_result, activity = fallback_tool_presentation(tool_name, content)
+                    result_data: Dict[str, Any] = {
+                        "id": tool_call_id,
+                        "name": tool_name,
+                        "result": display_result,
+                        "activity": activity,
+                    }
+                else:
+                    result_data = {
+                        "id": tool_call_id,
+                        "name": tool_name,
+                        "result": str(report.get("result") or "工具执行完成"),
+                        "activity": report.get("activity") if isinstance(report.get("activity"), dict) else None,
+                    }
+                    if report.get("html") is not None:
+                        result_data["html"] = report["html"]
+                # Every successful ToolMessage gets exactly one canonical
+                # terminal event with its provider ID. The browser can now
+                # settle repeated tool names and delayed stream events safely.
+                get_stream_writer()({"event": "tool_result", "data": result_data})
             # Pages already point to their existing object. Re-storing them
             # would create an unnecessary recursive output chain.
-            if str(message.name or "") == "read_tool_output":
+            if tool_name == "read_tool_output":
                 bound_messages.append(message)
                 continue
             try:
@@ -3896,7 +3967,7 @@ def _build_editor_graph(
                 else:
                     binding = tool_output_store.bind(
                         tool_call_id=str(message.tool_call_id or ""),
-                        tool_name=str(message.name or ""),
+                        tool_name=tool_name,
                         content=content,
                         max_preview_tokens=dynamic_limit,
                     )

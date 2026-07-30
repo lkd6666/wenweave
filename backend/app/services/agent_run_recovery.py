@@ -111,10 +111,13 @@ def recover_interrupted_turn(events: Iterable[object], terminal_notice: str) -> 
                     tool["preparing"] = False
             continue
         if event == "tool_result":
+            tool_id = _text(data.get("id"))
             tool_name = _text(data.get("name"))
-            tool = next(
-                (item for item in reversed(tool_calls) if item["name"] == tool_name and item["status"] == "running"),
-                None,
+            tool = (
+                next((item for item in reversed(tool_calls) if item["id"] == tool_id), None)
+                if tool_id
+                else next(
+                    (item for item in reversed(tool_calls) if item["name"] == tool_name and item["status"] == "running"), None)
             )
             if tool is not None:
                 result = _text(data.get("result"))

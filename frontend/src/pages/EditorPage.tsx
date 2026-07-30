@@ -1364,7 +1364,7 @@ export default function EditorPage() {
           const nextTools = [...activeTools]
           const resultToolId = typeof evt.data.id === 'string' ? evt.data.id : null
           const directIndex = resultToolId
-            ? nextTools.findIndex((item) => item.id === resultToolId && (item.status === 'running' || item.status === 'waiting'))
+            ? nextTools.findIndex((item) => item.id === resultToolId)
             : -1
           const fallbackReverseIndex = resultToolId
             ? -1

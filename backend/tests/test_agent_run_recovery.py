@@ -42,6 +42,33 @@ class AgentRunRecoveryTests(unittest.TestCase):
         self.assertNotIn("断流前的片段", recovered.content)
         self.assertIn("重试后的完整答复", recovered.content)
 
+    def test_matches_repeated_tool_names_by_call_id(self) -> None:
+        events = [
+            SimpleNamespace(
+                event="tool_call",
+                payload_json=json.dumps({"id": "call-a", "name": "search_session_history", "arguments": {}}),
+            ),
+            SimpleNamespace(
+                event="tool_call",
+                payload_json=json.dumps({"id": "call-b", "name": "search_session_history", "arguments": {}}),
+            ),
+            SimpleNamespace(
+                event="tool_result",
+                payload_json=json.dumps({"id": "call-a", "name": "search_session_history", "result": "已检索第一页"}),
+            ),
+            SimpleNamespace(
+                event="tool_result",
+                payload_json=json.dumps({"id": "call-b", "name": "search_session_history", "result": "错误：第二页不可用"}),
+            ),
+        ]
+
+        recovered = recover_interrupted_turn(events, "服务已重启。")
+
+        self.assertEqual(recovered.tool_calls[0]["status"], "success")
+        self.assertEqual(recovered.tool_calls[0]["result"], "已检索第一页")
+        self.assertEqual(recovered.tool_calls[1]["status"], "error")
+        self.assertEqual(recovered.tool_calls[1]["result"], "错误：第二页不可用")
+
 
 if __name__ == "__main__":
     unittest.main()

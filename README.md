@@ -91,11 +91,14 @@ uvicorn app.main:app --no-proxy-headers --host 0.0.0.0 --port 8001
 
 后端会自动托管 `frontend/dist` 静态文件，访问 http://127.0.0.1:8001 即可使用完整应用。
 
-## 发布与宝塔部署
+## 发布与部署
 
 发布包和个人加密备份由 `scripts/package-release.ps1` 生成。发布包不包含 `.env`、数据库、上传文件、加密密钥或 Git 元数据；个人备份使用 AES-256 加密的 `.7z`，包含当前 MySQL 逻辑备份和运行时数据。
 
-完整的宝塔面板部署步骤、Nginx SSE 配置和升级说明见 [docs/DEPLOY_BAOTA.md](docs/DEPLOY_BAOTA.md)。
+完整的部署步骤、Nginx SSE 配置和升级说明见：
+
+- [宝塔面板部署](docs/DEPLOY_BAOTA.md)
+- [常规 Linux 部署（systemd + Nginx）](docs/DEPLOY_LINUX.md)
 
 ## 环境变量说明
 

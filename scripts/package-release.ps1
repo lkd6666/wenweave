@@ -189,11 +189,11 @@ if (-not $SkipPrivateArchive) {
     $password = Get-ArchivePassword -EnvironmentVariable $PrivateArchivePasswordEnvironmentVariable
     try {
         Invoke-Checked -FilePath $SevenZipPath -Arguments @('a', '-t7z', $privateArchive, (Join-Path $privateStage '*'), '-mhe=on', "-p$password") -WorkingDirectory $outputVersionDir
+        Invoke-Checked -FilePath $SevenZipPath -Arguments @('t', $privateArchive, "-p$password") -WorkingDirectory $outputVersionDir
     }
     finally {
         Remove-Variable password -ErrorAction SilentlyContinue
     }
-    Invoke-Checked -FilePath $SevenZipPath -Arguments @('t', $privateArchive, "-p$password") -WorkingDirectory $outputVersionDir
     Write-Sha256 -FilePath $privateArchive
 }
 

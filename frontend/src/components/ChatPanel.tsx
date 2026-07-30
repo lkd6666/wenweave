@@ -97,6 +97,9 @@ const TOOL_LABELS: Record<string, string> = {
   read_gzh_theme: '读取主题组件库',
   read_current_gzh_theme: '读取当前主题参考',
   read_attached_templates: '读取已附组件',
+  read_tool_output: '读取完整工具结果',
+  search_session_history: '检索会话历史',
+  read_session_detail: '读取会话详情',
   validate_gzh_html: '主题严格检查',
 }
 
@@ -1890,7 +1893,8 @@ type ToolVisualKind = 'read' | 'search' | 'history' | 'image' | 'edit' | 'check'
 function toolVisualKind(name: string): ToolVisualKind {
   if (['get_document_map', 'read_blocks', 'read_gzh_theme', 'read_current_gzh_theme', 'get_layout_reference_map', 'read_layout_reference_blocks'].includes(name)) return 'read'
   if (['search_html', 'search_layout_reference'].includes(name)) return 'search'
-  if (['list_history_versions', 'search_history_versions', 'search_history_version', 'compare_history_version', 'read_history_blocks'].includes(name)) return 'history'
+  if (['list_history_versions', 'search_history_versions', 'search_history_version', 'compare_history_version', 'read_history_blocks', 'search_session_history', 'read_session_detail'].includes(name)) return 'history'
+  if (name === 'read_tool_output') return 'read'
   if (['inspect_current_images', 'inspect_history_images'].includes(name)) return 'image'
   if (['apply_html_patch', 'replace_document'].includes(name)) return 'edit'
   if (name === 'check_compliance' || name === 'validate_gzh_html') return 'check'

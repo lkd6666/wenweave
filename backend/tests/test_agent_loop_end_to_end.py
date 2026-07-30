@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 import unittest
+from contextlib import nullcontext
 from typing import Any, AsyncIterator, Sequence
 from unittest.mock import patch
 
@@ -95,6 +96,7 @@ def _run(
     budget: int = 0,
     timeout: float | None = None,
     attached_templates: Sequence[dict[str, Any]] | None = None,
+    tool_output_store: ToolOutputStore | None = None,
 ) -> list[dict[str, Any]]:
     async def go() -> list[dict[str, Any]]:
         return [
@@ -113,6 +115,7 @@ def _run(
                 None,
                 budget,
                 attached_templates=attached_templates,
+                tool_output_store=tool_output_store,
             )
         ]
 
@@ -120,6 +123,40 @@ def _run(
 
 
 class AgentLoopEndToEndTests(unittest.TestCase):
+    def test_session_history_result_reaches_model_and_timeline_with_call_id(self) -> None:
+        """A tool that only returns ToolMessage must still settle the live UI."""
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_session_history", {"query": "标题"})},
+                {"text": "已检索到会话中的相关记录。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        store = ToolOutputStore(document_id=1, session_id=1, run_id="session-history-test")
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", side_effect=lambda: nullcontext(object())),
+            patch(
+                "app.services.chat_agent.SessionHistoryReader.search",
+                return_value={"ok": True, "results": [], "next_cursor": None},
+            ),
+        ):
+            events = _run(model, session, tool_output_store=store)
+
+        result = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "search_session_history"
+        )
+        self.assertEqual(result["id"], "call-1")
+        self.assertEqual(result["result"], "已检索会话历史")
+        self.assertEqual(result["activity"]["kind"], "search")
+        self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
+        self.assertEqual(model.seen_messages[1][-1].tool_call_id, "call-1")
+        self.assertIn('"ok":true', str(model.seen_messages[1][-1].content))
+
     def test_attached_template_reader_accepts_json_array_tool_argument(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
         model = ScriptedChatModel(

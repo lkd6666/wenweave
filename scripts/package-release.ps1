@@ -108,6 +108,33 @@ function Write-Sha256 {
     Set-Content -LiteralPath "$FilePath.sha256" -Value $line -Encoding ascii
 }
 
+function New-PortableZip {
+    param([string]$SourceDirectory, [string]$DestinationFile)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $sourceRoot = [System.IO.Path]::GetFullPath($SourceDirectory).TrimEnd([char[]]@('\', '/'))
+    $archive = [System.IO.Compression.ZipFile]::Open(
+        $DestinationFile,
+        [System.IO.Compression.ZipArchiveMode]::Create
+    )
+    try {
+        Get-ChildItem -LiteralPath $sourceRoot -Recurse -Force -File | ForEach-Object {
+            $relativePath = $_.FullName.Substring($sourceRoot.Length).TrimStart([char[]]@('\', '/'))
+            # ZIP entry names must use '/' so Linux unzip creates directories.
+            $entryName = $relativePath.Replace('\', '/')
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive,
+                $_.FullName,
+                $entryName,
+                [System.IO.Compression.CompressionLevel]::Optimal
+            ) | Out-Null
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
 if (git -C $repoRoot status --porcelain) {
     throw 'Working tree is not clean. Commit the intended source before packaging.'
 }
@@ -153,7 +180,7 @@ Set-Content -LiteralPath (Join-Path $releaseStage 'RELEASE_MANIFEST.txt') -Encod
     'private-runtime-data=excluded'
 )
 Assert-PublicStageSafe -Stage $releaseStage
-Compress-Archive -Path (Join-Path $releaseStage '*') -DestinationPath $releaseZip -CompressionLevel Optimal -Force
+New-PortableZip -SourceDirectory $releaseStage -DestinationFile $releaseZip
 Write-Sha256 -FilePath $releaseZip
 
 if (-not $SkipPrivateArchive) {

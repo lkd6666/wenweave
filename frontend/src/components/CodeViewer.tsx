@@ -1,9 +1,11 @@
+import { useEffect, useRef } from 'react'
 import { Button, Space, Typography, message } from 'antd'
-import { CopyOutlined, SaveOutlined } from '@ant-design/icons'
+import { CodeOutlined, CopyOutlined, SaveOutlined } from '@ant-design/icons'
 import CodeMirror from '@uiw/react-codemirror'
 import { html as htmlLanguage } from '@codemirror/lang-html'
 import { githubDark, githubLight } from '@uiw/codemirror-theme-github'
 import { useAppTheme } from '../theme/appTheme'
+import { formatHtml } from '../utils/formatHtml'
 
 const { Text } = Typography
 
@@ -17,6 +19,20 @@ interface CodeViewerProps {
 
 export default function CodeViewer({ html, onChange, onSave, saving, disabled = false }: CodeViewerProps) {
   const { resolvedTheme } = useAppTheme()
+  const autoFormattedSourceRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (disabled || /[\r\n]/.test(html)) {
+      autoFormattedSourceRef.current = null
+      return
+    }
+    const formatted = formatHtml(html)
+    if (formatted === html || autoFormattedSourceRef.current === html) return
+    autoFormattedSourceRef.current = html
+    onChange(formatted)
+    message.info('已自动格式化单行 HTML 源码')
+  }, [disabled, html, onChange])
+
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(html)
@@ -26,11 +42,24 @@ export default function CodeViewer({ html, onChange, onSave, saving, disabled = 
     }
   }
 
+  const handleFormat = () => {
+    const formatted = formatHtml(html)
+    if (formatted === html) {
+      message.info('源码已经是格式化状态')
+      return
+    }
+    onChange(formatted)
+    message.success('源码已格式化')
+  }
+
   return (
     <div className="code-viewer">
       <div className="code-viewer-toolbar">
         <Text type="secondary">HTML 源码（可手动微调后保存）</Text>
         <Space>
+          <Button size="small" icon={<CodeOutlined />} disabled={disabled || !html.trim()} onClick={handleFormat}>
+            格式化代码
+          </Button>
           <Button size="small" icon={<CopyOutlined />} onClick={handleCopy}>
             复制代码
           </Button>

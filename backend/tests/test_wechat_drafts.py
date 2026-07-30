@@ -1,0 +1,819 @@
+import asyncio
+import hashlib
+import ipaddress
+import json
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from bs4 import BeautifulSoup
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import app.models  # noqa: F401
+from app.api.routes import documents, wechat_accounts
+from app.core.crypto import encrypt_secret
+from app.db.base import Base
+from app.models.agent_run import AgentRun, AgentRunStatus
+from app.models.document import Document
+from app.models.document_visibility import VisibilityMode
+from app.models.user import User, UserRole
+from app.models.user_group import UserGroup
+from app.models.wechat_account import (
+    WeChatAccount,
+    WeChatBodyImageMaterial,
+    WeChatCoverMaterial,
+    WeChatDraft,
+    WeChatDraftStatus,
+    WeChatDraftSyncMode,
+)
+from app.schemas.document import DocumentUpdate
+from app.schemas.wechat import WeChatAccountCreate, WeChatAccountUpdate, WeChatArticleMetadata, WeChatDraftCreate
+from app.services.wechat_official_account import (
+    BodyImageCacheEntry,
+    CoverImage,
+    DraftPushResult,
+    DraftTarget,
+    WeChatApiError,
+    WeChatOfficialAccountClient,
+)
+
+
+class WeChatAccountAndDraftTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+        self.admin = User(username="admin", display_name="管理员", password_hash="x", role=UserRole.ADMIN, is_active=True)
+        self.user = User(username="writer", display_name="作者", password_hash="x", role=UserRole.USER, is_active=True)
+        self.other_user = User(username="other", display_name="其他", password_hash="x", role=UserRole.USER, is_active=True)
+        self.db.add_all([self.admin, self.user, self.other_user])
+        self.db.commit()
+        self.document = Document(
+            owner_id=self.user.id,
+            created_by_id=self.user.id,
+            last_modified_by_id=self.user.id,
+            title="文章标题",
+            current_html="<p>正文</p>",
+        )
+        self.db.add(self.document)
+        self.db.commit()
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self.engine.dispose()
+
+    def make_account(self, users: list[User] | None = None, active: bool = True) -> WeChatAccount:
+        account = WeChatAccount(
+            name="测试号",
+            app_id=f"wx-{self.db.query(WeChatAccount).count()}",
+            app_secret_encrypted=encrypt_secret("test-secret"),
+            is_active=active,
+        )
+        account.allowed_users = users or []
+        self.db.add(account)
+        self.db.commit()
+        return account
+
+    def test_account_masks_secret_and_limits_available_accounts(self) -> None:
+        account = self.make_account([self.user])
+        created = wechat_accounts.create_account(
+            WeChatAccountCreate(
+                name="第二个号",
+                app_id="wx-second",
+                app_secret="another-secret",
+                allowed_user_ids=[self.other_user.id],
+            ),
+            self.db,
+        )
+        self.assertNotIn("another-secret", created.app_secret_masked)
+        self.assertEqual(
+            [item.id for item in wechat_accounts.list_available_accounts(self.user, self.db)],
+            [account.id],
+        )
+        self.assertEqual(
+            [item.id for item in wechat_accounts.list_available_accounts(self.admin, self.db)],
+            [account.id, created.id],
+        )
+
+    def test_authorized_user_group_can_push_and_revocation_takes_effect(self) -> None:
+        group = UserGroup(name="新媒体中心")
+        group.members.append(self.user)
+        self.db.add(group)
+        self.db.commit()
+
+        created = wechat_accounts.create_account(
+            WeChatAccountCreate(
+                name="用户组授权号",
+                app_id="wx-group-access",
+                app_secret="group-secret",
+                allowed_group_ids=[group.id],
+            ),
+            self.db,
+        )
+        account = self.db.get(WeChatAccount, created.id)
+        assert account is not None
+
+        self.assertEqual(created.allowed_group_ids, [group.id])
+        self.assertEqual(
+            [item.id for item in wechat_accounts.list_available_accounts(self.user, self.db)],
+            [account.id],
+        )
+        self.assertEqual(wechat_accounts.list_available_accounts(self.other_user, self.db), [])
+        self.assertTrue(documents._can_push_wechat_draft(self.user, account))
+        self.assertFalse(documents._can_push_wechat_draft(self.other_user, account))
+
+        updated = wechat_accounts.update_account(
+            account.id,
+            WeChatAccountUpdate(allowed_group_ids=[]),
+            self.db,
+        )
+        self.assertEqual(updated.allowed_group_ids, [])
+        self.assertEqual(wechat_accounts.list_available_accounts(self.user, self.db), [])
+        self.db.refresh(account)
+        self.assertFalse(documents._can_push_wechat_draft(self.user, account))
+
+    def test_metadata_is_saved_without_creating_a_document_version(self) -> None:
+        metadata = WeChatArticleMetadata(
+            title="草稿标题",
+            author="作者",
+            digest="摘要",
+            content_source_url="https://example.com/read",
+            cover_url="https://cdn.example.com/cover.png",
+            pic_crop_235_1="0_0_1_1",
+            pic_crop_1_1="0_0_1_1",
+            need_open_comment=True,
+            only_fans_can_comment=True,
+        )
+        documents.update_document(self.document.id, DocumentUpdate(wechat_metadata=metadata), self.user, self.db)
+        self.db.refresh(self.document)
+        self.assertEqual(self.document.title, "草稿标题")
+        self.assertEqual(self.document.wechat_title, "草稿标题")
+        self.assertEqual(self.document.wechat_metadata["title"], "草稿标题")
+        self.assertEqual(self.document.wechat_metadata["cover_url"], "https://cdn.example.com/cover.png")
+        self.assertTrue(self.document.wechat_need_open_comment)
+
+    def test_system_title_update_also_updates_wechat_title(self) -> None:
+        documents.update_document(self.document.id, DocumentUpdate(title="同步后的标题"), self.user, self.db)
+        self.db.refresh(self.document)
+
+        self.assertEqual(self.document.title, "同步后的标题")
+        self.assertEqual(self.document.wechat_title, "同步后的标题")
+        self.assertEqual(self.document.wechat_metadata["title"], "同步后的标题")
+
+    def test_rejects_request_with_conflicting_system_and_wechat_titles(self) -> None:
+        with self.assertRaises(Exception) as context:
+            documents.update_document(
+                self.document.id,
+                DocumentUpdate(
+                    title="系统标题",
+                    wechat_metadata=WeChatArticleMetadata(title="不同的微信标题"),
+                ),
+                self.user,
+                self.db,
+            )
+
+        self.assertEqual(getattr(context.exception, "status_code", None), 422)
+        self.db.refresh(self.document)
+        self.assertEqual(self.document.title, "文章标题")
+        self.assertEqual(self.document.wechat_title, "文章标题")
+
+    def test_active_agent_run_blocks_wechat_draft_push(self) -> None:
+        self.db.add(
+            AgentRun(
+                id="active-wechat-draft-run",
+                document_id=self.document.id,
+                session_id=1,
+                user_id=self.user.id,
+                user_message_id=1,
+                client_request_id="active-wechat-draft-request",
+                status=AgentRunStatus.RUNNING,
+            )
+        )
+        self.db.commit()
+
+        self.assertTrue(documents.list_documents(self.user, self.db)[0].is_ai_editing)
+        with self.assertRaises(Exception) as context:
+            asyncio.run(
+                documents.create_wechat_draft(
+                    self.document.id,
+                    WeChatDraftCreate(account_id=999),
+                    self.user,
+                    self.db,
+                )
+            )
+
+        self.assertEqual(getattr(context.exception, "status_code", None), 409)
+        self.assertIn("正在由 AI 编辑", str(context.exception.detail))
+
+    def test_ai_editing_status_only_includes_accessible_active_documents(self) -> None:
+        self.document.visibility_mode = VisibilityMode.RESTRICTED
+        self.document.allowed_users = [self.user]
+        self.db.add(
+            AgentRun(
+                id="active-status-run",
+                document_id=self.document.id,
+                session_id=1,
+                user_id=self.user.id,
+                user_message_id=1,
+                client_request_id="active-status-request",
+                status=AgentRunStatus.RUNNING,
+            )
+        )
+        self.db.commit()
+
+        self.assertEqual(documents.get_ai_editing_status(self.user, self.db).active_document_ids, [self.document.id])
+        self.assertEqual(documents.get_ai_editing_status(self.other_user, self.db).active_document_ids, [])
+
+    def test_draft_route_enforces_account_access_and_caches_cover_media(self) -> None:
+        account = self.make_account([self.user])
+        self.document.wechat_title = "草稿标题"
+        self.document.wechat_cover_url = "https://cdn.example.com/cover.png"
+        self.db.commit()
+        cover = CoverImage(b"cover", "image/png", "cover.png")
+        client = type("MockClient", (), {
+            "download_cover": AsyncMock(return_value=cover),
+            "create_draft": AsyncMock(return_value=DraftPushResult(
+                "draft-media",
+                "cover-media",
+                True,
+                (BodyImageCacheEntry("a" * 64, "b" * 64, "image/png", "https://mmbiz.qpic.cn/body.png", "temporary"),),
+            )),
+        })()
+        with patch("app.api.routes.documents.WeChatOfficialAccountClient", return_value=client):
+            result = asyncio.run(
+                documents.create_wechat_draft(
+                    self.document.id, WeChatDraftCreate(account_id=account.id), self.user, self.db
+                )
+            )
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.media_id, "draft-media")
+        self.assertEqual(self.db.query(WeChatDraft).one().status, WeChatDraftStatus.SUCCEEDED)
+        self.assertEqual(self.db.query(WeChatCoverMaterial).one().media_id, "cover-media")
+        self.assertEqual(self.db.query(WeChatBodyImageMaterial).one().wechat_url, "https://mmbiz.qpic.cn/body.png")
+
+        blocked = self.make_account([self.other_user])
+        with self.assertRaises(Exception) as context:
+            asyncio.run(
+                documents.create_wechat_draft(
+                    self.document.id, WeChatDraftCreate(account_id=blocked.id), self.user, self.db
+                )
+            )
+        self.assertEqual(getattr(context.exception, "status_code", None), 403)
+
+    def test_draft_route_updates_selected_remote_draft_and_records_mode(self) -> None:
+        account = self.make_account([self.user])
+        self.document.wechat_title = "草稿标题"
+        self.document.wechat_cover_url = "https://cdn.example.com/cover.png"
+        self.db.commit()
+        cover = CoverImage(b"cover", "image/png", "cover.png")
+        client = type("MockClient", (), {
+            "validate_draft_target": AsyncMock(return_value=DraftTarget("target-media", "原草稿", None, 1)),
+            "download_cover": AsyncMock(return_value=cover),
+            "update_draft": AsyncMock(return_value=DraftPushResult("target-media", "cover-media", True)),
+            "create_draft": AsyncMock(),
+        })()
+        with patch("app.api.routes.documents.WeChatOfficialAccountClient", return_value=client):
+            result = asyncio.run(
+                documents.create_wechat_draft(
+                    self.document.id,
+                    WeChatDraftCreate(
+                        account_id=account.id,
+                        sync_mode="update",
+                        target_media_id="target-media",
+                    ),
+                    self.user,
+                    self.db,
+                )
+            )
+
+        self.assertEqual(result.media_id, "target-media")
+        self.assertEqual(result.sync_mode, "update")
+        client.validate_draft_target.assert_awaited_once_with(account, "target-media")
+        client.update_draft.assert_awaited_once()
+        client.create_draft.assert_not_awaited()
+        self.assertEqual(self.db.query(WeChatDraft).one().sync_mode, WeChatDraftSyncMode.UPDATE)
+
+    def test_auto_sync_updates_latest_successful_draft_for_the_same_account(self) -> None:
+        account = self.make_account([self.user])
+        self.document.wechat_title = "草稿标题"
+        self.document.wechat_cover_url = "https://cdn.example.com/cover.png"
+        self.db.add(
+            WeChatDraft(
+                document_id=self.document.id,
+                account_id=account.id,
+                created_by_id=self.user.id,
+                status=WeChatDraftStatus.SUCCEEDED,
+                sync_mode=WeChatDraftSyncMode.CREATE,
+                media_id="previous-media",
+                article_title="旧草稿",
+            )
+        )
+        self.db.commit()
+        client = type("MockClient", (), {
+            "download_cover": AsyncMock(return_value=CoverImage(b"cover", "image/png", "cover.png")),
+            "update_draft": AsyncMock(return_value=DraftPushResult("previous-media", "cover-media", True)),
+            "create_draft": AsyncMock(),
+        })()
+        with patch("app.api.routes.documents.WeChatOfficialAccountClient", return_value=client):
+            result = asyncio.run(
+                documents.create_wechat_draft(
+                    self.document.id, WeChatDraftCreate(account_id=account.id, sync_mode="auto"), self.user, self.db
+                )
+            )
+
+        self.assertEqual(result.sync_mode, "update")
+        client.update_draft.assert_awaited_once()
+        self.assertEqual(client.update_draft.await_args.kwargs["target_media_id"], "previous-media")
+        client.create_draft.assert_not_awaited()
+
+    def test_auto_sync_creates_a_new_draft_when_only_another_account_has_history(self) -> None:
+        previous_account = self.make_account([self.user])
+        account = self.make_account([self.user])
+        self.document.wechat_title = "草稿标题"
+        self.document.wechat_cover_url = "https://cdn.example.com/cover.png"
+        self.db.add(
+            WeChatDraft(
+                document_id=self.document.id,
+                account_id=previous_account.id,
+                created_by_id=self.user.id,
+                status=WeChatDraftStatus.SUCCEEDED,
+                sync_mode=WeChatDraftSyncMode.CREATE,
+                media_id="previous-account-media",
+                article_title="另一个公众号的草稿",
+            )
+        )
+        self.db.commit()
+        client = type("MockClient", (), {
+            "download_cover": AsyncMock(return_value=CoverImage(b"cover", "image/png", "cover.png")),
+            "create_draft": AsyncMock(return_value=DraftPushResult("new-media", "cover-media", True)),
+            "update_draft": AsyncMock(),
+        })()
+        with patch("app.api.routes.documents.WeChatOfficialAccountClient", return_value=client):
+            result = asyncio.run(
+                documents.create_wechat_draft(
+                    self.document.id, WeChatDraftCreate(account_id=account.id, sync_mode="auto"), self.user, self.db
+                )
+            )
+
+        self.assertEqual(result.sync_mode, "create")
+        client.create_draft.assert_awaited_once()
+        client.update_draft.assert_not_awaited()
+
+    def test_auto_sync_records_failure_when_the_previous_draft_has_been_deleted(self) -> None:
+        account = self.make_account([self.user])
+        self.document.wechat_title = "草稿标题"
+        self.document.wechat_cover_url = "https://cdn.example.com/cover.png"
+        self.db.add(
+            WeChatDraft(
+                document_id=self.document.id,
+                account_id=account.id,
+                created_by_id=self.user.id,
+                status=WeChatDraftStatus.SUCCEEDED,
+                sync_mode=WeChatDraftSyncMode.CREATE,
+                media_id="deleted-media",
+                article_title="已删除草稿",
+            )
+        )
+        self.db.commit()
+        client = type("MockClient", (), {
+            "download_cover": AsyncMock(return_value=CoverImage(b"cover", "image/png", "cover.png")),
+            "update_draft": AsyncMock(side_effect=WeChatApiError("要覆盖的草稿不存在", 40007)),
+            "create_draft": AsyncMock(),
+        })()
+        with patch("app.api.routes.documents.WeChatOfficialAccountClient", return_value=client):
+            with self.assertRaises(Exception) as context:
+                asyncio.run(
+                    documents.create_wechat_draft(
+                        self.document.id, WeChatDraftCreate(account_id=account.id, sync_mode="auto"), self.user, self.db
+                    )
+                )
+
+        self.assertEqual(getattr(context.exception, "status_code", None), 502)
+        client.update_draft.assert_awaited_once()
+        client.create_draft.assert_not_awaited()
+        failed_draft = self.db.query(WeChatDraft).order_by(WeChatDraft.id.desc()).first()
+        self.assertEqual(failed_draft.status, WeChatDraftStatus.FAILED)
+        self.assertEqual(failed_draft.sync_mode, WeChatDraftSyncMode.UPDATE)
+        self.assertEqual(failed_draft.media_id, None)
+        self.assertEqual(failed_draft.error_code, 40007)
+
+    def test_draft_target_route_lists_remote_drafts_for_permitted_account(self) -> None:
+        account = self.make_account([self.user])
+        client = type("MockClient", (), {
+            "list_draft_targets": AsyncMock(return_value=[DraftTarget("media-1", "要覆盖的草稿", 1_700_000_000, 2)]),
+        })()
+        with patch("app.api.routes.documents.WeChatOfficialAccountClient", return_value=client):
+            targets = asyncio.run(
+                documents.list_wechat_draft_targets(self.document.id, account.id, self.user, self.db)
+            )
+
+        self.assertEqual([(target.media_id, target.title, target.article_count) for target in targets], [("media-1", "要覆盖的草稿", 2)])
+        client.list_draft_targets.assert_awaited_once_with(account)
+
+
+class WeChatHttpClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.account = WeChatAccount(
+            id=101,
+            name="测试号",
+            app_id="wx-test",
+            app_secret_encrypted=encrypt_secret("test-secret"),
+        )
+
+    def test_allows_large_body_for_wechat_to_validate(self) -> None:
+        WeChatOfficialAccountClient.validate_draft_input(
+            WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),
+            f"<p>{'正文' * 10_001}</p>",
+        )
+
+    def test_replaces_small_body_images_with_temporary_urls_and_retries_once_for_invalid_token(self) -> None:
+        seen_paths: list[str] = []
+        progress_events: list[tuple[str, int, str]] = []
+        draft_attempts = 0
+
+        async def report(stage: str, percent: int, detail: str) -> None:
+            progress_events.append((stage, percent, detail))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal draft_attempts
+            seen_paths.append(request.url.path)
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": f"token-{seen_paths.count('/cgi-bin/stable_token')}", "expires_in": 7200})
+            if request.url.host == "images.example.com":
+                return httpx.Response(200, headers={"content-type": "image/png"}, content=b"png")
+            if request.url.path == "/cgi-bin/media/uploadimg":
+                call_number = seen_paths.count("/cgi-bin/media/uploadimg")
+                return httpx.Response(200, json={"url": f"https://mmbiz.qpic.cn/temporary-{call_number}.png"})
+            if request.url.path == "/cgi-bin/material/add_material":
+                call_number = seen_paths.count("/cgi-bin/material/add_material")
+                return httpx.Response(
+                    200,
+                    json={
+                        "media_id": f"material-{call_number}",
+                        "url": f"https://mmbiz.qpic.cn/permanent-{call_number}.png",
+                    },
+                )
+            if request.url.path == "/cgi-bin/draft/add":
+                draft_attempts += 1
+                if draft_attempts == 1:
+                    return httpx.Response(200, json={"errcode": 40001, "errmsg": "invalid credential"})
+                body = json.loads(request.content)
+                self.assertIn("mmbiz.qpic.cn/temporary-2.png", body["articles"][0]["content"])
+                self.assertEqual(body["articles"][0]["digest"], "")
+                return httpx.Response(200, json={"media_id": "draft-media"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ), patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            result = asyncio.run(
+                WeChatOfficialAccountClient().create_draft(
+                    self.account,
+                    html='<p><img src="https://images.example.com/a.png"></p>',
+                    metadata=WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id=None,
+                    progress_callback=report,
+                )
+            )
+        self.assertEqual(result.media_id, "draft-media")
+        self.assertEqual(seen_paths.count("/cgi-bin/stable_token"), 2)
+        self.assertEqual(seen_paths.count("/cgi-bin/media/uploadimg"), 2)
+        self.assertEqual(seen_paths.count("/cgi-bin/material/add_material"), 2)
+        self.assertTrue(any(stage == "token" and "access_token" in detail for stage, _, detail in progress_events))
+        self.assertTrue(any(stage == "body-images" and "正文图片 1/1" in detail for stage, _, detail in progress_events))
+        self.assertTrue(any(stage == "cover" and "封面永久素材" in detail for stage, _, detail in progress_events))
+        self.assertTrue(any(stage == "draft" and "草稿" in detail for stage, _, detail in progress_events))
+
+    def test_preserves_gif_body_by_using_a_permanent_material_url(self) -> None:
+        seen_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_paths.append(request.url.path)
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.host == "images.example.com":
+                return httpx.Response(200, headers={"content-type": "image/gif"}, content=b"gif")
+            if request.url.path == "/cgi-bin/material/add_material":
+                if b"body.gif" in request.content:
+                    return httpx.Response(
+                        200,
+                        json={"media_id": "body-gif-media", "url": "https://mmbiz.qpic.cn/body.gif"},
+                    )
+                return httpx.Response(200, json={"media_id": "cover-media", "url": "https://mmbiz.qpic.cn/cover.gif"})
+            if request.url.path == "/cgi-bin/draft/add":
+                body = json.loads(request.content)
+                self.assertIn("https://mmbiz.qpic.cn/body.gif", body["articles"][0]["content"])
+                return httpx.Response(200, json={"media_id": "draft-media"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ), patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            result = asyncio.run(
+                WeChatOfficialAccountClient().create_draft(
+                    self.account,
+                    html='<p><img src="https://images.example.com/body.gif"></p>',
+                    metadata=WeChatArticleMetadata(title="动图", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id=None,
+                )
+            )
+
+        self.assertEqual(result.media_id, "draft-media")
+        self.assertEqual(seen_paths.count("/cgi-bin/media/uploadimg"), 0)
+        self.assertEqual(seen_paths.count("/cgi-bin/material/add_material"), 2)
+
+    def test_reuses_cached_body_image_without_downloading_or_uploading(self) -> None:
+        source = "https://images.example.com/cached.png"
+        source_hash = WeChatOfficialAccountClient.body_image_source_sha256(source)
+        cached_entry = BodyImageCacheEntry(
+            source_url_sha256=source_hash,
+            content_sha256="a" * 64,
+            content_type="image/png",
+            wechat_url="https://mmbiz.qpic.cn/cached.png",
+            upload_mode="temporary",
+        )
+        seen_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_paths.append(request.url.path)
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.path == "/cgi-bin/draft/add":
+                body = json.loads(request.content)
+                self.assertIn(cached_entry.wechat_url, body["articles"][0]["content"])
+                return httpx.Response(200, json={"media_id": "draft-media"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ), patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            result = asyncio.run(
+                WeChatOfficialAccountClient().create_draft(
+                    self.account,
+                    html=f'<p><img src="{source}"></p>',
+                    metadata=WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id="cover-media",
+                    cached_body_images={source_hash: cached_entry},
+                )
+            )
+
+        self.assertEqual(result.media_id, "draft-media")
+        self.assertEqual(seen_paths, ["/cgi-bin/stable_token", "/cgi-bin/draft/add"])
+        self.assertEqual(result.body_image_cache_entries, ())
+
+    def test_reuses_matching_content_hash_for_a_new_body_image_url(self) -> None:
+        previous_source = "https://images.example.com/old.png"
+        source = "https://images.example.com/new.png"
+        content = b"same-image"
+        cached_entry = BodyImageCacheEntry(
+            source_url_sha256=WeChatOfficialAccountClient.body_image_source_sha256(previous_source),
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            content_type="image/png",
+            wechat_url="https://mmbiz.qpic.cn/reused.png",
+            upload_mode="temporary",
+        )
+        seen_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_paths.append(request.url.path)
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.host == "images.example.com":
+                return httpx.Response(200, headers={"content-type": "image/png"}, content=content)
+            if request.url.path == "/cgi-bin/draft/add":
+                body = json.loads(request.content)
+                self.assertIn(cached_entry.wechat_url, body["articles"][0]["content"])
+                return httpx.Response(200, json={"media_id": "draft-media"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ), patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            result = asyncio.run(
+                WeChatOfficialAccountClient().create_draft(
+                    self.account,
+                    html=f'<p><img src="{source}"></p>',
+                    metadata=WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id="cover-media",
+                    cached_body_images={cached_entry.source_url_sha256: cached_entry},
+                )
+            )
+
+        self.assertEqual(seen_paths.count("/cgi-bin/media/uploadimg"), 0)
+        self.assertEqual(result.body_image_cache_entries[0].source_url_sha256, WeChatOfficialAccountClient.body_image_source_sha256(source))
+
+    def test_reuploads_cached_body_image_once_when_wechat_rejects_its_url(self) -> None:
+        source = "https://images.example.com/cached.png"
+        source_hash = WeChatOfficialAccountClient.body_image_source_sha256(source)
+        cached_entry = BodyImageCacheEntry(source_hash, "a" * 64, "image/png", "https://mmbiz.qpic.cn/stale.png", "temporary")
+        seen_paths: list[str] = []
+        draft_attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal draft_attempts
+            seen_paths.append(request.url.path)
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.host == "images.example.com":
+                return httpx.Response(200, headers={"content-type": "image/png"}, content=b"fresh-image")
+            if request.url.path == "/cgi-bin/media/uploadimg":
+                return httpx.Response(200, json={"url": "https://mmbiz.qpic.cn/fresh.png"})
+            if request.url.path == "/cgi-bin/draft/add":
+                draft_attempts += 1
+                body = json.loads(request.content)
+                if draft_attempts == 1:
+                    self.assertIn("stale.png", body["articles"][0]["content"])
+                    return httpx.Response(200, json={"errcode": 47001, "errmsg": "data format error"})
+                self.assertIn("fresh.png", body["articles"][0]["content"])
+                return httpx.Response(200, json={"media_id": "draft-media"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ), patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            result = asyncio.run(
+                WeChatOfficialAccountClient().create_draft(
+                    self.account,
+                    html=f'<p><img src="{source}"></p>',
+                    metadata=WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id="cover-media",
+                    cached_body_images={source_hash: cached_entry},
+                )
+            )
+
+        self.assertEqual(result.media_id, "draft-media")
+        self.assertEqual(draft_attempts, 2)
+        self.assertEqual(seen_paths.count("/cgi-bin/media/uploadimg"), 1)
+        self.assertEqual(result.body_image_cache_entries[0].wechat_url, "https://mmbiz.qpic.cn/fresh.png")
+
+    def test_invalid_draft_input_does_not_call_wechat(self) -> None:
+        with patch("app.services.wechat_official_account.httpx.AsyncClient") as async_client:
+            with self.assertRaises(WeChatApiError):
+                asyncio.run(
+                    WeChatOfficialAccountClient().create_draft(
+                        self.account,
+                        html="<p>正文</p>",
+                        metadata=WeChatArticleMetadata(title=""),
+                        cover=CoverImage(b"cover", "image/png", "cover.png"),
+                        cached_cover_media_id=None,
+                    )
+                )
+        async_client.assert_not_called()
+
+    def test_downgrades_mini_program_text_links_before_submitting_draft(self) -> None:
+        submitted_content = ""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal submitted_content
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.path == "/cgi-bin/draft/add":
+                submitted_content = json.loads(request.content)["articles"][0]["content"]
+                return httpx.Response(200, json={"media_id": "draft-media"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        source_html = (
+            '<p style="font-size:13px;color:#555;line-height:1.8;margin:8px 0 0 0;">'
+            '<a class="weapp_text_link" data-miniprogram-appid="wxc8dc2d3cafab889e" '
+            'data-miniprogram-path="/pages/koc/kl?fid=734952377437786112" '
+            'data-miniprogram-nickname="文助手" href="https://idocx.cc/" style="font-size:15px;">'
+            '易路同行 耕耘不辍.docx</a></p>'
+        )
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            asyncio.run(
+                WeChatOfficialAccountClient().create_draft(
+                    self.account,
+                    html=source_html,
+                    metadata=WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id="cover-media",
+                )
+            )
+
+        link = BeautifulSoup(submitted_content, "html.parser").find("a")
+        assert link is not None
+        self.assertEqual(link.get("href"), "https://idocx.cc/")
+        self.assertNotIn("weapp_text_link", link.get("class") or [])
+        self.assertFalse(any(name.startswith("data-miniprogram-") for name in link.attrs))
+        self.assertIn("font-size:15px", link.get("style") or "")
+        self.assertIn("color:#576b95", link.get("style") or "")
+        self.assertIn("text-decoration:none", link.get("style") or "")
+
+    def test_lists_targets_and_updates_existing_draft(self) -> None:
+        seen_update_payload: dict[str, object] | None = None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal seen_update_payload
+            if request.url.path == "/cgi-bin/stable_token":
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.path == "/cgi-bin/draft/batchget":
+                self.assertEqual(json.loads(request.content), {"offset": 0, "count": 20, "no_content": 1})
+                return httpx.Response(
+                    200,
+                    json={
+                        "total_count": 1,
+                        "item": [{
+                            "media_id": "target-media",
+                            "update_time": 1_700_000_000,
+                            "content": {"news_item": [{"title": "原草稿"}, {"title": "第二篇"}]},
+                        }],
+                    },
+                )
+            if request.url.path == "/cgi-bin/draft/get":
+                self.assertEqual(json.loads(request.content), {"media_id": "target-media"})
+                return httpx.Response(200, json={"news_item": [{"title": "原草稿"}, {"title": "第二篇"}]})
+            if request.url.host == "images.example.com":
+                return httpx.Response(200, headers={"content-type": "image/png"}, content=b"png")
+            if request.url.path == "/cgi-bin/media/uploadimg":
+                return httpx.Response(200, json={"url": "https://mmbiz.qpic.cn/temporary-body.png"})
+            if request.url.path == "/cgi-bin/material/add_material":
+                return httpx.Response(200, json={"media_id": "cover-media", "url": "https://mmbiz.qpic.cn/body.png"})
+            if request.url.path == "/cgi-bin/draft/update":
+                seen_update_payload = json.loads(request.content)
+                return httpx.Response(200, json={"errcode": 0, "errmsg": "ok"})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+        with patch(
+            "app.services.wechat_official_account.httpx.AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ), patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+            asyncio.run(WeChatOfficialAccountClient.clear_token_cache())
+            client = WeChatOfficialAccountClient()
+            targets = asyncio.run(client.list_draft_targets(self.account))
+            self.assertEqual(targets, [DraftTarget("target-media", "原草稿", 1_700_000_000, 2)])
+            target = asyncio.run(client.validate_draft_target(self.account, "target-media"))
+            self.assertEqual(target, DraftTarget("target-media", "原草稿", None, 2))
+            result = asyncio.run(
+                client.update_draft(
+                    self.account,
+                    target_media_id="target-media",
+                    html='<p><img src="https://images.example.com/a.png"></p>',
+                    metadata=WeChatArticleMetadata(title="新标题", cover_url="https://images.example.com/cover.png"),
+                    cover=CoverImage(b"cover", "image/png", "cover.png"),
+                    cached_cover_media_id=None,
+                )
+            )
+
+        self.assertEqual(result.media_id, "target-media")
+        self.assertEqual(seen_update_payload and seen_update_payload["media_id"], "target-media")
+        self.assertEqual(seen_update_payload and seen_update_payload["index"], 0)
+        self.assertIsInstance((seen_update_payload or {})["articles"], dict)
+        self.assertEqual((seen_update_payload or {})["articles"]["title"], "新标题")
+        self.assertIn("temporary-body.png", str((seen_update_payload or {})["articles"]))
+
+    def test_trusted_oss_benchmark_address_is_narrowly_allowed(self) -> None:
+        hostname = "bucket.oss-cn-chengdu.aliyuncs.com"
+        self.assertTrue(
+            WeChatOfficialAccountClient._is_trusted_oss_benchmark_address(
+                hostname, ipaddress.ip_address("198.18.1.52"), {hostname}
+            )
+        )
+        self.assertFalse(
+            WeChatOfficialAccountClient._is_trusted_oss_benchmark_address(
+                "other.example.com", ipaddress.ip_address("198.18.1.52"), {hostname}
+            )
+        )
+        self.assertFalse(
+            WeChatOfficialAccountClient._is_trusted_oss_benchmark_address(
+                hostname, ipaddress.ip_address("10.0.0.1"), {hostname}
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

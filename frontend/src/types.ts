@@ -1,5 +1,35 @@
 export type UserRole = 'admin' | 'user'
 
+export type OperationLogStatus = 'succeeded' | 'failed' | 'cancelled'
+
+export interface OperationLog {
+  id: number
+  actor_user_id: number | null
+  actor_username: string
+  actor_display_name: string
+  action: string
+  resource_type: string
+  resource_id: string
+  resource_name: string
+  document_id: number | null
+  session_id: number | null
+  status: OperationLogStatus
+  summary: string
+  error_summary: string
+  details: Record<string, unknown>
+  request_id: string
+  client_ip: string
+  user_agent: string
+  created_at: string
+}
+
+export interface OperationLogListResult {
+  items: OperationLog[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export interface User {
   id: number
   username: string
@@ -14,6 +44,15 @@ export interface UserGroup {
   name: string
   members: Array<Pick<User, 'id' | 'username' | 'display_name' | 'is_active'>>
   created_at: string
+}
+
+export interface AppBranding {
+  system_name: string
+  logo_url: string | null
+  logo_content_type: string
+  favicon_url: string | null
+  favicon_content_type: string
+  updated_at: string | null
 }
 
 export interface TokenResponse {
@@ -34,10 +73,59 @@ export interface AIModelItem {
   max_output_tokens: number
   tool_result_max_tokens: number
   is_default: boolean
+  is_multimodal: boolean
+  supports_disabled_thinking: boolean
   access_mode: 'all' | 'restricted'
   allowed_user_ids: number[]
   allowed_group_ids: number[]
   thinking_config: Record<string, unknown>
+}
+
+export type WorkboardPeriod = 'today' | '7d' | '30d' | 'month'
+
+export interface WorkboardTokenStats {
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cache_hit_rate: number | null
+  usage_unreported_calls: number
+}
+
+export interface WorkboardModelRank extends WorkboardTokenStats {
+  model_id: number
+  display_name: string
+  call_count: number
+}
+
+export interface WorkboardUserRank extends WorkboardTokenStats {
+  user_id: number | null
+  display_name: string
+  username: string
+  call_count: number
+}
+
+export interface WorkboardTweetActivity {
+  total_documents: number
+  created_documents: number
+  active_creators: number
+  ai_versions: number
+  manual_versions: number
+}
+
+export interface WorkboardOverview extends WorkboardTokenStats {
+  model_call_count: number
+  active_users: number
+}
+
+export interface WorkboardData {
+  period: WorkboardPeriod
+  start_at: string
+  end_at: string
+  overview: WorkboardOverview
+  model_ranking: WorkboardModelRank[]
+  user_ranking: WorkboardUserRank[]
+  tweet_activity: WorkboardTweetActivity
 }
 
 export interface AIProviderItem {
@@ -57,6 +145,8 @@ export interface ModelPresetItem {
   context_compaction_threshold_tokens: number
   max_output_tokens: number
   tool_result_max_tokens: number
+  is_multimodal: boolean
+  supports_disabled_thinking: boolean
   thinking_config: Record<string, unknown>
   thinking_efforts: string[]
 }
@@ -83,14 +173,17 @@ export interface ModelDiscoveryResult {
 
 export interface StorageConfigItem {
   configured: boolean
+  provider: 'aliyun_oss' | 'tencent_cos' | 'huawei_obs' | 'volcengine_tos' | 'qiniu_kodo'
   endpoint: string
   bucket: string
   access_key_id: string
   access_key_secret_masked: string
+  region_or_zone: string
+  upload_endpoint: string
   custom_domain: string
 }
 
-export type DocumentSourceType = 'blank' | 'pdf' | 'word'
+export type DocumentSourceType = 'blank' | 'pdf' | 'word' | 'markdown' | 'web'
 export type VisibilityMode = 'all' | 'restricted'
 
 export interface VisibilitySettings {
@@ -124,6 +217,8 @@ export interface DocumentSummary extends VisibilitySettings {
   title: string
   source_type: DocumentSourceType
   group_id: number | null
+  wechat_cover_url: string
+  is_ai_editing: boolean
   created_by: UserReference | null
   last_modified_by: UserReference | null
   created_at: string
@@ -133,13 +228,111 @@ export interface DocumentSummary extends VisibilitySettings {
 
 export interface DocumentDetail extends DocumentSummary {
   current_html: string
+  wechat_metadata: WeChatArticleMetadata
   messages?: ChatMessageItem[]
+}
+
+export interface DocumentShareRecord {
+  id: number
+  document_id: number | null
+  document_title: string
+  token: string
+  created_by_id: number | null
+  created_by_username: string
+  created_by_display_name: string
+  expires_at: string
+  revoked_at: string | null
+  revoked_by_id: number | null
+  revoked_by_username: string
+  revoked_by_display_name: string
+  created_at: string
+  is_active: boolean
+  visit_count: number
+  last_visited_at: string | null
+}
+
+export interface DocumentShareVisit {
+  id: number
+  ip_address: string
+  user_agent: string
+  referer: string
+  first_seen_at: string
+  last_seen_at: string
+}
+
+export interface DocumentShareVisitList {
+  items: DocumentShareVisit[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface WeChatArticleMetadata {
+  title: string
+  author: string
+  digest: string
+  content_source_url: string
+  cover_url: string
+  pic_crop_235_1: string
+  pic_crop_1_1: string
+  need_open_comment: boolean
+  only_fans_can_comment: boolean
+}
+
+export interface WeChatAccount {
+  id: number
+  name: string
+  app_id: string
+  app_secret_masked: string
+  allowed_user_ids: number[]
+  allowed_group_ids: number[]
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface WeChatAvailableAccount {
+  id: number
+  name: string
+}
+
+export interface WeChatDraftRecord {
+  id: number
+  account_id: number
+  account_name: string
+  status: 'succeeded' | 'failed'
+  media_id: string | null
+  sync_mode: 'create' | 'update'
+  article_title: string
+  error_code: number | null
+  error_message: string
+  created_by_name: string | null
+  created_at: string
+}
+
+export interface WeChatDraftTarget {
+  media_id: string
+  title: string
+  update_time: number | null
+  article_count: number
 }
 
 export interface LayoutReferenceSummary {
   block_count: number
   image_slots: number
+  image_assets: number
   extracted_from: string
+}
+
+export interface LayoutReferenceAssetPreview {
+  asset_id: string
+  preview_url: string
+  content_type: string
+  width: number
+  height: number
+  usage_count: number
+  role: string
+  default_selected: boolean
 }
 
 export interface LayoutReferencePreview {
@@ -148,7 +341,9 @@ export interface LayoutReferencePreview {
   title: string
   site_name: string
   preview_html: string
+  assets: LayoutReferenceAssetPreview[]
   summary: LayoutReferenceSummary
+  requires_asset_reuse_confirmation: boolean
   warning: string | null
 }
 
@@ -170,9 +365,33 @@ export interface DocumentVersionDetail extends DocumentVersionSummary {
 
 export type ChatRole = 'user' | 'assistant' | 'tool'
 
-export type AgentRunStatus = 'pending' | 'running' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
+export type AgentRunStatus = 'pending' | 'running' | 'waiting_for_input' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
 
-export type ToolExecutionStatus = 'running' | 'success' | 'error'
+export type ToolExecutionStatus = 'running' | 'waiting' | 'success' | 'error'
+
+export interface ChatUserQuestionOption {
+  id: string
+  label: string
+  description: string
+  style_html: string | null
+}
+
+export interface ChatUserQuestion {
+  id: string
+  run_id: string
+  question: string
+  options: ChatUserQuestionOption[]
+  allow_multiple: boolean
+  include_style: boolean
+  timeout_at?: string | null
+  inactivity_seconds?: number
+  timeline?: {
+    tool_calls?: ToolExecution[]
+    turn_blocks?: AssistantTurnBlock[]
+    reasoning?: ReasoningTrace
+  }
+  event_sequence?: number
+}
 
 export type ReasoningStatus = 'idle' | 'thinking' | 'complete' | 'unavailable'
 
@@ -219,8 +438,13 @@ export interface ToolActivityTarget {
   after?: string
 }
 
+export interface TaskPlanItem {
+  step: string
+  status: 'pending' | 'in_progress' | 'done'
+}
+
 export interface ToolActivity {
-  kind: 'map' | 'search' | 'read' | 'edit' | 'check' | 'reference' | 'error' | string
+  kind: 'map' | 'search' | 'read' | 'edit' | 'check' | 'plan' | 'reference' | 'error' | string
   summary: string
   query?: string
   revision?: string
@@ -243,16 +467,61 @@ export interface ChatContextStats {
   tool_summary_replayed_count: number
   tool_compact_replayed_count: number
   tool_full_replayed_count: number
+  event_count?: number
+  replayed_event_count?: number
+  compaction_strategy?: string
+  compaction_target_tokens?: number
   tokens_saved: number
   context_policy: string
   max_output_tokens: number
   tool_result_max_tokens: number
+  effective_tool_preview_tokens?: number
+  stored_tool_output_count?: number
+  stored_tool_output_bytes?: number
+  stored_tool_output_tokens?: number
+  tool_output_retention_days?: number
   active_context_threshold_tokens: number
   budget_multiplier: number
   requires_compaction: boolean
   can_fit_after_compaction: boolean
   overflow_tokens: number
   projected_used_tokens: number
+  conversation_tokens?: number
+  conversation_message_count?: number
+  compacted_history_tokens?: number
+  compacted_history_message_count?: number
+  runtime_context_state?: string
+  runtime_input_tokens?: number
+  runtime_original_tokens?: number
+  runtime_digested_cycles?: number
+  runtime_dropped_cycles?: number
+  runtime_projected_tokens?: number
+  runtime_visible_output_tokens?: number
+  runtime_reasoning_tokens?: number
+  runtime_tool_argument_tokens?: number
+  last_model_output_tokens?: number
+  last_model_cached_input_tokens?: number
+  ledger_tokens?: number
+  raw_input_tokens?: number
+  compiled_input_tokens?: number
+  raw_breakdown?: Record<string, number>
+  snapshot_id?: number
+  snapshot_covered_event_count?: number
+  hot_event_count?: number
+  cold_event_count?: number
+  tool_output_retention_mode?: 'session' | 'ttl' | string
+  run_summarized_cycles?: number
+  runtime_summary_tokens?: number
+  snapshot_source_event_count?: number
+  snapshot_prefix_valid?: boolean
+  archived_branch_count?: number
+  compaction_location?: string
+  thinking_capability_fallback?: {
+    model_id: number
+    reason: string
+    fallback_mode: 'auto'
+    message: string
+  } | null
 }
 
 export type AssistantTurnBlockType = 'thought' | 'tool' | 'content'
@@ -271,12 +540,73 @@ export interface ChatMessageItem {
   id: number
   role: ChatRole
   content: string
+  created_by: UserReference | null
+  model_usage: ChatMessageModelUsage | null
+  image_attachments: ChatImageAttachment[]
   tool_calls: ToolExecution[]
   reasoning_trace: ReasoningTrace
   turn_blocks: AssistantTurnBlock[]
   selected_elements: SelectedElementContext[]
+  template_refs: Array<{ id: number; name: string }>
   can_revert: boolean
   created_at: string
+}
+
+export interface ChatMessageModelUsage {
+  model_names: string[]
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cache_hit_rate?: number
+  call_count?: number
+  usage_reported: boolean
+}
+
+export interface ChatHistoryArchive {
+  id: number
+  source_message_id: number
+  reason: string
+  message_count: number
+  created_at: string
+}
+
+export interface ChatImageAttachment {
+  id: string
+  filename: string
+  content_type: string
+  size: number
+  preview_url: string
+}
+
+export type LayoutReferenceImitationStrength = 'style' | 'structure' | 'maximum'
+
+export interface ChatSessionItem {
+  id: number
+  title: string
+  is_archived: boolean
+  context_start_message_id: number
+  visible_message_count: number
+  hidden_message_count: number
+  layout_reference: {
+    title: string
+    site_name: string
+    extracted_from: string
+    block_count: number
+    image_assets: number
+    imitation_strength: LayoutReferenceImitationStrength
+  } | null
+  attached_templates: TemplateItem[]
+  theme_context: {
+    proposal_id: string
+    theme_key: string
+    theme_name: string
+    apply_mode: GzhApplyMode
+    status: string
+  } | null
+  created_at: string
+  updated_at: string
 }
 
 export interface SelectedElementContext {
@@ -291,12 +621,181 @@ export interface ComplianceReport {
   keptClasses: string[]
   removedIdAttributes: string[]
   riskStyleHints: string[]
+  bannedTags: string[]
+  consecutiveBrRuns: number[]
+  svgIdAttributes: string[]
+  imageIssues: string[]
   removedSvgBrs: number
   hasSvg: boolean
   oversizedSvgBlocks: number[]
   maxNestingDepth: number
   willFlattenNesting: boolean
   emptyNodeSuspects: string[]
+  diagnostics: ComplianceDiagnostic[]
   hasError: boolean
   hasWarning: boolean
+  gzhStrict?: GzhStrictReport | null
+}
+
+export interface GzhStrictReport {
+  hasError: boolean
+  hasWarning: boolean
+  errors: string[]
+  warnings: string[]
+  leafCount: number
+}
+
+export type GzhApplyMode = 'full' | 'restrained' | 'key_components'
+export type GzhThemeStatus = 'draft' | 'published' | 'archived'
+
+export interface GzhThemeItem {
+  id: number | null
+  key: string
+  name: string
+  description: string
+  scenarios: string[]
+  accent_color: string
+  is_builtin: boolean
+  status: GzhThemeStatus
+  preview_available: boolean
+  active_version_id?: number | null
+  active_version?: number | null
+}
+
+export interface GzhThemeComponent {
+  id: string
+  name: string
+  category: string
+  source: 'theme' | 'common'
+}
+
+export interface GzhThemeRecipe {
+  id: string
+  article_type: string
+  core_component_ids: string[]
+  decorative_component_ids: string[]
+}
+
+export interface GzhThemeManifest {
+  schema_version: number
+  source_checksum: string
+  design_tokens: Array<{ name: string; value: string }>
+  components: GzhThemeComponent[]
+  recipes: GzhThemeRecipe[]
+  structural_component_ids: string[]
+  recommended_recipe_id: string
+}
+
+export interface GzhThemeCreatePayload {
+  slug: string
+  name: string
+  description: string
+  scenarios: string[]
+  accent_color: string
+  source_markdown: string
+  preview_html: string
+}
+
+export interface GzhThemeVersion {
+  id: number
+  theme_id: number
+  version: number
+  status: GzhThemeStatus
+  generation_brief: string
+  validation: Array<{ level: string; message: string }>
+  component_count: number
+  recipe_count: number
+  created_at: string
+  published_at: string | null
+}
+
+export interface GzhThemeManagerItem extends GzhThemeItem {
+  id: number
+  versions: GzhThemeVersion[]
+}
+
+export interface GzhThemeReferenceAsset {
+  id: string
+  filename: string
+  content_type: string
+  size: number
+  expires_at: string
+}
+
+export interface GzhThemeGeneration {
+  id: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'saved'
+  theme_id: number | null
+  name_hint: string
+  slug_hint: string
+  brief: string
+  validation: Array<{ level: string; message: string }>
+  error_message: string
+  preview_html: string
+  component_count: number
+  recipe_count: number
+  created_at: string
+  finished_at: string | null
+}
+
+export interface GzhThemeProposal {
+  id: string
+  theme_key: string
+  theme_name: string
+  apply_mode: GzhApplyMode
+  user_instructions: string
+  article_type: string
+  recipe_id: string
+  selected_component_ids: string[]
+  status: string
+  expires_at: string
+}
+
+export type TemplateSourceType = 'rich_paste' | 'source' | 'ai'
+export type TemplateGenerationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'saved'
+
+export interface TemplateCategory {
+  id: number
+  name: string
+  sort_order: number
+  created_at: string
+  updated_at: string
+}
+
+export interface TemplateImageWarning {
+  source: string
+  message: string
+}
+
+export interface TemplateItem {
+  id: number
+  name: string
+  category_id: number | null
+  html: string
+  source_type: TemplateSourceType
+  image_warnings: TemplateImageWarning[]
+  created_at: string
+  updated_at: string
+}
+
+export interface TemplateGeneration {
+  id: string
+  status: TemplateGenerationStatus
+  prompt: string
+  output_html: string
+  error_message: string
+  created_at: string
+  finished_at: string | null
+}
+
+export interface ComplianceDiagnostic {
+  code: string
+  severity: 'error' | 'warning' | 'info'
+  path: string
+  line: number
+  column: number
+  snippet: string
+  message: string
+  consequence: string
+  suggestion: string
 }

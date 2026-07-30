@@ -1,8 +1,9 @@
-import { documentsApi, uploadToOss } from '../api/documents'
+import { documentsApi, uploadToOss, uploadToServer } from '../api/documents'
 import { ApiError } from '../api/client'
 import type { DocumentDetail } from '../types'
+import { prepareWeChatBodyImage } from '../utils/wechatBodyImage'
 import { parseImportFile } from './documentImportParser'
-import type { ImportParseProgress, ParsedImportAsset } from './types'
+import type { ImportParseProgress, ParsedImport, ParsedImportAsset } from './types'
 
 export interface DirectImportProgress {
   phase: 'parsing' | 'uploading' | 'finalizing'
@@ -12,6 +13,20 @@ export interface DirectImportProgress {
 
 const RETRY_COUNT = 3
 const UPLOAD_CONCURRENCY = 3
+
+async function prepareImportAssetsForWeChat(assets: ParsedImportAsset[], signal?: AbortSignal): Promise<ParsedImportAsset[]> {
+  return Promise.all(assets.map(async (asset) => {
+    if (signal?.aborted) throw new DOMException('导入已取消', 'AbortError')
+    const file = new File([asset.blob], asset.filename, { type: asset.contentType })
+    const prepared = await prepareWeChatBodyImage(file)
+    return {
+      ...asset,
+      filename: prepared.file.name,
+      contentType: prepared.file.type,
+      blob: prepared.file,
+    }
+  }))
+}
 
 function waitForRetry(delay: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -51,7 +66,28 @@ async function uploadWithRetry(
       await waitForRetry(attempt * 450, signal)
     }
   }
-  throw failure instanceof Error ? failure : new Error('OSS 上传失败')
+  throw failure instanceof Error ? failure : new Error('对象存储上传失败')
+}
+
+async function uploadToServerWithRetry(
+  path: string,
+  blob: Blob,
+  filename: string,
+  onProgress: (percent: number) => void,
+  signal?: AbortSignal,
+) {
+  let failure: unknown
+  for (let attempt = 1; attempt <= RETRY_COUNT; attempt += 1) {
+    try {
+      await uploadToServer(path, blob, filename, onProgress, signal)
+      return
+    } catch (error) {
+      failure = error
+      if (signal?.aborted || attempt === RETRY_COUNT) break
+      await waitForRetry(attempt * 450, signal)
+    }
+  }
+  throw failure instanceof Error ? failure : new Error('服务器上传失败')
 }
 
 async function completeWithRetry(
@@ -68,7 +104,7 @@ async function completeWithRetry(
       onProgress({
         phase: 'finalizing',
         percent: 96,
-        detail: `OSS 文件正在同步，正在重试 ${attempt}/${RETRY_COUNT - 1}…`,
+        detail: `对象存储文件正在同步，正在重试 ${attempt}/${RETRY_COUNT - 1}…`,
       })
       await waitForRetry(attempt * 900, signal)
     }
@@ -79,6 +115,7 @@ async function completeWithRetry(
 async function uploadAssets(
   importId: string,
   assets: ParsedImportAsset[],
+  uploadMode: 'oss' | 'server',
   onProgress: (uploadedBytes: number, totalBytes: number, detail: string) => void,
   signal?: AbortSignal,
 ) {
@@ -93,7 +130,7 @@ async function uploadAssets(
     })),
   )
   const targets = new Map(result.assets.map((asset) => [asset.client_id, asset]))
-  if (targets.size !== assets.length) throw new Error('OSS 图片上传授权不完整')
+  if (targets.size !== assets.length) throw new Error('对象存储图片上传授权不完整')
 
   const totalBytes = assets.reduce((total, asset) => total + asset.blob.size, 0)
   const loadedByAsset = new Map<string, number>()
@@ -105,15 +142,29 @@ async function uploadAssets(
       cursor += 1
       const target = targets.get(asset.clientId)
       if (!target) throw new Error('找不到图片上传授权')
-      await uploadWithRetry(target.upload, asset.blob, (percent) => {
+      const updateProgress = (percent: number) => {
         const bytes = Math.round((asset.blob.size * percent) / 100)
         loadedByAsset.set(asset.clientId, bytes)
         const loaded = [...loadedByAsset.values()].reduce((total, value) => total + value, 0)
-        onProgress(loaded, totalBytes, `正在直传图片 ${loadedByAsset.size}/${assets.length}…`)
-      }, signal)
+        const verb = uploadMode === 'oss' ? '正在直传图片' : '正在上传图片到服务器'
+        onProgress(loaded, totalBytes, `${verb} ${loadedByAsset.size}/${assets.length}…`)
+      }
+      if (uploadMode === 'oss') {
+        if (!target.upload) throw new Error('对象存储图片上传授权不完整')
+        await uploadWithRetry(target.upload, asset.blob, updateProgress, signal)
+      } else {
+        await uploadToServerWithRetry(
+          `/documents/imports/${importId}/assets/${target.asset_id}/upload`,
+          asset.blob,
+          asset.filename,
+          updateProgress,
+          signal,
+        )
+      }
       loadedByAsset.set(asset.clientId, asset.blob.size)
       const loaded = [...loadedByAsset.values()].reduce((total, value) => total + value, 0)
-      onProgress(loaded, totalBytes, `已直传图片 ${loadedByAsset.size}/${assets.length}`)
+      const doneVerb = uploadMode === 'oss' ? '已直传图片' : '已上传图片到服务器'
+      onProgress(loaded, totalBytes, `${doneVerb} ${loadedByAsset.size}/${assets.length}`)
       clientToAssetId.set(asset.clientId, target.asset_id)
     }
   }
@@ -125,16 +176,26 @@ export async function importDocumentDirectly(
   file: File,
   onProgress: (progress: DirectImportProgress) => void,
   signal?: AbortSignal,
+  preparedImport?: ParsedImport,
 ): Promise<DocumentDetail> {
   const started = await documentsApi.startDirectImport(file)
-  const sourceUpload = uploadWithRetry(started.source_upload, file, (percent) => {
-    onProgress({ phase: 'uploading', percent: Math.round(percent * 0.32), detail: `正在直传原文件…${percent}%` })
-  }, signal)
-  const parsed = await parseImportFile(file, (progress: ImportParseProgress) => {
+  const sourceProgress = (percent: number) => {
+    const detail = started.upload_mode === 'oss' ? `正在直传原文件…${percent}%` : `正在上传原文件到服务器…${percent}%`
+    onProgress({ phase: 'uploading', percent: Math.round(percent * 0.32), detail })
+  }
+  const sourceUpload = started.upload_mode === 'oss'
+    ? (() => {
+        if (!started.source_upload) throw new Error('对象存储原文件上传授权不完整')
+        return uploadWithRetry(started.source_upload, file, sourceProgress, signal)
+      })()
+    : uploadToServerWithRetry(`/documents/imports/${started.id}/source/upload`, file, file.name, sourceProgress, signal)
+  const parsed = preparedImport ?? await parseImportFile(file, (progress: ImportParseProgress) => {
     onProgress({ phase: 'parsing', percent: Math.min(58, Math.round(8 + progress.percent * 0.5)), detail: progress.detail })
   }, signal)
 
-  const assetIds = await uploadAssets(started.id, parsed.assets, (uploaded, total, detail) => {
+  onProgress({ phase: 'uploading', percent: 58, detail: '正在准备公众号正文图片…' })
+  const uploadAssetsForWechat = await prepareImportAssetsForWeChat(parsed.assets, signal)
+  const assetIds = await uploadAssets(started.id, uploadAssetsForWechat, started.upload_mode, (uploaded, total, detail) => {
     const ratio = total === 0 ? 1 : uploaded / total
     onProgress({ phase: 'uploading', percent: 58 + Math.round(ratio * 36), detail })
   }, signal)
@@ -144,7 +205,11 @@ export async function importDocumentDirectly(
   for (const [clientId, assetId] of assetIds) {
     html = html.split(`direct-import://asset/${clientId}`).join(`direct-import://asset/${assetId}`)
   }
-  onProgress({ phase: 'finalizing', percent: 96, detail: '正在校验 OSS 文件并创建排版稿…' })
+  onProgress({
+    phase: 'finalizing',
+    percent: 96,
+    detail: started.upload_mode === 'oss' ? '正在校验对象存储文件并创建排版稿…' : '正在校验服务器文件并创建排版稿…',
+  })
   const document = await completeWithRetry(started.id, html, onProgress, signal)
   onProgress({ phase: 'finalizing', percent: 100, detail: '导入完成' })
   return document

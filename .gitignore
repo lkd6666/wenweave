@@ -33,6 +33,18 @@ backend/uploads/
 *.log
 *.pid
 *.seed
+backend/sse_raw_output.txt
+
+# Local snapshots of WeChat editor frontend assets (not for distribution)
+wechatediter/
+
+# Local tooling and generated delivery artifacts
+.claude/
+.agents/
+123.json
+release-artifacts/
+artifacts/
+*.private.7z
 
 # Editor and operating system files
 .DS_Store

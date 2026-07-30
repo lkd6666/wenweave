@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime
-from typing import List
+from typing import TYPE_CHECKING, List
 
 from sqlalchemy import DateTime, Enum, ForeignKey, String, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.db.base import Base
 from app.db.types import ID_TYPE, LONG_TEXT
@@ -15,11 +15,16 @@ from app.models.document_visibility import (
     document_visible_users,
 )
 
+if TYPE_CHECKING:
+    from app.models.wechat_account import WeChatDraft
+
 
 class DocumentSourceType(str, enum.Enum):
     BLANK = "blank"
     PDF = "pdf"
     WORD = "word"
+    MARKDOWN = "markdown"
+    WEB = "web"
 
 
 class Document(Base):
@@ -45,6 +50,15 @@ class Document(Base):
     source_filename: Mapped[str | None] = mapped_column(String(512), nullable=True)
     source_content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     source_size: Mapped[int | None] = mapped_column(nullable=True)
+    wechat_title: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    wechat_author: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    wechat_digest: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    wechat_content_source_url: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    wechat_cover_url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
+    wechat_pic_crop_235_1: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    wechat_pic_crop_1_1: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    wechat_need_open_comment: Mapped[bool] = mapped_column(default=False, nullable=False)
+    wechat_only_fans_can_comment: Mapped[bool] = mapped_column(default=False, nullable=False)
     visibility_mode: Mapped[VisibilityMode] = mapped_column(
         Enum(VisibilityMode, values_callable=lambda enum_class: [item.value for item in enum_class]),
         default=VisibilityMode.ALL,
@@ -66,6 +80,9 @@ class Document(Base):
     last_modified_by: Mapped["User | None"] = relationship("User", foreign_keys=[last_modified_by_id])
     allowed_users: Mapped[List["User"]] = relationship("User", secondary=document_visible_users)
     allowed_groups: Mapped[List["UserGroup"]] = relationship("UserGroup", secondary=document_visible_user_groups)
+    wechat_drafts: Mapped[List["WeChatDraft"]] = relationship(
+        "WeChatDraft", back_populates="document", cascade="all, delete-orphan"
+    )
 
     @property
     def allowed_user_ids(self) -> list[int]:
@@ -78,3 +95,31 @@ class Document(Base):
     @property
     def has_source_file(self) -> bool:
         return bool(self.source_object_key and self.source_filename and self.source_content_type and self.source_size)
+
+    @property
+    def is_ai_editing(self) -> bool:
+        return bool(getattr(self, "_is_ai_editing", False))
+
+    @is_ai_editing.setter
+    def is_ai_editing(self, value: bool) -> None:
+        self._is_ai_editing = bool(value)
+
+    @validates("title")
+    def synchronize_wechat_title(self, _key: str, value: str) -> str:
+        """Retain the legacy metadata field, but let the article title own its value."""
+        self.wechat_title = value
+        return value
+
+    @property
+    def wechat_metadata(self) -> dict[str, str | bool]:
+        return {
+            "title": self.title,
+            "author": self.wechat_author,
+            "digest": self.wechat_digest,
+            "content_source_url": self.wechat_content_source_url,
+            "cover_url": self.wechat_cover_url,
+            "pic_crop_235_1": self.wechat_pic_crop_235_1,
+            "pic_crop_1_1": self.wechat_pic_crop_1_1,
+            "need_open_comment": self.wechat_need_open_comment,
+            "only_fans_can_comment": self.wechat_only_fans_can_comment,
+        }

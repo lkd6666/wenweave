@@ -1,24 +1,30 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Descriptions, Input, Modal, Spin } from 'antd'
+import { Alert, Button, Checkbox, Descriptions, Input, Modal, Segmented, Spin } from 'antd'
 import { LinkOutlined, ReloadOutlined } from '@ant-design/icons'
 import { layoutReferencesApi } from '../api/layoutReferences'
 import { ApiError } from '../api/client'
-import type { LayoutReferencePreview } from '../types'
+import type { LayoutReferenceImitationStrength, LayoutReferencePreview } from '../types'
+import { frameDocumentWithNewWindowLinks, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 
 interface LayoutImitationModalProps {
   open: boolean
   streaming: boolean
   modelAvailable: boolean
   onClose: () => void
-  onConfirm: (reference: LayoutReferencePreview) => void
+  onConfirm: (
+    reference: LayoutReferencePreview,
+    assetsConfirmed: boolean,
+    selectedAssetIds: string[],
+    imitationStrength: LayoutReferenceImitationStrength,
+  ) => void
 }
 
 function previewDocument(referenceHtml: string) {
-  return `<!doctype html>
+  return frameDocumentWithNewWindowLinks(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:" />
   <style>
     * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; background: #fff; }
@@ -28,11 +34,10 @@ function previewDocument(referenceHtml: string) {
     h1, h2, h3, h4, h5, h6 { line-height: 1.45; }
     table { width: 100%; max-width: 100%; border-collapse: collapse; }
     td, th { min-width: 0; }
-    .layout-reference-image { display: block; min-height: 96px; margin: 10px 0; padding: 34px 12px; border: 1px dashed #b7c6d9; background: #f5f8fc; color: #77879a; text-align: center; font-size: 12px; }
   </style>
 </head>
 <body>${referenceHtml}</body>
-</html>`
+</html>`)
 }
 
 export default function LayoutImitationModal({
@@ -46,6 +51,9 @@ export default function LayoutImitationModal({
   const [reference, setReference] = useState<LayoutReferencePreview | null>(null)
   const [parsing, setParsing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [assetsConfirmed, setAssetsConfirmed] = useState(false)
+  const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([])
+  const [imitationStrength, setImitationStrength] = useState<LayoutReferenceImitationStrength>('structure')
 
   useEffect(() => {
     if (open) return
@@ -53,6 +61,9 @@ export default function LayoutImitationModal({
     setReference(null)
     setError(null)
     setParsing(false)
+    setAssetsConfirmed(false)
+    setSelectedAssetIds([])
+    setImitationStrength('structure')
   }, [open])
 
   const srcDoc = useMemo(() => reference ? previewDocument(reference.preview_html) : '', [reference])
@@ -66,8 +77,12 @@ export default function LayoutImitationModal({
     setParsing(true)
     setError(null)
     setReference(null)
+    setAssetsConfirmed(false)
+    setSelectedAssetIds([])
     try {
-      setReference(await layoutReferencesApi.preview(value))
+      const parsed = await layoutReferencesApi.preview(value)
+      setReference(parsed)
+      setSelectedAssetIds(parsed.assets.filter((asset) => asset.default_selected).map((asset) => asset.asset_id))
     } catch (err) {
       setError(err instanceof ApiError ? String(err.detail) : '解析参考页面失败，请稍后重试')
     } finally {
@@ -75,9 +90,19 @@ export default function LayoutImitationModal({
     }
   }
 
+  const hasSelectedAssets = selectedAssetIds.length > 0
+
+  const toggleAsset = (assetId: string, checked: boolean) => {
+    setSelectedAssetIds((current) => {
+      const next = checked ? [...new Set([...current, assetId])] : current.filter((id) => id !== assetId)
+      if (!next.length) setAssetsConfirmed(false)
+      return next
+    })
+  }
+
   const confirm = () => {
-    if (!reference || streaming || !modelAvailable) return
-    onConfirm(reference)
+    if (!reference || streaming || !modelAvailable || (hasSelectedAssets && !assetsConfirmed)) return
+    onConfirm(reference, assetsConfirmed, selectedAssetIds, imitationStrength)
   }
 
   return (
@@ -86,11 +111,16 @@ export default function LayoutImitationModal({
       open={open}
       onCancel={onClose}
       width={760}
+      className="layout-imitation-modal"
       destroyOnHidden
       footer={(
         <div className="layout-imitation-modal-actions">
           <Button onClick={onClose}>取消</Button>
-          <Button type="primary" disabled={!reference || streaming || !modelAvailable} onClick={confirm}>
+          <Button
+            type="primary"
+            disabled={!reference || streaming || !modelAvailable || (hasSelectedAssets && !assetsConfirmed)}
+            onClick={confirm}
+          >
             确认并开始模仿
           </Button>
         </div>
@@ -122,11 +152,52 @@ export default function LayoutImitationModal({
             <Descriptions className="layout-imitation-meta" size="small" column={1} bordered>
               <Descriptions.Item label="参考文章">{reference.title}</Descriptions.Item>
               <Descriptions.Item label="来源">{reference.site_name}</Descriptions.Item>
-              <Descriptions.Item label="提取范围">{reference.summary.extracted_from}，{reference.summary.block_count} 个排版块，{reference.summary.image_slots} 个图片位置</Descriptions.Item>
+              <Descriptions.Item label="提取范围">
+                {reference.summary.extracted_from}，{reference.summary.block_count} 个排版块，{reference.summary.image_slots} 个图片位置，已加载 {reference.summary.image_assets} 个素材，已选择 {selectedAssetIds.length} 个
+              </Descriptions.Item>
             </Descriptions>
+            <div className="layout-imitation-strength">
+              <span>模仿强度</span>
+              <Segmented
+                value={imitationStrength}
+                options={[
+                  { label: '风格', value: 'style' },
+                  { label: '结构', value: 'structure' },
+                  { label: '最大还原', value: 'maximum' },
+                ]}
+                onChange={(value) => setImitationStrength(value as LayoutReferenceImitationStrength)}
+              />
+              <small>
+                {imitationStrength === 'style' && '保留当前结构，主要借鉴颜色、标题和装饰风格。'}
+                {imitationStrength === 'structure' && '强力复刻组件层次、关键 flex/对齐、间距和主要尺寸。'}
+                {imitationStrength === 'maximum' && '严格复刻复杂容器、flex 关系、尺寸、定位与层叠。'}
+              </small>
+            </div>
             {reference.warning && <Alert type="warning" showIcon message={reference.warning} />}
+            {reference.assets.length > 0 && (
+              <div className="layout-imitation-assets" aria-label="参考图片素材选择">
+                {reference.assets.map((asset) => {
+                  const selected = selectedAssetIds.includes(asset.asset_id)
+                  return (
+                    <label className={`layout-imitation-asset${selected ? ' is-selected' : ''}`} key={asset.asset_id}>
+                      <Checkbox checked={selected} onChange={(event) => toggleAsset(asset.asset_id, event.target.checked)} />
+                      <img src={asset.preview_url} alt="" />
+                      <span className="layout-imitation-asset-meta">
+                        <b>{asset.role}</b>
+                        <small>{asset.width && asset.height ? `${asset.width} × ${asset.height}` : asset.content_type}，使用 {asset.usage_count} 次</small>
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+            )}
+            {hasSelectedAssets && (
+              <Checkbox checked={assetsConfirmed} onChange={(event) => setAssetsConfirmed(event.target.checked)}>
+                我确认已取得所选参考图片素材的复用授权
+              </Checkbox>
+            )}
             <div className="layout-imitation-preview">
-              <iframe title="参考排版预览" sandbox="" srcDoc={srcDoc} />
+              <iframe title="参考排版预览" sandbox={SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW} referrerPolicy="no-referrer" srcDoc={srcDoc} />
             </div>
           </>
         )}

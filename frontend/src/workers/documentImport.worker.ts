@@ -1,4 +1,6 @@
 import type { ParsedImport, ParsedImportAsset } from '../imports/types'
+import { readWordImageOccurrences } from '../imports/docxCropMetadata'
+import { cropImageBlob, isFullCropRect, serializeCropRect } from '../utils/imageCrop'
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 
 type ParseMessage = {
@@ -48,29 +50,73 @@ const report = (percent: number, detail: string) => {
 
 async function parseWord(buffer: ArrayBuffer): Promise<ParsedImport> {
   report(16, '正在读取 Word 正文与图片…')
-  const imported = await import('mammoth')
+  const [occurrences, imported] = await Promise.all([
+    readWordImageOccurrences(buffer),
+    import('mammoth'),
+  ])
   const mammoth = (imported.default ?? imported) as any
   const assets: ParsedImportAsset[] = []
+  const sourceAssetsByRelationship = new Map<string, ParsedImportAsset>()
+  const warnings: string[] = []
+  let imageIndex = 0
   const result = await mammoth.convertToHtml(
     { arrayBuffer: buffer },
     {
       convertImage: mammoth.images.inline(async (image: any) => {
-        const clientId = `word-image-${assets.length + 1}`
+        const instanceNumber = imageIndex + 1
+        const occurrence = occurrences[imageIndex]
+        imageIndex += 1
         const contentType = String(image.contentType || 'image/png').toLowerCase()
         const blob = new Blob([base64Bytes(await image.read('base64'))], { type: contentType })
-        assets.push({
-          clientId,
-          filename: `${clientId}.${extensionForContentType(contentType)}`,
-          contentType,
-          blob,
-        })
-        report(Math.min(88, 30 + assets.length * 3), `已提取 ${assets.length} 张 Word 图片…`)
-        return { src: `direct-import://asset/${clientId}` }
+        const sourceKey = occurrence?.relationshipId ?? `instance-${instanceNumber}`
+        let sourceAsset = sourceAssetsByRelationship.get(sourceKey)
+        if (!sourceAsset) {
+          const clientId = `word-source-${sourceAssetsByRelationship.size + 1}`
+          sourceAsset = {
+            clientId,
+            filename: `${clientId}.${extensionForContentType(contentType)}`,
+            contentType,
+            blob,
+          }
+          sourceAssetsByRelationship.set(sourceKey, sourceAsset)
+          assets.push(sourceAsset)
+        }
+        const sourceUrl = `direct-import://asset/${sourceAsset.clientId}`
+        const cropRect = occurrence?.cropRect
+        if (!cropRect || isFullCropRect(cropRect)) {
+          report(Math.min(88, 30 + imageIndex * 3), `已提取 ${imageIndex} 张 Word 图片…`)
+          return { src: sourceUrl }
+        }
+
+        try {
+          const croppedBlob = await cropImageBlob(blob, cropRect)
+          const clientId = `word-crop-${instanceNumber}`
+          assets.push({
+            clientId,
+            filename: `${clientId}.png`,
+            contentType: 'image/png',
+            blob: croppedBlob,
+          })
+          report(Math.min(88, 30 + imageIndex * 3), `已还原 ${imageIndex} 张 Word 图片的裁剪…`)
+          return {
+            src: `direct-import://asset/${clientId}`,
+            'data-crop-source': sourceUrl,
+            'data-crop-rect': serializeCropRect(cropRect),
+          }
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : '无法还原裁剪'
+          warnings.push(`第 ${instanceNumber} 张 Word 图片未还原裁剪：${detail}`)
+          report(Math.min(88, 30 + imageIndex * 3), `已提取 ${imageIndex} 张 Word 图片…`)
+          return { src: sourceUrl }
+        }
       }),
     },
   )
+  if (occurrences.length !== imageIndex) {
+    warnings.push('部分 Word 图片无法与裁剪信息对应，已按原图导入。')
+  }
   report(92, 'Word 解析完成，正在准备上传…')
-  return { html: result.value || '<p>（Word 未提取到正文内容）</p>', assets }
+  return { html: result.value || '<p>（Word 未提取到正文内容）</p>', assets, warnings }
 }
 
 function multiplyMatrix(left: number[], right: number[]) {

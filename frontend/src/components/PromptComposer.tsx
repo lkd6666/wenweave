@@ -1,22 +1,26 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import type { ClipboardEvent, DragEvent, KeyboardEvent, MouseEvent, PointerEvent } from 'react'
 import { createPortal } from 'react-dom'
-import type { SelectedElementContext } from '../types'
+import type { SelectedElementContext, TemplateItem } from '../types'
 import ElementRenderPreview from './ElementRenderPreview'
 
 export interface PromptComposerHandle {
-  getPayload: () => { message: string; references: SelectedElementContext[] }
+  getPayload: () => { message: string; references: SelectedElementContext[]; templateIds: number[] }
 }
 
 interface PromptComposerProps {
   value: string
   references: SelectedElementContext[]
+  templates: TemplateItem[]
   disabled?: boolean
   onChange: (value: string) => void
   onSubmit: () => void
   onRemoveReference: (index: number) => void
   onDuplicateReference: (index: number) => void
   onMoveReference: (fromIndex: number, toIndex: number) => void
+  onRemoveTemplate: (templateId: number) => void
+  acceptImages?: boolean
+  onPasteImages?: (files: File[]) => void
 }
 
 const PLACEHOLDER = '输入排版指令…（Shift+Enter 换行，Enter 发送）'
@@ -30,9 +34,9 @@ function isSameReference(left: SelectedElementContext, right: SelectedElementCon
   return left.selector === right.selector && left.tag_name === right.tag_name && left.html === right.html
 }
 
-/** 文本与元素引用共用同一行流；引用令牌本身不可编辑，但可拖拽、复制、移除。 */
+/** 文本、元素和组件模板共用同一行流；令牌本身不可编辑，但可拖拽和移除。 */
 const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(function PromptComposer(
-  { value, references, disabled, onChange, onSubmit, onRemoveReference, onDuplicateReference, onMoveReference },
+  { value, references, templates, disabled, onChange, onSubmit, onRemoveReference, onDuplicateReference, onMoveReference, onRemoveTemplate, acceptImages = false, onPasteImages },
   ref,
 ) {
   const editorRef = useRef<HTMLDivElement>(null)
@@ -62,7 +66,8 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     }, PREVIEW_CLOSE_DELAY_MS)
   }
 
-  const tokenNodes = () => Array.from(editorRef.current?.querySelectorAll<HTMLElement>('[data-reference-token]') ?? [])
+  const referenceTokenNodes = () => Array.from(editorRef.current?.querySelectorAll<HTMLElement>('[data-reference-token]') ?? [])
+  const templateTokenNodes = () => Array.from(editorRef.current?.querySelectorAll<HTMLElement>('[data-template-token]') ?? [])
 
   const contextFromToken = (token: HTMLElement): SelectedElementContext | null => {
     try {
@@ -72,11 +77,25 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     }
   }
 
+  const templateFromToken = (token: HTMLElement): Pick<TemplateItem, 'id' | 'name'> | null => {
+    try {
+      const context = JSON.parse(decodeURIComponent(token.dataset.templateContext ?? '')) as Pick<TemplateItem, 'id' | 'name'>
+      return typeof context.id === 'number' && typeof context.name === 'string' ? context : null
+    } catch {
+      return null
+    }
+  }
+
   const refreshLabels = () => {
-    tokenNodes().forEach((token, index) => {
+    referenceTokenNodes().forEach((token, index) => {
       const label = token.querySelector<HTMLElement>('[data-reference-label]')
       const context = contextFromToken(token)
       if (label && context) label.textContent = `@元素${index + 1} <${context.tag_name}>`
+    })
+    templateTokenNodes().forEach((token, index) => {
+      const label = token.querySelector<HTMLElement>('[data-template-label]')
+      const template = templateFromToken(token)
+      if (label && template) label.textContent = `@组件${index + 1} <${template.name}>`
     })
   }
 
@@ -91,10 +110,20 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     return token
   }
 
-  const appendTokenAtCaret = (context: SelectedElementContext) => {
+  const createTemplateToken = (template: TemplateItem) => {
+    const token = document.createElement('span')
+    token.className = 'prompt-template-token'
+    token.setAttribute('contenteditable', 'false')
+    token.draggable = true
+    token.dataset.templateToken = 'true'
+    token.dataset.templateContext = encodeURIComponent(JSON.stringify({ id: template.id, name: template.name }))
+    token.innerHTML = `<span class="prompt-template-label" data-template-label>@组件 &lt;${escapeHtml(template.name)}&gt;</span><button type="button" data-template-action="remove" aria-label="移除组件" title="移除组件">x</button>`
+    return token
+  }
+
+  const appendTokenAtCaret = (token: HTMLElement) => {
     const editor = editorRef.current
     if (!editor) return
-    const token = createToken(context)
     const selection = window.getSelection()
     const range = selection?.rangeCount && selection.getRangeAt(0)
     if (range && editor.contains(range.commonAncestorContainer)) {
@@ -148,7 +177,8 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
   const payload = () => {
     const editor = editorRef.current
     const references: SelectedElementContext[] = []
-    if (!editor) return { message: '', references }
+    const templateIds: number[] = []
+    if (!editor) return { message: '', references, templateIds }
     const readNode = (node: Node): string => {
       if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
       if (node.nodeType !== Node.ELEMENT_NODE) return ''
@@ -159,16 +189,22 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
         references.push(context)
         return ` @元素${references.length} `
       }
+      if (element.dataset.templateToken !== undefined) {
+        const template = templateFromToken(element)
+        if (!template) return ''
+        templateIds.push(template.id)
+        return ` @组件${templateIds.length} `
+      }
       if (element.tagName === 'BR') return '\n'
       const text = Array.from(element.childNodes).map(readNode).join('')
       return /^(DIV|P)$/.test(element.tagName) ? `${text}\n` : text
     }
     const message = Array.from(editor.childNodes).map(readNode).join('').replace(/[ \t]+\n/g, '\n').trim()
-    return { message, references }
+    return { message, references, templateIds }
   }
 
   const emitChange = () => {
-    const nextValue = payload().message.replace(/@元素\d+/g, '').replace(/[ \t]{2,}/g, ' ').trim()
+    const nextValue = payload().message.replace(/@(元素|组件)\d+/g, '').replace(/[ \t]{2,}/g, ' ').trim()
     lastEmittedValueRef.current = nextValue
     onChange(nextValue)
   }
@@ -191,14 +227,25 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
   }, [value, references])
 
   useEffect(() => {
-    const tokens = tokenNodes()
-    if (tokens.length < references.length) {
-      references.slice(tokens.length).forEach(appendTokenAtCaret)
-    } else if (tokens.length > references.length) {
-      tokens.slice(references.length).forEach((token) => token.remove())
+    const referenceTokens = referenceTokenNodes()
+    if (referenceTokens.length < references.length) {
+      references.slice(referenceTokens.length).forEach((reference) => appendTokenAtCaret(createToken(reference)))
+    } else if (referenceTokens.length > references.length) {
+      referenceTokens.slice(references.length).forEach((token) => token.remove())
       refreshLabels()
     }
   }, [references])
+
+  useEffect(() => {
+    const templateIds = new Set(templates.map((template) => template.id))
+    templateTokenNodes().forEach((token) => {
+      const template = templateFromToken(token)
+      if (!template || !templateIds.has(template.id)) token.remove()
+    })
+    const presentIds = new Set(templateTokenNodes().map(templateFromToken).flatMap((template) => template ? [template.id] : []))
+    templates.filter((template) => !presentIds.has(template.id)).forEach((template) => appendTokenAtCaret(createTemplateToken(template)))
+    refreshLabels()
+  }, [templates])
 
   useEffect(() => {
     if (hoveredPreview && !references.some((reference) => isSameReference(reference, hoveredPreview.context))) {
@@ -208,33 +255,45 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
 
   useEffect(() => () => cancelPreviewClose(), [])
 
-  const indexOfToken = (token: HTMLElement) => tokenNodes().indexOf(token)
+  const indexOfToken = (token: HTMLElement) => referenceTokenNodes().indexOf(token)
 
   const handleClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement
-    const actionButton = target.closest<HTMLButtonElement>('[data-reference-action]')
-    const token = target.closest<HTMLElement>('[data-reference-token]')
-    if (!actionButton || !token) return
+    const actionButton = target.closest<HTMLButtonElement>('[data-reference-action], [data-template-action]')
+    const referenceToken = target.closest<HTMLElement>('[data-reference-token]')
+    const templateToken = target.closest<HTMLElement>('[data-template-token]')
+    if (!actionButton || (!referenceToken && !templateToken)) return
     event.preventDefault()
     event.stopPropagation()
-    const index = indexOfToken(token)
-    if (index < 0) return
-    if (actionButton.dataset.referenceAction === 'duplicate') {
-      const copy = token.cloneNode(true) as HTMLElement
-      token.insertAdjacentElement('afterend', copy)
+    if (referenceToken) {
+      const index = indexOfToken(referenceToken)
+      if (index < 0) return
+      if (actionButton.dataset.referenceAction === 'duplicate') {
+        const copy = referenceToken.cloneNode(true) as HTMLElement
+        referenceToken.insertAdjacentElement('afterend', copy)
+        refreshLabels()
+        onDuplicateReference(index)
+      } else {
+        closePreview()
+        referenceToken.remove()
+        refreshLabels()
+        onRemoveReference(index)
+        emitChange()
+      }
+      return
+    }
+    if (templateToken && actionButton.dataset.templateAction === 'remove') {
+      const template = templateFromToken(templateToken)
+      if (!template) return
+      templateToken.remove()
       refreshLabels()
-      onDuplicateReference(index)
-    } else {
-      closePreview()
-      token.remove()
-      refreshLabels()
-      onRemoveReference(index)
+      onRemoveTemplate(template.id)
       emitChange()
     }
   }
 
   const handleDragStart = (event: DragEvent<HTMLDivElement>) => {
-    const token = (event.target as HTMLElement).closest<HTMLElement>('[data-reference-token]')
+    const token = (event.target as HTMLElement).closest<HTMLElement>('[data-reference-token], [data-template-token]')
     if (!token) return
     draggingTokenRef.current = token
     event.dataTransfer.effectAllowed = 'move'
@@ -246,15 +305,10 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     if (!editor || !dragged) return
     event.preventDefault()
     const sourceIndex = indexOfToken(dragged)
-    const target = (event.target as HTMLElement).closest<HTMLElement>('[data-reference-token]')
+    const target = (event.target as HTMLElement).closest<HTMLElement>('[data-reference-token], [data-template-token]')
     if (target && target !== dragged) {
-      const targetIndex = indexOfToken(target)
       const placeAfter = event.clientX > target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2
       target.insertAdjacentElement(placeAfter ? 'afterend' : 'beforebegin', dragged)
-      const destinationIndex = placeAfter
-        ? (sourceIndex < targetIndex ? targetIndex : targetIndex + 1)
-        : (sourceIndex < targetIndex ? targetIndex - 1 : targetIndex)
-      onMoveReference(sourceIndex, destinationIndex)
     } else if (!target) {
       const caretRange = document.caretRangeFromPoint?.(event.clientX, event.clientY)
       if (caretRange && editor.contains(caretRange.startContainer)) {
@@ -262,8 +316,9 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
       } else {
         editor.append(dragged)
       }
-      onMoveReference(sourceIndex, indexOfToken(dragged))
     }
+    const destinationIndex = indexOfToken(dragged)
+    if (sourceIndex >= 0 && destinationIndex >= 0 && sourceIndex !== destinationIndex) onMoveReference(sourceIndex, destinationIndex)
     draggingTokenRef.current = null
     refreshLabels()
   }
@@ -277,7 +332,15 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     if (disabled) return
+    const imageFiles = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null)
     event.preventDefault()
+    if (imageFiles.length > 0 && acceptImages) {
+      onPasteImages?.(imageFiles)
+      return
+    }
     insertPlainTextAtCaret(event.clipboardData.getData('text/plain'))
     emitChange()
   }

@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Pattern, Union
 
 # ==========================================
@@ -103,12 +104,31 @@ VOID_TAGS = {
     "area", "base", "br", "col", "embed", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr",
 }
-NEST_LIMIT = 10
+NEST_LIMIT = 20
 NEST_SAFE = NEST_LIMIT - 2
 SVG_LENGTH_LIMIT = 11000
-RISKY_STYLE_PROPS = ["position", "z-index", "top", "left", "float"]
+CONSECUTIVE_BR_LIMIT = 10
+RISKY_STYLE_PROPS = ["position", "z-index", "top", "left", "float", "display", "transform"]
+BANNED_TAGS = {
+    "style": ("WX-TAG-001", "内嵌 <style> 标签不受公众号文章 HTML 支持。", "将需要保留的受支持样式写到对应元素的 style 属性中。"),
+    "link": ("WX-TAG-002", "外链样式表不会随公众号文章正文加载。", "移除 <link>，并将必要的受支持样式改为行内样式。"),
+    "script": ("WX-TAG-003", "公众号文章正文不会执行 <script> 中的 JavaScript。", "移除脚本；将交互改为静态内容或公众号支持的组件。"),
+    "iframe": ("WX-TAG-004", "普通 <iframe> 不能作为可移植的公众号文章正文内容。", "改用公众号支持的媒体、卡片或静态内容。"),
+    "noscript": ("WX-TAG-005", "<noscript> 内容不能作为可靠的公众号文章正文。", "移除 <noscript>，直接保留需要展示的静态内容。"),
+}
+SVG_GRAPHIC_TAGS = {
+    "animate", "animatemotion", "animatetransform", "circle", "clippath", "defs", "ellipse",
+    "feblend", "fecolormatrix", "fecomponenttransfer", "fecomposite", "feconvolvematrix",
+    "fediffuselighting", "fedisplacementmap", "fedistantlight", "fedropshadow", "feflood",
+    "fefunca", "fefuncb", "fefuncg", "fefuncr", "fegaussianblur", "feimage", "femerge",
+    "femergenode", "femorphology", "feoffset", "fepointlight", "fespecularlighting",
+    "fespotlight", "fetile", "feturbulence", "filter", "foreignobject", "g", "image", "line",
+    "lineargradient", "marker", "mask", "path", "pattern", "polygon", "polyline", "radialgradient",
+    "rect", "set", "stop", "symbol", "text", "textpath", "tspan", "use",
+}
 EMPTY_NODE_EXEMPT_TAGS = re.compile(
-    r"^(img|hr|svg|mp-common|iframe|cps|br|a|mp|video|audio|path|embed)", re.IGNORECASE
+    r"^(img|hr|svg|mp-common|iframe|cps|br|a|mp|video|audio|path|embed|rect|circle|ellipse|line|polyline|polygon|g|defs|use|text|tspan|animate|set)",
+    re.IGNORECASE,
 )
 
 _ATTR_VALUE = r'(?:(?:"([^"]*?)")|(?:\'([^\']*?)\')|([^\'"\s=<>]*?))'
@@ -116,11 +136,110 @@ _STYLE_ATTR_RE = re.compile(r'(<[^<>]*?)\sstyle=' + _ATTR_VALUE + r'([\s/>])')
 _CLASS_ATTR_RE = re.compile(r'(<[^<>]*?)\sclass=' + _ATTR_VALUE + r'([\s/>])')
 _SVG_BLOCK_RE = re.compile(r'<svg[^>]*>([\s\S]*?)</svg>', re.IGNORECASE)
 _BR_IN_TAG_RE = re.compile(r'<br[^>]*>', re.IGNORECASE)
-_CONSECUTIVE_BR_RE = re.compile(r'(<br[^<>]*>\s*<br[^<>]*>){10,}')
+_CONSECUTIVE_BR_RE = re.compile(r'(?:(?:<br\b[^<>]*>)\s*){10,}', re.IGNORECASE)
 _APPLE_BR_RE = re.compile(r'<br class="Apple-interchange-newline">')
 _ID_ATTR_RE = re.compile(r'(<(\w+)[^>]*)\sid="([^">]*)"([^>]*>)')
 _TAG_RE = re.compile(r'<(/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*?(/)?>')
 _EMPTY_TAG_RE = re.compile(r'<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*)>\s*</\1>')
+_SVG_BLOCK_WITH_OFFSET_RE = re.compile(r'<svg\b[^>]*>[\s\S]*?</svg>', re.IGNORECASE)
+
+
+@dataclass
+class ComplianceDiagnostic:
+    code: str
+    severity: str
+    path: str
+    line: int
+    column: int
+    snippet: str
+    message: str
+    consequence: str
+    suggestion: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "code": self.code,
+            "severity": self.severity,
+            "path": self.path,
+            "line": self.line,
+            "column": self.column,
+            "snippet": self.snippet,
+            "message": self.message,
+            "consequence": self.consequence,
+            "suggestion": self.suggestion,
+        }
+
+
+@dataclass
+class _HtmlElement:
+    tag: str
+    attrs: Dict[str, str]
+    raw: str
+    path: str
+    line: int
+    column: int
+    html_depth: int
+    inside_svg: bool
+    child_counts: Dict[str, int] = field(default_factory=dict)
+
+
+class _FragmentParser(HTMLParser):
+    """A tolerant fragment parser used only to give audit hits a stable location."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.elements: List[_HtmlElement] = []
+        self._stack: List[_HtmlElement] = []
+        self._root_counts: Dict[str, int] = {}
+
+    def _add_element(self, tag: str, attrs: List[tuple[str, Optional[str]]], is_self_closing: bool) -> None:
+        tag = tag.lower()
+        parent = self._stack[-1] if self._stack else None
+        counts = parent.child_counts if parent else self._root_counts
+        index = counts.get(tag, 0) + 1
+        counts[tag] = index
+        path_part = f"{tag}:nth-of-type({index})"
+        path = f"{parent.path} > {path_part}" if parent else path_part
+        inside_svg = bool(parent and (parent.inside_svg or parent.tag == "svg"))
+        html_depth = 0 if inside_svg or tag == "svg" else (parent.html_depth if parent else 0) + 1
+        line, column = self.getpos()
+        element = _HtmlElement(
+            tag=tag,
+            attrs={name.lower(): value or "" for name, value in attrs},
+            raw=self.get_starttag_text() or f"<{tag}>",
+            path=path,
+            line=line,
+            column=column + 1,
+            html_depth=html_depth,
+            inside_svg=inside_svg,
+        )
+        self.elements.append(element)
+        if not is_self_closing and tag not in VOID_TAGS:
+            self._stack.append(element)
+
+    def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
+        self._add_element(tag, attrs, is_self_closing=False)
+
+    def handle_startendtag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
+        self._add_element(tag, attrs, is_self_closing=True)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self._stack) - 1, -1, -1):
+            if self._stack[index].tag == tag:
+                del self._stack[index:]
+                break
+
+
+def _parse_html_fragment(html: str) -> List[_HtmlElement]:
+    parser = _FragmentParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        # The rest of the checker is regex tolerant; location metadata should not make it fail.
+        pass
+    return parser.elements
 
 
 # ==========================================
@@ -132,22 +251,65 @@ class ComplianceReport:
     kept_classes: List[str] = field(default_factory=list)
     removed_id_attributes: List[str] = field(default_factory=list)
     risk_style_hints: List[str] = field(default_factory=list)
+    banned_tags: List[str] = field(default_factory=list)
+    consecutive_br_runs: List[int] = field(default_factory=list)
+    svg_id_attributes: List[str] = field(default_factory=list)
+    image_issues: List[str] = field(default_factory=list)
     removed_svg_brs: int = 0
     has_svg: bool = False
     oversized_svg_blocks: List[int] = field(default_factory=list)
     max_nesting_depth: int = 0
     will_flatten_nesting: bool = False
     empty_node_suspects: List[str] = field(default_factory=list)
+    diagnostics: List[ComplianceDiagnostic] = field(default_factory=list)
+
+    def add_diagnostic(
+        self,
+        code: str,
+        severity: str,
+        element: Optional[_HtmlElement],
+        message: str,
+        consequence: str,
+        suggestion: str,
+        *,
+        snippet: Optional[str] = None,
+        path: Optional[str] = None,
+        line: int = 0,
+        column: int = 0,
+    ) -> None:
+        """Append a UI-ready audit record without making individual scanners know the schema."""
+        self.diagnostics.append(
+            ComplianceDiagnostic(
+                code=code,
+                severity=severity,
+                path=path or (element.path if element else "文档"),
+                line=element.line if element else line,
+                column=element.column if element else column,
+                snippet=(snippet if snippet is not None else (element.raw if element else ""))[:240],
+                message=message,
+                consequence=consequence,
+                suggestion=suggestion,
+            )
+        )
 
     @property
     def has_error(self) -> bool:
         """对应已证实规则下的严重错误：会导致排版实际渲染崩溃/动效失效。"""
-        return self.will_flatten_nesting or bool(self.oversized_svg_blocks) or self.removed_svg_brs > 0
+        return (
+            self.will_flatten_nesting
+            or bool(self.oversized_svg_blocks)
+            or self.removed_svg_brs > 0
+            or any(item.severity == "error" for item in self.diagnostics)
+        )
 
     @property
     def has_warning(self) -> bool:
         """对应已证实规则下的警告：类名/id 会被剥离，但不至于让排版整体崩溃。"""
-        return bool(self.removed_classes) or bool(self.removed_id_attributes)
+        return (
+            bool(self.removed_classes)
+            or bool(self.removed_id_attributes)
+            or any(item.severity == "warning" for item in self.diagnostics)
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -155,12 +317,17 @@ class ComplianceReport:
             "keptClasses": sorted(set(self.kept_classes)),
             "removedIdAttributes": self.removed_id_attributes,
             "riskStyleHints": self.risk_style_hints,
+            "bannedTags": self.banned_tags,
+            "consecutiveBrRuns": self.consecutive_br_runs,
+            "svgIdAttributes": self.svg_id_attributes,
+            "imageIssues": self.image_issues,
             "removedSvgBrs": self.removed_svg_brs,
             "hasSvg": self.has_svg,
             "oversizedSvgBlocks": self.oversized_svg_blocks,
             "maxNestingDepth": self.max_nesting_depth,
             "willFlattenNesting": self.will_flatten_nesting,
             "emptyNodeSuspects": self.empty_node_suspects,
+            "diagnostics": [item.to_dict() for item in self.diagnostics],
             "hasError": self.has_error,
             "hasWarning": self.has_warning,
         }
@@ -174,7 +341,7 @@ def filter_br(html: str, report: Optional[ComplianceReport] = None) -> str:
     """已证实：连续 br 折叠 + Apple 换行清理 + SVG 内部 br 剥离"""
     cleaned = html
     if _CONSECUTIVE_BR_RE.search(cleaned):
-        cleaned = _CONSECUTIVE_BR_RE.sub(r"\1", cleaned)
+        cleaned = _CONSECUTIVE_BR_RE.sub(lambda match: _BR_IN_TAG_RE.search(match.group(0)).group(0), cleaned)
     cleaned = _APPLE_BR_RE.sub("", cleaned)
 
     def _clean_svg(match: "re.Match[str]") -> str:
@@ -323,44 +490,288 @@ def filter_class(html: str, class_names: str) -> str:
 # 6. 检查函数（明确区分"已证实规则"与"风险提示"）
 # ==========================================
 
+def _is_allowed_class(class_name: str, white_list: List[str], white_list_reg: List[Pattern[str]], black_list: List[str]) -> bool:
+    if class_name in black_list:
+        return False
+    return class_name in white_list or any(reg.search(class_name) for reg in white_list_reg)
+
+
 def audit_id_stripping(
-    html: str, tag_white_list: Optional[List[str]] = None, report: Optional[ComplianceReport] = None
+    html: str,
+    tag_white_list: Optional[List[str]] = None,
+    report: Optional[ComplianceReport] = None,
+    elements: Optional[List[_HtmlElement]] = None,
 ) -> List[Dict[str, str]]:
-    """已证实规则：id 属性剥离审计，正则来自旧版 getEditorData"""
+    """已证实规则：id 属性剥离审计，并为每个命中提供元素定位。"""
     white_list = {t.lower() for t in (tag_white_list or ID_STRIP_TAG_WHITE_LIST)}
     found: List[Dict[str, str]] = []
-    for match in _ID_ATTR_RE.finditer(html):
-        tag_name = match.group(2).lower()
-        id_value = match.group(3)
-        if tag_name in white_list:
+    for element in elements if elements is not None else _parse_html_fragment(html):
+        id_value = element.attrs.get("id")
+        if id_value is None or element.tag in white_list:
             continue
-        found.append({"tag": tag_name, "id": id_value})
+        found.append({"tag": element.tag, "id": id_value})
         if report is not None:
-            report.removed_id_attributes.append(f'<{tag_name} id="{id_value}">')
+            report.removed_id_attributes.append(f'<{element.tag} id="{id_value}">')
+            report.add_diagnostic(
+                "WX-ATTR-001",
+                "warning",
+                element,
+                "id 属性会在公众号编辑器处理时被剥离。",
+                "依赖该 id 的 CSS、锚点或 SVG 动画触发器会失效。",
+                "不要依赖正文 HTML 的 id；SVG 动画请使用不依赖外部 id 的触发方式。",
+            )
+            if element.inside_svg or element.tag == "svg":
+                report.svg_id_attributes.append(f'<{element.tag} id="{id_value}">')
     return found
 
 
-def scan_risky_inline_styles(html: str, report: Optional[ComplianceReport] = None) -> List[str]:
-    """
-    未证实规则 / 风险提示：定位类样式使用扫描。
-    没有找到 position/z-index/top/left/float 会被强制过滤的调用证据，仅供参考。
-    """
-    pattern = re.compile(r'<[^<>]*?\sstyle="([^"]*?)"[^<>]*>')
+def _split_inline_style(style: str) -> List[tuple[str, str]]:
+    """Split inline CSS without treating semicolons inside strings or url() as declarations."""
+    declarations: List[str] = []
+    start = 0
+    quote = ""
+    parentheses = 0
+    for index, char in enumerate(style):
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            parentheses += 1
+        elif char == ")":
+            parentheses = max(0, parentheses - 1)
+        elif char == ";" and parentheses == 0:
+            declarations.append(style[start:index])
+            start = index + 1
+    declarations.append(style[start:])
+
+    parsed: List[tuple[str, str]] = []
+    for declaration in declarations:
+        prop, separator, value = declaration.partition(":")
+        prop = prop.strip().lower()
+        if separator and prop:
+            parsed.append((prop, value.strip().lower()))
+    return parsed
+
+
+def _record_style_risk(
+    report: Optional[ComplianceReport],
+    hints: List[str],
+    element: _HtmlElement,
+    code: str,
+    prop: str,
+    value: str,
+    message: str,
+    consequence: str,
+    suggestion: str,
+) -> None:
+    hint = f'{prop}:{value} in "{element.attrs.get("style", "").strip()}"'
+    hints.append(prop)
+    if report is not None:
+        report.risk_style_hints.append(hint)
+        report.add_diagnostic(code, "warning", element, message, consequence, suggestion)
+
+
+def scan_risky_inline_styles(
+    html: str,
+    report: Optional[ComplianceReport] = None,
+    elements: Optional[List[_HtmlElement]] = None,
+) -> List[str]:
+    """Detect CSS features that are fragile in the public-account editor without claiming they are always stripped."""
     hints: List[str] = []
-    for match in pattern.finditer(html):
-        style_val = match.group(1)
-        for prop in RISKY_STYLE_PROPS:
-            if re.search(r'(^|;|\s)' + re.escape(prop) + r'\s*:', style_val, re.IGNORECASE):
-                hints.append(prop)
-                if report is not None:
-                    report.risk_style_hints.append(f'{prop} in "{style_val.strip()}"')
+    for element in elements if elements is not None else _parse_html_fragment(html):
+        style = element.attrs.get("style")
+        if not style:
+            continue
+        for prop, value in _split_inline_style(style):
+            if prop == "position" and value in {"absolute", "fixed", "sticky"}:
+                _record_style_risk(
+                    report, hints, element, "WX-CSS-001", prop, value,
+                    f"检测到 position:{value}，该定位方式在公众号正文中兼容性不稳定。",
+                    "不同客户端可能忽略定位或导致元素重叠、脱离预期布局。",
+                    "改用普通文档流、margin/padding 和 text-align 完成布局。",
+                )
+            elif prop in {"z-index", "top", "left", "float"}:
+                _record_style_risk(
+                    report, hints, element, "WX-CSS-002", prop, value,
+                    f"检测到 {prop} 定位相关样式。",
+                    "公众号客户端的样式处理可能改变层叠或定位结果。",
+                    "避免依赖层叠、偏移或浮动；使用普通文档流布局。",
+                )
+            elif (prop == "display" and value == "grid") or prop.startswith("grid-"):
+                _record_style_risk(
+                    report, hints, element, "WX-CSS-003", prop, value,
+                    "检测到 CSS Grid 布局。",
+                    "部分公众号客户端不支持或会降级 Grid，列布局可能错乱。",
+                    "改用支持范围更广的块级布局和行内样式。",
+                )
+            elif prop == "transform":
+                _record_style_risk(
+                    report, hints, element, "WX-CSS-004", prop, value,
+                    "检测到 transform 样式。",
+                    "变形、位移或缩放效果在公众号客户端可能失效或影响文字排版。",
+                    "优先使用原始尺寸和普通间距，避免依赖 transform 定位。",
+                )
     return hints
 
 
-def check_nesting_depth(html: str, report: Optional[ComplianceReport] = None) -> int:
+def scan_banned_tags(elements: List[_HtmlElement], report: ComplianceReport) -> None:
+    for element in elements:
+        rule = BANNED_TAGS.get(element.tag)
+        if rule is None:
+            continue
+        code, message, suggestion = rule
+        report.banned_tags.append(element.tag)
+        report.add_diagnostic(
+            code,
+            "error",
+            element,
+            message,
+            "该节点会被清理、忽略或无法按网页方式运行，正文效果不可预测。",
+            suggestion,
+        )
+
+
+def scan_class_removal_diagnostics(elements: List[_HtmlElement], report: ComplianceReport) -> None:
+    for element in elements:
+        class_value = element.attrs.get("class")
+        if not class_value:
+            continue
+        for class_name in class_value.split():
+            if not _is_allowed_class(class_name, CLASS_WHITE_LIST, CLASS_WHITE_LIST_REG, CLASS_BLACK_LIST):
+                report.add_diagnostic(
+                    "WX-ATTR-002",
+                    "warning",
+                    element,
+                    f'自定义 class "{class_name}" 不在公众号编辑器白名单内。',
+                    "该 class 会被清理，依赖它的样式或脚本选择器会失效。",
+                    "将必要的受支持样式直接写入 style 属性，不要依赖自定义 class。",
+                )
+
+
+def scan_consecutive_brs(html: str, elements: List[_HtmlElement], report: ComplianceReport) -> None:
+    br_elements = [element for element in elements if element.tag == "br"]
+    for match in _CONSECUTIVE_BR_RE.finditer(html):
+        count = len(_BR_IN_TAG_RE.findall(match.group(0)))
+        if count < CONSECUTIVE_BR_LIMIT:
+            continue
+        report.consecutive_br_runs.append(count)
+        element = next((item for item in br_elements if item.raw in match.group(0)), None)
+        report.add_diagnostic(
+            "WX-HTML-001",
+            "warning",
+            element,
+            f"检测到连续 {count} 个 <br> 标签。",
+            "编辑器可能压缩连续换行，依赖空行堆叠形成的间距会在发布后变化。",
+            "使用段落和受支持的 margin/padding 控制间距，避免连续 <br>。",
+            snippet=match.group(0),
+        )
+
+
+def scan_svg_animation_rules(html: str, elements: List[_HtmlElement], report: ComplianceReport) -> None:
+    svg_elements = [element for element in elements if element.tag == "svg"]
+    if not svg_elements:
+        return
+
+    report.has_svg = True
+    for match in _SVG_BLOCK_WITH_OFFSET_RE.finditer(html):
+        svg = next((element for element in svg_elements if element.raw in match.group(0)), svg_elements[0])
+        br_count = len(_BR_IN_TAG_RE.findall(match.group(0)))
+        if br_count:
+            report.add_diagnostic(
+                "WX-SVG-001",
+                "error",
+                svg,
+                f"SVG 内包含 {br_count} 个 <br> 标签。",
+                "公众号处理 SVG 时会删除这些 <br>，SVG 结构或文本布局会改变。",
+                "移除 SVG 内的 <br>，用 SVG 的 text/tspan 元素表达换行。",
+                snippet=match.group(0),
+            )
+
+        for begin_match in re.finditer(r'\bbegin\s*=\s*(["\'])(.*?)\1', match.group(0), re.IGNORECASE):
+            begin_value = begin_match.group(2).strip()
+            if not re.search(r'(^|;|\s)[A-Za-z_][\w:.-]*\.click(?:[+\-]\d+(?:\.\d+)?s)?(?:;|$)', begin_value):
+                continue
+            report.add_diagnostic(
+                "WX-SVG-002",
+                "error",
+                svg,
+                f'检测到跨元素 SVG 动画触发器 begin="{begin_value}"。',
+                "触发器依赖 id，而公众号会剥离 SVG 的 id 属性，动画将无法启动。",
+                '改为当前元素自触发的 begin="click"，并移除跨元素 id 依赖。',
+                snippet=begin_match.group(0),
+            )
+
+
+def scan_image_rules(elements: List[_HtmlElement], report: ComplianceReport) -> None:
+    for element in elements:
+        if element.tag != "img":
+            continue
+        style_props = {
+            prop: value.replace("!important", "").strip()
+            for prop, value in _split_inline_style(element.attrs.get("style", ""))
+        }
+        if "alt" not in element.attrs:
+            issue = "图片缺少 alt 文本"
+            report.image_issues.append(issue)
+            report.add_diagnostic(
+                "WX-IMG-001",
+                "warning",
+                element,
+                issue + "。",
+                "图片加载失败或需要辅助阅读时，没有可替代的说明文字。",
+                "为 img 添加能概括图片内容的 alt 属性；装饰图可使用 alt=\"\"。",
+            )
+
+        responsive_requirements = {
+            "max-width": "100%",
+            "height": "auto",
+            "display": "block",
+        }
+        missing = [
+            f"{prop}:{expected}"
+            for prop, expected in responsive_requirements.items()
+            if style_props.get(prop) != expected
+        ]
+        if missing:
+            issue = "图片缺少响应式样式：" + "、".join(missing)
+            report.image_issues.append(issue)
+            report.add_diagnostic(
+                "WX-IMG-002",
+                "warning",
+                element,
+                issue + "。",
+                "在不同屏幕宽度下，图片可能溢出、变形或产生基线空隙。",
+                "在 style 中添加 max-width:100%; height:auto; display:block;。",
+            )
+
+        has_fixed_style_dimension = any(
+            value and value != "auto" and not value.endswith("%")
+            for value in (style_props.get("width"), style_props.get("height"))
+        )
+        if "width" in element.attrs or "height" in element.attrs or has_fixed_style_dimension:
+            issue = "图片使用固定尺寸"
+            report.image_issues.append(issue)
+            report.add_diagnostic(
+                "WX-IMG-003",
+                "warning",
+                element,
+                issue + "。",
+                "固定尺寸在窄屏设备上可能溢出或导致比例失真。",
+                "保留 max-width:100% 和 height:auto，避免依赖固定宽高。",
+            )
+
+
+def check_nesting_depth(
+    html: str,
+    report: Optional[ComplianceReport] = None,
+    elements: Optional[List[_HtmlElement]] = None,
+) -> int:
     """
-    已证实规则：嵌套深度限制（editor_filter.js deleteNestNode）。
-    上限 10 层触发扁平化，扁平化收敛目标为 8 层。用通用标签栈扫描器估算 HTML
+    已证实规则：Word 粘贴嵌套深度限制（clear_dom.js）。
+    节点深度或连续同类子节点达到 20 时触发扁平化。用通用标签栈扫描器估算 HTML
     最大嵌套深度（忽略 void 元素/自闭合标签，且不把 SVG 内部图形标签计入层级）。
     """
     depth = 0
@@ -398,14 +809,37 @@ def check_nesting_depth(html: str, report: Optional[ComplianceReport] = None) ->
     if report is not None:
         report.max_nesting_depth = max_depth
         report.will_flatten_nesting = max_depth >= NEST_LIMIT
+        deepest = next((element for element in elements or [] if element.html_depth == max_depth), None)
+        if max_depth >= NEST_LIMIT:
+            report.add_diagnostic(
+                "WX-HTML-002",
+                "error",
+                deepest,
+                f"HTML 最大嵌套深度为 {max_depth} 层，达到 Word 粘贴扁平化阈值。",
+                "从 Word 粘贴时编辑器会扁平化节点，结构和排版可能被重写。",
+                f"将结构缩减到 {NEST_SAFE} 层以内，避免依赖深层容器。",
+            )
+        elif max_depth > NEST_SAFE:
+            report.add_diagnostic(
+                "WX-HTML-003",
+                "warning",
+                deepest,
+                f"HTML 最大嵌套深度为 {max_depth} 层，已超过建议安全线。",
+                "从 Word 粘贴或后续清理时可能使其达到扁平化阈值。",
+                f"建议将嵌套深度控制在 {NEST_SAFE} 层以内。",
+            )
     return max_depth
 
 
-def check_svg_serialized_length(html: str, report: Optional[ComplianceReport] = None) -> List[int]:
+def check_svg_serialized_length(
+    html: str,
+    report: Optional[ComplianceReport] = None,
+    elements: Optional[List[_HtmlElement]] = None,
+) -> List[int]:
     """已证实规则：单个 SVG 序列化长度 >= 11000 字符会被替换为 <embed>"""
-    pattern = re.compile(r'<svg[^>]*>[\s\S]*?</svg>', re.IGNORECASE)
     oversized: List[int] = []
-    for match in pattern.finditer(html):
+    svg_elements = [element for element in elements or [] if element.tag == "svg"]
+    for index, match in enumerate(_SVG_BLOCK_WITH_OFFSET_RE.finditer(html)):
         if report is not None:
             report.has_svg = True
         matched_len = len(match.group(0))
@@ -413,10 +847,23 @@ def check_svg_serialized_length(html: str, report: Optional[ComplianceReport] = 
             oversized.append(matched_len)
             if report is not None:
                 report.oversized_svg_blocks.append(matched_len)
+                report.add_diagnostic(
+                    "WX-SVG-003",
+                    "error",
+                    svg_elements[index] if index < len(svg_elements) else None,
+                    f"SVG 序列化长度为 {matched_len} 字符，达到 11000 字符硬性阈值。",
+                    "该 SVG 会被公众号替换为 <embed>，图形和动效都无法按原样保留。",
+                    "删除冗余属性和路径，拆分或简化 SVG，使单个 SVG 小于 11000 字符。",
+                    snippet=match.group(0),
+                )
     return oversized
 
 
-def scan_empty_node_suspects(html: str, report: Optional[ComplianceReport] = None) -> List[str]:
+def scan_empty_node_suspects(
+    html: str,
+    report: Optional[ComplianceReport] = None,
+    elements: Optional[List[_HtmlElement]] = None,
+) -> List[str]:
     """
     弱提示（非确定规则）：疑似冗余空节点扫描。
     真实的 deleteRedundantNode 触发条件是"父节点子元素数 > 20 且连续 15+ 个空子节点"，
@@ -426,13 +873,23 @@ def scan_empty_node_suspects(html: str, report: Optional[ComplianceReport] = Non
     for match in _EMPTY_TAG_RE.finditer(html):
         tag_name = match.group(1)
         attrs = match.group(2) or ""
-        if EMPTY_NODE_EXEMPT_TAGS.match(tag_name):
+        if tag_name.lower() in SVG_GRAPHIC_TAGS or EMPTY_NODE_EXEMPT_TAGS.match(tag_name):
             continue
         if "background-image" in attrs:
             continue
         suspects.append(match.group(0))
         if report is not None:
             report.empty_node_suspects.append(match.group(0)[:80])
+            element = next((item for item in elements or [] if item.tag.lower() == tag_name.lower()), None)
+            report.add_diagnostic(
+                "WX-HTML-004",
+                "info",
+                element,
+                f"检测到疑似冗余空节点 <{tag_name}>。",
+                "当父节点中存在大量连续空节点时，编辑器可能清理这些节点。",
+                "确认该节点是否承担布局职责；无意义的空节点应移除。",
+                snippet=match.group(0),
+            )
     return suspects
 
 
@@ -448,14 +905,21 @@ def run_compliance_check(html: str) -> ComplianceReport:
     """
     report = ComplianceReport()
 
+    elements = _parse_html_fragment(html)
+    scan_banned_tags(elements, report)
+    scan_class_removal_diagnostics(elements, report)
+    scan_consecutive_brs(html, elements, report)
+    scan_risky_inline_styles(html, report=report, elements=elements)
+    scan_image_rules(elements, report)
+
     cleaned = filter_br(html, report)
     cleaned = format_style(cleaned)
     format_class(cleaned, report=report)
-    audit_id_stripping(cleaned, report=report)
-    scan_risky_inline_styles(cleaned, report=report)
-    check_nesting_depth(cleaned, report=report)
-    check_svg_serialized_length(cleaned, report=report)
-    scan_empty_node_suspects(cleaned, report=report)
+    audit_id_stripping(html, report=report, elements=elements)
+    scan_svg_animation_rules(html, elements, report)
+    check_nesting_depth(html, report=report, elements=elements)
+    check_svg_serialized_length(html, report=report, elements=elements)
+    scan_empty_node_suspects(html, report=report, elements=elements)
 
     return report
 
@@ -481,7 +945,7 @@ def _print_cli_report(html: str) -> int:
     else:
         print("  通过: 未检测到会被剥离的 id 属性。")
 
-    print("\n[已证实 3/6] 嵌套深度审计（限制 10 层，安全线 8 层）:")
+    print(f"\n[已证实 3/6] Word 粘贴嵌套深度审计（限制 {NEST_LIMIT} 层，安全线 {NEST_SAFE} 层）:")
     if data["willFlattenNesting"]:
         print(f"  错误: 最大嵌套深度 {data['maxNestingDepth']} 层，已达到/超过扁平化阈值。")
     elif data["maxNestingDepth"] > NEST_SAFE:

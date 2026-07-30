@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Button, Card, Form, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography, message } from 'antd'
+import { Button, Card, Form, Grid, Input, Modal, Popconfirm, Select, Space, Table, Tag, Typography, message } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { PlusOutlined } from '@ant-design/icons'
 import { ApiError } from '../../api/client'
@@ -17,6 +17,8 @@ export default function AdminUserGroupsPage() {
   const [modalOpen, setModalOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [form] = Form.useForm()
+  const screens = Grid.useBreakpoint()
+  const isCompact = !screens.lg
 
   const loadData = async () => {
     setLoading(true)
@@ -78,6 +80,15 @@ export default function AdminUserGroupsPage() {
     }
   }
 
+  const groupActions = (group: UserGroup) => (
+    <Space wrap>
+      <Button size="small" onClick={() => openEdit(group)}>编辑</Button>
+      <Popconfirm title={`删除用户组“${group.name}”？`} onConfirm={() => void handleDelete(group)}>
+        <Button size="small" danger>删除</Button>
+      </Popconfirm>
+    </Space>
+  )
+
   const columns: ColumnsType<UserGroup> = [
     { title: '用户组', dataIndex: 'name', key: 'name', width: 240 },
     {
@@ -107,30 +118,45 @@ export default function AdminUserGroupsPage() {
       title: '操作',
       key: 'actions',
       width: 160,
-      render: (_, group) => (
-        <Space>
-          <Button size="small" onClick={() => openEdit(group)}>编辑</Button>
-          <Popconfirm title={`删除用户组“${group.name}”？`} onConfirm={() => void handleDelete(group)}>
-            <Button size="small" danger>删除</Button>
-          </Popconfirm>
-        </Space>
-      ),
+      render: (_, group) => groupActions(group),
     },
   ]
 
   return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+    <div className="admin-page">
+      <div className="admin-page-header">
         <Title level={4} style={{ margin: 0 }}>用户组</Title>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新建用户组</Button>
       </div>
       <Card>
-        <Table rowKey="id" columns={columns} dataSource={groups} loading={loading} pagination={false} />
+        {isCompact ? (
+          <div className="responsive-card-list" aria-label="用户组列表">
+            {groups.map((group) => (
+              <article className="responsive-data-card" key={group.id}>
+                <div className="responsive-data-card-heading">
+                  <strong>{group.name}</strong>
+                  <span className="responsive-data-card-secondary">创建于 {new Date(group.created_at).toLocaleString()}</span>
+                </div>
+                <div className="responsive-data-card-tags">
+                  {group.members.length ? group.members.map((member) => (
+                    <Tag key={member.id} color={member.is_active ? 'blue' : 'default'}>
+                      {member.display_name || member.username}
+                    </Tag>
+                  )) : <Text type="secondary">暂无成员</Text>}
+                </div>
+                <div className="responsive-data-card-actions">{groupActions(group)}</div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <Table rowKey="id" columns={columns} dataSource={groups} loading={loading} pagination={false} />
+        )}
       </Card>
 
       <Modal
         title={editingGroup ? `编辑用户组：${editingGroup.name}` : '新建用户组'}
         open={modalOpen}
+        className="admin-user-group-modal"
         onCancel={() => setModalOpen(false)}
         onOk={handleSave}
         confirmLoading={saving}

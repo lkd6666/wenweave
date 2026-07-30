@@ -4,7 +4,10 @@
 """
 from __future__ import annotations
 
+import os
+import time
 from functools import lru_cache
+from uuid import uuid4
 
 from cryptography.fernet import Fernet
 
@@ -17,13 +20,55 @@ def _load_or_create_key() -> bytes:
         return settings.ENCRYPTION_KEY.encode("utf-8")
 
     key_file = DATA_DIR / "encryption.key"
-    if key_file.exists():
-        return key_file.read_bytes().strip()
-
-    key = Fernet.generate_key()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    key_file.write_bytes(key)
-    return key
+    existing = key_file.read_bytes().strip() if key_file.exists() else b""
+    if existing:
+        return existing
+
+    # A direct ``write_bytes`` leaves a window where two workers cache
+    # different keys.  Serialize first creation with an exclusive sidecar and
+    # publish the completed key by atomic replacement.
+    lock_file = key_file.with_suffix(".key.lock")
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            descriptor = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = key_file.read_bytes().strip() if key_file.exists() else b""
+            if existing:
+                return existing
+            if time.monotonic() >= deadline:
+                raise RuntimeError("等待本地 encryption.key 初始化超时；请改用显式 ENCRYPTION_KEY")
+            time.sleep(0.05)
+            continue
+        break
+
+    try:
+        existing = key_file.read_bytes().strip() if key_file.exists() else b""
+        if existing:
+            return existing
+        key = Fernet.generate_key()
+        temporary = key_file.with_name(f"{key_file.name}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, key_file)
+            try:
+                os.chmod(key_file, 0o600)
+            except OSError:
+                pass
+        finally:
+            if temporary.exists():
+                temporary.unlink(missing_ok=True)
+        return key
+    finally:
+        os.close(descriptor)
+        try:
+            lock_file.unlink()
+        except FileNotFoundError:
+            pass
 
 
 @lru_cache

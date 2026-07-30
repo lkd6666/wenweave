@@ -131,6 +131,11 @@ let auditLog = {
   keptClasses: [],
   removedIdAttributes: [],   // 已证实规则
   riskStyleHints: [],        // 未证实规则（风险提示，不代表一定被过滤）
+  bannedTags: [],
+  consecutiveBrRuns: [],
+  svgIdAttributes: [],
+  imageIssues: [],
+  diagnostics: [],
   removedSvgBrs: 0,
   hasSvg: false,
   oversizedSvgBlocks: [],    // 已证实规则：单个 SVG 序列化长度 >= 11000 会被替换为 <embed>
@@ -145,6 +150,11 @@ function resetAuditLog() {
     keptClasses: [],
     removedIdAttributes: [],
     riskStyleHints: [],
+    bannedTags: [],
+    consecutiveBrRuns: [],
+    svgIdAttributes: [],
+    imageIssues: [],
+    diagnostics: [],
     removedSvgBrs: 0,
     hasSvg: false,
     oversizedSvgBlocks: [],
@@ -153,6 +163,94 @@ function resetAuditLog() {
     emptyNodeSuspects: []
   };
   return auditLog;
+}
+
+function addDiagnostic(code, severity, message, consequence, suggestion, snippet) {
+  auditLog.diagnostics.push({
+    code: code,
+    severity: severity,
+    path: '文档',
+    snippet: (snippet || '').slice(0, 240),
+    message: message,
+    consequence: consequence,
+    suggestion: suggestion
+  });
+}
+
+function scanBannedTags(html) {
+  var rules = {
+    style: ['WX-TAG-001', '内嵌 <style> 标签不受公众号文章 HTML 支持。'],
+    link: ['WX-TAG-002', '外链样式表不会随公众号文章正文加载。'],
+    script: ['WX-TAG-003', '公众号文章正文不会执行 <script> 中的 JavaScript。'],
+    iframe: ['WX-TAG-004', '普通 <iframe> 不能作为可移植的公众号文章正文内容。'],
+    noscript: ['WX-TAG-005', '<noscript> 内容不能作为可靠的公众号文章正文。']
+  };
+  Object.keys(rules).forEach(function(tag) {
+    var regex = new RegExp('<' + tag + '\\b[^>]*>', 'gi');
+    var match;
+    while ((match = regex.exec(html)) !== null) {
+      auditLog.bannedTags.push(tag);
+      addDiagnostic(rules[tag][0], 'error', rules[tag][1], '该节点会被清理、忽略或无法按网页方式运行，正文效果不可预测。', '移除该标签，并使用公众号正文支持的静态内容或行内样式。', match[0]);
+    }
+  });
+}
+
+function scanConsecutiveBrs(html) {
+  var regex = /(?:(?:<br\b[^<>]*>)\s*){10,}/gi;
+  var match;
+  while ((match = regex.exec(html)) !== null) {
+    var count = (match[0].match(/<br\b[^<>]*>/gi) || []).length;
+    auditLog.consecutiveBrRuns.push(count);
+    addDiagnostic('WX-HTML-001', 'warning', '检测到连续 ' + count + ' 个 <br> 标签。', '编辑器可能压缩连续换行，依赖空行堆叠形成的间距会在发布后变化。', '使用段落和受支持的 margin/padding 控制间距，避免连续 <br>。', match[0]);
+  }
+}
+
+function scanSvgAnimationRules(html) {
+  var blockRegex = /<svg\b[^>]*>[\s\S]*?<\/svg>/gi;
+  var block;
+  while ((block = blockRegex.exec(html)) !== null) {
+    var svg = block[0];
+    var idRegex = /\bid\s*=\s*(["'])(.*?)\1/gi;
+    var idMatch;
+    while ((idMatch = idRegex.exec(svg)) !== null) {
+      auditLog.svgIdAttributes.push(idMatch[0]);
+    }
+    var brCount = (svg.match(/<br\b[^>]*>/gi) || []).length;
+    if (brCount) {
+      addDiagnostic('WX-SVG-001', 'error', 'SVG 内包含 ' + brCount + ' 个 <br> 标签。', '公众号处理 SVG 时会删除这些 <br>，SVG 结构或文本布局会改变。', '移除 SVG 内的 <br>，用 SVG 的 text/tspan 元素表达换行。', svg);
+    }
+    var beginRegex = /\bbegin\s*=\s*(["'])(.*?)\1/gi;
+    var beginMatch;
+    while ((beginMatch = beginRegex.exec(svg)) !== null) {
+      var value = beginMatch[2].trim();
+      if (/(^|;|\s)[A-Za-z_][\w:.-]*\.click(?:[+\-]\d+(?:\.\d+)?s)?(?:;|$)/.test(value)) {
+        addDiagnostic('WX-SVG-002', 'error', '检测到跨元素 SVG 动画触发器 begin="' + value + '"。', '触发器依赖 id，而公众号会剥离 SVG 的 id 属性，动画将无法启动。', '改为当前元素自触发的 begin="click"，并移除跨元素 id 依赖。', beginMatch[0]);
+      }
+    }
+  }
+}
+
+function scanImageRules(html) {
+  var imgRegex = /<img\b[^>]*>/gi;
+  var match;
+  while ((match = imgRegex.exec(html)) !== null) {
+    var image = match[0];
+    if (!/\balt\s*=/.test(image)) {
+      auditLog.imageIssues.push('图片缺少 alt 文本');
+      addDiagnostic('WX-IMG-001', 'warning', '图片缺少 alt 文本。', '图片加载失败或需要辅助阅读时，没有可替代的说明文字。', '为 img 添加描述图片内容的 alt 属性；装饰图可使用 alt=""。', image);
+    }
+    var styleMatch = /\bstyle\s*=\s*(["'])(.*?)\1/i.exec(image);
+    var style = styleMatch ? styleMatch[2].toLowerCase() : '';
+    var responsive = /max-width\s*:\s*100%/.test(style) && /height\s*:\s*auto/.test(style) && /display\s*:\s*block/.test(style);
+    if (!responsive) {
+      auditLog.imageIssues.push('图片缺少响应式样式');
+      addDiagnostic('WX-IMG-002', 'warning', '图片缺少 max-width:100%; height:auto; display:block; 响应式样式。', '在不同屏幕宽度下，图片可能溢出、变形或产生基线空隙。', '在 style 中添加 max-width:100%; height:auto; display:block;。', image);
+    }
+    if (/\b(?:width|height)\s*=/.test(image) || /(?:^|;)\s*(?:width|height)\s*:/.test(style)) {
+      auditLog.imageIssues.push('图片使用固定尺寸');
+      addDiagnostic('WX-IMG-003', 'warning', '图片使用固定尺寸。', '固定尺寸在窄屏设备上可能溢出或导致比例失真。', '保留 max-width:100% 和 height:auto，避免依赖固定宽高。', image);
+    }
+  }
 }
 
 // ==========================================
@@ -312,6 +410,7 @@ function formatClass(rules, html) {
       if (className) {
         if (blackList && blackList.indexOf(className) !== -1) {
           auditLog.removedClasses.push(className + " (黑名单)");
+          addDiagnostic('WX-ATTR-002', 'warning', '自定义 class "' + className + '" 不在公众号编辑器白名单内。', '该 class 会被清理，依赖它的样式或脚本选择器会失效。', '将必要的受支持样式直接写入 style 属性，不要依赖自定义 class。', match[0]);
           continue;
         } else if (whiteList && whiteList.indexOf(className) !== -1) {
           keptClasses.push(className);
@@ -329,9 +428,11 @@ function formatClass(rules, html) {
           }
           if (!matchedReg) {
             auditLog.removedClasses.push(className);
+            addDiagnostic('WX-ATTR-002', 'warning', '自定义 class "' + className + '" 不在公众号编辑器白名单内。', '该 class 会被清理，依赖它的样式或脚本选择器会失效。', '将必要的受支持样式直接写入 style 属性，不要依赖自定义 class。', match[0]);
           }
         } else {
           auditLog.removedClasses.push(className);
+          addDiagnostic('WX-ATTR-002', 'warning', '自定义 class "' + className + '" 不在公众号编辑器白名单内。', '该 class 会被清理，依赖它的样式或脚本选择器会失效。', '将必要的受支持样式直接写入 style 属性，不要依赖自定义 class。', match[0]);
         }
       }
     }
@@ -392,6 +493,7 @@ function auditIdStripping(html, tagWhiteList) {
     if (whiteList.indexOf(tagName) !== -1) { continue; }
     found.push({ tag: tagName, id: idValue });
     auditLog.removedIdAttributes.push('<' + tagName + ' id="' + idValue + '">');
+    addDiagnostic('WX-ATTR-001', 'warning', 'id 属性会在公众号编辑器处理时被剥离。', '依赖该 id 的 CSS、锚点或 SVG 动画触发器会失效。', '不要依赖正文 HTML 的 id；SVG 动画请使用不依赖外部 id 的触发方式。', match[0]);
   }
   return found;
 }
@@ -409,11 +511,27 @@ function scanRiskyInlineStyles(html) {
   var hints = [];
   while ((match = stylePattern.exec(html)) !== null) {
     var styleVal = match[1];
-    RISKY_STYLE_PROPS.forEach(function(prop) {
-      var propRegex = new RegExp('(^|;|\\s)' + prop + '\\s*:', 'i');
-      if (propRegex.test(styleVal)) {
+    styleVal.split(';').forEach(function(declaration) {
+      var pair = declaration.split(':');
+      var prop = (pair.shift() || '').trim().toLowerCase();
+      var value = pair.join(':').trim().toLowerCase();
+      if (!prop) { return; }
+      var isRisk =
+        (prop === 'position' && ['absolute', 'fixed', 'sticky'].indexOf(value) !== -1) ||
+        ['z-index', 'top', 'left', 'float'].indexOf(prop) !== -1 ||
+        (prop === 'display' && value === 'grid') ||
+        prop.indexOf('grid-') === 0 ||
+        prop === 'transform';
+      if (isRisk) {
         hints.push(prop);
-        auditLog.riskStyleHints.push(prop + ' in "' + styleVal.trim() + '"');
+        auditLog.riskStyleHints.push(prop + ':' + value + ' in "' + styleVal.trim() + '"');
+        addDiagnostic(
+          prop === 'position' ? 'WX-CSS-001' : (prop === 'transform' ? 'WX-CSS-004' : ((prop === 'display' || prop.indexOf('grid-') === 0) ? 'WX-CSS-003' : 'WX-CSS-002')),
+          'warning',
+          '检测到 ' + prop + ':' + value + '，该样式在公众号正文中兼容性不稳定。',
+          '不同客户端可能改变布局、层叠或变形结果。',
+          '使用普通文档流、margin/padding 和 text-align 完成布局。'
+        );
       }
     });
   }
@@ -421,15 +539,15 @@ function scanRiskyInlineStyles(html) {
 }
 
 /**
- *【已证实规则】嵌套深度限制（editor_filter.js deleteNestNode）
- * 上限 10 层触发扁平化，扁平化收敛目标为 10 - 2 = 8 层。
+ *【已证实规则】Word 粘贴嵌套深度限制（clear_dom.js）
+ * 节点深度或连续同类子节点达到 20 时触发扁平化。
  * 用通用标签栈扫描器估算 HTML 最大嵌套深度（忽略 void 元素/自闭合标签，且不把
  * SVG 内部图形标签计入 HTML 层级嵌套，因为 SVG 有自己的一套渲染规则）。
  * 这是对真实 DOM 深度的近似估算，可能与浏览器解析结果有细微差异，但足以发现
  * “层级过深”的排版问题。
  */
 const VOID_TAGS = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
-const NEST_LIMIT = 10;
+const NEST_LIMIT = 20;
 const NEST_SAFE = NEST_LIMIT - 2;
 
 function checkNestingDepth(html) {
@@ -484,6 +602,7 @@ function checkSvgSerializedLength(html) {
     if (match[0].length >= SVG_LENGTH_LIMIT) {
       oversized.push(match[0].length);
       auditLog.oversizedSvgBlocks.push(match[0].length);
+      addDiagnostic('WX-SVG-003', 'error', 'SVG 序列化长度为 ' + match[0].length + ' 字符，达到 11000 字符硬性阈值。', '该 SVG 会被公众号替换为 <embed>，图形和动效都无法按原样保留。', '删除冗余属性和路径，拆分或简化 SVG，使单个 SVG 小于 11000 字符。', match[0]);
     }
   }
   return oversized;
@@ -498,7 +617,7 @@ function checkSvgSerializedLength(html) {
  * 这里只做单节点级别的启发式提示（不复现 >20 子节点/连续 15+ 的真实阈值判断），
  * 命中不代表一定会被清理，仅供人工复核排版结构是否有明显冗余的空标签。
  */
-const EMPTY_NODE_EXEMPT_TAGS = /^(img|hr|svg|mp-common|iframe|cps|br|a|mp|video|audio|path|embed)/i;
+const EMPTY_NODE_EXEMPT_TAGS = /^(img|hr|svg|mp-common|iframe|cps|br|a|mp|video|audio|path|embed|rect|circle|ellipse|line|polyline|polygon|g|defs|use|text|tspan|animate|set)/i;
 function scanEmptyNodeSuspects(html) {
   var tagPattern = /<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*)>\s*<\/\1>/g;
   var match;
@@ -563,6 +682,10 @@ function runCheck(filePath) {
 
   // 执行全套清洗/审计逻辑
   let output = fileContent;
+  scanBannedTags(fileContent);
+  scanConsecutiveBrs(fileContent);
+  scanRiskyInlineStyles(fileContent);
+  scanImageRules(fileContent);
   output = filterBr(output);
   output = formatStyle(output);
   formatClass({
@@ -571,13 +694,13 @@ function runCheck(filePath) {
     blackList: classBlackList
   }, output);
   auditIdStripping(output);
-  scanRiskyInlineStyles(output);
+  scanSvgAnimationRules(fileContent);
   checkNestingDepth(output);
-  checkSvgSerializedLength(output);
+  checkSvgSerializedLength(fileContent);
   scanEmptyNodeSuspects(output);
 
-  let hasWarning = false;
-  let hasError = false;
+  let hasWarning = auditLog.diagnostics.some(function(item) { return item.severity === 'warning'; });
+  let hasError = auditLog.diagnostics.some(function(item) { return item.severity === 'error'; });
 
   console.log(`\n\x1b[35m[已证实 1/6] class 白名单过滤审计:\x1b[0m`);
   const uniqueRemovedClasses = [...new Set(auditLog.removedClasses)];
@@ -600,14 +723,14 @@ function runCheck(filePath) {
     console.log(`✅ 未检测到会被剥离的 id 属性。`);
   }
 
-  console.log(`\n\x1b[35m[已证实 3/6] 嵌套深度审计（限制 10 层，安全线 8 层）:\x1b[0m`);
+  console.log(`\n\x1b[35m[已证实 3/6] Word 粘贴嵌套深度审计（限制 20 层，安全线 18 层）:\x1b[0m`);
   if (auditLog.willFlattenNesting) {
-    console.log(`\x1b[31m❌ 错误: 检测到最大嵌套深度达到 ${auditLog.maxNestingDepth} 层，已到达/超过微信 10 层扁平化阈值。`);
-    console.log(`   保存后这部分结构会被强制扁平化处理，排版可能整体错乱！\x1b[0m`);
+    console.log(`\x1b[31m❌ 错误: 检测到最大嵌套深度达到 ${auditLog.maxNestingDepth} 层，已到达/超过微信 Word 粘贴 20 层扁平化阈值。`);
+    console.log(`   从 Word 粘贴时这部分结构会被强制扁平化处理，排版可能整体错乱！\x1b[0m`);
     hasError = true;
   } else if (auditLog.maxNestingDepth > NEST_SAFE) {
     console.log(`\x1b[33m⚠️  警告: 检测到最大嵌套深度为 ${auditLog.maxNestingDepth} 层，已超过建议安全线（${NEST_SAFE} 层）。`);
-    console.log(`   虽然还没到 10 层扁平化阈值，但建议精简结构以留出余量。\x1b[0m`);
+    console.log(`   虽然还没到 20 层扁平化阈值，但建议精简结构以留出余量。\x1b[0m`);
     hasWarning = true;
   } else {
     console.log(`✅ 最大嵌套深度为 ${auditLog.maxNestingDepth} 层，在安全范围内。`);
@@ -649,6 +772,18 @@ function runCheck(filePath) {
     console.log(`   目前没有在微信源码中找到这些样式一定会被过滤的调用证据，仅供参考，不计入下方通过/失败结论。`);
   } else {
     console.log(`✅ 未检测到 position: absolute 等定位样式使用。`);
+  }
+
+  console.log(`\n\x1b[35m[详细诊断] 禁用标签、SVG 动画、图片与换行规则:\x1b[0m`);
+  if (auditLog.diagnostics.length > 0) {
+    auditLog.diagnostics.forEach(function(item) {
+      var label = item.severity === 'error' ? '错误' : (item.severity === 'warning' ? '风险' : '提示');
+      console.log(`  [${item.code}] ${label}: ${item.message}`);
+      console.log(`    后果: ${item.consequence}`);
+      console.log(`    建议: ${item.suggestion}`);
+    });
+  } else {
+    console.log(`✅ 未命中新增兼容性规则。`);
   }
 
   console.log(`\n\x1b[36m==================================================`);
@@ -699,7 +834,11 @@ module.exports = {
   filterClass,
   // 检查函数
   auditIdStripping,
+  scanBannedTags,
+  scanConsecutiveBrs,
   scanRiskyInlineStyles,
+  scanSvgAnimationRules,
+  scanImageRules,
   checkNestingDepth,
   checkSvgSerializedLength,
   scanEmptyNodeSuspects,

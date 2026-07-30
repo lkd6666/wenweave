@@ -40,19 +40,12 @@ def bounded_json(
     next_step: str,
     status: dict[str, Any] | None = None,
 ) -> str:
-    """Protect model context when a structured tool report unexpectedly grows.
+    """Serialize a structured tool report before the graph-level output store.
 
-    Exact HTML is intentionally never passed here: callers must reject an
-    oversized source block rather than truncate it into invalid markup.
+    ``ToolOutputStore`` now owns model-visible truncation because it needs the
+    complete value and the provider's real ``tool_call_id`` to offer a durable
+    continuation.  Keep this compatibility helper so existing tool bodies do
+    not accidentally reintroduce lossy, per-tool truncation.
     """
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if estimate_tokens(encoded) <= max_tokens:
-        return encoded
-    fallback = {
-        "truncated": True,
-        "returned_tokens_limit": max_tokens,
-        "estimated_original_tokens": estimate_tokens(encoded),
-        "next_step": next_step,
-        **(status or {}),
-    }
-    return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+    del max_tokens, next_step, status
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

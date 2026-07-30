@@ -13,17 +13,31 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 
 class AnthropicClient:
-    def __init__(self, base_url: str, api_key: str, timeout: float = 60.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout: float = 60.0,
+        auth_style: str = "x-api-key",
+    ):
         self.base_url = (base_url or "https://api.anthropic.com").rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        # 国内云厂商的 Claude Code 兼容网关（阿里云百炼 / 智谱 / Kimi）文档只给出
+        # ANTHROPIC_AUTH_TOKEN，即 Authorization: Bearer；官方 Anthropic 与 DeepSeek
+        # 用 x-api-key。两者不通用，发错会直接 401，故由预设声明具体形式。
+        self.auth_style = auth_style
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "x-api-key": self.api_key,
+        headers = {
             "anthropic-version": ANTHROPIC_VERSION,
             "Content-Type": "application/json",
         }
+        if self.auth_style == "bearer":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        else:
+            headers["x-api-key"] = self.api_key
+        return headers
 
     @staticmethod
     def _split_system(messages: List[Dict[str, Any]]):

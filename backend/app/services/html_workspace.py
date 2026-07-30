@@ -12,6 +12,7 @@ import hashlib
 import html as html_lib
 import json
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Callable, Iterable, Literal
@@ -51,8 +52,8 @@ BLOCK_TAGS = {
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 MAX_MAP_BLOCKS = 72
 MAX_SEARCH_RESULTS = 12
-MAX_READ_BLOCKS = 4
-DEFAULT_TOOL_RESULT_MAX_TOKENS = 4_096
+MAX_READ_BLOCKS = 16
+DEFAULT_TOOL_RESULT_MAX_TOKENS = 8_192
 
 PatchMode = Literal["replace_outer", "replace_inner", "insert_before", "insert_after", "delete"]
 
@@ -388,6 +389,59 @@ class HtmlWorkspace:
             requested_count=max(1, min(limit, MAX_SEARCH_RESULTS)),
         )
 
+    def image_inventory(self) -> dict:
+        """Return a source-safe, stable inventory of image slots.
+
+        Image URLs and inline image data are intentionally excluded.  The
+        fingerprint makes it possible to establish whether slots match across
+        versions without exposing inline data to the model.
+        """
+        blocks_by_start = {block.start: block for block in self.blocks}
+        images: list[dict] = []
+        for node in self._nodes:
+            if node.tag != "img":
+                continue
+            source = node.attrs.get("src", "").strip()
+            if not source:
+                source_kind = "missing"
+                fingerprint = ""
+                host = ""
+            elif source.lower().startswith("data:"):
+                source_kind = "inline_data"
+                fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+                host = ""
+            else:
+                source_kind = "url"
+                fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+                host = (urlparse(source).hostname or "").lower()
+            block = blocks_by_start.get(node.start)
+            images.append(
+                {
+                    "slot": len(images) + 1,
+                    "source_kind": source_kind,
+                    "source_fingerprint": fingerprint,
+                    "url_host": host,
+                    "has_srcset": bool(node.attrs.get("srcset", "").strip()),
+                    "srcset_fingerprint": (
+                        hashlib.sha256(node.attrs["srcset"].strip().encode("utf-8")).hexdigest()[:16]
+                        if node.attrs.get("srcset", "").strip()
+                        else ""
+                    ),
+                    "block_id": block.block_id if block else "",
+                    "path": block.path if block else self._path(node),
+                }
+            )
+        fingerprints = {item["source_fingerprint"] for item in images if item["source_fingerprint"]}
+        return {
+            "revision": self.revision,
+            "image_count": len(images),
+            "unique_source_count": len(fingerprints),
+            "inline_data_count": sum(item["source_kind"] == "inline_data" for item in images),
+            "url_count": sum(item["source_kind"] == "url" for item in images),
+            "missing_source_count": sum(item["source_kind"] == "missing" for item in images),
+            "images": images,
+        }
+
     def resolve_selection(self, selector: str, tag_name: str, text: str) -> HtmlBlock | None:
         selector = selector.strip()
         tag_name = tag_name.lower().strip()
@@ -401,7 +455,7 @@ class HtmlWorkspace:
             candidates = [block for block in candidates if text_lower in block.text.lower()] or candidates
         return min(candidates, key=lambda block: block.start, default=None)
 
-    def read(self, block_ids: list[str]) -> dict:
+    def read(self, block_ids: list[str], cursor: int = 0) -> dict:
         if not block_ids:
             raise WorkspaceError("请至少提供一个 block_id")
         if len(block_ids) > MAX_READ_BLOCKS:
@@ -413,26 +467,55 @@ class HtmlWorkspace:
                     "suggestion": "请把 block_id 分成多次 read_blocks 调用。",
                 },
             )
+        if not isinstance(cursor, int) or cursor < 0 or cursor >= len(block_ids):
+            raise WorkspaceError(
+                "读取游标无效",
+                {"cursor": cursor, "requested_block_count": len(block_ids)},
+            )
+
+        def payload(items: list[dict], next_cursor: int | None) -> dict:
+            remaining = len(block_ids) - (next_cursor if next_cursor is not None else len(block_ids))
+            result = {
+                "revision": self.revision,
+                "requested_block_count": len(block_ids),
+                "cursor": cursor,
+                "blocks": items,
+                "next_cursor": next_cursor,
+                "remaining_block_count": remaining,
+            }
+            if next_cursor is not None:
+                result.update(
+                    {
+                        "truncated": True,
+                        "next_step": "请使用相同 block_ids 和 next_cursor 继续读取剩余完整排版块。",
+                    }
+                )
+            return result
+
         blocks: list[dict] = []
-        for block_id in block_ids:
+        for index, block_id in enumerate(block_ids[cursor:], start=cursor):
             block = self._blocks_by_id.get(block_id)
             if not block:
                 raise WorkspaceError("排版块已变化，请先调用 get_document_map 或 search_html 重新定位", {"revision": self.revision})
             source = self._redact(self.source_html[block.start : block.end])
-            blocks.append({**block.map_item(), "html": source})
-        result = {"revision": self.revision, "blocks": blocks}
-        estimated_tokens = estimate_tokens(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-        if estimated_tokens > self.tool_result_max_tokens:
+            candidate = {**block.map_item(), "html": source}
+            next_cursor = index + 1 if index + 1 < len(block_ids) else None
+            candidate_payload = payload([*blocks, candidate], next_cursor)
+            if estimate_tokens(json.dumps(candidate_payload, ensure_ascii=False, separators=(",", ":"))) <= self.tool_result_max_tokens:
+                blocks.append(candidate)
+                continue
+            if blocks:
+                return payload(blocks, index)
             raise WorkspaceError(
-                "读取源码超过该模型的单次工具返回上限，未返回不完整 HTML",
+                "单个排版块源码超过当前工具预览预算，未返回不完整 HTML",
                 {
-                    "estimated_tokens": estimated_tokens,
+                    "estimated_tokens": estimate_tokens(json.dumps(candidate_payload, ensure_ascii=False, separators=(",", ":"))),
                     "tool_result_max_tokens": self.tool_result_max_tokens,
-                    "requested_blocks": len(block_ids),
-                    "suggestion": "请先搜索更细粒度的子块，或每次只读取一个较小的排版块。",
+                    "block_id": block_id,
+                    "suggestion": "请搜索更细粒度的子块后再读取；系统不会返回不完整 HTML。",
                 },
             )
-        return result
+        return payload(blocks, None)
 
     def apply_patch(self, revision: str, operations: list[dict], restore: Callable[[str], str]) -> tuple[str, dict]:
         if revision != self.revision:

@@ -66,7 +66,12 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
     return user
 
 
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_admin)])
+@router.delete(
+    "/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+    dependencies=[Depends(require_admin)],
+)
 def delete_user(user_id: int, current_user: User = Depends(require_admin), db: Session = Depends(get_db)) -> None:
     user = db.get(User, user_id)
     if not user:

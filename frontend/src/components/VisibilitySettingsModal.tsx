@@ -69,6 +69,7 @@ export default function VisibilitySettingsModal({
     <Modal
       title={title}
       open={open}
+      className="visibility-settings-modal"
       okText="保存权限"
       cancelText="取消"
       confirmLoading={saving}

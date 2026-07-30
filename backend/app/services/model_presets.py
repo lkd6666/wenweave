@@ -13,6 +13,7 @@ from copy import deepcopy
 from typing import Any
 
 CATALOG_SOURCE = "models.dev 开源模型目录（https://models.dev）"
+OFFICIAL_DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com/v1"
 
 # 模型发现协议与聊天协议并不完全相同。预设显式标记发现适配器，避免把所有厂商都假定为
 # Bearer + /models：Gemini 的原生列表接口使用 x-goog-api-key 且响应为 models[]，
@@ -30,6 +31,27 @@ VOLCENGINE_ARK_DISCOVERY = {
     "path": "/endpoints",
     "response_key": "items",
 }
+# 各家的 Claude Code 兼容网关只实现 /v1/messages，不提供 /v1/models（阿里云文档明确
+# 写了这一点）。显式标记为不支持，避免发一次注定 404 的请求后把配置问题报成密钥问题。
+UNSUPPORTED_DISCOVERY = {"adapter": "unsupported", "reason": "该端点仅提供 /v1/messages，不支持模型列表查询"}
+
+# Anthropic 协议的凭证头在各网关之间不一致：官方与 DeepSeek 接受 x-api-key，而
+# 阿里云 / 智谱 / Kimi 的文档只给出 ANTHROPIC_AUTH_TOKEN（Claude Code 将其发为
+# Authorization: Bearer）。预设据此声明，客户端按声明发送对应请求头。
+AUTH_STYLE_API_KEY = "x-api-key"
+AUTH_STYLE_BEARER = "bearer"
+
+
+def recommended_tool_preview_tokens(input_budget_tokens: int) -> int:
+    """Match mainstream Agent preview sizes while keeping full results retrievable."""
+    budget = max(1, int(input_budget_tokens))
+    if budget < 65_536:
+        target = 8_192
+    elif budget <= 262_144:
+        target = 12_288
+    else:
+        target = 16_384
+    return min(budget, target)
 
 
 def _openai_reasoning_config() -> dict[str, Any]:
@@ -61,6 +83,19 @@ def _toggle_config(key: str = "enable_thinking") -> dict[str, Any]:
     return {"enabled": {key: True}, "disabled": {key: False}}
 
 
+def _deepseek_thinking_config() -> dict[str, Any]:
+    return {"enabled": {"thinking": {"type": "enabled"}}, "disabled": {"thinking": {"type": "disabled"}}}
+
+
+def official_deepseek_thinking_config() -> dict[str, Any]:
+    """Return a fresh native thinking mapping for the official OpenAI endpoint."""
+    return deepcopy(_deepseek_thinking_config())
+
+
+def is_official_deepseek_openai_endpoint(base_url: str) -> bool:
+    return str(base_url or "").rstrip("/").lower() == OFFICIAL_DEEPSEEK_OPENAI_BASE_URL
+
+
 def _models(*items: tuple[str, str, dict[str, Any] | None]) -> list[dict[str, Any]]:
     return [
         {
@@ -73,10 +108,45 @@ def _models(*items: tuple[str, str, dict[str, Any] | None]) -> list[dict[str, An
             "context_window_tokens": 32768,
             "context_compaction_threshold_tokens": 24576,
             "max_output_tokens": 8192,
-            "tool_result_max_tokens": 4096,
+            "tool_result_max_tokens": recommended_tool_preview_tokens(24_576),
+            "is_multimodal": False,
         }
         for model_name, display_name, thinking_config in items
     ]
+
+
+def _coding_models(
+    *items: tuple[str, str, int, int, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    """按显式上下文/输出容量构造 coding plan 模型条目。
+
+    ``_models()`` 的 32768 默认值对编码套餐是错的量级：这些端点主打长上下文，套用默认
+    值会在管理端看不出异常的情况下把可用窗口砍掉一个数量级。这里要求每条显式给出容量，
+    并按既有约定推导压缩阈值与单次工具结果预览上限。
+    """
+    entries: list[dict[str, Any]] = []
+    for model_name, display_name, context_window, max_output, thinking_config in items:
+        threshold = context_window - max_output
+        entries.append(
+            {
+                "model_name": model_name,
+                "display_name": display_name,
+                "thinking_config": deepcopy(thinking_config or {}),
+                "context_window_tokens": context_window,
+                "context_compaction_threshold_tokens": threshold,
+                "max_output_tokens": max_output,
+                "tool_result_max_tokens": recommended_tool_preview_tokens(threshold),
+                "is_multimodal": False,
+            }
+        )
+    return entries
+
+
+def _glm_thinking_config() -> dict[str, Any]:
+    return {
+        "enabled": {"thinking": {"type": "enabled"}},
+        "disabled": {"thinking": {"type": "disabled"}},
+    }
 
 
 # ``id`` 是稳定的产品内部标识，不依赖某个供应商模型名称。后续增加模型不影响已有配置。
@@ -113,11 +183,12 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "id": "deepseek",
         "name": "DeepSeek",
         "provider_type": "openai_compatible",
-        "base_url": "https://api.deepseek.com/v1",
+        "base_url": OFFICIAL_DEEPSEEK_OPENAI_BASE_URL,
         "api_key_hint": "sk-...",
         "model_discovery": OPENAI_COMPATIBLE_DISCOVERY,
         # DeepSeek 会频繁切换正式模型与别名；创建时应通过 /models 获取当前账号可用模型，
         # 不在预设界面展示容易过时的 deepseek-chat / deepseek-reasoner 固定条目。
+        "thinking_config": _deepseek_thinking_config(),
         "models": [],
     },
     {
@@ -283,6 +354,89 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
             ("gemini-2.5-flash", "Gemini 2.5 Flash", _openai_reasoning_config()),
         ),
     },
+    # ---------------------------------------------------------------------
+    # 国内云厂商的 Anthropic 兼容套餐端点（Token Plan / Coding Plan）
+    #
+    # 这些端点复用 Anthropic Messages 协议，因此走 provider_type="anthropic"，
+    # AnthropicClient 无需改动即可请求 {base_url}/v1/messages。三点与官方 Anthropic 不同：
+    #   1. 认证头：阿里云 / 智谱 / Kimi 文档给的是 ANTHROPIC_AUTH_TOKEN（对应 Bearer），
+    #      仅 DeepSeek 明确写了 x-api-key「Fully Supported」。故用 auth_style 区分。
+    #   2. base_url 已包含各家的网关前缀（/apps/anthropic、/api/anthropic、/anthropic），
+    #      不要再补 /v1，客户端会自行拼接 /v1/messages。
+    #   3. 模型列表接口大多不存在，必须写死 models，否则发现失败时会退化成
+    #      「请检查 API Key」这种把配置问题误报成密钥问题的提示。
+    #
+    # 容量取值原则：只有厂商文档明确写出的上下文才写进预设（[1m] 后缀 = 1M 窗口，
+    # kimi-k2.7-code = 256K）。max_output 属于本产品自选的保守预算而非厂商声明值，
+    # 管理端可上调。文档未给出容量的模型 ID 见各条目下方注释，不进预设以免写入错误量级。
+    # ---------------------------------------------------------------------
+    {
+        "id": "aliyun_bailian_coding_plan",
+        "name": "阿里云百炼 · Coding Plan（Anthropic 兼容）",
+        "provider_type": "anthropic",
+        "base_url": "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+        "api_key_hint": "sk-...",
+        "auth_style": AUTH_STYLE_BEARER,
+        # 文档明确说明该端点只提供 /v1/messages，不提供 /v1/models。
+        "model_discovery": UNSUPPORTED_DISCOVERY,
+        "models": _coding_models(
+            ("qwen3.7-plus[1m]", "Qwen3.7 Plus（1M 上下文）", 1_000_000, 65_536, None),
+        ),
+    },
+    {
+        "id": "aliyun_bailian_token_plan",
+        "name": "阿里云百炼 · Token Plan（Anthropic 兼容）",
+        "provider_type": "anthropic",
+        "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        "api_key_hint": "sk-...",
+        "auth_style": AUTH_STYLE_BEARER,
+        "model_discovery": UNSUPPORTED_DISCOVERY,
+        # 该套餐还列出 qwen3.8-max-preview / qwen3.7-max / qwen3.6-flash / glm-5.2，
+        # 但文档未给出各自的上下文窗口，需要时在模型编辑里按实际容量手动添加。
+        "models": _coding_models(
+            ("qwen3.7-plus[1m]", "Qwen3.7 Plus（1M 上下文）", 1_000_000, 65_536, None),
+            ("deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000, 384_000, None),
+        ),
+    },
+    {
+        "id": "zhipu_coding_plan",
+        "name": "智谱 GLM Coding Plan（Anthropic 兼容）",
+        "provider_type": "anthropic",
+        "base_url": "https://open.bigmodel.cn/api/anthropic",
+        "api_key_hint": "...",
+        "auth_style": AUTH_STYLE_BEARER,
+        "models": _coding_models(
+            ("glm-5.2[1m]", "GLM-5.2（1M 上下文）", 1_000_000, 65_536, _glm_thinking_config()),
+        )
+        # glm-4.7 在该端点可用，但这一页没有给出窗口，沿用目录中既有的保守默认值。
+        + _models(("glm-4.7", "GLM-4.7", _glm_thinking_config())),
+    },
+    {
+        "id": "moonshot_anthropic",
+        "name": "Moonshot Kimi（Anthropic 兼容）",
+        "provider_type": "anthropic",
+        "base_url": "https://api.moonshot.cn/anthropic",
+        "api_key_hint": "sk-...",
+        "auth_style": AUTH_STYLE_BEARER,
+        # kimi-k2.7-code-highspeed / kimi-k2.6 也可用，文档未给出窗口，故未纳入。
+        "models": _coding_models(
+            ("kimi-k3[1m]", "Kimi K3（1M 上下文）", 1_000_000, 65_536, None),
+            ("kimi-k2.7-code", "Kimi K2.7 Code（256K）", 262_144, 32_768, None),
+        ),
+    },
+    {
+        "id": "deepseek_anthropic",
+        "name": "DeepSeek（Anthropic 兼容）",
+        "provider_type": "anthropic",
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key_hint": "sk-...",
+        # 唯一明确记录 x-api-key「Fully Supported」的一家，沿用默认认证头。
+        "auth_style": AUTH_STYLE_API_KEY,
+        "models": _coding_models(
+            ("deepseek-v4-pro", "DeepSeek V4 Pro", 1_000_000, 384_000, None),
+            ("deepseek-v4-flash", "DeepSeek V4 Flash", 1_000_000, 384_000, None),
+        ),
+    },
 ]
 
 # Capability records are deliberately separate from ``PROVIDER_PRESETS``.
@@ -302,15 +456,48 @@ DISCOVERED_MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
         "max_output_tokens": 384_000,
         "tool_result_max_tokens": 4_096,
     },
+    # These IDs are returned by OpenAI-compatible /models endpoints without
+    # capacity metadata. Keep the documented limits here so discovery does not
+    # silently collapse a long-context model to the 32K fallback. The dated
+    # DashScope ID is the pinned alias of qwen3.7-max used by existing users.
+    "qwen3.7-max": {
+        "display_name": "Qwen3.7 Max",
+        "context_window_tokens": 1_000_000,
+        "max_output_tokens": 65_536,
+        "tool_result_max_tokens": 4_096,
+    },
+    "qwen3.7-max-2026-06-08": {
+        "display_name": "Qwen3.7 Max",
+        "context_window_tokens": 1_000_000,
+        "max_output_tokens": 65_536,
+        "tool_result_max_tokens": 4_096,
+    },
+    "kimi-k2.7-code": {
+        "display_name": "Kimi K2.7 Code",
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 32_768,
+        "tool_result_max_tokens": 4_096,
+    },
+    "glm-5.2": {
+        "display_name": "GLM-5.2",
+        "context_window_tokens": 1_000_000,
+        "max_output_tokens": 131_072,
+        "tool_result_max_tokens": 4_096,
+    },
+    "qwen3.8-max-preview": {
+        "display_name": "Qwen3.8 Max Preview",
+        "context_window_tokens": 1_000_000,
+        "max_output_tokens": 131_072,
+        "tool_result_max_tokens": 4_096,
+    },
 }
 
 for capability in DISCOVERED_MODEL_CAPABILITIES.values():
     capability["context_compaction_threshold_tokens"] = (
         capability["context_window_tokens"] - capability["max_output_tokens"]
     )
-    capability["tool_result_max_tokens"] = max(
-        4_096,
-        capability["context_compaction_threshold_tokens"] // 16,
+    capability["tool_result_max_tokens"] = recommended_tool_preview_tokens(
+        capability["context_compaction_threshold_tokens"]
     )
 
 
@@ -345,6 +532,20 @@ def find_model_preset(model_name: str, provider_preset: dict[str, Any] | None = 
                 return deepcopy(model)
     capability = DISCOVERED_MODEL_CAPABILITIES.get(normalized)
     return deepcopy(capability) if capability else None
+
+
+def resolve_auth_style(base_url: str, provider_type: str) -> str:
+    """按已保存的 base_url 反查该网关要求的 Anthropic 凭证头形式。
+
+    供应商表只存 base_url + 加密密钥，没有认证方式字段，因此这里复用
+    ``find_provider_preset`` 的匹配方式（``discover_models`` 已是同一套做法），
+    避免为一个由 base_url 完全决定的属性增加数据库迁移。未命中预设时返回官方
+    Anthropic 的 x-api-key，与改动前的行为一致。
+    """
+    preset = find_provider_preset(base_url, provider_type)
+    if preset and preset.get("auth_style") == AUTH_STYLE_BEARER:
+        return AUTH_STYLE_BEARER
+    return AUTH_STYLE_API_KEY
 
 
 def thinking_efforts(thinking_config: dict[str, Any]) -> list[str]:

@@ -3,8 +3,8 @@
 SQLite 开发库继续使用其原生可用类型；MySQL 部署时显式升级为 BIGINT 和大文本，避免
 公众号 HTML、Agent 工具参数或推理记录超过 MySQL ``TEXT`` 的 64 KiB 上限。
 """
-from sqlalchemy import Integer, Text
-from sqlalchemy.dialects.mysql import BIGINT, LONGTEXT, MEDIUMTEXT
+from sqlalchemy import Integer, LargeBinary, Text
+from sqlalchemy.dialects.mysql import BIGINT, LONGBLOB, LONGTEXT, MEDIUMTEXT
 
 # MySQL 使用 unsigned BIGINT（约 1.8e19 个主键），SQLite 则保留 INTEGER 以支持自增。
 ID_TYPE = Integer().with_variant(BIGINT(unsigned=True), "mysql")
@@ -14,3 +14,8 @@ LONG_TEXT = Text().with_variant(LONGTEXT, "mysql")
 
 # MEDIUMTEXT 最大 16 MiB，适合加密密钥与普通长配置，避免无必要的 LONGTEXT 行外存储。
 MEDIUM_TEXT = Text().with_variant(MEDIUMTEXT, "mysql")
+
+# Temporary, user-approved layout-reference assets can be up to 10 MiB each.
+# MySQL's default BLOB is only 64 KiB, so use LONGBLOB there while retaining a
+# regular binary column for SQLite development.
+LONG_BINARY = LargeBinary().with_variant(LONGBLOB, "mysql")

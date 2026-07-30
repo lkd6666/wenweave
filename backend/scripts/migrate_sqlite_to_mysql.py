@@ -25,12 +25,28 @@ from app.db.base import Base
 
 TABLES_IN_ORDER = [
     "users",
+    "user_groups",
+    "user_group_members",
     "ai_providers",
     "ai_models",
+    "model_user_access",
+    "model_group_access",
     "storage_configs",
     "document_groups",
     "documents",
+    "chat_sessions",
     "chat_messages",
+    "agent_runs",
+    "document_agent_memories",
+    "chat_session_memories",
+    "document_content_objects",
+    "document_versions",
+    "wechat_accounts",
+    "wechat_account_user_access",
+    "wechat_account_group_access",
+    "wechat_body_image_materials",
+    "wechat_cover_materials",
+    "wechat_drafts",
 ]
 
 
@@ -63,6 +79,39 @@ def main() -> int:
             if existing:
                 raise RuntimeError(f"目标表 {table_name} 已有 {existing} 条记录，迁移已停止")
 
+            if table_name == "chat_sessions" and table_name not in source_tables:
+                # Older releases stored one implicit conversation per document.
+                # Materialize it before copying legacy chat_messages, whose new
+                # session_id column is non-nullable in the target schema.
+                document_rows = target.execute(select(metadata.tables["documents"].c.id)).mappings()
+                compatible_rows = [
+                    {"document_id": row["id"], "title": "初始对话", "is_archived": False, "context_start_message_id": 0}
+                    for row in document_rows
+                ]
+                if compatible_rows:
+                    target.execute(table.insert(), compatible_rows)
+                print(f"{table_name}: {len(compatible_rows)} 条（由旧文档对话回填）")
+                continue
+
+            if table_name == "chat_session_memories" and table_name not in source_tables:
+                legacy_memory_table = metadata.tables["document_agent_memories"]
+                sessions = target.execute(select(metadata.tables["chat_sessions"].c.id, metadata.tables["chat_sessions"].c.document_id)).mappings()
+                session_by_document = {row["document_id"]: row["id"] for row in sessions}
+                legacy_rows = target.execute(select(legacy_memory_table)).mappings()
+                compatible_rows = [
+                    {
+                        "session_id": session_by_document[row["document_id"]],
+                        "compacted_through_message_id": row["compacted_through_message_id"],
+                        "summary_json": row["summary_json"],
+                    }
+                    for row in legacy_rows
+                    if row["document_id"] in session_by_document
+                ]
+                if compatible_rows:
+                    target.execute(table.insert(), compatible_rows)
+                print(f"{table_name}: {len(compatible_rows)} 条（由旧摘要回填）")
+                continue
+
             if table_name not in source_tables:
                 print(f"{table_name}: 0 条（源库无此表）")
                 continue
@@ -78,6 +127,24 @@ def main() -> int:
                     copied.setdefault("group_id", None)
                     copied.setdefault("created_by_id", row["owner_id"])
                     copied.setdefault("last_modified_by_id", row["owner_id"])
+                if table_name == "chat_messages" and "session_id" not in copied:
+                    session_id = target.execute(
+                        select(metadata.tables["chat_sessions"].c.id).where(
+                            metadata.tables["chat_sessions"].c.document_id == row["document_id"]
+                        )
+                    ).scalar_one_or_none()
+                    if session_id is None:
+                        raise RuntimeError(f"消息 {row['id']} 找不到所属文档的初始对话")
+                    copied["session_id"] = session_id
+                if table_name == "agent_runs" and "session_id" not in copied:
+                    session_id = target.execute(
+                        select(metadata.tables["chat_messages"].c.session_id).where(
+                            metadata.tables["chat_messages"].c.id == row["user_message_id"]
+                        )
+                    ).scalar_one_or_none()
+                    if session_id is None:
+                        raise RuntimeError(f"运行 {row['id']} 找不到用户消息所属对话")
+                    copied["session_id"] = session_id
                 compatible_rows.append(copied)
             if compatible_rows:
                 target.execute(table.insert(), compatible_rows)

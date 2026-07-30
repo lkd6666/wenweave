@@ -26,8 +26,10 @@ class ModelRead(BaseModel):
     context_window_tokens: int = Field(default=32768, ge=8192, le=2_000_000)
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
-    tool_result_max_tokens: int = Field(default=4096, ge=128, le=1_000_000)
+    tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     is_default: bool
+    is_multimodal: bool = False
+    supports_disabled_thinking: bool = True
     access_mode: Literal["all", "restricted"] = "all"
     allowed_user_ids: list[int] = Field(default_factory=list)
     allowed_group_ids: list[int] = Field(default_factory=list)
@@ -44,8 +46,10 @@ class ModelCreate(BaseModel):
     context_window_tokens: int = Field(default=32768, ge=8192, le=2_000_000)
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
-    tool_result_max_tokens: int = Field(default=4096, ge=128, le=1_000_000)
+    tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     is_default: bool = False
+    is_multimodal: bool = False
+    supports_disabled_thinking: bool = True
     thinking_config: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -67,6 +71,8 @@ class ModelUpdate(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=128, le=1_000_000)
     tool_result_max_tokens: int | None = Field(default=None, ge=128, le=1_000_000)
     is_default: bool | None = None
+    is_multimodal: bool | None = None
+    supports_disabled_thinking: bool | None = None
     thinking_config: dict[str, Any] | None = None
     access_mode: Literal["all", "restricted"] | None = None
     allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
@@ -102,7 +108,9 @@ class ModelPresetRead(BaseModel):
     context_window_tokens: int = 32768
     context_compaction_threshold_tokens: int = 24576
     max_output_tokens: int = 8192
-    tool_result_max_tokens: int = 4096
+    tool_result_max_tokens: int = 8192
+    is_multimodal: bool = False
+    supports_disabled_thinking: bool = True
     thinking_config: dict[str, Any] = Field(default_factory=dict)
     thinking_efforts: list[str] = Field(default_factory=list)
 
@@ -137,7 +145,9 @@ class ModelBulkCreateItem(BaseModel):
     context_window_tokens: int = Field(default=32768, ge=8192, le=2_000_000)
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
-    tool_result_max_tokens: int = Field(default=4096, ge=128, le=1_000_000)
+    tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
+    is_multimodal: bool = False
+    supports_disabled_thinking: bool = True
     thinking_config: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

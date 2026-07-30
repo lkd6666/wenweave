@@ -37,12 +37,17 @@ from app.schemas.ai_provider import (
 )
 from app.services.ai_client.factory import build_ai_client
 from app.services.model_presets import (
+    AUTH_STYLE_API_KEY,
+    AUTH_STYLE_BEARER,
     CATALOG_SOURCE,
     find_model_preset,
     find_provider_preset,
     get_provider_preset,
     list_provider_presets,
+    recommended_tool_preview_tokens,
     thinking_efforts,
+    is_official_deepseek_openai_endpoint,
+    official_deepseek_thinking_config,
 )
 
 router = APIRouter(prefix="/api/ai-providers", tags=["ai-providers"], dependencies=[Depends(require_admin)])
@@ -66,6 +71,13 @@ def _validate_model_budget(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="单次工具返回 token 上限不能超过压缩阈值",
         )
+
+
+def _effective_thinking_config(base_url: str, thinking_config: dict[str, Any] | None) -> dict[str, Any]:
+    """Fill the documented native mapping only for unconfigured DeepSeek models."""
+    if is_official_deepseek_openai_endpoint(base_url) and not thinking_config:
+        return official_deepseek_thinking_config()
+    return thinking_config or {}
 
 
 def _to_provider_read(provider: AIProvider) -> ProviderRead:
@@ -130,11 +142,8 @@ def _metadata_integer(item: dict[str, Any], *paths: tuple[str, ...]) -> int | No
 
 
 def _recommended_tool_result_max_tokens(context_threshold_tokens: int) -> int:
-    """Leave room for several tool rounds, not just one large source read."""
-    return min(
-        context_threshold_tokens,
-        max(DEFAULT_TOOL_RESULT_MAX_TOKENS, context_threshold_tokens // 16),
-    )
+    """Recommend a model-visible preview cap; full output is stored separately."""
+    return recommended_tool_preview_tokens(context_threshold_tokens)
 
 
 def _discovery_token_budget(raw_model: dict[str, Any], known: dict[str, Any] | None) -> tuple[dict[str, int], str]:
@@ -216,6 +225,10 @@ def _model_discovery_item(
     if not known:
         known = find_model_preset(model_name)
     thinking_config = known.get("thinking_config", {}) if known else {}
+    # The official DeepSeek OpenAI endpoint documents the native thinking.type
+    # request shape even when its /models response contains no capability data.
+    if is_official_deepseek_openai_endpoint(str((provider_preset or {}).get("base_url", ""))):
+        thinking_config = official_deepseek_thinking_config()
     budget, context_window_source = _discovery_token_budget(model.get("metadata", {}), known)
     return ModelDiscoveryItem(
         model_name=model_name,
@@ -223,6 +236,7 @@ def _model_discovery_item(
         description=known.get("description", "") if known else "",
         **budget,
         thinking_config=thinking_config,
+        supports_disabled_thinking=True,
         thinking_efforts=thinking_efforts(thinking_config),
         source=source,
         context_window_source=context_window_source,
@@ -260,7 +274,20 @@ def _sync_default_discovered_budgets(
             capability.max_output_tokens,
             DEFAULT_TOOL_RESULT_MAX_TOKENS,
         )
-        if current_budget not in {default_budget, legacy_discovery_budget}:
+        # Before durable tool-output storage, discovery derived the cap from
+        # the whole input window. Treat only that exact automatic value as
+        # legacy; any other number remains an administrator's choice.
+        legacy_proportional_preview_budget = (
+            capability.context_window_tokens,
+            capability.context_compaction_threshold_tokens,
+            capability.max_output_tokens,
+            max(1, capability.context_compaction_threshold_tokens // 16),
+        )
+        if current_budget not in {
+            default_budget,
+            legacy_discovery_budget,
+            legacy_proportional_preview_budget,
+        }:
             continue
         next_budget = (
             capability.context_window_tokens,
@@ -282,6 +309,10 @@ def _sync_default_discovered_budgets(
     return changed
 
 
+class ModelDiscoveryUnsupported(Exception):
+    """预设声明该端点没有模型列表接口，不应发出注定失败的请求。"""
+
+
 def _model_discovery_config(provider_type: str, preset: dict[str, Any] | None) -> dict[str, Any]:
     if preset and isinstance(preset.get("model_discovery"), dict):
         return preset["model_discovery"]
@@ -295,9 +326,18 @@ async def _fetch_connection_models(
 ) -> list[dict[str, Any]]:
     config = _model_discovery_config(provider_type, preset)
     adapter = config["adapter"]
+    if adapter == "unsupported":
+        raise ModelDiscoveryUnsupported(config.get("reason") or "该端点不支持模型列表查询")
     if adapter == "anthropic":
+        # 凭证头随网关而异（官方/DeepSeek 用 x-api-key，阿里云/智谱/Kimi 用 Bearer）。
+        auth_style = str((preset or {}).get("auth_style") or AUTH_STYLE_API_KEY)
+        credential = (
+            {"Authorization": f"Bearer {api_key}"}
+            if auth_style == AUTH_STYLE_BEARER
+            else {"x-api-key": api_key}
+        )
         headers = {
-            "x-api-key": api_key,
+            **credential,
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
@@ -446,7 +486,11 @@ def install_preset(
                     preset_model.get("tool_result_max_tokens", DEFAULT_TOOL_RESULT_MAX_TOKENS)
                 ),
                 is_default=payload.set_as_default and index == 0,
-                thinking_config=preset_model.get("thinking_config", {}),
+                is_multimodal=bool(preset_model.get("is_multimodal", False)),
+                supports_disabled_thinking=bool(preset_model.get("supports_disabled_thinking", True)),
+                thinking_config=_effective_thinking_config(
+                    provider.base_url, preset_model.get("thinking_config")
+                ),
             )
         )
     db.commit()
@@ -465,6 +509,17 @@ async def discover_preset_models(
     try:
         models = await _fetch_connection_models(
             str(preset["provider_type"]), preset["base_url"], payload.api_key, preset
+        )
+    except ModelDiscoveryUnsupported as exc:
+        # 预期情况，不是故障：这类套餐端点只有 /v1/messages。直接展示内置模型，
+        # 且不要提示「检查 API Key」——此时密钥并未被验证过。
+        return ModelDiscoveryResult(
+            models=[
+                _model_discovery_item({"model_name": model["model_name"], "metadata": {}}, preset, CATALOG_SOURCE)
+                for model in preset["models"]
+            ],
+            source=CATALOG_SOURCE,
+            warning=f"{exc}，已列出该套餐的内置模型；如需其他模型可在添加后手动补充。",
         )
     except httpx.HTTPStatusError as exc:
         status_text = f"HTTP {exc.response.status_code}"
@@ -529,7 +584,7 @@ def update_provider(provider_id: int, payload: ProviderUpdate, db: Session = Dep
     return _to_provider_read(provider)
 
 
-@router.delete("/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{provider_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_provider(provider_id: int, db: Session = Depends(get_db)) -> None:
     provider = db.get(AIProvider, provider_id)
     if not provider:
@@ -564,7 +619,9 @@ def create_model(provider_id: int, payload: ModelCreate, db: Session = Depends(g
         max_output_tokens=payload.max_output_tokens,
         tool_result_max_tokens=payload.tool_result_max_tokens,
         is_default=payload.is_default,
-        thinking_config=payload.thinking_config,
+        is_multimodal=payload.is_multimodal,
+        supports_disabled_thinking=payload.supports_disabled_thinking,
+        thinking_config=_effective_thinking_config(provider.base_url, payload.thinking_config),
     )
     db.add(model)
     db.commit()
@@ -608,8 +665,12 @@ def update_model(model_id: int, payload: ModelUpdate, db: Session = Depends(get_
         model.tool_result_max_tokens = payload.tool_result_max_tokens
     if payload.is_default is not None:
         model.is_default = payload.is_default
+    if payload.is_multimodal is not None:
+        model.is_multimodal = payload.is_multimodal
+    if payload.supports_disabled_thinking is not None:
+        model.supports_disabled_thinking = payload.supports_disabled_thinking
     if payload.thinking_config is not None:
-        model.thinking_config = payload.thinking_config
+        model.thinking_config = _effective_thinking_config(model.provider.base_url, payload.thinking_config)
     if payload.access_mode is not None:
         model.access_mode = payload.access_mode
     allowed_users, allowed_groups = _validate_access_targets(db, payload.allowed_user_ids, payload.allowed_group_ids)
@@ -633,6 +694,15 @@ async def discover_models(provider_id: int, db: Session = Depends(get_db)) -> Mo
     preset = find_provider_preset(provider.base_url, provider.provider_type.value)
     try:
         models = await _fetch_provider_models(provider, preset)
+    except ModelDiscoveryUnsupported as exc:
+        return ModelDiscoveryResult(
+            models=[
+                _model_discovery_item({"model_name": model["model_name"], "metadata": {}}, preset, CATALOG_SOURCE)
+                for model in (preset["models"] if preset else [])
+            ],
+            source=CATALOG_SOURCE,
+            warning=f"{exc}，已列出该套餐的内置模型；如需其他模型可在添加后手动补充。",
+        )
     except httpx.HTTPStatusError as exc:
         status_text = f"HTTP {exc.response.status_code}"
         models = []
@@ -697,7 +767,9 @@ def create_models_bulk(
             context_compaction_threshold_tokens=item.context_compaction_threshold_tokens,
             max_output_tokens=item.max_output_tokens,
             tool_result_max_tokens=item.tool_result_max_tokens,
-            thinking_config=item.thinking_config,
+            thinking_config=_effective_thinking_config(provider.base_url, item.thinking_config),
+            is_multimodal=item.is_multimodal,
+            supports_disabled_thinking=item.supports_disabled_thinking,
             is_default=False,
         )
         db.add(model)
@@ -709,7 +781,7 @@ def create_models_bulk(
     return ModelBulkCreateResult(created=created, skipped_model_names=skipped_model_names)
 
 
-@router.delete("/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_model(model_id: int, db: Session = Depends(get_db)) -> None:
     model = db.get(AIModel, model_id)
     if not model:

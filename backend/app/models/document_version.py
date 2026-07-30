@@ -29,7 +29,15 @@ class DocumentVersion(Base):
     )
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Retained for migration compatibility. New commits store their immutable
+    # content in DocumentContentObject and leave this legacy column empty.
     html: Mapped[str] = mapped_column(LONG_TEXT, nullable=False, default="")
+    content_object_id: Mapped[int | None] = mapped_column(
+        ID_TYPE,
+        ForeignKey("document_content_objects.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     source: Mapped[DocumentVersionSource] = mapped_column(Enum(DocumentVersionSource), nullable=False)
     label: Mapped[str] = mapped_column(String(256), nullable=False, default="")
     created_by_id: Mapped[int | None] = mapped_column(
@@ -38,4 +46,7 @@ class DocumentVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     document: Mapped["Document"] = relationship("Document", back_populates="versions")
+    content_object: Mapped["DocumentContentObject | None"] = relationship(
+        "DocumentContentObject", foreign_keys=[content_object_id]
+    )
     created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])

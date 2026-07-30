@@ -30,6 +30,19 @@ def create_access_token(subject: str, extra_claims: Optional[Dict[str, Any]] = N
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
+def create_scoped_token(subject: str, scope: str, extra_claims: Optional[Dict[str, Any]] = None, *, expires_in_minutes: int = 5) -> str:
+    """Create a short-lived, purpose-limited token for a single browser resource."""
+    settings = get_settings()
+    payload: Dict[str, Any] = {
+        "sub": subject,
+        "scope": scope,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=expires_in_minutes),
+    }
+    if extra_claims:
+        payload.update(extra_claims)
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
 def decode_access_token(token: str) -> Dict[str, Any]:
     settings = get_settings()
     return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])

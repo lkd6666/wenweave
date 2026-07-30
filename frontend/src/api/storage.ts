@@ -2,10 +2,13 @@ import { api } from './client'
 import type { StorageConfigItem } from '../types'
 
 export interface UpdateStoragePayload {
+  provider: StorageConfigItem['provider']
   endpoint: string
   bucket: string
   access_key_id: string
   access_key_secret?: string
+  region_or_zone: string
+  upload_endpoint: string
   custom_domain: string
 }
 
@@ -18,6 +21,10 @@ export interface StorageDirectUploadCheck {
   object_key: string
   upload_url: string
   content_type: string
+  upload_method: 'PUT' | 'POST'
+  upload_headers: Record<string, string>
+  upload_fields: Record<string, string>
+  file_field_name: string
   expected_size: number
   expires_in_seconds: number
 }

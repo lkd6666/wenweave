@@ -23,9 +23,9 @@ def _get_accessible_group(db: Session, group_id: int, user: User) -> DocumentGro
     return group
 
 
-def _ensure_group_manager(group: DocumentGroup, user: User) -> None:
+def _ensure_group_visibility_manager(group: DocumentGroup, user: User) -> None:
     if user.role != UserRole.ADMIN and group.owner_id != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有分组创建人或管理员可以管理分组")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有分组创建人或管理员可以设置可见权限")
 
 
 def _get_users(db: Session, user_ids: list[int]) -> list[User]:
@@ -129,7 +129,6 @@ def update_group(
     group = _get_accessible_group(db, group_id, current_user)
     changed = False
     if payload.name is not None:
-        _ensure_group_manager(group, current_user)
         name = _normalized_name(payload.name)
         _ensure_name_available(db, name, group.id)
         if group.name != name:
@@ -137,7 +136,7 @@ def update_group(
             changed = True
     visibility_fields = {"visibility_mode", "allowed_user_ids", "allowed_group_ids"}
     if visibility_fields.intersection(payload.model_fields_set):
-        _ensure_group_manager(group, current_user)
+        _ensure_group_visibility_manager(group, current_user)
         visibility_mode = payload.visibility_mode or group.visibility_mode.value
         _apply_visibility(group, db, visibility_mode, payload.allowed_user_ids, payload.allowed_group_ids)
         changed = True
@@ -148,14 +147,13 @@ def update_group(
     return group
 
 
-@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_group(
     group_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
     group = _get_accessible_group(db, group_id, current_user)
-    _ensure_group_manager(group, current_user)
     documents = db.query(Document).filter(Document.group_id == group.id).all()
     for document in documents:
         document.group_id = None

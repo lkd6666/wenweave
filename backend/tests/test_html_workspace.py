@@ -97,15 +97,46 @@ class HtmlWorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "未返回不完整 HTML"):
             workspace.read([block.block_id])
 
+    def test_read_accepts_fourteen_requested_blocks(self) -> None:
+        workspace = self.make_workspace("".join(f"<p>段落 {index}</p>" for index in range(14)))
+        block_ids = [block.block_id for block in workspace.blocks[:14]]
+
+        result = workspace.read(block_ids)
+
+        self.assertEqual(len(result["blocks"]), 14)
+        self.assertIsNone(result["next_cursor"])
+        self.assertEqual(result["remaining_block_count"], 0)
+
+    def test_read_paginates_at_complete_block_boundaries(self) -> None:
+        source = "".join(f"<p>段落 {index} " + (f"token-{index} " * 24) + "</p>" for index in range(12))
+        workspace = HtmlWorkspace(source, tool_result_max_tokens=450)
+        block_ids = [block.block_id for block in workspace.blocks[:12]]
+
+        pages: list[dict] = []
+        cursor = 0
+        while True:
+            page = workspace.read(block_ids, cursor)
+            pages.append(page)
+            if page["next_cursor"] is None:
+                break
+            cursor = page["next_cursor"]
+
+        self.assertGreater(len(pages), 1)
+        self.assertTrue(all(page["blocks"] for page in pages))
+        self.assertEqual(
+            [item["block_id"] for page in pages for item in page["blocks"]],
+            block_ids,
+        )
+
     def test_read_limit_reports_the_actual_requested_block_count(self) -> None:
-        workspace = self.make_workspace("".join(f"<p>段落 {index}</p>" for index in range(5)))
-        block_ids = [block.block_id for block in workspace.blocks[:5]]
+        workspace = self.make_workspace("".join(f"<p>段落 {index}</p>" for index in range(17)))
+        block_ids = [block.block_id for block in workspace.blocks[:17]]
 
         with self.assertRaisesRegex(WorkspaceError, "一次最多读取") as raised:
             workspace.read(block_ids)
 
-        self.assertEqual(raised.exception.details["requested_block_count"], 5)
-        self.assertEqual(raised.exception.details["max_read_blocks"], 4)
+        self.assertEqual(raised.exception.details["requested_block_count"], 17)
+        self.assertEqual(raised.exception.details["max_read_blocks"], 16)
 
     def test_map_truncates_at_block_boundaries_within_configured_token_limit(self) -> None:
         source = "".join(f"<p class='item-{index}'>段落 {index} " + ("正文" * 80) + "</p>" for index in range(12))

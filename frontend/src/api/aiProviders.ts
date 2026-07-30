@@ -29,6 +29,8 @@ export interface CreateModelPayload {
   max_output_tokens: number
   tool_result_max_tokens: number
   is_default: boolean
+  is_multimodal: boolean
+  supports_disabled_thinking: boolean
   thinking_config?: Record<string, unknown>
 }
 
@@ -40,6 +42,8 @@ export interface UpdateModelPayload {
   max_output_tokens?: number
   tool_result_max_tokens?: number
   is_default?: boolean
+  is_multimodal?: boolean
+  supports_disabled_thinking?: boolean
   thinking_config?: Record<string, unknown>
   access_mode?: 'all' | 'restricted'
   allowed_user_ids?: number[]
@@ -57,6 +61,8 @@ export interface InstallPresetPayload {
     context_compaction_threshold_tokens: number
     max_output_tokens: number
     tool_result_max_tokens: number
+    is_multimodal: boolean
+    supports_disabled_thinking: boolean
     thinking_config: Record<string, unknown>
     thinking_efforts: string[]
   }>
@@ -73,6 +79,8 @@ export interface BulkModelPayload {
     context_compaction_threshold_tokens: number
     max_output_tokens: number
     tool_result_max_tokens: number
+    is_multimodal: boolean
+    supports_disabled_thinking: boolean
     thinking_config: Record<string, unknown>
   }>
 }

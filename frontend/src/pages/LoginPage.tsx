@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { Button, Card, Form, Input, message, Typography } from 'antd'
 import { LockOutlined, UserOutlined } from '@ant-design/icons'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { api, ApiError } from '../api/client'
 import { useAuthStore } from '../store/authStore'
+import { brandingAssetUrl, useAppBranding } from '../brand/appBranding'
 import type { TokenResponse, User } from '../types'
 
 const { Title, Text } = Typography
@@ -11,6 +12,7 @@ const { Title, Text } = Typography
 export default function LoginPage() {
   const navigate = useNavigate()
   const setAuth = useAuthStore((s) => s.setAuth)
+  const { branding } = useAppBranding()
   const [loading, setLoading] = useState(false)
 
   const onFinish = async (values: { username: string; password: string }) => {
@@ -34,9 +36,10 @@ export default function LoginPage() {
   return (
     <div className="login-page">
       <Card className="login-card" variant="borderless">
-        <div style={{ textAlign: 'center', marginBottom: 24 }}>
+        <div className="login-brand-header">
+          <img className="login-brand-logo" src={brandingAssetUrl(branding.logo_url, branding.updated_at) ?? '/favicon.svg'} alt="" />
           <Title level={3} style={{ marginBottom: 4 }}>
-            公众号 AI 排版系统
+            {branding.system_name}
           </Title>
           <Text type="secondary">登录后开始智能排版</Text>
         </div>

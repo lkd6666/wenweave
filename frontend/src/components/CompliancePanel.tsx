@@ -28,11 +28,66 @@ export default function CompliancePanel({ report, loading }: CompliancePanelProp
     )
   }
 
-  const statusColor = report.hasError ? 'error' : report.hasWarning ? 'warning' : 'success'
-  const statusText = report.hasError ? '存在严重错误' : report.hasWarning ? '存在潜在警告' : '合规检测通过'
-  const StatusIcon = report.hasError ? CloseCircleOutlined : report.hasWarning ? WarningOutlined : CheckCircleOutlined
+  const diagnostics = report.diagnostics ?? []
+  const gzhStrict = report.gzhStrict
+  const hasError = report.hasError || Boolean(gzhStrict?.hasError)
+  const hasWarning = report.hasWarning || Boolean(gzhStrict?.hasWarning)
+  const statusColor = hasError ? 'error' : hasWarning ? 'warning' : 'success'
+  const statusText = hasError ? '存在严重错误' : hasWarning ? '存在潜在警告' : '合规检测通过'
+  const StatusIcon = hasError ? CloseCircleOutlined : hasWarning ? WarningOutlined : CheckCircleOutlined
+  const diagnosticLabels = { error: '严重错误', warning: '兼容性风险', info: '提示' } as const
+  const diagnosticColors = { error: 'red', warning: 'orange', info: 'blue' } as const
 
   const items = [
+    ...(gzhStrict ? [{
+      key: 'gzh-strict',
+      label: (
+        <span>
+          主题严格检查{' '}
+          {gzhStrict.hasError ? <Tag color="red">{gzhStrict.errors.length} 项错误</Tag>
+            : gzhStrict.hasWarning ? <Tag color="orange">{gzhStrict.warnings.length} 项警告</Tag>
+              : <Tag color="green">通过</Tag>}
+        </span>
+      ),
+      children: (
+        <div className="compliance-diagnostics">
+          <Text type="secondary">span leaf 包裹：{gzhStrict.leafCount} 处</Text>
+          {gzhStrict.errors.map((item) => <Alert key={item} type="error" showIcon message={item} />)}
+          {gzhStrict.warnings.map((item) => <Alert key={item} type="warning" showIcon message={item} />)}
+          {!gzhStrict.errors.length && !gzhStrict.warnings.length && <Text type="secondary">主题产物满足严格公众号规则</Text>}
+        </div>
+      ),
+    }] : []),
+    {
+      key: 'diagnostics',
+      label: (
+        <span>
+          详细诊断{' '}
+          {diagnostics.length > 0 ? <Badge count={diagnostics.length} size="small" /> : <Tag color="green">通过</Tag>}
+        </span>
+      ),
+      children: diagnostics.length ? (
+        <div className="compliance-diagnostics">
+          {diagnostics.map((diagnostic, index) => (
+            <div className="compliance-diagnostic" key={`${diagnostic.code}-${diagnostic.path}-${index}`}>
+              <div>
+                <Tag color={diagnosticColors[diagnostic.severity]}>{diagnosticLabels[diagnostic.severity]}</Tag>
+                <Text strong>{diagnostic.code}</Text>
+              </div>
+              <div>{diagnostic.message}</div>
+              <Text type="secondary">
+                {diagnostic.path}（第 {diagnostic.line} 行，第 {diagnostic.column} 列）
+              </Text>
+              {diagnostic.snippet && <code className="compliance-snippet">{diagnostic.snippet}</code>}
+              <Text type="secondary">后果：{diagnostic.consequence}</Text>
+              <Text>建议：{diagnostic.suggestion}</Text>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <Text type="secondary">未发现需要处理的规则命中</Text>
+      ),
+    },
     {
       key: 'class',
       label: (
@@ -88,7 +143,7 @@ export default function CompliancePanel({ report, loading }: CompliancePanelProp
           嵌套深度（{report.maxNestingDepth} 层）{' '}
           {report.willFlattenNesting ? (
             <Tag color="red">超限</Tag>
-          ) : report.maxNestingDepth > 8 ? (
+          ) : report.maxNestingDepth > 18 ? (
             <Tag color="orange">接近上限</Tag>
           ) : (
             <Tag color="green">安全</Tag>
@@ -98,9 +153,9 @@ export default function CompliancePanel({ report, loading }: CompliancePanelProp
       children: (
         <Text type={report.willFlattenNesting ? 'danger' : undefined}>
           {report.willFlattenNesting
-            ? '嵌套深度 >= 10 层，微信编辑器会触发扁平化'
-            : report.maxNestingDepth > 8
-              ? '建议控制在 8 层以内'
+            ? '嵌套深度 >= 20 层，Word 粘贴时会触发扁平化'
+            : report.maxNestingDepth > 18
+              ? '建议控制在 18 层以内'
               : '嵌套深度在安全范围内'}
         </Text>
       ),
@@ -197,7 +252,7 @@ export default function CompliancePanel({ report, loading }: CompliancePanelProp
         title={statusText}
         style={{ marginBottom: 12 }}
       />
-      <Collapse size="small" defaultActiveKey={report.hasError ? ['class', 'id', 'nesting', 'svg'] : []} items={items} />
+      <Collapse size="small" defaultActiveKey={report.hasError ? ['diagnostics', 'class', 'id', 'nesting', 'svg'] : []} items={items} />
     </div>
   )
 }

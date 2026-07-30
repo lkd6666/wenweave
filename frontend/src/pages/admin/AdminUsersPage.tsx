@@ -3,6 +3,7 @@ import {
   Button,
   Card,
   Form,
+  Grid,
   Input,
   Modal,
   Popconfirm,
@@ -35,6 +36,8 @@ export default function AdminUsersPage() {
   const [editingUser, setEditingUser] = useState<User | null>(null)
   const [editForm] = Form.useForm()
   const [saving, setSaving] = useState(false)
+  const screens = Grid.useBreakpoint()
+  const isCompact = !screens.lg
 
   const loadUsers = async () => {
     setLoading(true)
@@ -111,6 +114,23 @@ export default function AdminUsersPage() {
     }
   }
 
+  const userActions = (user: User) => (
+    <Space wrap>
+      <Button size="small" onClick={() => openEdit(user)}>
+        编辑
+      </Button>
+      <Popconfirm
+        title="确认删除该用户？"
+        disabled={user.id === currentUser?.id}
+        onConfirm={() => handleDelete(user)}
+      >
+        <Button size="small" danger disabled={user.id === currentUser?.id}>
+          删除
+        </Button>
+      </Popconfirm>
+    </Space>
+  )
+
   const columns: ColumnsType<User> = [
     { title: '账号', dataIndex: 'username', key: 'username' },
     { title: '用户名', dataIndex: 'display_name', key: 'display_name' },
@@ -137,28 +157,13 @@ export default function AdminUsersPage() {
     {
       title: '操作',
       key: 'actions',
-      render: (_, user) => (
-        <Space>
-          <Button size="small" onClick={() => openEdit(user)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该用户？"
-            disabled={user.id === currentUser?.id}
-            onConfirm={() => handleDelete(user)}
-          >
-            <Button size="small" danger disabled={user.id === currentUser?.id}>
-              删除
-            </Button>
-          </Popconfirm>
-        </Space>
-      ),
+      render: (_, user) => userActions(user),
     },
   ]
 
   return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+    <div className="admin-page">
+      <div className="admin-page-header">
         <Title level={4} style={{ margin: 0 }}>
           用户管理
         </Title>
@@ -168,12 +173,34 @@ export default function AdminUsersPage() {
       </div>
 
       <Card>
-        <Table rowKey="id" columns={columns} dataSource={users} loading={loading} pagination={false} />
+        {isCompact ? (
+          <div className="responsive-card-list" aria-label="用户列表">
+            {users.map((user) => (
+              <article className="responsive-data-card" key={user.id}>
+                <div className="responsive-data-card-heading">
+                  <div>
+                    <strong>{user.display_name || user.username}</strong>
+                    <div className="responsive-data-card-secondary">账号：{user.username}</div>
+                  </div>
+                  <Tag color={user.is_active ? 'green' : 'red'}>{user.is_active ? '启用' : '已禁用'}</Tag>
+                </div>
+                <div className="responsive-data-card-meta">
+                  <Tag color={user.role === 'admin' ? 'blue' : 'default'}>{user.role === 'admin' ? '管理员' : '普通用户'}</Tag>
+                  <span>创建于 {new Date(user.created_at).toLocaleString()}</span>
+                </div>
+                <div className="responsive-data-card-actions">{userActions(user)}</div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <Table rowKey="id" columns={columns} dataSource={users} loading={loading} pagination={false} />
+        )}
       </Card>
 
       <Modal
         title="新建用户"
         open={createOpen}
+        className="admin-user-modal"
         onCancel={() => setCreateOpen(false)}
         onOk={handleCreate}
         confirmLoading={creating}
@@ -203,6 +230,7 @@ export default function AdminUsersPage() {
       <Modal
         title={`编辑用户：${editingUser?.username ?? ''}`}
         open={!!editingUser}
+        className="admin-user-modal"
         onCancel={() => setEditingUser(null)}
         onOk={handleSaveEdit}
         confirmLoading={saving}

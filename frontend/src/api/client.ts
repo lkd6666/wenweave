@@ -20,6 +20,13 @@ interface RequestOptions {
   signal?: AbortSignal
 }
 
+interface EventStreamOptions {
+  method?: 'POST'
+  body?: unknown
+  signal?: AbortSignal
+  onEvent: (event: string, data: unknown) => void
+}
+
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, isFormData, signal } = options
   const token = useAuthStore.getState().token
@@ -65,6 +72,65 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     return undefined as T
   }
   return (await res.json()) as T
+}
+
+export async function apiEventStream(path: string, options: EventStreamOptions): Promise<void> {
+  const { method = 'POST', body, signal, onEvent } = options
+  const token = useAuthStore.getState().token
+  const headers: Record<string, string> = { Accept: 'text/event-stream' }
+  if (token) headers.Authorization = `Bearer ${token}`
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
+  })
+  if (res.status === 401) useAuthStore.getState().logout()
+  if (!res.ok) {
+    let detail: unknown = res.statusText
+    try {
+      const data = await res.json()
+      detail = data.detail ?? data
+    } catch {
+      // Event streams can fail before the response body is established.
+    }
+    throw new ApiError(res.status, detail)
+  }
+  if (!res.body) throw new ApiError(res.status, '推送进度连接未建立')
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const consumeEvent = (rawEvent: string) => {
+    const lines = rawEvent.split('\n')
+    let event = 'message'
+    const dataLines: string[] = []
+    for (const line of lines) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    }
+    if (dataLines.length === 0) return
+    try {
+      onEvent(event, JSON.parse(dataLines.join('\n')))
+    } catch {
+      throw new ApiError(res.status, '推送进度数据格式无效')
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n')
+    let separator = buffer.indexOf('\n\n')
+    while (separator >= 0) {
+      consumeEvent(buffer.slice(0, separator))
+      buffer = buffer.slice(separator + 2)
+      separator = buffer.indexOf('\n\n')
+    }
+    if (done) break
+  }
+  if (buffer.trim()) consumeEvent(buffer)
 }
 
 export const api = {

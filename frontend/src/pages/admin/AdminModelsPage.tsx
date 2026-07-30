@@ -6,6 +6,7 @@ import {
   Checkbox,
   Empty,
   Form,
+  Grid,
   Input,
   InputNumber,
   Modal,
@@ -25,6 +26,7 @@ import { ApiError } from '../../api/client'
 import { userGroupsApi } from '../../api/userGroups'
 import { usersApi } from '../../api/users'
 import type { AIModelItem, AIProviderItem, DiscoveredModelItem, ModelDiscoveryResult, ProviderPresetItem, User, UserGroup } from '../../types'
+import { deriveModelTokenBudget, formatKTokens, tokensToWholeK } from '../../utils/modelTokenBudget'
 
 const { Title, Text, Paragraph } = Typography
 
@@ -40,31 +42,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function thinkingEfforts(config: Record<string, unknown> | undefined): string[] {
   const efforts = config?.efforts
   return isRecord(efforts) ? Object.keys(efforts) : []
-}
-
-function asInteger(value: unknown): number | null {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? Math.trunc(parsed) : null
-}
-
-function recommendedTokenBudget(contextValue: unknown, outputValue: unknown) {
-  const contextWindow = asInteger(contextValue)
-  if (contextWindow === null || contextWindow < 8192) return null
-  const configuredOutput = asInteger(outputValue)
-  const defaultOutput = Math.min(8192, Math.max(128, Math.floor(contextWindow / 4)))
-  const maxOutputTokens = configuredOutput !== null && configuredOutput >= 128 && configuredOutput < contextWindow
-    ? configuredOutput
-    : defaultOutput
-  const contextCompactionThresholdTokens = contextWindow - maxOutputTokens
-  return {
-    context_window_tokens: contextWindow,
-    context_compaction_threshold_tokens: contextCompactionThresholdTokens,
-    max_output_tokens: maxOutputTokens,
-    tool_result_max_tokens: Math.min(
-      contextCompactionThresholdTokens,
-      Math.max(4096, Math.floor(contextCompactionThresholdTokens / 16)),
-    ),
-  }
 }
 
 export default function AdminModelsPage() {
@@ -103,6 +80,11 @@ export default function AdminModelsPage() {
   const [savingAccess, setSavingAccess] = useState(false)
 
   const [testingKey, setTestingKey] = useState<string | null>(null)
+  const screens = Grid.useBreakpoint()
+  const isCompact = !screens.lg
+  const inputLimitK = Form.useWatch('input_limit_k', modelForm)
+  const outputLimitK = Form.useWatch('output_limit_k', modelForm)
+  const automaticTokenBudget = deriveModelTokenBudget(inputLimitK, outputLimitK)
 
   const loadProviders = async () => {
     setLoading(true)
@@ -184,7 +166,10 @@ export default function AdminModelsPage() {
     modelForm.resetFields()
     modelForm.setFieldsValue({
       is_default: false,
-      ...(recommendedTokenBudget(32768, 8192) ?? {}),
+      is_multimodal: false,
+      supports_disabled_thinking: true,
+      input_limit_k: 24,
+      output_limit_k: 8,
       thinking_config_text: '',
       thinking_efforts: [],
     })
@@ -193,39 +178,33 @@ export default function AdminModelsPage() {
 
   const openEditModel = (model: AIModelItem) => {
     setEditingModel(model)
-    const recommended = recommendedTokenBudget(
-      model.context_window_tokens ?? 32768,
-      model.max_output_tokens ?? 8192,
-    ) ?? recommendedTokenBudget(32768, 8192)
     modelForm.setFieldsValue({
       model_name: model.model_name,
       display_name: model.display_name,
       description: model.description,
-      context_window_tokens: recommended?.context_window_tokens,
-      context_compaction_threshold_tokens: model.context_compaction_threshold_tokens ?? recommended?.context_compaction_threshold_tokens,
-      max_output_tokens: recommended?.max_output_tokens,
-      tool_result_max_tokens: model.tool_result_max_tokens ?? recommended?.tool_result_max_tokens,
+      input_limit_k: tokensToWholeK(model.context_compaction_threshold_tokens),
+      output_limit_k: tokensToWholeK(model.max_output_tokens),
       is_default: model.is_default,
+      is_multimodal: model.is_multimodal,
+      supports_disabled_thinking: model.supports_disabled_thinking,
       thinking_config_text: Object.keys(model.thinking_config ?? {}).length ? JSON.stringify(model.thinking_config, null, 2) : '',
       thinking_efforts: thinkingEfforts(model.thinking_config),
     })
     setModelModalProviderId(model.provider_id)
   }
 
-  const handleModelBudgetBaseChange = (changedValues: Record<string, unknown>) => {
-    if (!('context_window_tokens' in changedValues) && !('max_output_tokens' in changedValues)) return
-    const recommended = recommendedTokenBudget(
-      modelForm.getFieldValue('context_window_tokens'),
-      modelForm.getFieldValue('max_output_tokens'),
-    )
-    if (!recommended) return
-    modelForm.setFieldsValue(recommended)
-  }
-
   const handleSaveModel = async () => {
     if (modelModalProviderId === null) return
     try {
       const values = await modelForm.validateFields()
+      const tokenBudget = deriveModelTokenBudget(values.input_limit_k, values.output_limit_k)
+      if (!tokenBudget) {
+        modelForm.setFields([{
+          name: 'input_limit_k',
+          errors: ['输入和输出合计需在 8K 至 2,000K 之间，输出最多为 1,000K'],
+        }])
+        return
+      }
       let thinkingConfig: Record<string, unknown> = {}
       if (values.thinking_config_text?.trim()) {
         try {
@@ -256,11 +235,10 @@ export default function AdminModelsPage() {
         await aiProvidersApi.updateModel(editingModel.id, {
           display_name: values.display_name,
           description: values.description?.trim() ?? '',
-          context_window_tokens: values.context_window_tokens,
-          context_compaction_threshold_tokens: values.context_compaction_threshold_tokens,
-          max_output_tokens: values.max_output_tokens,
-          tool_result_max_tokens: values.tool_result_max_tokens,
+          ...tokenBudget,
           is_default: values.is_default,
+          is_multimodal: values.is_multimodal,
+          supports_disabled_thinking: values.supports_disabled_thinking,
           thinking_config: thinkingConfig,
         })
         message.success('模型已更新')
@@ -269,11 +247,10 @@ export default function AdminModelsPage() {
           model_name: values.model_name,
           display_name: values.display_name,
           description: values.description?.trim() ?? '',
-          context_window_tokens: values.context_window_tokens,
-          context_compaction_threshold_tokens: values.context_compaction_threshold_tokens,
-          max_output_tokens: values.max_output_tokens,
-          tool_result_max_tokens: values.tool_result_max_tokens,
+          ...tokenBudget,
           is_default: values.is_default,
+          is_multimodal: values.is_multimodal,
+          supports_disabled_thinking: values.supports_disabled_thinking,
           thinking_config: thinkingConfig,
         })
         message.success('模型已添加')
@@ -477,6 +454,35 @@ export default function AdminModelsPage() {
     }
   }
 
+  const modelAccess = (model: AIModelItem) => model.access_mode === 'all' ? (
+    <Tag color="green">所有用户</Tag>
+  ) : (
+    <Space size={4} wrap>
+      <Tag color="orange">受限</Tag>
+      {model.allowed_user_ids.length > 0 && <Tag>用户 {model.allowed_user_ids.length}</Tag>}
+      {model.allowed_group_ids.length > 0 && <Tag>用户组 {model.allowed_group_ids.length}</Tag>}
+      {model.allowed_user_ids.length === 0 && model.allowed_group_ids.length === 0 && <Text type="secondary">仅管理员</Text>}
+    </Space>
+  )
+
+  const modelActions = (provider: AIProviderItem, model: AIModelItem) => (
+    <Space size={8} wrap>
+      <Button
+        size="small"
+        icon={<ThunderboltOutlined />}
+        loading={testingKey === `${provider.id}-${model.id}`}
+        onClick={() => handleTestConnection(provider, model)}
+      >
+        测试连接
+      </Button>
+      <Button size="small" onClick={() => openEditModel(model)}>编辑</Button>
+      <Button size="small" icon={<SafetyCertificateOutlined />} onClick={() => void openModelAccess(model)}>权限</Button>
+      <Popconfirm title="确认删除该模型？" onConfirm={() => handleDeleteModel(model)}>
+        <Button size="small" danger>删除</Button>
+      </Popconfirm>
+    </Space>
+  )
+
   const modelColumns = (provider: AIProviderItem): ColumnsType<AIModelItem> => [
     { title: '模型名称（调用用）', dataIndex: 'model_name', key: 'model_name', width: 220, ellipsis: true },
     { title: '展示名称', dataIndex: 'display_name', key: 'display_name', width: 180, ellipsis: true },
@@ -501,6 +507,17 @@ export default function AdminModelsPage() {
         ) : <Text type="secondary">自动识别</Text>,
     },
     {
+      title: '能力',
+      key: 'capabilities',
+      width: 170,
+      render: (_, model) => (
+        <Space size={4} wrap>
+          {model.is_multimodal ? <Tag color="green">多模态</Tag> : <Text type="secondary">文本</Text>}
+          {model.supports_disabled_thinking ? <Tag color="blue">可不思考</Tag> : <Tag>仅默认思考</Tag>}
+        </Space>
+      ),
+    },
+    {
       title: '默认模型',
       dataIndex: 'is_default',
       key: 'is_default',
@@ -518,44 +535,13 @@ export default function AdminModelsPage() {
       title: '使用范围',
       key: 'access',
       width: 190,
-      render: (_, model) => model.access_mode === 'all' ? (
-        <Tag color="green">所有用户</Tag>
-      ) : (
-        <Space size={4} wrap>
-          <Tag color="orange">受限</Tag>
-          {model.allowed_user_ids.length > 0 && <Tag>用户 {model.allowed_user_ids.length}</Tag>}
-          {model.allowed_group_ids.length > 0 && <Tag>用户组 {model.allowed_group_ids.length}</Tag>}
-          {model.allowed_user_ids.length === 0 && model.allowed_group_ids.length === 0 && <Text type="secondary">仅管理员</Text>}
-        </Space>
-      ),
+      render: (_, model) => modelAccess(model),
     },
     {
       title: '操作',
       key: 'actions',
       width: 360,
-      render: (_, model) => (
-        <Space size={8} wrap={false}>
-          <Button
-            size="small"
-            icon={<ThunderboltOutlined />}
-            loading={testingKey === `${provider.id}-${model.id}`}
-            onClick={() => handleTestConnection(provider, model)}
-          >
-            测试连接
-          </Button>
-          <Button size="small" onClick={() => openEditModel(model)}>
-            编辑
-          </Button>
-          <Button size="small" icon={<SafetyCertificateOutlined />} onClick={() => void openModelAccess(model)}>
-            权限
-          </Button>
-          <Popconfirm title="确认删除该模型？" onConfirm={() => handleDeleteModel(model)}>
-            <Button size="small" danger>
-              删除
-            </Button>
-          </Popconfirm>
-        </Space>
-      ),
+      render: (_, model) => modelActions(provider, model),
     },
   ]
 
@@ -563,8 +549,8 @@ export default function AdminModelsPage() {
   const installableModels = presetDiscovery?.models ?? []
 
   return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+    <div className="admin-page admin-models-page">
+      <div className="admin-page-header">
         <Title level={4} style={{ margin: 0 }}>
           AI 模型与密钥管理
         </Title>
@@ -586,6 +572,7 @@ export default function AdminModelsPage() {
         {providers.map((provider) => (
           <Card
             key={provider.id}
+            className="admin-model-provider-card"
             title={
               <Space>
                 <Text strong>{provider.name}</Text>
@@ -618,15 +605,42 @@ export default function AdminModelsPage() {
             <Paragraph type="secondary" style={{ marginBottom: 12 }}>
               Base URL：{provider.base_url} ｜ API Key：{provider.api_key_masked}
             </Paragraph>
-            <Table
-              rowKey="id"
-              size="small"
-              columns={modelColumns(provider)}
-              dataSource={provider.models}
-              pagination={false}
-              scroll={{ x: 1500 }}
-              locale={{ emptyText: '暂无模型，点击下方按钮添加' }}
-            />
+            {isCompact ? (
+              <div className="responsive-card-list admin-model-card-list" aria-label={`${provider.name} 模型列表`}>
+                {provider.models.length === 0 ? (
+                  <Empty description="暂无模型，点击下方按钮添加" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                ) : provider.models.map((model) => (
+                  <article className="responsive-data-card" key={model.id}>
+                    <div className="responsive-data-card-heading">
+                      <div>
+                        <strong>{model.display_name}</strong>
+                        <div className="responsive-data-card-secondary">{model.model_name}</div>
+                      </div>
+                      {model.is_default ? <Tag color="blue">默认</Tag> : (
+                        <Button size="small" type="link" onClick={() => handleSetDefault(model)}>设为默认</Button>
+                      )}
+                    </div>
+                    {model.description && <div className="responsive-data-card-description">{model.description}</div>}
+                    <div className="responsive-data-card-tags">
+                      {Object.keys(model.thinking_config ?? {}).length ? <Tag color="cyan">推理已配置</Tag> : <Tag>自动推理</Tag>}
+                      {thinkingEfforts(model.thinking_config).map((effort) => <Tag key={effort}>{effort}</Tag>)}
+                      {modelAccess(model)}
+                    </div>
+                    <div className="responsive-data-card-actions">{modelActions(provider, model)}</div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <Table
+                rowKey="id"
+                size="small"
+                columns={modelColumns(provider)}
+                dataSource={provider.models}
+                pagination={false}
+                scroll={{ x: 1500 }}
+                locale={{ emptyText: '暂无模型，点击下方按钮添加' }}
+              />
+            )}
             <Button
               type="dashed"
               icon={<PlusOutlined />}
@@ -642,6 +656,7 @@ export default function AdminModelsPage() {
       <Modal
         title={editingProvider ? `编辑 Provider：${editingProvider.name}` : '新增 Provider'}
         open={providerModalOpen}
+        className="admin-model-modal"
         onCancel={() => setProviderModalOpen(false)}
         onOk={handleSaveProvider}
         confirmLoading={savingProvider}
@@ -676,6 +691,7 @@ export default function AdminModelsPage() {
       <Modal
         title="从模型预设添加"
         open={presetModalOpen}
+        className="admin-model-modal"
         onCancel={() => setPresetModalOpen(false)}
         onOk={handleInstallPreset}
         confirmLoading={installingPreset}
@@ -733,7 +749,7 @@ export default function AdminModelsPage() {
                        {model.thinking_efforts.length > 0 && <Tag color="cyan" style={{ marginLeft: 8 }}>思考强度</Tag>}
                        {Boolean(model.thinking_config.enabled) && model.thinking_efforts.length === 0 ? <Tag color="cyan" style={{ marginLeft: 8 }}>可开关思考</Tag> : null}
                        <Tag color={model.context_window_source === '供应商接口' ? 'green' : 'gold'} style={{ marginLeft: 8 }}>
-                         上下文 {model.context_window_tokens.toLocaleString()} / 压缩 {model.context_compaction_threshold_tokens.toLocaleString()}
+                         输入 {formatKTokens(model.context_compaction_threshold_tokens)} / 输出 {formatKTokens(model.max_output_tokens)}
                        </Tag>
                     </Checkbox>
                   ))}
@@ -750,6 +766,7 @@ export default function AdminModelsPage() {
       <Modal
         title={discoverModalProvider ? `获取模型：${discoverModalProvider.name}` : '获取模型'}
         open={Boolean(discoverModalProvider)}
+        className="admin-model-modal"
         onCancel={() => {
           setDiscoverModalProvider(null)
           setDiscovery(null)
@@ -780,7 +797,7 @@ export default function AdminModelsPage() {
                        {exists && <Tag style={{ marginLeft: 8 }}>已添加</Tag>}
                        {model.thinking_efforts.length > 0 && <Tag color="cyan" style={{ marginLeft: 8 }}>{model.thinking_efforts.join(' / ')}</Tag>}
                        <Tag color={model.context_window_source === '供应商接口' ? 'green' : 'gold'} style={{ marginLeft: 8 }}>
-                         上下文 {model.context_window_tokens.toLocaleString()} / 压缩 {model.context_compaction_threshold_tokens.toLocaleString()}
+                         输入 {formatKTokens(model.context_compaction_threshold_tokens)} / 输出 {formatKTokens(model.max_output_tokens)}
                        </Tag>
                     </Checkbox>
                   )
@@ -794,6 +811,7 @@ export default function AdminModelsPage() {
       <Modal
         title={editingModel ? `编辑模型：${editingModel.display_name}` : '添加模型'}
         open={modelModalProviderId !== null}
+        className="admin-model-modal"
         onCancel={() => {
           setModelModalProviderId(null)
           setEditingModel(null)
@@ -802,7 +820,7 @@ export default function AdminModelsPage() {
         confirmLoading={savingModel}
         destroyOnHidden
       >
-        <Form form={modelForm} layout="vertical" onValuesChange={handleModelBudgetBaseChange}>
+        <Form form={modelForm} layout="vertical">
           <Form.Item
             name="model_name"
             label="模型名称（调用 API 时使用）"
@@ -822,50 +840,57 @@ export default function AdminModelsPage() {
             />
           </Form.Item>
           <Form.Item
-            name="context_window_tokens"
-            label="模型最大上下文窗口（tokens）"
-            rules={[{ required: true, message: '请输入模型上下文窗口' }]}
-            extra="供应商声明的总请求上限。修改此项或最大输出时，会自动更新推荐的压缩阈值和工具返回上限。"
+            name="input_limit_k"
+            label="最大输入（K tokens）"
+            rules={[{ required: true, message: '请输入最大输入' }]}
           >
-            <InputNumber min={8192} max={2000000} step={1024} style={{ width: '100%' }} />
+            <InputNumber min={1} max={1999} step={1} precision={0} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item
-            name="context_compaction_threshold_tokens"
-            label="压缩阈值 / 实际输入上下文（tokens）"
-            rules={[{ required: true, message: '请输入实际输入上下文窗口' }]}
-            extra="达到此输入预算时会先压缩旧对话；切换到较小模型时也按此值重新评估。"
+            name="output_limit_k"
+            label="单次最大输出（K tokens）"
+            rules={[{ required: true, message: '请输入最大输出' }]}
           >
-            <InputNumber min={1024} max={2000000} step={1024} style={{ width: '100%' }} />
+            <InputNumber min={1} max={1000} step={1} precision={0} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item
-            name="max_output_tokens"
-            label="单次模型最大输出（tokens）"
-            rules={[{ required: true, message: '请输入最大输出 token 数' }]}
-            extra="同时传给模型接口，限制回答和工具调用参数的最大生成量。"
-          >
-            <InputNumber min={128} max={1000000} step={256} style={{ width: '100%' }} />
-          </Form.Item>
-          <Form.Item
-            name="tool_result_max_tokens"
-            label="单次工具返回上限（tokens）"
-            rules={[{ required: true, message: '请输入工具返回上限' }]}
-            extra="目录和搜索会按条目裁剪；精确 HTML 超限会拒绝返回，避免截断标签。"
-          >
-            <InputNumber min={128} max={1000000} step={256} style={{ width: '100%' }} />
-          </Form.Item>
+          {automaticTokenBudget && (
+            <Space size={[8, 8]} wrap style={{ marginTop: -8, marginBottom: 16 }} aria-label="自动配置">
+              <Text type="secondary">自动配置</Text>
+              <Tag>压缩开始约 {formatKTokens(Math.floor(automaticTokenBudget.context_compaction_threshold_tokens * 0.9))}</Tag>
+              <Tag>压缩目标约 {formatKTokens(Math.min(automaticTokenBudget.context_compaction_threshold_tokens, 20_000))}</Tag>
+              <Tag>工具预览 {formatKTokens(automaticTokenBudget.tool_result_max_tokens)}</Tag>
+            </Space>
+          )}
           <Form.Item name="is_default" label="设为默认模型" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            name="is_multimodal"
+            label="支持图片交互"
+            valuePropName="checked"
+            extra="开启后，用户可在聊天输入框选择或粘贴图片。请仅为确认支持视觉输入的模型开启。"
+          >
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            name="supports_disabled_thinking"
+            label="支持不思考"
+            valuePropName="checked"
+            extra="关闭后，编辑器不会发送禁止思考参数，已保存的旧请求也会自动按默认思考设置执行。"
+          >
             <Switch />
           </Form.Item>
           <Form.Item
             name="thinking_efforts"
             label="思考强度"
-            extra="选择后会生成 OpenAI reasoning_effort 的低/中/高等参数；其他厂商使用下方高级 JSON 覆盖。"
+            extra="选择后会生成 OpenAI reasoning_effort 的低/中/高/超高等参数；其他厂商使用下方高级 JSON 覆盖。"
           >
             <Checkbox.Group options={[
               { label: '极简', value: 'minimal' },
               { label: '低', value: 'low' },
               { label: '中', value: 'medium' },
               { label: '高', value: 'high' },
+              { label: '超高', value: 'xhigh' },
             ]} />
           </Form.Item>
           <Form.Item
@@ -884,6 +909,7 @@ export default function AdminModelsPage() {
       <Modal
         title={accessModalModel ? `模型权限：${accessModalModel.display_name}` : '模型权限'}
         open={Boolean(accessModalModel)}
+        className="admin-model-modal"
         onCancel={() => setAccessModalModel(null)}
         onOk={handleSaveModelAccess}
         confirmLoading={savingAccess}

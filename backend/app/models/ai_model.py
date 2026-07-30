@@ -13,7 +13,8 @@ from app.models.user_group import model_group_access, model_user_access
 DEFAULT_CONTEXT_WINDOW_TOKENS = 32_768
 DEFAULT_CONTEXT_COMPACTION_THRESHOLD_TOKENS = 24_576
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
-DEFAULT_TOOL_RESULT_MAX_TOKENS = 4_096
+# This is a provider-visible preview cap, not a cap on retained tool data.
+DEFAULT_TOOL_RESULT_MAX_TOKENS = 8_192
 
 
 class AIModel(Base):
@@ -54,6 +55,12 @@ class AIModel(Base):
         server_default=str(DEFAULT_TOOL_RESULT_MAX_TOKENS),
     )
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # This is an explicit administrator capability flag.  Model discovery APIs
+    # are inconsistent, so new and existing models stay text-only until enabled.
+    is_multimodal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
+    # Whether callers may explicitly request provider-side disabled thinking.
+    # Unknown models default to enabled for backwards compatibility.
+    supports_disabled_thinking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
     # ``all`` 保持历史行为；``restricted`` 时仅直接授权的用户或所属获授权组可使用。
     access_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="all", server_default="all")
     # Provider-specific reasoning request mappings. Besides enabled/disabled, presets

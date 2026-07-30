@@ -8,6 +8,7 @@ export interface ParsedImportAsset {
 export interface ParsedImport {
   html: string
   assets: ParsedImportAsset[]
+  warnings?: string[]
 }
 
 export type ImportParseStage = 'reading' | 'parsing' | 'extracting'

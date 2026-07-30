@@ -21,7 +21,7 @@ Define the task to achieve, including specific requirements, constraints, and su
 > 以下标注【已证实】的规则，均已通过对微信编辑器前端资源包（旧版 UEditor 管线 `template_edit_fe.e4e63001.js.下载`、`editor_filter.js`、灰度 ProseMirror 编辑器管线 `appmsg_edit_v2_gray_fe.704669e7.js.下载` 等）的静态逆向核实到具体函数/正则/调用点；标注【经验建议】的规则没有找到直接源码证据，作为工程上规避不确定性的最佳实践保留，不代表微信一定会这样处理。
 
 - **块级标签处理【经验建议，非强制转换】**：没有找到微信把 `div`/`article`/`script`/`style`/`link` **全局强制转换为 `section`** 的证据。真实机制是按标签名分支处理的，例如：`div` 会被拆成 `<p>` 子节点后删除自身；`style`/`script` 的内容会被编码后存进 `cdata_data` 属性、标签本身改写为空 `div`；`dl`→`ul`、`dt`/`dd`→`li`。由于这类改写细节不完全可控，**仍建议优先使用 `section` 作为核心块级标签**，规避未知的标签重写风险，但不要再把"强制转 section"当作确定事实来做其他推断。
-- **嵌套深度限制【已证实】**：微信编辑器的 `deleteNestNode` 逻辑对嵌套层数上限为 **10 层**（`R=10`）。当嵌套深度 `>= 10` 时，会被扁平化清理（Flatten DOM），扁平化后收敛到 `R-2 = 8` 层。生成排版时嵌套层级必须控制在 **8 层以内**，以保安全。`wechat_format_rules_source.js` 的 `checkNestingDepth()` 会对此做硬性判定（>=10 层直接判定为错误）。
+- **Word 粘贴嵌套深度限制【已证实】**：`clear_dom.js` 对 Word 粘贴内容设置 `deepLen:20` 与 `flatLen:20`。当符合其节点条件的嵌套深度或连续同类子节点数达到 **20** 时，会执行扁平化清理（Flatten DOM）。这不是草稿 API 同步的通用改写规则；生成排版仍建议控制在 **18 层以内**，为人工复制、从 Word 粘贴和后续编辑预留余量。`wechat_format_rules_source.js` 的 `checkNestingDepth()` 会在 >=20 层时报错。
 - **空标签清理【已证实存在，但触发条件比想象中更苛刻】**：真实的 `deleteRedundantNode` 触发条件是"父节点子元素数 > 20 且连续 15+ 个空子节点"才会清理，不是任意一个空标签都会被删。豁免的标签集合（已证实）为 `img|hr|svg|mp-common|iframe|cps|br|a|mp|video|audio|path|embed`，或 `style` 中含 `background-image` 也豁免。生成排版时仍应避免堆砌无意义的空标签，但不必对单个空 `<p></p>` 过度紧张。
 - **连续换行符【已证实】**：连续的 `<br>` 达到 10 个（即 `(<br>\s*<br>){10,}`）会被压缩为 1 组，生成排版时不应依赖大量连续 `<br>` 做空白间隔。
 - **SVG 序列化长度限制【已证实，新发现的硬指标】**：单个 `<svg>...</svg>` 的序列化（`outerHTML`）长度达到 **11000 字符**时会被整体替换为 `<embed>`，导致该 SVG 的交互动效彻底失效。制作 SVG 交互卡片时必须把单块 SVG 代码体积严格控制在 11000 字符以内（`wechat_format_rules_source.js` 的 `checkSvgSerializedLength()` 会检查此项）。
@@ -45,7 +45,7 @@ Define the task to achieve, including specific requirements, constraints, and su
 - 注意省略号不转义，直接使用`...`。
 
 ### 图片规范
-- 默认占位图地址：`https://img.xiumi.us/xmi/ua/tXyu/i/1198f4e2f088a6081a63c042286be73b-sz_1336891.png`。
+- 图片应使用用户提供或已确认有权使用的地址；未提供图片时，不要插入占位图。
 - 必须包含 `alt` 描述。
 - 常规图片统一设置：`max-width:100%; height:auto; display:block;`。
 - 如出现图片间白缝，可允许微调 `margin-top:-1px;`。
@@ -199,7 +199,7 @@ Define the task to achieve, including specific requirements, constraints, and su
 - **SVG 交互是否使用了 `begin="elementId.click"`**（必须改为 `begin="click"` 自触发）。
 - **SVG 交互是否使用了无 ID 的自触发方案**（如遮罩盖帽法、自状态转换法，禁止依赖外部 `id`）。
 - **单个 SVG 代码体积是否 >= 11000 字符**（已证实的硬性阈值，超过会被替换为 `<embed>`）。
-- 整体嵌套层级是否 >= 10 层（已证实会被扁平化，建议控制在 8 层以内）。
+- 整体嵌套层级是否 >= 20 层（Word 粘贴时会被扁平化，建议控制在 18 层以内）。
 - 是否存在核心布局依赖 `position:absolute/fixed` 或 `grid`（经验建议规避，非已证实强制过滤）。
 - 图片是否都带 `alt`，且设置了 `max-width:100%; height:auto;`。
 - 全文左右边距是否只使用同一个值（3/4/5px 之一）。
@@ -207,7 +207,7 @@ Define the task to achieve, including specific requirements, constraints, and su
 - 若含 SVG：是否含 `viewBox`、是否控制体积（<11000 字符）、`image` 是否写宽高与可用链接。
 - **静态工具校验（强制）**：每次生成或修改排版 HTML 文件后，**必须**直接在宿主机终端通过命令运行微信排版规范校验工具：
   `node wechat_format_rules_source.js <排版HTML路径>`
-  必须仔细阅读控制台输出的检查报告。报告分两类：标注"已证实"的检查项若报 `❌ 错误`（如嵌套深度 >=10、SVG 超长、SVG 内含 `<br>`）**必须**修复；标注"风险提示/弱提示"的项目（如定位类样式、疑似空节点）仅供参考判断，不强制要求清零。只要不再出现 `❌ 存在已证实规则下的严重错误`，即可认为通过校验。
+  必须仔细阅读控制台输出的检查报告。报告分两类：标注"已证实"的检查项若报 `❌ 错误`（如嵌套深度 >=20、SVG 超长、SVG 内含 `<br>`）**必须**修复；标注"风险提示/弱提示"的项目（如定位类样式、疑似空节点）仅供参考判断，不强制要求清零。只要不再出现 `❌ 存在已证实规则下的严重错误`，即可认为通过校验。
 
 ## 执行要求
 - 当用户请求生成公众号文章 HTML 时，自动应用本规范。

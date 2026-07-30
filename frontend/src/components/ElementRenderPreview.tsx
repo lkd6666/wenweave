@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { frameDocumentWithNewWindowLinks, SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 
 interface ElementRenderPreviewProps {
   html: string
@@ -33,6 +34,6 @@ export default function ElementRenderPreview({ html }: ElementRenderPreviewProps
     )
   }
 
-  const srcDoc = `<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;background:#fff}body{padding:12px;font:14px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;color:#111;word-break:break-word}img,video,table{max-width:100%;height:auto}*{box-sizing:border-box}</style></head><body>${html}</body></html>`
-  return <iframe title="元素渲染预览" className="element-render-preview" sandbox="" srcDoc={srcDoc} />
+  const srcDoc = frameDocumentWithNewWindowLinks(`<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;background:#fff}body{padding:12px;font:14px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;color:#111;word-break:break-word}img,video,table{max-width:100%;height:auto}*{box-sizing:border-box}</style></head><body>${html}</body></html>`)
+  return <iframe title="元素渲染预览" className="element-render-preview" sandbox={SANDBOX_ALLOW_NEW_WINDOW} srcDoc={srcDoc} />
 }

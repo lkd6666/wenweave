@@ -37,6 +37,7 @@ export default function ChangePasswordModal({ open, onClose }: ChangePasswordMod
     <Modal
       title="修改密码"
       open={open}
+      className="change-password-modal"
       onCancel={onClose}
       onOk={handleOk}
       confirmLoading={loading}

@@ -56,7 +56,7 @@ def update_user_group(group_id: int, payload: UserGroupUpdate, db: Session = Dep
     return group
 
 
-@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_user_group(group_id: int, db: Session = Depends(get_db)) -> None:
     group = db.get(UserGroup, group_id)
     if not group:

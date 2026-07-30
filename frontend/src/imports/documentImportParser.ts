@@ -1,4 +1,5 @@
 import type { ImportParseProgress, ParsedImport } from './types'
+import { parseMarkdownFile } from './markdownImportParser'
 import { parsePdfInBrowser } from './pdfImportParser'
 
 interface WorkerProgressMessage {
@@ -24,9 +25,10 @@ export async function parseImportFile(
   signal?: AbortSignal,
 ): Promise<ParsedImport> {
   const extension = file.name.split('.').pop()?.toLowerCase()
-  if (extension !== 'pdf' && extension !== 'docx') {
-    throw new Error('仅支持 PDF 或 Word(.docx) 文件')
+  if (extension !== 'pdf' && extension !== 'docx' && extension !== 'md') {
+    throw new Error('仅支持 PDF、Word(.docx) 或 Markdown(.md) 文件')
   }
+  if (extension === 'md') return parseMarkdownFile(file, onProgress, signal)
 
   onProgress({ stage: 'reading', percent: 2, detail: '正在读取原始文件…' })
   const buffer = await file.arrayBuffer()

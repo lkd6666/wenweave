@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react'
 import { Button, Drawer, Dropdown, Grid, Input, Modal, Popover, Segmented, Slider, Space, Spin, Tooltip, message } from 'antd'
 import { AppstoreOutlined, ArrowLeftOutlined, BulbOutlined, EditOutlined, FileSearchOutlined, HistoryOutlined, LinkOutlined, MoreOutlined, PictureOutlined, RedoOutlined, ReloadOutlined, SafetyCertificateOutlined, SaveOutlined, SelectOutlined, SendOutlined, UndoOutlined } from '@ant-design/icons'
@@ -8,14 +8,8 @@ import type { UserQuestionAnswer } from '../components/UserQuestionPanel'
 import PreviewFrame from '../components/PreviewFrame'
 import type { PreviewFrameHandle, PreviewMode } from '../components/PreviewFrame'
 import CompliancePanel from '../components/CompliancePanel'
-import CodeViewer from '../components/CodeViewer'
 import VersionHistoryDrawer from '../components/VersionHistoryDrawer'
-import LayoutImitationModal from '../components/LayoutImitationModal'
-import SourceDocumentModal from '../components/SourceDocumentModal'
-import ThemeGalleryModal from '../components/ThemeGalleryModal'
 import TemplateLibraryPanel from '../components/TemplateLibraryPanel'
-import WeChatDraftModal from '../components/WeChatDraftModal'
-import DocumentShareModal from '../components/DocumentShareModal'
 import { documentsApi } from '../api/documents'
 import { modelsApi } from '../api/models'
 import { aiProvidersApi } from '../api/aiProviders'
@@ -29,6 +23,13 @@ import { sanitizeSelectedElement, sanitizeSelectedElements } from '../utils/sele
 import { formatWeChatImageSize, prepareWeChatBodyImage } from '../utils/wechatBodyImage'
 import { clearChatComposerDraft, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
 import { useAuthStore } from '../store/authStore'
+
+const CodeViewer = lazy(() => import('../components/CodeViewer'))
+const LayoutImitationModal = lazy(() => import('../components/LayoutImitationModal'))
+const SourceDocumentModal = lazy(() => import('../components/SourceDocumentModal'))
+const ThemeGalleryModal = lazy(() => import('../components/ThemeGalleryModal'))
+const WeChatDraftModal = lazy(() => import('../components/WeChatDraftModal'))
+const DocumentShareModal = lazy(() => import('../components/DocumentShareModal'))
 
 type CenterView = 'preview' | 'code'
 type MobileWorkspace = 'chat' | CenterView
@@ -2652,7 +2653,11 @@ export default function EditorPage() {
             />
           </div>
           <div className={`editor-center-panel${centerView === 'code' ? '' : ' is-hidden'}`}>
-            <CodeViewer html={draftHtml} onChange={handleHtmlChange} onSave={handleSaveHtml} saving={saving} disabled={streaming} />
+            {centerView === 'code' && (
+              <Suspense fallback={<div className="editor-panel-loading" aria-busy="true" />}>
+                <CodeViewer html={draftHtml} onChange={handleHtmlChange} onSave={handleSaveHtml} saving={saving} disabled={streaming} />
+              </Suspense>
+            )}
           </div>
         </div>
 
@@ -2703,49 +2708,69 @@ export default function EditorPage() {
         onRestored={handleVersionRestored}
         onCopied={(document) => navigate(`/editor/${document.id}`)}
       />
-      <LayoutImitationModal
-        open={layoutImitationOpen}
-        streaming={streaming}
-        modelAvailable={Boolean(modelId)}
-        onClose={() => setLayoutImitationOpen(false)}
-        onConfirm={(reference, assetsConfirmed, selectedAssetIds, imitationStrength) => {
-          void handleLayoutImitation(reference, assetsConfirmed, selectedAssetIds, imitationStrength)
-        }}
-      />
-      <ThemeGalleryModal
-        open={themeGalleryOpen}
-        initialThemeKey={themeGalleryInitialKey}
-        documentId={docId}
-        sessionId={activeChatSessionId}
-        modelId={modelId}
-        disabled={streaming || saving || !modelId}
-        onClose={() => {
-          setThemeGalleryOpen(false)
-          setThemeGalleryInitialKey(null)
-        }}
-        onApproved={(proposal) => { void handleThemeApplication(proposal) }}
-      />
-      <WeChatDraftModal
-        open={wechatDraftOpen}
-        documentId={docId}
-        documentTitle={title}
-        metadata={wechatMetadata}
-        accounts={wechatAccounts}
-        disabled={streaming || saving || draftHtml !== html}
-        onClose={() => setWechatDraftOpen(false)}
-        onMetadataSaved={(nextMetadata, nextTitle) => {
-          setWechatMetadata(nextMetadata)
-          setTitle(nextTitle)
-          setVersionRefreshToken((value) => value + 1)
-        }}
-      />
-      <DocumentShareModal
-        open={documentShareOpen}
-        documentId={docId}
-        documentTitle={title}
-        onClose={() => setDocumentShareOpen(false)}
-      />
-      <SourceDocumentModal documentId={docId} currentHtml={draftHtml} open={sourcePreviewOpen} onClose={() => setSourcePreviewOpen(false)} />
+      {layoutImitationOpen && (
+        <Suspense fallback={null}>
+          <LayoutImitationModal
+            open
+            streaming={streaming}
+            modelAvailable={Boolean(modelId)}
+            onClose={() => setLayoutImitationOpen(false)}
+            onConfirm={(reference, assetsConfirmed, selectedAssetIds, imitationStrength) => {
+              void handleLayoutImitation(reference, assetsConfirmed, selectedAssetIds, imitationStrength)
+            }}
+          />
+        </Suspense>
+      )}
+      {themeGalleryOpen && (
+        <Suspense fallback={null}>
+          <ThemeGalleryModal
+            open
+            initialThemeKey={themeGalleryInitialKey}
+            documentId={docId}
+            sessionId={activeChatSessionId}
+            modelId={modelId}
+            disabled={streaming || saving || !modelId}
+            onClose={() => {
+              setThemeGalleryOpen(false)
+              setThemeGalleryInitialKey(null)
+            }}
+            onApproved={(proposal) => { void handleThemeApplication(proposal) }}
+          />
+        </Suspense>
+      )}
+      {wechatDraftOpen && (
+        <Suspense fallback={null}>
+          <WeChatDraftModal
+            open
+            documentId={docId}
+            documentTitle={title}
+            metadata={wechatMetadata}
+            accounts={wechatAccounts}
+            disabled={streaming || saving || draftHtml !== html}
+            onClose={() => setWechatDraftOpen(false)}
+            onMetadataSaved={(nextMetadata, nextTitle) => {
+              setWechatMetadata(nextMetadata)
+              setTitle(nextTitle)
+              setVersionRefreshToken((value) => value + 1)
+            }}
+          />
+        </Suspense>
+      )}
+      {documentShareOpen && (
+        <Suspense fallback={null}>
+          <DocumentShareModal
+            open
+            documentId={docId}
+            documentTitle={title}
+            onClose={() => setDocumentShareOpen(false)}
+          />
+        </Suspense>
+      )}
+      {sourcePreviewOpen && (
+        <Suspense fallback={null}>
+          <SourceDocumentModal documentId={docId} currentHtml={draftHtml} open onClose={() => setSourcePreviewOpen(false)} />
+        </Suspense>
+      )}
     </div>
   )
 }

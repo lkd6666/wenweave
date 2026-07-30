@@ -45,6 +45,11 @@ body {
   color: var(--app-text);
 }
 
+.route-loading {
+  min-height: 100vh;
+  background: var(--app-page-bg);
+}
+
 .app-layout {
   min-height: 100vh;
   background: var(--app-page-bg);
@@ -1265,6 +1270,11 @@ body {
 
 .editor-center-panel.is-hidden {
   display: none;
+}
+
+.editor-panel-loading {
+  height: 100%;
+  background: var(--app-surface);
 }
 
 /* 共享模板库与主题库 */

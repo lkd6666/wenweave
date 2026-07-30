@@ -133,7 +133,14 @@ function Move-FileIntoPlace {
     param([string]$Source, [string]$Destination)
     if (Test-Path -LiteralPath $Destination) {
         # Replace preserves the existing artifact until the replacement is complete.
-        [System.IO.File]::Replace($Source, $Destination, $null)
+        $backupPath = "$Destination.replace-backup"
+        Remove-ExistingPath -Path $backupPath
+        try {
+            [System.IO.File]::Replace($Source, $Destination, $backupPath)
+        }
+        finally {
+            Remove-TemporaryPath -Path $backupPath
+        }
     }
     else {
         [System.IO.File]::Move($Source, $Destination)

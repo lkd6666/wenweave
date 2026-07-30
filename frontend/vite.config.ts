@@ -18,54 +18,5 @@ export default defineConfig({
   build: {
     // 生产构建输出到 frontend/dist，由后端 FastAPI 的 StaticFiles 挂载托管，实现单体部署。
     outDir: 'dist',
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (!id.includes('node_modules')) return undefined
-
-          if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/scheduler/')) {
-            return 'react-vendor'
-          }
-          if (
-            id.includes('/antd/')
-            || id.includes('/@ant-design/')
-            || id.includes('/@rc-component/')
-            || id.includes('/rc-')
-          ) {
-            return 'antd-vendor'
-          }
-          if (
-            id.includes('/@uiw/')
-            || id.includes('/@codemirror/')
-            || id.includes('/@lezer/')
-            || id.includes('/codemirror/')
-          ) {
-            return 'codemirror-vendor'
-          }
-          if (
-            id.includes('/react-syntax-highlighter/')
-            || id.includes('/refractor/')
-            || id.includes('/prismjs/')
-          ) {
-            return 'syntax-highlighter-vendor'
-          }
-          if (
-            id.includes('/react-markdown/')
-            || id.includes('/remark-')
-            || id.includes('/rehype-')
-            || id.includes('/unified/')
-            || id.includes('/micromark')
-            || id.includes('/mdast-')
-            || id.includes('/hast-')
-            || id.includes('/vfile')
-          ) {
-            return 'markdown-vendor'
-          }
-          if (id.includes('/katex/')) return 'katex-vendor'
-
-          return 'vendor'
-        },
-      },
-    },
   },
 })

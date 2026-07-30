@@ -108,6 +108,38 @@ function Write-Sha256 {
     Set-Content -LiteralPath "$FilePath.sha256" -Value $line -Encoding ascii
 }
 
+function Remove-ExistingPath {
+    param([string]$Path, [switch]$Recurse)
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse:$Recurse -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $Path) {
+        throw "Unable to remove existing temporary path: $Path"
+    }
+}
+
+function Remove-TemporaryPath {
+    param([string]$Path, [switch]$Recurse)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        Remove-ExistingPath -Path $Path -Recurse:$Recurse
+    }
+    catch {
+        Write-Warning "Temporary path could not be removed; delete it manually: $Path"
+    }
+}
+
+function Move-FileIntoPlace {
+    param([string]$Source, [string]$Destination)
+    if (Test-Path -LiteralPath $Destination) {
+        # Replace preserves the existing artifact until the replacement is complete.
+        [System.IO.File]::Replace($Source, $Destination, $null)
+    }
+    else {
+        [System.IO.File]::Move($Source, $Destination)
+    }
+}
+
 function New-PortableZip {
     param([string]$SourceDirectory, [string]$DestinationFile)
 
@@ -156,12 +188,16 @@ $privateStage = Join-Path $outputVersionDir 'private-stage'
 $sourceArchive = Join-Path $outputVersionDir 'source.zip'
 $releaseZip = Join-Path $outputVersionDir "yibanpaiban-release-$Version.zip"
 $privateArchive = Join-Path $outputVersionDir "yibanpaiban-private-$Version.private.7z"
+$releaseZipCandidate = "$releaseZip.new"
+$privateArchiveCandidate = "$privateArchive.new"
 
 New-Item -ItemType Directory -Force -Path $outputVersionDir | Out-Null
 foreach ($stage in @($releaseStage, $privateStage)) {
-    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    Remove-ExistingPath -Path $stage -Recurse
 }
-Remove-Item -LiteralPath $sourceArchive, $releaseZip, $privateArchive -Force -ErrorAction SilentlyContinue
+foreach ($temporaryPath in @($sourceArchive, $releaseZipCandidate, $privateArchiveCandidate)) {
+    Remove-ExistingPath -Path $temporaryPath
+}
 
 Invoke-Checked -FilePath 'git' -Arguments @('-C', $repoRoot, 'archive', '--format=zip', "--output=$sourceArchive", $commit)
 Expand-Archive -LiteralPath $sourceArchive -DestinationPath $releaseStage -Force
@@ -180,7 +216,8 @@ Set-Content -LiteralPath (Join-Path $releaseStage 'RELEASE_MANIFEST.txt') -Encod
     'private-runtime-data=excluded'
 )
 Assert-PublicStageSafe -Stage $releaseStage
-New-PortableZip -SourceDirectory $releaseStage -DestinationFile $releaseZip
+New-PortableZip -SourceDirectory $releaseStage -DestinationFile $releaseZipCandidate
+Move-FileIntoPlace -Source $releaseZipCandidate -Destination $releaseZip
 Write-Sha256 -FilePath $releaseZip
 
 if (-not $SkipPrivateArchive) {
@@ -200,31 +237,40 @@ if (-not $SkipPrivateArchive) {
         }
     }
 
-    Expand-Archive -LiteralPath $sourceArchive -DestinationPath $privateStage -Force
-    Copy-IfPresent -Source (Join-Path $repoRoot 'backend\.env') -Destination (Join-Path $privateStage 'backend\.env')
-    Copy-IfPresent -Source (Join-Path $repoRoot 'backend\data') -Destination (Join-Path $privateStage 'backend\data')
-    Copy-IfPresent -Source (Join-Path $repoRoot 'backend\uploads') -Destination (Join-Path $privateStage 'backend\uploads')
-    Invoke-Checked -FilePath $PythonExecutable -Arguments @('scripts/backup_personal_mysql.py', '--mysqldump', $MySqlDumpPath, '--output', (Join-Path $privateStage 'private\mysql-full.sql')) -WorkingDirectory (Join-Path $repoRoot 'backend')
-    Set-Content -LiteralPath (Join-Path $privateStage 'PRIVATE_BACKUP_MANIFEST.txt') -Encoding ascii -Value @(
-        "commit=$commit",
-        "version=$Version",
-        'database=full-mysqldump',
-        'runtime=backend/.env,backend/data,backend/uploads',
-        'warning=contains-secrets-and-personal-data'
-    )
-
-    $password = Get-ArchivePassword -EnvironmentVariable $PrivateArchivePasswordEnvironmentVariable
     try {
-        Invoke-Checked -FilePath $SevenZipPath -Arguments @('a', '-t7z', $privateArchive, (Join-Path $privateStage '*'), '-mhe=on', "-p$password") -WorkingDirectory $outputVersionDir
-        Invoke-Checked -FilePath $SevenZipPath -Arguments @('t', $privateArchive, "-p$password") -WorkingDirectory $outputVersionDir
+        Expand-Archive -LiteralPath $sourceArchive -DestinationPath $privateStage -Force
+        Copy-IfPresent -Source (Join-Path $repoRoot 'backend\.env') -Destination (Join-Path $privateStage 'backend\.env')
+        Copy-IfPresent -Source (Join-Path $repoRoot 'backend\data') -Destination (Join-Path $privateStage 'backend\data')
+        Copy-IfPresent -Source (Join-Path $repoRoot 'backend\uploads') -Destination (Join-Path $privateStage 'backend\uploads')
+        Invoke-Checked -FilePath $PythonExecutable -Arguments @('scripts/backup_personal_mysql.py', '--mysqldump', $MySqlDumpPath, '--output', (Join-Path $privateStage 'private\mysql-full.sql')) -WorkingDirectory (Join-Path $repoRoot 'backend')
+        Set-Content -LiteralPath (Join-Path $privateStage 'PRIVATE_BACKUP_MANIFEST.txt') -Encoding ascii -Value @(
+            "commit=$commit",
+            "version=$Version",
+            'database=full-mysqldump',
+            'runtime=backend/.env,backend/data,backend/uploads',
+            'warning=contains-secrets-and-personal-data'
+        )
+
+        $password = Get-ArchivePassword -EnvironmentVariable $PrivateArchivePasswordEnvironmentVariable
+        try {
+            Invoke-Checked -FilePath $SevenZipPath -Arguments @('a', '-t7z', $privateArchiveCandidate, (Join-Path $privateStage '*'), '-mhe=on', "-p$password") -WorkingDirectory $outputVersionDir
+            Invoke-Checked -FilePath $SevenZipPath -Arguments @('t', $privateArchiveCandidate, "-p$password") -WorkingDirectory $outputVersionDir
+        }
+        finally {
+            Remove-Variable password -ErrorAction SilentlyContinue
+        }
+        Move-FileIntoPlace -Source $privateArchiveCandidate -Destination $privateArchive
+        Write-Sha256 -FilePath $privateArchive
     }
     finally {
-        Remove-Variable password -ErrorAction SilentlyContinue
+        Remove-TemporaryPath -Path $privateStage -Recurse
+        Remove-TemporaryPath -Path $privateArchiveCandidate
     }
-    Write-Sha256 -FilePath $privateArchive
 }
 
-Remove-Item -LiteralPath $releaseStage, $privateStage, $sourceArchive -Recurse -Force -ErrorAction SilentlyContinue
+Remove-TemporaryPath -Path $releaseStage -Recurse
+Remove-TemporaryPath -Path $sourceArchive
+Remove-TemporaryPath -Path $releaseZipCandidate
 Write-Host "Release package: $releaseZip"
 Write-Host "Release checksum: $releaseZip.sha256"
 if (-not $SkipPrivateArchive) {

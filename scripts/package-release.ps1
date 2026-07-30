@@ -6,6 +6,7 @@ param(
     [string]$PythonExecutable = '',
     [string]$MySqlDumpPath = '',
     [string]$SevenZipPath = '',
+    [string]$PrivateArchivePasswordEnvironmentVariable = '',
     [switch]$SkipPrivateArchive
 )
 
@@ -52,6 +53,18 @@ function Get-PlainTextPassword {
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
     }
+}
+
+function Get-ArchivePassword {
+    param([string]$EnvironmentVariable)
+    if ($EnvironmentVariable) {
+        $value = [Environment]::GetEnvironmentVariable($EnvironmentVariable, 'Process')
+        if ([string]::IsNullOrWhiteSpace($value) -or $value.Length -lt 12) {
+            throw "Environment variable $EnvironmentVariable must contain a password with at least 12 characters."
+        }
+        return $value
+    }
+    return Get-PlainTextPassword
 }
 
 function Copy-IfPresent {
@@ -173,7 +186,7 @@ if (-not $SkipPrivateArchive) {
         'warning=contains-secrets-and-personal-data'
     )
 
-    $password = Get-PlainTextPassword
+    $password = Get-ArchivePassword -EnvironmentVariable $PrivateArchivePasswordEnvironmentVariable
     try {
         Invoke-Checked -FilePath $SevenZipPath -Arguments @('a', '-t7z', $privateArchive, (Join-Path $privateStage '*'), '-mhe=on', "-p$password") -WorkingDirectory $outputVersionDir
     }

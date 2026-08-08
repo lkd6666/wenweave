@@ -2,6 +2,8 @@ from app.models.user import User
 from app.models.user_group import UserGroup
 from app.models.ai_provider import AIProvider
 from app.models.ai_model import AIModel
+from app.models.ai_image_model import AIImageModel
+from app.models.image_generation import GeneratedImageAsset, ImageGeneration
 from app.models.storage_config import StorageConfig
 from app.models.document import Document
 from app.models.document_group import DocumentGroup
@@ -43,6 +45,9 @@ __all__ = [
     "UserGroup",
     "AIProvider",
     "AIModel",
+    "AIImageModel",
+    "ImageGeneration",
+    "GeneratedImageAsset",
     "StorageConfig",
     "Document",
     "DocumentGroup",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.types import ID_TYPE, LONG_TEXT
@@ -29,6 +29,12 @@ class ChatSession(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    image_model_id: Mapped[int | None] = mapped_column(
+        ID_TYPE, ForeignKey("ai_image_models.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    auto_image_generation_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+
+    image_model = relationship("AIImageModel")
 
 
 class ChatSessionMemory(Base):

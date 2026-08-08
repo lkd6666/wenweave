@@ -114,6 +114,15 @@ class DocumentShareTests(unittest.TestCase):
             document_shares.list_document_shares(self.document.id, self.outsider, self.db)
         self.assertEqual(context.exception.status_code, 404)
 
+    def test_share_management_uses_the_document_current_title(self) -> None:
+        self.make_share()
+        self.document.title = "改名后的文章"
+        self.db.commit()
+
+        entries = document_shares.list_document_shares(self.document.id, self.owner, self.db)
+
+        self.assertEqual(entries[0].document_title, "改名后的文章")
+
     def test_public_reader_tracks_one_visit_per_session_and_observes_revision(self) -> None:
         share, token = self.make_share()
         request = make_request()
@@ -123,6 +132,8 @@ class DocumentShareTests(unittest.TestCase):
         self.assertEqual(payload.title, "公开文章")
         self.assertEqual(payload.html, "<p>初始正文</p>")
         self.assertEqual(payload.cover_url, "")
+        self.assertEqual(payload.cover_crop_235_1, "")
+        self.assertEqual(payload.cover_crop_1_1, "")
         self.assertEqual(payload.expires_at.tzinfo, timezone.utc)
         self.assertEqual(payload.revision, document_revision(self.document))
         self.assertIn("document_share_visit_", response.headers["set-cookie"])
@@ -147,13 +158,17 @@ class DocumentShareTests(unittest.TestCase):
     def test_public_reader_exposes_cover_and_refreshes_its_revision(self) -> None:
         share, token = self.make_share()
         self.document.wechat_cover_url = "https://covers.example.test/article.jpg"
+        self.document.wechat_pic_crop_235_1 = "0_0.1_1_0.9"
+        self.document.wechat_pic_crop_1_1 = "0.2_0_0.8_1"
         self.db.commit()
 
         payload = document_shares.get_public_document_share(token, make_request(), Response(), self.db)
         self.assertEqual(payload.cover_url, "https://covers.example.test/article.jpg")
+        self.assertEqual(payload.cover_crop_235_1, "0_0.1_1_0.9")
+        self.assertEqual(payload.cover_crop_1_1, "0.2_0_0.8_1")
         original_revision = payload.revision
 
-        self.document.wechat_cover_url = "https://covers.example.test/article-next.jpg"
+        self.document.wechat_pic_crop_1_1 = "0.1_0_0.9_1"
         self.db.commit()
         revision = document_shares.get_public_document_share_revision(token, Response(), self.db)
         self.assertNotEqual(revision.revision, original_revision)

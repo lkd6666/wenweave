@@ -7,8 +7,10 @@ SET FOREIGN_KEY_CHECKS = 0;
 CREATE TABLE ai_providers (
 	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 	name VARCHAR(128) NOT NULL,
-	provider_type ENUM('OPENAI_COMPATIBLE','ANTHROPIC') NOT NULL,
+	provider_type ENUM('OPENAI_COMPATIBLE','OPENAI_RESPONSES','ANTHROPIC') NOT NULL,
 	base_url VARCHAR(512) NOT NULL,
+	image_protocol VARCHAR(48) NOT NULL DEFAULT '',
+	image_base_url VARCHAR(512) NOT NULL DEFAULT '',
 	api_key_encrypted MEDIUMTEXT NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id)
@@ -68,7 +70,7 @@ CREATE TABLE model_call_records (
 	user_id BIGINT UNSIGNED,
 	source ENUM('agent','agent_context_compaction','agent_runtime_compaction','theme_generation','template_generation') NOT NULL,
 	source_id VARCHAR(64) NOT NULL,
-	status ENUM('completed','failed','cancelled') NOT NULL,
+	status ENUM('running','completed','failed','cancelled','abandoned') NOT NULL,
 	usage_reported BOOL NOT NULL,
 	input_tokens INTEGER,
 	output_tokens INTEGER,
@@ -76,7 +78,7 @@ CREATE TABLE model_call_records (
 	cache_write_tokens INTEGER,
 	error_message VARCHAR(512) NOT NULL,
 	started_at DATETIME NOT NULL,
-	finished_at DATETIME NOT NULL,
+	finished_at DATETIME,
 	PRIMARY KEY (id)
 )CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 CREATE INDEX ix_model_call_records_model_started ON model_call_records (model_id, started_at);
@@ -154,8 +156,27 @@ CREATE TABLE ai_models (
 	is_default BOOL NOT NULL,
 	is_multimodal BOOL NOT NULL DEFAULT '0',
 	supports_disabled_thinking BOOL NOT NULL DEFAULT '1',
+	default_thinking_effort VARCHAR(16) NOT NULL DEFAULT 'auto',
+	prompt_cache_enabled BOOL NOT NULL DEFAULT '0',
 	access_mode VARCHAR(16) NOT NULL DEFAULT 'all',
 	thinking_config JSON NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id),
+	FOREIGN KEY(provider_id) REFERENCES ai_providers (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+
+
+CREATE TABLE ai_image_models (
+	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+	provider_id BIGINT UNSIGNED NOT NULL,
+	model_name VARCHAR(256) NOT NULL,
+	display_name VARCHAR(256) NOT NULL,
+	description VARCHAR(1024) NOT NULL,
+	supported_aspect_ratios JSON NOT NULL,
+	supported_qualities JSON NOT NULL,
+	is_default BOOL NOT NULL DEFAULT 0,
+	access_mode VARCHAR(16) NOT NULL DEFAULT 'all',
+	adapter_config JSON NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id),
 	FOREIGN KEY(provider_id) REFERENCES ai_providers (id) ON DELETE CASCADE
@@ -470,6 +491,24 @@ CREATE TABLE model_user_access (
 );
 
 
+CREATE TABLE image_model_group_access (
+	model_id BIGINT UNSIGNED NOT NULL,
+	group_id BIGINT UNSIGNED NOT NULL,
+	PRIMARY KEY (model_id, group_id),
+	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE CASCADE,
+	FOREIGN KEY(group_id) REFERENCES user_groups (id) ON DELETE CASCADE
+);
+
+
+CREATE TABLE image_model_user_access (
+	model_id BIGINT UNSIGNED NOT NULL,
+	user_id BIGINT UNSIGNED NOT NULL,
+	PRIMARY KEY (model_id, user_id),
+	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE CASCADE,
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+
 CREATE TABLE template_generations (
 	id VARCHAR(36) NOT NULL,
 	model_id BIGINT UNSIGNED NOT NULL,
@@ -517,6 +556,8 @@ CREATE TABLE chat_sessions (
 	is_archived BOOL NOT NULL,
 	context_start_message_id INTEGER NOT NULL,
 	context_generation INTEGER NOT NULL,
+	image_model_id BIGINT UNSIGNED,
+	auto_image_generation_enabled BOOL NOT NULL DEFAULT 0,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	updated_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id),
@@ -524,6 +565,59 @@ CREATE TABLE chat_sessions (
 )CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 CREATE INDEX ix_chat_sessions_document_id ON chat_sessions (document_id);
 CREATE INDEX ix_chat_sessions_is_archived ON chat_sessions (is_archived);
+
+
+CREATE TABLE image_generations (
+	id VARCHAR(36) NOT NULL,
+	document_id BIGINT UNSIGNED NOT NULL,
+	session_id BIGINT UNSIGNED,
+	model_id BIGINT UNSIGNED NOT NULL,
+	user_id BIGINT UNSIGNED NOT NULL,
+	source ENUM('editor','agent') NOT NULL,
+	purpose ENUM('cover','body') NOT NULL,
+	prompt LONGTEXT NOT NULL,
+	quantity INTEGER NOT NULL DEFAULT 1,
+	aspect_ratio VARCHAR(24) NOT NULL DEFAULT 'landscape',
+	quality VARCHAR(24) NOT NULL DEFAULT 'auto',
+	anchor_block_id VARCHAR(128) NOT NULL,
+	direct_insert BOOL NOT NULL DEFAULT 0,
+	provider_task_id VARCHAR(256) NOT NULL,
+	status ENUM('pending','running','succeeded','failed','cancelled') NOT NULL,
+	cancel_requested BOOL NOT NULL DEFAULT 0,
+	usage_json LONGTEXT NOT NULL,
+	error_message VARCHAR(2048) NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	updated_at DATETIME NOT NULL DEFAULT now(),
+	finished_at DATETIME,
+	PRIMARY KEY (id),
+	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE,
+	FOREIGN KEY(session_id) REFERENCES chat_sessions (id) ON DELETE SET NULL,
+	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE RESTRICT,
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_image_generations_document_id ON image_generations (document_id);
+CREATE INDEX ix_image_generations_status ON image_generations (status);
+
+
+CREATE TABLE generated_image_assets (
+	id VARCHAR(36) NOT NULL,
+	generation_id VARCHAR(36) NOT NULL,
+	object_key VARCHAR(512) NOT NULL,
+	storage_mode VARCHAR(12) NOT NULL,
+	url VARCHAR(4096) NOT NULL,
+	content_type VARCHAR(64) NOT NULL,
+	size INTEGER NOT NULL,
+	width INTEGER NOT NULL DEFAULT 0,
+	height INTEGER NOT NULL DEFAULT 0,
+	revised_prompt LONGTEXT NOT NULL,
+	is_applied BOOL NOT NULL DEFAULT 0,
+	applied_at DATETIME,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id),
+	UNIQUE KEY uq_generated_image_assets_object_key (object_key(255)),
+	FOREIGN KEY(generation_id) REFERENCES image_generations (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_generated_image_assets_generation_id ON generated_image_assets (generation_id);
 
 
 CREATE TABLE document_agent_memories (
@@ -923,6 +1017,9 @@ CREATE TABLE agent_runs (
 	lease_expires_at DATETIME,
 	heartbeat_at DATETIME,
 	cancel_requested_at DATETIME,
+	worker_pid INTEGER,
+	last_phase VARCHAR(64) NOT NULL DEFAULT '',
+	last_progress_at DATETIME,
 	event_sequence INTEGER NOT NULL DEFAULT '0',
 	created_at DATETIME NOT NULL DEFAULT now(),
 	updated_at DATETIME NOT NULL DEFAULT now(),

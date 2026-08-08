@@ -19,9 +19,11 @@ class ModelCallSource(str, enum.Enum):
 
 
 class ModelCallStatus(str, enum.Enum):
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    ABANDONED = "abandoned"
 
 
 class ModelCallRecord(Base):
@@ -59,4 +61,4 @@ class ModelCallRecord(Base):
     cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

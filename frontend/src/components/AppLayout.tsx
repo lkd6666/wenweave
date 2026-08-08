@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Layout, Menu, Avatar, Button, Drawer, Dropdown, Grid, Tooltip, Typography } from 'antd'
+import { Layout, Menu, Avatar, Button, Drawer, Dropdown, Grid, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   FileTextOutlined,
@@ -153,14 +153,12 @@ export default function AppLayout() {
           </div>
           <div className="app-header-actions">
             <Dropdown trigger={['click']} menu={themeMenu}>
-              <Tooltip title={`主题：${preference === 'system' ? `跟随系统（当前${resolvedTheme === 'dark' ? '黑暗' : '白天'}）` : preference === 'dark' ? '黑暗模式' : '白天模式'}`}>
-                <Button
-                  aria-label="切换主题"
-                  type="text"
-                  className="app-theme-trigger"
-                  icon={preference === 'system' ? <DesktopOutlined /> : resolvedTheme === 'dark' ? <MoonOutlined /> : <SunOutlined />}
-                />
-              </Tooltip>
+              <Button
+                aria-label="切换主题"
+                type="text"
+                className="app-theme-trigger"
+                icon={preference === 'system' ? <DesktopOutlined /> : resolvedTheme === 'dark' ? <MoonOutlined /> : <SunOutlined />}
+              />
             </Dropdown>
             <Dropdown
               trigger={['click']}

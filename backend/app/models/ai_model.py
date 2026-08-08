@@ -61,6 +61,16 @@ class AIModel(Base):
     # Whether callers may explicitly request provider-side disabled thinking.
     # Unknown models default to enabled for backwards compatibility.
     supports_disabled_thinking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
+    # ``auto`` preserves the legacy ``thinking_config.enabled`` mapping. A
+    # concrete value selects its matching entry from ``thinking_config.efforts``.
+    default_thinking_effort: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="auto", server_default="auto"
+    )
+    # Explicit cache breakpoints require an endpoint that supports the current
+    # OpenAI prompt-caching request fields, so this remains opt-in per model.
+    prompt_cache_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     # ``all`` 保持历史行为；``restricted`` 时仅直接授权的用户或所属获授权组可使用。
     access_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="all", server_default="all")
     # Provider-specific reasoning request mappings. Besides enabled/disabled, presets

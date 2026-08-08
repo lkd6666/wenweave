@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -42,6 +42,7 @@ class ScriptedChatModel(BaseChatModel):
     script: list[dict[str, Any]] = []
     seen_message_counts: list[int] = []
     seen_messages: list[list[BaseMessage]] = []
+    bound_tool_names: list[str] = []
 
     @property
     def _llm_type(self) -> str:
@@ -49,6 +50,7 @@ class ScriptedChatModel(BaseChatModel):
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> "ScriptedChatModel":
         # 脚本已经决定了调用哪个工具，这里只需保持链式调用可用。
+        self.bound_tool_names = [str(getattr(tool, "name", "")) for tool in tools]
         return self
 
     async def _astream(
@@ -67,20 +69,24 @@ class ScriptedChatModel(BaseChatModel):
             raise RuntimeError("connection reset by peer")
         if step.get("tool"):
             name, args = step["tool"]
-            yield ChatGenerationChunk(
-                message=AIMessageChunk(
-                    content="",
-                    tool_call_chunks=[
-                        {
-                            "name": name,
-                            "args": json.dumps(args, ensure_ascii=False),
-                            "id": f"call-{len(self.seen_message_counts)}",
-                            "index": 0,
-                            "type": "tool_call_chunk",
-                        }
-                    ],
+            serialized_args = json.dumps(args, ensure_ascii=False)
+            fragments = step.get("tool_argument_fragments") or [serialized_args]
+            for index, fragment in enumerate(fragments):
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content="",
+                        tool_call_chunks=[
+                            {
+                                **({"name": name, "id": f"call-{len(self.seen_message_counts)}"} if index == 0 else {}),
+                                "args": fragment,
+                                "index": 0,
+                                "type": "tool_call_chunk",
+                            }
+                        ],
+                    )
                 )
-            )
+                if index < len(fragments) - 1 and step.get("tool_argument_fragment_delay"):
+                    await asyncio.sleep(float(step["tool_argument_fragment_delay"]))
         if step.get("hang_after_tool"):
             # Simulate a compatible gateway that sent complete JSON but never
             # sends the terminating stream frame. The agent must close it.
@@ -97,6 +103,7 @@ def _run(
     timeout: float | None = None,
     attached_templates: Sequence[dict[str, Any]] | None = None,
     tool_output_store: ToolOutputStore | None = None,
+    selected_elements: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     async def go() -> list[dict[str, Any]]:
         return [
@@ -109,7 +116,7 @@ def _run(
                 session.document_map(),
                 None,
                 [],
-                None,
+                selected_elements,
                 None,
                 session,
                 None,
@@ -185,6 +192,99 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertIn("已读取 2 个附加模板", result)
         self.assertEqual(events[-1]["event"], "final")
 
+    def test_theme_component_reader_accepts_json_array_tool_argument(self) -> None:
+        session = HtmlEditSession(
+            '<section><h1><span leaf="">标题</span></h1><p><span leaf="">正文内容</span></p></section>'
+        )
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("read_gzh_theme_components", {"component_ids": '["1", "2"]'})},
+                {"text": "已读取主题组件。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        theme_application = {
+            "theme_name": "数组兼容主题",
+            "article_type": "教程/操作指南",
+            "recipe_id": "recipe-01",
+            "selected_component_ids": ["1", "2", "6d"],
+            "components": [
+                {"id": "1", "name": "标题", "html": "<h1>标题</h1>"},
+                {"id": "2", "name": "导语", "html": "<p>导语</p>"},
+                {"id": "6d", "name": "引用", "html": "<blockquote>引用</blockquote>"},
+            ],
+        }
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "主题组件参数兼容测试稿",
+                    session.html,
+                    "读取主题组件",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    theme_application=theme_application,
+                )
+            ]
+
+        events = asyncio.run(go())
+
+        result = next(
+            event["data"]["result"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "read_gzh_theme_components"
+        )
+        self.assertIn("已读取 2 个已确认主题组件", result)
+        self.assertEqual(events[-1]["event"], "final")
+
+    def test_validation_tools_are_exposed_only_for_their_applicable_context(self) -> None:
+        ordinary_model = ScriptedChatModel(
+            script=[{"text": "无需修改。"}],
+            seen_message_counts=[],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+        _run(ordinary_model, HtmlEditSession(SOURCE_HTML))
+
+        self.assertIn("check_compliance", ordinary_model.bound_tool_names)
+        self.assertNotIn("validate_gzh_html", ordinary_model.bound_tool_names)
+
+        theme_model = ScriptedChatModel(
+            script=[{"text": "主题任务已准备。"}],
+            seen_message_counts=[],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+        theme_application = {
+            "theme_name": "测试主题",
+            "apply_mode": "full",
+            "article_type": "通用",
+            "selected_component_ids": ["heading"],
+        }
+
+        async def go() -> None:
+            async for _ in run_agent_loop(
+                theme_model,
+                "主题工具可见性测试稿",
+                SOURCE_HTML,
+                "应用主题",
+                HtmlEditSession(SOURCE_HTML).document_map(),
+                None,
+                [],
+                theme_application=theme_application,
+            ):
+                pass
+
+        asyncio.run(go())
+
+        self.assertIn("check_compliance", theme_model.bound_tool_names)
+        self.assertIn("validate_gzh_html", theme_model.bound_tool_names)
+
     def _patch_script(self, session: HtmlEditSession) -> list[dict[str, Any]]:
         blocks = session.search("旧标题")["results"]
         heading = next(item for item in blocks if item["tag"] == "h1")
@@ -241,6 +341,140 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertIn("compliance", final)
         # 会话对象与 final 事件必须一致，取消时的部分持久化依赖这一点。
         self.assertEqual(session.html, final["html"])
+
+    def test_continuous_local_patches_reuse_an_untouched_block_without_reloading_map(self) -> None:
+        source = "<section><p>first</p><p>second</p></section>"
+        session = HtmlEditSession(source)
+        first = next(item for item in session.search("first")["results"] if item["tag"] == "p")
+        second = next(item for item in session.search("second")["results"] if item["tag"] == "p")
+        read = session.read_blocks([first["block_id"], second["block_id"]])
+        hashes = {block["block_id"]: block["expected_hash"] for block in read["blocks"]}
+        after_first = source.replace("first", "FIRST-UPDATED")
+        after_first_revision = HtmlWorkspace.revision_for(after_first)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_html", {"query": "first second"})},
+                {"tool": ("read_blocks", {"block_ids": [first["block_id"], second["block_id"]]})},
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": read["revision"],
+                            "operations": [
+                                {
+                                    "block_id": first["block_id"],
+                                    "expected_hash": hashes[first["block_id"]],
+                                    "mode": "replace_inner",
+                                    "html": "FIRST-UPDATED",
+                                }
+                            ],
+                        },
+                    )
+                },
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": after_first_revision,
+                            "operations": [
+                                {
+                                    "block_id": second["block_id"],
+                                    "expected_hash": hashes[second["block_id"]],
+                                    "mode": "replace_inner",
+                                    "html": "SECOND-UPDATED",
+                                }
+                            ],
+                        },
+                    )
+                },
+                {"tool": ("check_compliance", {})},
+                {"text": "两处独立段落已连续更新。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+        tool_names = [
+            event["data"]["name"]
+            for event in events
+            if event["event"] == "tool_call" and not event["data"].get("preparing")
+        ]
+        first_edit_activity = next(
+            event["data"]["activity"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_html_patch"
+        )
+
+        self.assertEqual(
+            tool_names,
+            ["search_html", "read_blocks", "apply_html_patch", "apply_html_patch", "check_compliance"],
+        )
+        self.assertNotIn("get_document_map", tool_names)
+        self.assertGreater(first_edit_activity["continuity"]["preserved_block_count"], 0)
+        self.assertIn("FIRST-UPDATED", session.html)
+        self.assertIn("SECOND-UPDATED", session.html)
+        self.assertEqual(events[-1]["event"], "final")
+
+    def test_selected_anchor_is_relocated_before_the_next_model_turn(self) -> None:
+        source = '<section><p><img src="https://cdn.example/target.png"></p><p>其他内容</p></section>'
+        session = HtmlEditSession(source)
+        section = next(block for block in session.workspace().blocks if block.tag == "section")
+        next_html = '<p>其他内容</p><p><img src="https://cdn.example/target.png"></p>'
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": session.workspace().revision,
+                            "operations": [
+                                {
+                                    "block_id": section.block_id,
+                                    "expected_hash": section.expected_hash,
+                                    "mode": "replace_inner",
+                                    "html": next_html,
+                                }
+                            ],
+                        },
+                    )
+                },
+                {"text": "已移动选中图片。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        anchor = {
+            "selector": "section:nth-of-type(1) > p:nth-of-type(1) > img:nth-of-type(1)",
+            "tag_name": "img",
+            "html": '<img src="https://cdn.example/target.png">',
+            "text": "",
+            "locator": {
+                "path": "section:nth-of-type(1) > p:nth-of-type(1) > img:nth-of-type(1)",
+                "parent_path": "section:nth-of-type(1) > p:nth-of-type(1)",
+                "sibling_index": 1,
+                "fingerprint": {
+                    "tag_name": "img",
+                    "stable_attributes": {"src": "https://cdn.example/target.png"},
+                    "text": "",
+                },
+            },
+        }
+
+        events = _run(model, session, selected_elements=[anchor])
+
+        self.assertEqual(events[-1]["event"], "final")
+        self.assertGreaterEqual(len(model.seen_messages), 2)
+        first_system = model.seen_messages[0][0]
+        second_system = model.seen_messages[1][0]
+        self.assertIsInstance(first_system, SystemMessage)
+        self.assertIsInstance(second_system, SystemMessage)
+        self.assertIn("status=exact", str(first_system.content))
+        self.assertIn("status=relocated", str(second_system.content))
+        self.assertIn(
+            "path=section:nth-of-type(1) > p:nth-of-type(2) > img:nth-of-type(1)",
+            str(second_system.content),
+        )
 
     def test_bound_layout_template_is_readable_by_tools_without_entering_system_prompt(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
@@ -322,6 +556,76 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertTrue(tool_calls)
         self.assertEqual(tool_calls, tool_results)
         self.assertTrue(any(event["kind"] == "assistant" and event["payload"].get("content") for event in ledger))
+
+    def test_image_replacement_uses_current_semantic_locator_without_searching_history_or_html(self) -> None:
+        source = (
+            "<article>"
+            "<p>校徽</p><p><img src='https://cdn.example/logo.png'></p>"
+            "<p>主标题后的宣传横幅</p><p><img src='https://cdn.example/banner-old.png'></p>"
+            "<p>一、活动主题</p><p><img src='https://cdn.example/theme-old.png'></p>"
+            "<p>二、活动对象</p><p><img src='https://cdn.example/audience.png'></p>"
+            "<p>七、报名方式</p><p><img src='https://cdn.example/signup-old.png'></p>"
+            "<p>附件 1：</p><p><img src='https://cdn.example/form.png'></p>"
+            "<p>附件 2：</p><p><img src='https://cdn.example/qrcode.png'></p>"
+            "</article>"
+        )
+        session = HtmlEditSession(source)
+        workspace = session.workspace()
+        target_queries = ["宣传横幅", "活动主题", "报名方式"]
+        targets = [workspace.image_inventory(query=query, limit=8)["images"][0] for query in target_queries]
+        read = session.read_blocks([item["block_id"] for item in targets])
+        replacements = [
+            {
+                "block_id": block["block_id"],
+                "expected_hash": block["expected_hash"],
+                "mode": "replace_outer",
+                "html": f"<img src='https://cdn.example/new-{index}.png' alt='更新配图 {index}'>",
+            }
+            for index, block in enumerate(read["blocks"], start=1)
+        ]
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("inspect_current_images", {"query": "活动主题", "limit": 8})},
+                {"tool": ("read_blocks", {"block_ids": [item["block_id"] for item in targets]})},
+                {"tool": ("apply_html_patch", {"revision": read["revision"], "operations": replacements})},
+                {"tool": ("check_compliance", {})},
+                {"text": "三处配图已根据当前文章位置更新。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+        tool_names = [
+            event["data"]["name"]
+            for event in events
+            if event["event"] == "tool_call" and not event["data"].get("preparing")
+        ]
+        activity = next(
+            event["data"]["activity"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "inspect_current_images"
+        )
+
+        self.assertEqual(tool_names, ["inspect_current_images", "read_blocks", "apply_html_patch", "check_compliance"])
+        inspect_call = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_call"
+            and not event["data"].get("preparing")
+            and event["data"]["name"] == "inspect_current_images"
+        )
+        self.assertEqual(
+            inspect_call["arguments"],
+            {"query": "活动主题", "limit": 8, "cursor": 0},
+        )
+        self.assertEqual(len(activity["targets"]), 1)
+        self.assertIn("前文：一、活动主题", activity["targets"][0]["text"])
+        self.assertNotIn("search_html", tool_names)
+        self.assertNotIn("search_history_version", tool_names)
+        self.assertIn("form.png", session.html)
+        self.assertIn("new-3.png", session.html)
+        self.assertEqual(events[-1]["event"], "final")
 
     def test_large_tool_result_is_previewed_for_the_next_model_turn(self) -> None:
         """The graph must retain raw output outside, not inside, provider history."""
@@ -561,6 +865,93 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         ]
         self.assertTrue(snapshots, "修改工具必须立即推送 HTML 快照，否则预览要等整轮结束")
         self.assertIn("新标题", snapshots[-1])
+
+    def test_streamed_tool_parameters_publish_a_live_token_count(self) -> None:
+        """The preparing timeline can replace its static label while args stream."""
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_html", {"query": "正文内容"})},
+                {"text": "已找到对应排版块。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+
+        progress_events = [
+            event["data"]
+            for event in events
+            if event["event"] == "tool_call"
+            and event["data"].get("preparing") is True
+            and isinstance(event["data"].get("argument_tokens"), int)
+        ]
+        self.assertTrue(progress_events)
+        self.assertGreater(progress_events[-1]["argument_tokens"], 0)
+
+    def test_streamed_patch_parameter_tokens_increase_with_each_fragment(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": ("search_html", {"query": "正文内容和标题"}),
+                    "tool_argument_fragments": ['{"query":"正', '文内容和标题"}'],
+                    "tool_argument_fragment_delay": 0.3,
+                },
+                {"text": "已找到对应排版块。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+
+        token_counts = [
+            event["data"]["argument_tokens"]
+            for event in events
+            if event["event"] == "tool_call"
+            and event["data"].get("preparing") is True
+            and isinstance(event["data"].get("argument_tokens"), int)
+        ]
+        self.assertGreaterEqual(len(token_counts), 2)
+        self.assertGreater(token_counts[-1], token_counts[0])
+
+    def test_ask_user_parameter_tokens_increase_without_a_stream_delay(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "ask_user",
+                        {
+                            "question": "请选择标题样式",
+                            "options": [{"label": "大标题"}, {"label": "小标题"}],
+                        },
+                    ),
+                    "tool_argument_fragments": [
+                        '{"question":"请选择标题',
+                        '样式","options":[{"label":"大标题"},{"label":"小标题"}]}',
+                    ],
+                },
+                {"text": "收到你的选择。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+
+        token_counts = [
+            event["data"]["argument_tokens"]
+            for event in events
+            if event["event"] == "tool_call"
+            and event["data"].get("preparing") is True
+            and event["data"].get("name") == "ask_user"
+            and isinstance(event["data"].get("argument_tokens"), int)
+        ]
+        self.assertGreaterEqual(len(token_counts), 2)
+        self.assertGreater(token_counts[-1], token_counts[0])
 
     def test_complete_write_tool_json_does_not_wait_for_provider_stream_close(self) -> None:
         """兼容网关漏掉 finish_reason 时，完整补丁仍必须立即执行。"""

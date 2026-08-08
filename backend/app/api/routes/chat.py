@@ -20,6 +20,8 @@ from sqlalchemy.orm import Session
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import get_current_user
+from app.api.sse import SSE_RESPONSE_HEADERS
+from app.bootstrap import recover_expired_agent_runs
 from app.core.config import get_settings
 from app.core.security import create_scoped_token, decode_access_token
 from app.db.session import SessionLocal, get_db
@@ -27,6 +29,8 @@ from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.agent_run_event import AgentRunEvent
 from app.models.app_runtime_lock import AppRuntimeLock
 from app.models.ai_model import AIModel
+from app.models.ai_image_model import AIImageModel
+from app.models.image_generation import GeneratedImageAsset, ImageGeneration
 from app.models.chat_message import ChatMessage, MessageRole
 from app.models.chat_image_attachment import ChatImageAttachment
 from app.models.chat_context_event import ChatContextEvent, ContextEventKind
@@ -53,6 +57,7 @@ from app.schemas.chat import (
     ChatUserQuestionAnswerRequest,
     ChatUserQuestionRead,
     ChatSessionCreate,
+    ChatSessionImageSettingsUpdate,
     ChatSessionRead,
     ChatSessionTemplateAttachmentsUpdate,
     ChatSessionUpdate,
@@ -65,6 +70,7 @@ from app.services.chat_agent import (
     HtmlEditSession,
     build_chat_model,
     build_compaction_model,
+    build_agent_prompt_cache_key,
     claim_thinking_capability_fallback_data,
     context_budget_prompt,
     restore_resume_messages,
@@ -78,6 +84,7 @@ from app.services.chat_session_context import (
     clear_session_theme_proposal,
     replace_session_attached_templates,
     session_attached_templates,
+    session_approved_theme_proposal,
     session_theme_proposal,
 )
 from app.services.document_activity import touch_document, touch_group
@@ -94,7 +101,7 @@ from app.services.layout_reference import (
     session_layout_reference_agent_payload,
     session_layout_reference_summary,
 )
-from app.services.model_access import can_access_model
+from app.services.model_access import can_access_image_model, can_access_model
 from app.services.model_call_accounting import ModelCallTracker
 from app.services.tool_output_store import ToolOutputStore
 from app.services.wechat_compliance import run_compliance_check
@@ -106,10 +113,55 @@ from app.services.gzh_theme import (
     reask_theme_proposal_id,
 )
 from app.services.operation_logs import append_operation_log, get_operation_request_id, get_operation_request_metadata
+from app.services.runtime_diagnostics import log_process_memory
 
 
 def _template_payload_from_models(templates: list[TemplateLibraryItem]) -> list[dict]:
     return [{"id": item.id, "name": item.name, "html": item.html} for item in templates]
+
+
+def _agent_image_model(
+    db: Session,
+    user_id: int,
+    requested_model_id: int | None,
+) -> AIImageModel | None:
+    """Resolve an Agent image model without exposing inaccessible providers."""
+    from sqlalchemy.orm import joinedload as _joinedload
+
+    actor = db.get(User, user_id)
+    if actor is None:
+        return None
+    if requested_model_id is not None:
+        requested = (
+            db.query(AIImageModel)
+            .options(_joinedload(AIImageModel.provider))
+            .filter(AIImageModel.id == requested_model_id)
+            .first()
+        )
+        if (
+            requested is not None
+            and can_access_image_model(actor, requested)
+            and requested.provider.image_protocol
+            and requested.provider.image_base_url
+        ):
+            return requested
+    # Eager-load provider to avoid N+1 queries when checking image_protocol.
+    candidates = (
+        db.query(AIImageModel)
+        .options(_joinedload(AIImageModel.provider))
+        .order_by(AIImageModel.is_default.desc(), AIImageModel.id)
+        .all()
+    )
+    return next(
+        (
+            model
+            for model in candidates
+            if can_access_image_model(actor, model)
+            and model.provider.image_protocol
+            and model.provider.image_base_url
+        ),
+        None,
+    )
 
 
 def _attached_template_payload(db: Session, template_ids: list[int]) -> list[dict]:
@@ -178,10 +230,16 @@ settings = get_settings()
 AGENT_EVENT_IDLE_TIMEOUT_SECONDS = settings.CHAT_AGENT_EVENT_IDLE_TIMEOUT_SECONDS
 AGENT_MAX_RUNTIME_SECONDS = settings.CHAT_AGENT_MAX_RUNTIME_SECONDS
 AGENT_TURN_FINALIZATION_TIMEOUT_SECONDS = settings.CHAT_AGENT_TURN_FINALIZATION_TIMEOUT_SECONDS
+AGENT_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS = settings.CHAT_AGENT_MODEL_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS
 CANCEL_GRACE_SECONDS = 8
 FORCED_CANCELLATION_MESSAGE = "已停止本轮操作。模型未在短时间内响应停止请求，后续输出未被保存。"
 CONTEXT_LIMIT_ERROR_PATTERN = re.compile(
     r"context(?:[_ -]?length)?|maximum context|input.*too (?:long|large)|too many tokens|token limit",
+    re.IGNORECASE,
+)
+MODEL_CAPACITY_ERROR_PATTERN = re.compile(
+    r"(?:\b429\b|\b503\b|rate.?limit|too many requests|overloaded|service(?:[_ ]is)? too busy|"
+    r"service[_ ]unavailable|concurrency (?:limit|exceeded)|concurrent requests|account.*busy)",
     re.IGNORECASE,
 )
 CHAT_IMAGE_PREVIEW_SCOPE = "chat-image-preview"
@@ -839,6 +897,8 @@ def _session_read(db: Session, session: ChatSession) -> dict:
             if theme_proposal
             else None
         ),
+        "image_model_id": session.image_model_id,
+        "auto_image_generation_enabled": session.auto_image_generation_enabled,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -965,6 +1025,92 @@ def _settle_user_question_timeline(
         if isinstance(block, dict) and isinstance(block.get("tool"), dict):
             settle_tool(block["tool"])
     return timeline_tool_id
+
+
+def _preserve_retried_tool_previews(
+    checkpoint_tools: list[dict],
+    checkpoint_blocks: list[dict],
+    current_tools: list[dict],
+    current_blocks: list[dict],
+    retry_data: dict,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Retain interrupted parameter generation as a truthful timeline entry.
+
+    A provider retry must discard incomplete model content so it cannot be
+    mistaken for a completed response. A pending tool call is different: it is
+    useful operational evidence, especially for large HTML patches. Preserve
+    it as ``interrupted`` with a new display ID, while the retried request is
+    free to reuse the provider's original call ID.
+    """
+    baseline_ids = {
+        str(tool.get("id") or "")
+        for tool in checkpoint_tools
+        if isinstance(tool, dict) and tool.get("id")
+    }
+    retry_attempt = max(1, int(retry_data.get("attempt") or 1))
+    suffix = f":retry-{retry_attempt}"
+    interrupted_by_source_id: dict[str, dict] = {}
+
+    for tool in current_tools:
+        if not isinstance(tool, dict):
+            continue
+        source_id = str(tool.get("id") or "")
+        if (
+            not source_id
+            or source_id in baseline_ids
+            or tool.get("status") != "running"
+            or not tool.get("preparing")
+        ):
+            continue
+        interrupted = copy.deepcopy(tool)
+        interrupted["id"] = f"{source_id}{suffix}"
+        interrupted["status"] = "interrupted"
+        interrupted["preparing"] = False
+        interrupted["result"] = "本次工具参数生成被模型重试中断，尚未执行任何修改。"
+        interrupted["activity"] = {
+            "kind": "retry",
+            "summary": "参数生成中断，正在重新请求模型",
+            "details": {"retry_reason": str(retry_data.get("reason") or "unknown")},
+        }
+        interrupted_by_source_id[source_id] = interrupted
+
+    if not interrupted_by_source_id:
+        return copy.deepcopy(checkpoint_tools), copy.deepcopy(checkpoint_blocks), []
+
+    next_tools = [*copy.deepcopy(checkpoint_tools), *interrupted_by_source_id.values()]
+    next_blocks = copy.deepcopy(checkpoint_blocks)
+    block_tool_ids: set[str] = set()
+    for block in current_blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool":
+            continue
+        source_tool = block.get("tool")
+        if not isinstance(source_tool, dict):
+            continue
+        source_id = str(source_tool.get("id") or "")
+        interrupted = interrupted_by_source_id.get(source_id)
+        if not interrupted:
+            continue
+        copied_block = copy.deepcopy(block)
+        copied_block["id"] = f"{str(block.get('id') or f'block-{source_id}')}{suffix}"
+        copied_block["state"] = "done"
+        copied_block["content"] = str(copied_block.get("content") or "")
+        copied_block["tool"] = interrupted
+        next_blocks.append(copied_block)
+        block_tool_ids.add(str(interrupted["id"]))
+
+    for source_id, interrupted in interrupted_by_source_id.items():
+        if str(interrupted["id"]) in block_tool_ids:
+            continue
+        next_blocks.append(
+            {
+                "id": f"block-{source_id}{suffix}",
+                "type": "tool",
+                "state": "done",
+                "content": "",
+                "tool": interrupted,
+            }
+        )
+    return next_tools, next_blocks, [str(item["id"]) for item in interrupted_by_source_id.values()]
 
 
 def _unresolved_edit_failure(tool_calls: list[dict]) -> tuple[str, str] | None:
@@ -1249,7 +1395,9 @@ def _restart_failure_events(
 
 
 def _agent_execution_error_message(message: str) -> str:
-    """Avoid duplicating the public prefix when a graph error is re-raised."""
+    """Return a safe, actionable browser message while retaining raw diagnostics."""
+    if MODEL_CAPACITY_ERROR_PATTERN.search(message):
+        return "当前模型服务繁忙或并发已满。请稍后重试，或更换其他可用模型后重新发送本轮请求。"
     prefix = "Agent 执行失败:"
     return message if message.startswith(prefix) else f"{prefix} {message}"
 
@@ -1344,7 +1492,10 @@ async def _force_stuck_cancellation(run_id: str, document_id: int) -> None:
     agent_run_manager.request_cancel(run_id)
     db = SessionLocal()
     try:
-        run = db.get(AgentRun, run_id)
+        # Fence the executing worker before saving a forced terminal result.
+        # This lock is acquired before the document lock, matching normal
+        # terminal persistence and lease recovery.
+        run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().first()
         document = (
             db.query(Document)
             .filter(Document.id == document_id)
@@ -1370,6 +1521,10 @@ async def _force_stuck_cancellation(run_id: str, document_id: int) -> None:
         run.status = AgentRunStatus.CANCELLED
         run.error_message = terminal_message
         run.finished_at = datetime.now(timezone.utc)
+        run.owner_id = ""
+        run.lease_expires_at = None
+        run.last_phase = "forced_cancelled"
+        run.last_progress_at = run.finished_at
         append_operation_log(
             db,
             actor=(
@@ -1484,6 +1639,31 @@ def rename_chat_session(
     _get_accessible_document(db, document_id, current_user)
     session = _get_chat_session(db, document_id, session_id)
     session.title = payload.title.strip() or "新对话"
+    db.commit()
+    db.refresh(session)
+    return _session_read(db, session)
+
+
+@router.patch("/{document_id}/chat-sessions/{session_id}/image-settings", response_model=ChatSessionRead)
+def update_chat_session_image_settings(
+    document_id: int,
+    session_id: int,
+    payload: ChatSessionImageSettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _get_accessible_document(db, document_id, current_user)
+    session = _get_chat_session(db, document_id, session_id, allow_archived=False)
+    if payload.image_model_id is None:
+        session.image_model_id = None
+    else:
+        model = db.get(AIImageModel, payload.image_model_id)
+        if model is None or not can_access_image_model(current_user, model):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="你没有使用该图片模型的权限")
+        if not model.provider.image_protocol or not model.provider.image_base_url:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该 Provider 尚未配置图片生成端点")
+        session.image_model_id = model.id
+    session.auto_image_generation_enabled = payload.auto_image_generation_enabled
     db.commit()
     db.refresh(session)
     return _session_read(db, session)
@@ -2090,6 +2270,12 @@ async def start_chat_run(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     theme_application: dict | None = None
     theme_proposal_id = payload.gzh_theme_proposal_id or inherited_theme_proposal_id
+    if theme_proposal_id is None:
+        # A failed or stopped initial application leaves the confirmed proposal
+        # approved. Continue it in this session without making the user approve
+        # the same unchanged proposal again.
+        pending_proposal = session_approved_theme_proposal(db, chat_session.id)
+        theme_proposal_id = pending_proposal.id if pending_proposal else None
     if theme_proposal_id:
         try:
             proposal = consume_approved_proposal(
@@ -2177,6 +2363,7 @@ async def start_chat_run(
         model,
         payload.thinking_mode,
         payload.thinking_effort,
+        prompt_cache_key=build_agent_prompt_cache_key(model.provider, model, current_user.id),
     )
     compaction_model = build_compaction_model(model.provider, model)
     user_message = ChatMessage(
@@ -2561,7 +2748,13 @@ async def answer_chat_user_question(
     thinking_mode = str(execution_context.get("thinking_mode") or "auto")
     if thinking_mode not in {"auto", "enabled", "disabled"}:
         thinking_mode = "auto"
-    chat_model, thinking_status = build_chat_model(model.provider, model, thinking_mode, "auto")
+    chat_model, thinking_status = build_chat_model(
+        model.provider,
+        model,
+        thinking_mode,
+        "auto",
+        prompt_cache_key=build_agent_prompt_cache_key(model.provider, model, current_user.id),
+    )
     compaction_model = build_compaction_model(model.provider, model)
     question.status = ChatUserQuestionStatus.ANSWERED
     question.answer_json = json.dumps(canonical_answer, ensure_ascii=False)
@@ -2710,6 +2903,8 @@ async def cancel_chat_run(
         run.finished_at = datetime.now(timezone.utc)
         run.owner_id = ""
         run.lease_expires_at = None
+        run.last_phase = "cancelled_waiting_for_input"
+        run.last_progress_at = run.finished_at
         db.commit()
         if question:
             cancel_user_question_timeout(question.id)
@@ -2749,36 +2944,17 @@ async def stream_chat_run_events(
     if not run or run.document_id != document_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="执行记录不存在")
 
-    changed = False
     if run.status in EXECUTING_RUN_STATUSES and _run_lease_expired(run):
-        # Only an expired owner lease proves that no worker can still be
-        # executing this graph.  A missing local cache is normal behind a
-        # load balancer and must never be treated as a restart.
-        run.status = AgentRunStatus.FAILED
-        run.error_message = "Agent 工作进程心跳已超时，未完成的操作已停止；请重新执行本轮操作"
-        run.finished_at = datetime.now(timezone.utc)
-        run.owner_id = ""
-        run.lease_expires_at = None
-        changed = True
-    restart_save_state = "none"
-    if changed and run.status == AgentRunStatus.FAILED:
-        restart_save_state = _persist_restart_failure(db, run, document)
-        changed = True
-    restart_events = (
-        _restart_failure_events(
-            str(run.error_message),
-            str(document.current_html),
-            restart_save_state,
-        )
-        if changed and run.status == AgentRunStatus.FAILED
-        else []
-    )
-    if changed:
-        db.commit()
+        # The periodic recovery loop is the normal path. Keep this as a
+        # synchronous safety net for a request that arrives exactly at lease
+        # expiry, but use the same transactional recovery path so model calls,
+        # checkpoints and the final replay event stay consistent.
+        recover_expired_agent_runs(db)
+        db.expire_all()
+        run = db.get(AgentRun, run_id)
+        document = db.get(Document, document_id)
 
     async def event_generator():
-        for event in restart_events:
-            yield event
         async for item in agent_run_manager.events_after(run_id, after):
             if item.event == "user_question" and not await asyncio.to_thread(
                 _is_current_waiting_question_event,
@@ -2786,9 +2962,10 @@ async def stream_chat_run_events(
                 item.data,
             ):
                 continue
+            event_age_ms = max(0, round((datetime.now(timezone.utc) - item.occurred_at).total_seconds() * 1000))
             event = {
                 "event": item.event,
-                "data": json.dumps(item.data, ensure_ascii=False),
+                "data": json.dumps({**item.data, "_event_age_ms": event_age_ms}, ensure_ascii=False),
             }
             if item.sequence > 0:
                 event["id"] = str(item.sequence)
@@ -2797,7 +2974,7 @@ async def stream_chat_run_events(
     return EventSourceResponse(
         event_generator(),
         ping=15,
-        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+        headers=SSE_RESPONSE_HEADERS,
     )
 
 
@@ -2806,6 +2983,7 @@ async def _iterate_agent_events_with_timeout(events: AsyncIterator[dict]) -> Asy
     iterator = events.__aiter__()
     started_at = perf_counter()
     finalizing_turn = False
+    awaiting_tool_arguments = False
     try:
         while True:
             elapsed = perf_counter() - started_at
@@ -2814,11 +2992,12 @@ async def _iterate_agent_events_with_timeout(events: AsyncIterator[dict]) -> Asy
                 raise RuntimeError(
                     f"Agent 运行超过 {AGENT_MAX_RUNTIME_SECONDS} 秒总时限，已停止本轮执行"
                 )
-            idle_timeout = (
-                AGENT_TURN_FINALIZATION_TIMEOUT_SECONDS
-                if finalizing_turn
-                else AGENT_EVENT_IDLE_TIMEOUT_SECONDS
-            )
+            if finalizing_turn:
+                idle_timeout = AGENT_TURN_FINALIZATION_TIMEOUT_SECONDS
+            elif awaiting_tool_arguments:
+                idle_timeout = AGENT_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS
+            else:
+                idle_timeout = AGENT_EVENT_IDLE_TIMEOUT_SECONDS
             try:
                 event = await asyncio.wait_for(iterator.__anext__(), timeout=min(idle_timeout, remaining))
             except StopAsyncIteration:
@@ -2832,6 +3011,10 @@ async def _iterate_agent_events_with_timeout(events: AsyncIterator[dict]) -> Asy
                     raise RuntimeError(
                         f"Agent 在 {idle_timeout:g} 秒内未完成本轮响应整理，已停止本轮执行"
                     ) from exc
+                if awaiting_tool_arguments:
+                    raise RuntimeError(
+                        f"Agent 在 {idle_timeout:g} 秒内未收到新的工具参数片段，已停止本轮执行"
+                    ) from exc
                 raise RuntimeError(
                     f"Agent 连续 {idle_timeout:g} 秒没有产生任何输出或工具事件，已停止本轮执行"
                 ) from exc
@@ -2843,11 +3026,29 @@ async def _iterate_agent_events_with_timeout(events: AsyncIterator[dict]) -> Asy
                 and data.get("phase") == "model_turn_finalizing"
             ):
                 finalizing_turn = True
+            elif (
+                event_name == "tool_call"
+                and isinstance(data, dict)
+                and data.get("preparing") is True
+            ):
+                finalizing_turn = False
+                awaiting_tool_arguments = True
+            elif (
+                event_name == "heartbeat"
+                and isinstance(data, dict)
+                and data.get("phase") == "model_turn_started"
+            ):
+                finalizing_turn = False
+                awaiting_tool_arguments = False
+            elif event_name == "model_turn_retry":
+                finalizing_turn = False
+                awaiting_tool_arguments = False
             elif event_name in {"reasoning_delta", "text_delta", "tool_call", "tool_result", "final", "error"}:
                 # Stats and transport heartbeats can be flushed after the
                 # finalizing marker. They do not resume model work, so they
                 # must not silently relax the short finalization timeout.
                 finalizing_turn = False
+                awaiting_tool_arguments = False
             yield event
     finally:
         aclose = getattr(iterator, "aclose", None)
@@ -2880,6 +3081,13 @@ async def _execute_agent_run(
     resume_state: dict | None = None,
 ) -> None:
     """独立于浏览器 SSE 的执行任务；任何终态均保存已完成过程。"""
+    log_process_memory(
+        logger,
+        stage="agent_start",
+        worker_id=agent_run_manager.worker_id,
+        run_id=run_id,
+        document_id=document_id,
+    )
     stream_db = SessionLocal()
     resume_timeline = resume_state.get("timeline", {}) if isinstance(resume_state, dict) else {}
     tool_trace: list[dict] = list(resume_timeline.get("tool_calls", [])) if isinstance(resume_timeline, dict) else []
@@ -2959,6 +3167,13 @@ async def _execute_agent_run(
         context_events: list[dict] | None = None,
         runtime_compaction: dict | None = None,
     ) -> dict:
+        log_process_memory(
+            logger,
+            stage="agent_terminal_persist_start",
+            worker_id=agent_run_manager.worker_id,
+            run_id=run_id,
+            status=terminal_status.value,
+        )
         logger.warning(
             "agent_trace run=%s persist_start status=%s tools=%s blocks=%s html_changed=%s",
             run_id,
@@ -2995,7 +3210,12 @@ async def _execute_agent_run(
                 # message while a provider call was unwinding. Never overwrite
                 # that forced terminal result with late model output.
                 terminal_db.expire_all()
-                previous_run = terminal_db.get(AgentRun, run_id)
+                previous_run = (
+                    terminal_db.query(AgentRun)
+                    .filter(AgentRun.id == run_id)
+                    .with_for_update()
+                    .first()
+                )
                 if (
                     previous_run
                     and previous_run.status
@@ -3029,6 +3249,39 @@ async def _execute_agent_run(
                         "error_message": previous_run.error_message,
                     }
 
+                # A remote cancellation or lease recovery clears ownership in
+                # the same transaction that writes its terminal result. A late
+                # provider response from this worker must not create a message,
+                # alter the document or overwrite that terminal state.
+                if not previous_run or previous_run.owner_id != agent_run_manager.worker_id:
+                    document = terminal_db.get(Document, document_id)
+                    html = document.current_html if document else current_html
+                    return {
+                        "content": previous_run.error_message if previous_run else content,
+                        "html": html,
+                        "html_changed": False,
+                        "compliance": run_compliance_check(html).to_dict(),
+                        "cancelled": bool(previous_run and previous_run.status == AgentRunStatus.CANCELLED),
+                        "partial": True,
+                        "partial_save_state": "none",
+                        "run_status": previous_run.status.value if previous_run else AgentRunStatus.FAILED.value,
+                        "error_message": previous_run.error_message if previous_run else "Agent 运行所有权已失效",
+                    }
+
+                # Once cancellation is durable, a response that arrives while
+                # its task is winding down is a cancellation result, never a
+                # successful completion.
+                if (
+                    terminal_status == AgentRunStatus.COMPLETED
+                    and (
+                        previous_run.status == AgentRunStatus.CANCELLING
+                        or previous_run.cancel_requested_at is not None
+                    )
+                ):
+                    terminal_status = AgentRunStatus.CANCELLED
+                    error_message = previous_run.error_message or "已停止本轮操作。"
+                    content = partial_content("已停止本轮操作。")
+
                 document = (
                     terminal_db.query(Document)
                     .filter(Document.id == document_id)
@@ -3056,6 +3309,19 @@ async def _execute_agent_run(
                     touch_document(document, user_id)
                     if document.group:
                         touch_group(document.group, user_id)
+                    # Agent direct-insert flows use the normal HTML workspace
+                    # patch after receiving candidate URLs. Mark matching
+                    # assets as applied so the seven-day candidate sweep does
+                    # not remove an image that is now referenced by正文.
+                    referenced_assets = terminal_db.query(GeneratedImageAsset).filter(
+                        GeneratedImageAsset.is_applied.is_(False),
+                        GeneratedImageAsset.url != "",
+                        GeneratedImageAsset.generation.has(ImageGeneration.document_id == document_id),
+                    ).all()
+                    for asset in referenced_assets:
+                        if asset.url in latest_html:
+                            asset.is_applied = True
+                            asset.applied_at = datetime.now(timezone.utc)
 
                 assistant_message = ChatMessage(
                     document_id=document_id,
@@ -3167,6 +3433,13 @@ async def _execute_agent_run(
                     save_state,
                     terminal_status != AgentRunStatus.COMPLETED,
                     html_changed,
+                )
+                log_process_memory(
+                    logger,
+                    stage="agent_terminal_persist_done",
+                    worker_id=agent_run_manager.worker_id,
+                    run_id=run_id,
+                    status=terminal_status.value,
                 )
                 return {
                     "content": content,
@@ -3315,7 +3588,7 @@ async def _execute_agent_run(
             history_rows = [
                 row for row in history_rows if row.id > stream_session.context_start_message_id
             ]
-        session = HtmlEditSession(
+        edit_session = HtmlEditSession(
             current_html,
             stream_model.tool_result_max_tokens,
             checkpoint_callback=lambda html: _persist_run_checkpoint(run_id, html),
@@ -3336,7 +3609,7 @@ async def _execute_agent_run(
             document_id,
             session_id,
             stream_model,
-            session.workspace(),
+            edit_session.workspace(),
             history_rows,
             budget_prompt,
             user_message,
@@ -3498,6 +3771,21 @@ async def _execute_agent_run(
             provider_type=stream_model.provider.provider_type.value,
             include_images=stream_model.is_multimodal,
         )
+        selected_image_model = _agent_image_model(
+            stream_db,
+            user_id,
+            stream_session.image_model_id,
+        )
+        explicit_image_requested = any(
+            marker in user_message.lower()
+            for marker in ("配图", "生成图片", "生成图", "插图", "封面图", "设为封面", "设置封面", "作为封面", "直接插入")
+        )
+        image_generation_context = {
+            "enabled": bool(stream_session.auto_image_generation_enabled),
+            "explicit_requested": explicit_image_requested,
+            "image_model_id": selected_image_model.id if selected_image_model else None,
+            "model_name": selected_image_model.display_name if selected_image_model else "管理员默认图片模型",
+        }
         # Attachment hydration starts a new read transaction after the
         # preflight commit.  ``run_agent_loop`` can run for minutes, so end it
         # before entering the graph; every later persistence path owns a
@@ -3518,7 +3806,7 @@ async def _execute_agent_run(
                     prepared_context.history,
                     selected_elements,
                     active_layout_reference,
-                    session,
+                    edit_session,
                     history_workspace,
                     max(1, int(stream_model.context_compaction_threshold_tokens) - AGENT_TOOL_SCHEMA_RESERVE_TOKENS),
                     run_id,
@@ -3533,6 +3821,7 @@ async def _execute_agent_run(
                     resume_messages=resume_messages,
                     resume_tool_result=resume_tool_result,
                     prior_context_events=prior_context_events,
+                    image_generation_context=image_generation_context,
                 )
             ):
                 event = evt["event"]
@@ -3545,6 +3834,22 @@ async def _execute_agent_run(
                         run_id,
                         event,
                         data.get("phase", "-"),
+                    )
+                if event == "heartbeat" and data.get("phase") == "model_turn_started":
+                    log_process_memory(
+                        logger,
+                        stage="model_start",
+                        worker_id=agent_run_manager.worker_id,
+                        run_id=run_id,
+                        turn=data.get("turn"),
+                    )
+                elif event == "heartbeat" and data.get("phase") == "model_turn_finalizing":
+                    log_process_memory(
+                        logger,
+                        stage="model_finalize",
+                        worker_id=agent_run_manager.worker_id,
+                        run_id=run_id,
+                        turn=data.get("turn"),
                     )
                 if event == "reasoning_delta":
                     reasoning_text = data.get("text", "")
@@ -3569,8 +3874,15 @@ async def _execute_agent_run(
                     if model_turn_checkpoint and (
                         data.get("turn") is None or data.get("turn") == model_turn_checkpoint.get("turn")
                     ):
-                        tool_trace = copy.deepcopy(model_turn_checkpoint["tool_trace"])
-                        turn_blocks = copy.deepcopy(model_turn_checkpoint["turn_blocks"])
+                        tool_trace, turn_blocks, interrupted_tool_ids = _preserve_retried_tool_previews(
+                            model_turn_checkpoint["tool_trace"],
+                            model_turn_checkpoint["turn_blocks"],
+                            tool_trace,
+                            turn_blocks,
+                            data,
+                        )
+                        if interrupted_tool_ids:
+                            data = {**data, "interrupted_tool_ids": interrupted_tool_ids}
                         reasoning_parts = list(model_turn_checkpoint["reasoning_parts"])
                         reasoning_status = str(model_turn_checkpoint["reasoning_status"])
                         reasoning_detail = str(model_turn_checkpoint["reasoning_detail"])
@@ -3584,6 +3896,11 @@ async def _execute_agent_run(
                     if existing_tool:
                         existing_tool["name"] = data.get("name", existing_tool["name"])
                         existing_tool["arguments"] = data.get("arguments", existing_tool["arguments"])
+                        if isinstance(data.get("argument_tokens"), int):
+                            existing_tool["argument_tokens"] = max(
+                                int(existing_tool.get("argument_tokens") or 0),
+                                max(0, data["argument_tokens"]),
+                            )
                         if not data.get("preparing"):
                             existing_tool["preparing"] = False
                     else:
@@ -3593,11 +3910,19 @@ async def _execute_agent_run(
                             "arguments": data.get("arguments", {}),
                             "status": "running",
                             "preparing": bool(data.get("preparing")),
+                            "argument_tokens": max(0, int(data.get("argument_tokens") or 0)),
                             "result": None,
                             "html_changed": False,
                             "activity": None,
                         }
                         tool_trace.append(tool_entry)
+                        log_process_memory(
+                            logger,
+                            stage="tool_start",
+                            worker_id=agent_run_manager.worker_id,
+                            run_id=run_id,
+                            tool_name=tool_entry["name"],
+                        )
                         turn_blocks.append(
                             {
                                 "id": f"block-{tool_entry['id']}",
@@ -3630,13 +3955,20 @@ async def _execute_agent_run(
                         matched_tool["preparing"] = False
                         matched_tool["html_changed"] = bool(data.get("html"))
                         matched_tool["activity"] = data.get("activity")
+                    log_process_memory(
+                        logger,
+                        stage="tool_done",
+                        worker_id=agent_run_manager.worker_id,
+                        run_id=run_id,
+                        tool_name=data.get("name"),
+                    )
                     if data.get("html"):
                         latest_html = data["html"]
                     else:
                         # Tool activity is intentionally payload-safe; the
                         # mutable session remains the source for partial
                         # persistence if the run is cancelled after an edit.
-                        latest_html = session.html
+                        latest_html = edit_session.html
                 elif event == "user_question":
                     question = persist_waiting_question(data)
                     safe_question = _question_read(question)
@@ -3671,8 +4003,8 @@ async def _execute_agent_run(
                         # discard that transient candidate before failure
                         # persistence has a chance to create a version.
                         latest_html = str(data.get("html", current_html))
-                        session.html = latest_html
-                        session.edited = False
+                        edit_session.html = latest_html
+                        edit_session.edited = False
                         await asyncio.to_thread(_clear_run_checkpoint, run_id)
                         if isinstance(data.get("compliance"), dict):
                             terminal_compliance = data["compliance"]
@@ -3681,7 +4013,7 @@ async def _execute_agent_run(
                     # writes and must remain a terminal failure.
                     if (
                         not retried_for_context
-                        and not session.edited
+                        and not edit_session.edited
                         and not reasoning_parts
                         and not any(block.get("type") == "content" and block.get("content") for block in turn_blocks)
                         and _is_context_limit_error(detail)
@@ -3716,7 +4048,7 @@ async def _execute_agent_run(
                     document_id,
                     session_id,
                     stream_model,
-                    session.workspace(),
+                    edit_session.workspace(),
                     history_rows,
                     retry_budget_prompt,
                     user_message,
@@ -3768,11 +4100,12 @@ async def _execute_agent_run(
         await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
     except Exception as exc:  # noqa: BLE001
         message = str(exc) or "Agent 执行失败"
+        public_message = _agent_execution_error_message(message)
         logger.exception("agent_trace run=%s execution_failed detail=%s", run_id, message)
         try:
             terminal_data = persist_terminal(
                 AgentRunStatus.FAILED,
-                partial_content("本轮执行未完成。"),
+                partial_content(public_message),
                 error_message=message,
                 compliance=terminal_compliance,
                 context_events=terminal_context_events,
@@ -3784,10 +4117,16 @@ async def _execute_agent_run(
                 partial_content("本轮执行未完成，终态保存暂时不可用，未能确认修改是否已保存。"),
                 f"{message}; 终态保存失败: {persist_exc}",
             )
-        await agent_run_manager.publish(run_id, "error", {"message": _agent_execution_error_message(message)})
+        await agent_run_manager.publish(run_id, "error", {"message": public_message})
         await agent_run_manager.publish(run_id, "final", terminal_data)
         await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
         logger.warning("agent_trace run=%s failure_terminal_marked status=%s", run_id, terminal_data["run_status"])
     finally:
         stream_db.close()
+        log_process_memory(
+            logger,
+            stage="agent_end",
+            worker_id=agent_run_manager.worker_id,
+            run_id=run_id,
+        )
         logger.warning("agent_trace run=%s execution_closed", run_id)

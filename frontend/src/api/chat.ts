@@ -1,5 +1,4 @@
-import { useAuthStore } from '../store/authStore'
-import { ApiError } from './client'
+import { ApiError, authenticatedFetch } from './client'
 import type { AgentRunStatus, ChangeSummary, ChatContextStats, ChatHistoryArchive, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, LayoutReferenceImitationStrength, ReadRange, SelectedElementContext, ToolActivity, ToolExecution } from '../types'
 import { sanitizeSelectedElements } from '../utils/selectedElements'
 
@@ -12,9 +11,9 @@ const STREAM_INACTIVITY_TIMEOUT_MS = 5 * 60_000
 const CANCEL_REQUEST_TIMEOUT_MS = 10_000
 
 export type ChatStreamEvent =
-  | { event: 'text_delta'; data: { text: string } }
-  | { event: 'reasoning_delta'; data: { text: string } }
-  | { event: 'tool_call'; data: { id?: string; replaces_id?: string; name: string; arguments: ToolExecution['arguments']; preparing?: boolean } }
+  | { event: 'text_delta'; data: { text: string; _transient?: boolean } }
+  | { event: 'reasoning_delta'; data: { text: string; _transient?: boolean } }
+  | { event: 'tool_call'; data: { id?: string; replaces_id?: string; name: string; arguments: ToolExecution['arguments']; preparing?: boolean; argument_tokens?: number } }
   | { event: 'user_question'; data: ChatUserQuestion }
   | {
       event: 'tool_result'
@@ -93,7 +92,7 @@ export function reaskDocumentConflictFromError(error: unknown): ReaskDocumentCon
   return { code: detail.code, message: detail.message, current_checksum: detail.current_checksum }
 }
 
-export type SequencedChatStreamEvent = ChatStreamEvent & { sequence: number }
+export type SequencedChatStreamEvent = ChatStreamEvent & { sequence: number; eventAgeMs: number }
 
 export type ThinkingMode = 'auto' | 'enabled' | 'disabled'
 export type ThinkingEffort = 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -105,7 +104,7 @@ class StreamInactivityError extends Error {
   }
 }
 
-function parseSseChunk(buffer: string): { events: SequencedChatStreamEvent[]; rest: string } {
+export function parseSseChunk(buffer: string): { events: SequencedChatStreamEvent[]; rest: string } {
   const events: SequencedChatStreamEvent[] = []
   // EventSourceResponse 使用标准 CRLF（\r\n\r\n）分隔 SSE 事件。此前只按 \n\n
   // 切分，导致增量事件被留在 buffer 中直到响应结束才被一次性渲染。
@@ -129,10 +128,18 @@ function parseSseChunk(buffer: string): { events: SequencedChatStreamEvent[]; re
     const dataStr = dataLines.join('\n')
     if (!dataStr) continue
     try {
+      const rawData = JSON.parse(dataStr) as unknown
+      if (!rawData || typeof rawData !== 'object' || Array.isArray(rawData)) continue
+      const parsedData = { ...rawData } as Record<string, unknown>
+      const rawEventAgeMs = parsedData._event_age_ms
+      delete parsedData._event_age_ms
       events.push({
         sequence: eventId,
+        eventAgeMs: typeof rawEventAgeMs === 'number' && Number.isFinite(rawEventAgeMs)
+          ? Math.max(0, rawEventAgeMs)
+          : 0,
         event: eventName as ChatStreamEvent['event'],
-        data: JSON.parse(dataStr),
+        data: parsedData,
       } as SequencedChatStreamEvent)
     } catch {
       // 忽略无法解析的片段
@@ -161,7 +168,6 @@ export async function startChatRun(
   reaskConflictResolution?: ReaskConflictResolution,
   signal?: AbortSignal,
 ): Promise<AgentRunInfo> {
-  const token = useAuthStore.getState().token
   let lastError: unknown
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -171,7 +177,6 @@ export async function startChatRun(
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
           body: JSON.stringify({
             message,
@@ -199,7 +204,6 @@ export async function startChatRun(
         START_RUN_TIMEOUT_MS,
         '创建 Agent 运行超时，正在确认请求状态',
       )
-      if (res.status === 401) useAuthStore.getState().logout()
       if (!res.ok) {
         let detail: unknown = res.statusText
         try {
@@ -227,14 +231,12 @@ export async function* streamChatRunEvents(
   after: number,
   signal?: AbortSignal,
 ): AsyncGenerator<SequencedChatStreamEvent> {
-  const token = useAuthStore.getState().token
   const res = await fetchWithTimeout(
     `${API_BASE}/documents/${documentId}/chat-runs/${runId}/events?after=${after}`,
-    { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal },
+    { signal },
     STREAM_CONNECT_TIMEOUT_MS,
     '建立实时输出连接超时',
   )
-  if (res.status === 401) useAuthStore.getState().logout()
   if (!res.ok) {
     let detail: unknown = res.statusText
     try {
@@ -278,12 +280,10 @@ export async function* streamChatRunEvents(
 }
 
 export async function cancelChatRun(documentId: number, runId: string): Promise<AgentRunInfo> {
-  const token = useAuthStore.getState().token
   const res = await fetchWithTimeout(
     `${API_BASE}/documents/${documentId}/chat-runs/${runId}/cancel`,
     {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
     },
     CANCEL_REQUEST_TIMEOUT_MS,
     '停止请求超时，请重试',
@@ -333,6 +333,7 @@ export async function recordChatUserQuestionActivity(
 export const chatApi = {
   listSessions: (documentId: number, includeArchived = true) => apiGet<ChatSessionItem[]>(`/documents/${documentId}/chat-sessions?include_archived=${includeArchived}`),
   createSession: (documentId: number, title = '新对话') => apiPost<ChatSessionItem>(`/documents/${documentId}/chat-sessions`, { title }),
+  updateImageSettings: (documentId: number, sessionId: number, payload: { image_model_id: number | null; auto_image_generation_enabled: boolean }) => apiPatch<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/image-settings`, payload),
   renameSession: (documentId: number, sessionId: number, title: string) => apiPatch<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}`, { title }),
   archiveSession: (documentId: number, sessionId: number) => apiPost<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/archive`, {}),
   restoreSession: (documentId: number, sessionId: number) => apiPost<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/restore`, {}),
@@ -404,7 +405,7 @@ async function fetchWithTimeout(
     timeoutMs,
   )
   try {
-    return await fetch(input, { ...init, signal: controller.signal })
+    return await authenticatedFetch(input, { ...init, signal: controller.signal })
   } catch (error) {
     if (controller.signal.reason instanceof StreamInactivityError) throw controller.signal.reason
     throw error
@@ -446,10 +447,7 @@ async function readWithInactivityTimeout(
 }
 
 async function apiGet<T>(path: string): Promise<T> {
-  const token = useAuthStore.getState().token
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  })
+  const res = await authenticatedFetch(`${API_BASE}${path}`)
   if (!res.ok) {
     let detail: unknown = res.statusText
     try {
@@ -464,12 +462,10 @@ async function apiGet<T>(path: string): Promise<T> {
 }
 
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const token = useAuthStore.getState().token
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await authenticatedFetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify(body),
   })
@@ -487,12 +483,10 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function apiPatch<T>(path: string, body: unknown): Promise<T> {
-  const token = useAuthStore.getState().token
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await authenticatedFetch(`${API_BASE}${path}`, {
     method: 'PATCH',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify(body),
   })
@@ -510,12 +504,10 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function apiPut<T>(path: string, body: unknown): Promise<T> {
-  const token = useAuthStore.getState().token
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await authenticatedFetch(`${API_BASE}${path}`, {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify(body),
   })
@@ -533,12 +525,10 @@ async function apiPut<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function apiUpload<T>(path: string, file: File): Promise<T> {
-  const token = useAuthStore.getState().token
   const body = new FormData()
   body.append('file', file)
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await authenticatedFetch(`${API_BASE}${path}`, {
     method: 'POST',
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
     body,
   })
   if (!res.ok) throw await toApiError(res)
@@ -546,8 +536,7 @@ async function apiUpload<T>(path: string, file: File): Promise<T> {
 }
 
 async function apiDelete<T>(path: string): Promise<T> {
-  const token = useAuthStore.getState().token
-  const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE', headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  const res = await authenticatedFetch(`${API_BASE}${path}`, { method: 'DELETE' })
   if (!res.ok) throw await toApiError(res)
   if (res.status === 204 || !res.headers.get('content-type')?.includes('application/json')) {
     return undefined as T

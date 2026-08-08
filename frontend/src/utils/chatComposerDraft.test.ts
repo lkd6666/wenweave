@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { clearChatComposerDraft, readChatComposerDraft, writeChatComposerDraft } from './chatComposerDraft'
+import { clearChatComposerDraft, clearChatComposerDraftForRequest, readChatComposerDraft, writeChatComposerDraft } from './chatComposerDraft'
 
 describe('chat composer draft storage', () => {
   const originalWindow = globalThis.window
@@ -39,6 +39,27 @@ describe('chat composer draft storage', () => {
 
     writeChatComposerDraft(8, 2, { message: '保留这条指令', reaskFromMessageId: null, phase: 'running', runId: 'run-1' })
     clearChatComposerDraft(8, 2)
+    expect(readChatComposerDraft(8, 2)).toBeNull()
+  })
+
+  it('does not clear a newer draft when an earlier request completes', () => {
+    writeChatComposerDraft(8, 2, {
+      message: '刚输入的下一条指令',
+      reaskFromMessageId: null,
+      phase: 'editing',
+    })
+
+    expect(clearChatComposerDraftForRequest(8, 2, 'completed-request')).toBe(false)
+    expect(readChatComposerDraft(8, 2)?.message).toBe('刚输入的下一条指令')
+
+    writeChatComposerDraft(8, 2, {
+      message: '已发送的指令',
+      reaskFromMessageId: null,
+      phase: 'running',
+      clientRequestId: 'completed-request',
+    })
+
+    expect(clearChatComposerDraftForRequest(8, 2, 'completed-request')).toBe(true)
     expect(readChatComposerDraft(8, 2)).toBeNull()
   })
 })

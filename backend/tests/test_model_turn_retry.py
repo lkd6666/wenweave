@@ -338,6 +338,7 @@ class RetryClassifierTests(unittest.TestCase):
     def test_message_fallback_when_no_status_is_available(self) -> None:
         self.assertTrue(_is_retryable_provider_error(RuntimeError("connection reset by peer")))
         self.assertTrue(_is_retryable_provider_error(RuntimeError("server is overloaded")))
+        self.assertTrue(_is_retryable_provider_error(RuntimeError("Concurrency limit exceeded for account")))
         self.assertFalse(_is_retryable_provider_error(RuntimeError("invalid api key")))
 
     def test_stream_cleanup_failure_is_not_retryable(self) -> None:
@@ -396,7 +397,7 @@ class RetryStreamTests(unittest.TestCase):
         self.assertEqual(retry["reason"], "upstream_429")
         self.assertEqual(retry["retry_after_seconds"], 60.0)
         self.assertEqual(retry["delay_seconds"], 60.0)
-        self.assertEqual(retry["remaining_attempts"], 2)
+        self.assertEqual(retry["remaining_attempts"], 1)
 
     def test_successful_first_attempt_makes_no_retry_and_no_heartbeat(self) -> None:
         model = _FakeModel([["a", "b"]])

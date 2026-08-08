@@ -1,5 +1,5 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, Button, Drawer, Empty, Form, Grid, Input, List, Modal, Popconfirm, Radio, Select, Spin, Tag, Tooltip, Typography, message } from 'antd'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type Ref } from 'react'
+import { Alert, Button, Checkbox, Drawer, Empty, Form, Grid, Input, List, Modal, Popconfirm, Radio, Select, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import { ArrowLeftOutlined, CopyOutlined, EyeOutlined, HistoryOutlined, RollbackOutlined, SwapOutlined } from '@ant-design/icons'
 import { documentGroupsApi } from '../api/documentGroups'
 import { documentsApi } from '../api/documents'
@@ -66,29 +66,54 @@ function copyTitle(version: DocumentVersionSummary): string {
   return `${version.title.slice(0, Math.max(0, 256 - suffix.length))}${suffix}`
 }
 
+type ComparisonSide = 'left' | 'right'
+
+function getFrameScrollElement(frame: HTMLIFrameElement | null): HTMLElement | null {
+  const document = frame?.contentDocument
+  return (document?.scrollingElement ?? document?.documentElement ?? document?.body) as HTMLElement | null
+}
+
+function getMaxScrollTop(element: HTMLElement): number {
+  return Math.max(0, element.scrollHeight - element.clientHeight)
+}
+
 const VersionPreview = memo(function VersionPreview({
   versionId,
   versionNumber,
   html,
+  iframeRef,
+  onLoad,
 }: {
   versionId: number
   versionNumber: number
   html: string
+  iframeRef?: Ref<HTMLIFrameElement>
+  onLoad?: () => void
 }) {
   const srcDoc = useMemo(() => versionPreviewDocument(html), [html])
   return (
     <iframe
       key={versionId}
+      ref={iframeRef}
       className="version-html-preview-frame"
       title={`版本 v${versionNumber} 排版预览`}
       sandbox={SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW}
       srcDoc={srcDoc}
+      onLoad={onLoad}
     />
   )
 })
 
 function versionOptionLabel(version: DocumentVersionSummary) {
-  return `v${version.version_number} · ${version.title || sourceLabels[version.source]} · ${formatTime(version.created_at)}`
+  return (
+    <span className="version-comparison-option">
+      <strong className="version-comparison-option-number">v{version.version_number}</strong>
+      <time className="version-comparison-option-time" dateTime={version.created_at}>
+        {formatTime(version.created_at)}
+      </time>
+      <span className="version-comparison-option-title">{version.title || sourceLabels[version.source]}</span>
+    </span>
+  )
 }
 
 function VersionComparisonModal({
@@ -112,11 +137,19 @@ function VersionComparisonModal({
   const [rightVersion, setRightVersion] = useState<DocumentVersionDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [syncScroll, setSyncScroll] = useState(false)
+  const leftFrameRef = useRef<HTMLIFrameElement>(null)
+  const rightFrameRef = useRef<HTMLIFrameElement>(null)
+  const syncScrollRef = useRef(false)
+  const scrollCleanupRef = useRef<Record<ComparisonSide, (() => void) | null>>({ left: null, right: null })
+  const syncLockRef = useRef<ComparisonSide | null>(null)
+  const clearSyncLockFrameRef = useRef<number | null>(null)
 
   useEffect(() => {
     if (!open) return
     setLeftVersionId(initialLeftId)
     setRightVersionId(initialRightId)
+    setSyncScroll(false)
   }, [initialLeftId, initialRightId, open])
 
   useEffect(() => {
@@ -140,6 +173,73 @@ function VersionComparisonModal({
       })
     return () => { active = false }
   }, [leftVersionId, loadVersion, open, rightVersionId])
+
+  const cleanupFrameScroll = useCallback((side: ComparisonSide) => {
+    scrollCleanupRef.current[side]?.()
+    scrollCleanupRef.current[side] = null
+  }, [])
+
+  const cleanupAllFrameScroll = useCallback(() => {
+    cleanupFrameScroll('left')
+    cleanupFrameScroll('right')
+    syncLockRef.current = null
+    if (clearSyncLockFrameRef.current !== null) {
+      cancelAnimationFrame(clearSyncLockFrameRef.current)
+      clearSyncLockFrameRef.current = null
+    }
+  }, [cleanupFrameScroll])
+
+  const bindFrameScroll = useCallback((side: ComparisonSide) => {
+    cleanupFrameScroll(side)
+    if (!syncScrollRef.current) return
+
+    const sourceFrame = side === 'left' ? leftFrameRef.current : rightFrameRef.current
+    const sourceScroller = getFrameScrollElement(sourceFrame)
+    const sourceWindow = sourceFrame?.contentWindow
+    if (!sourceScroller || !sourceWindow) return
+
+    const targetSide: ComparisonSide = side === 'left' ? 'right' : 'left'
+    const onScroll = () => {
+      if (!syncScrollRef.current) return
+      if (syncLockRef.current === side) {
+        syncLockRef.current = null
+        return
+      }
+
+      const targetFrame = targetSide === 'left' ? leftFrameRef.current : rightFrameRef.current
+      const targetScroller = getFrameScrollElement(targetFrame)
+      if (!targetScroller) return
+
+      const sourceMaxScrollTop = getMaxScrollTop(sourceScroller)
+      const targetMaxScrollTop = getMaxScrollTop(targetScroller)
+      const progress = sourceMaxScrollTop > 0
+        ? Math.min(1, Math.max(0, sourceScroller.scrollTop / sourceMaxScrollTop))
+        : 0
+
+      syncLockRef.current = targetSide
+      targetScroller.scrollTop = progress * targetMaxScrollTop
+      if (clearSyncLockFrameRef.current !== null) cancelAnimationFrame(clearSyncLockFrameRef.current)
+      clearSyncLockFrameRef.current = requestAnimationFrame(() => {
+        if (syncLockRef.current === targetSide) syncLockRef.current = null
+        clearSyncLockFrameRef.current = null
+      })
+    }
+
+    sourceWindow.addEventListener('scroll', onScroll, { passive: true })
+    scrollCleanupRef.current[side] = () => sourceWindow.removeEventListener('scroll', onScroll)
+  }, [cleanupFrameScroll])
+
+  useEffect(() => {
+    syncScrollRef.current = syncScroll
+    if (!open || !syncScroll) {
+      cleanupAllFrameScroll()
+      return
+    }
+
+    bindFrameScroll('left')
+    bindFrameScroll('right')
+    return cleanupAllFrameScroll
+  }, [bindFrameScroll, cleanupAllFrameScroll, leftVersion?.id, open, rightVersion?.id, syncScroll])
 
   const options = versions.map((version) => ({ value: version.id, label: versionOptionLabel(version) }))
   const chooseLeft = (versionId: number) => {
@@ -171,6 +271,11 @@ function VersionComparisonModal({
           <Select value={rightVersionId ?? undefined} options={options.map((option) => ({ ...option, disabled: option.value === leftVersionId }))} onChange={chooseRight} />
         </label>
       </div>
+      <div className="version-comparison-controls">
+        <Checkbox checked={syncScroll} onChange={(event) => setSyncScroll(event.target.checked)}>
+          同步滚动
+        </Checkbox>
+      </div>
       {loading ? (
         <div className="version-history-loading"><Spin description="正在加载比较版本…" /></div>
       ) : error ? (
@@ -183,7 +288,13 @@ function VersionComparisonModal({
               <Text type="secondary">{leftVersion.title}</Text>
             </div>
             <div className="version-html-preview">
-              <VersionPreview versionId={leftVersion.id} versionNumber={leftVersion.version_number} html={leftVersion.html} />
+              <VersionPreview
+                versionId={leftVersion.id}
+                versionNumber={leftVersion.version_number}
+                html={leftVersion.html}
+                iframeRef={leftFrameRef}
+                onLoad={() => bindFrameScroll('left')}
+              />
             </div>
           </section>
           <section className="version-comparison-pane" aria-label={`版本 v${rightVersion.version_number}`}>
@@ -192,7 +303,13 @@ function VersionComparisonModal({
               <Text type="secondary">{rightVersion.title}</Text>
             </div>
             <div className="version-html-preview">
-              <VersionPreview versionId={rightVersion.id} versionNumber={rightVersion.version_number} html={rightVersion.html} />
+              <VersionPreview
+                versionId={rightVersion.id}
+                versionNumber={rightVersion.version_number}
+                html={rightVersion.html}
+                iframeRef={rightFrameRef}
+                onLoad={() => bindFrameScroll('right')}
+              />
             </div>
           </section>
         </div>

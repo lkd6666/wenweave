@@ -18,6 +18,7 @@ from app.models.ai_model import AIModel
 from app.models.ai_provider import AIProvider
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.agent_run_event import AgentRunEvent
+from app.models.model_call_record import ModelCallRecord, ModelCallStatus
 from app.models.chat_user_question import ChatUserQuestion
 from app.models.chat_message import ChatMessage, MessageRole
 from app.models.document import Document
@@ -36,9 +37,10 @@ from app.services.document_versions import create_document_version, migrate_lega
 from app.services.operation_logs import append_operation_log
 from app.services.agent_run_recovery import recover_interrupted_turn
 from app.services.model_presets import is_official_deepseek_openai_endpoint, official_deepseek_thinking_config
+from app.services.wechat_compliance import run_compliance_check
 
 
-SCHEMA_REVISION = "20260730_session_resource_context_v1"
+SCHEMA_REVISION = "20260808_model_prompt_cache_v1"
 
 
 @contextmanager
@@ -348,6 +350,35 @@ def migrate_schema() -> None:
                             f"ENUM({enum_definition}) NOT NULL DEFAULT 'BLANK'"
                         )
                     )
+        if inspector.has_table("ai_providers"):
+            provider_columns = {column["name"]: column for column in inspector.get_columns("ai_providers")}
+            for column_name, definition in {
+                "image_protocol": "VARCHAR(48) NOT NULL DEFAULT ''",
+                "image_base_url": "VARCHAR(512) NOT NULL DEFAULT ''",
+            }.items():
+                if column_name not in provider_columns:
+                    connection.execute(text(f"ALTER TABLE ai_providers ADD COLUMN {column_name} {definition}"))
+            provider_type_column = provider_columns.get("provider_type")
+            provider_enum_values = ("OPENAI_COMPATIBLE", "OPENAI_RESPONSES", "ANTHROPIC")
+            existing_provider_values = set(
+                getattr(provider_type_column["type"], "enums", ()) if provider_type_column else ()
+            )
+            if not set(provider_enum_values).issubset(existing_provider_values):
+                provider_enum_definition = ", ".join(f"'{value}'" for value in provider_enum_values)
+                connection.execute(
+                    text(
+                        "ALTER TABLE ai_providers MODIFY COLUMN provider_type "
+                        f"ENUM({provider_enum_definition}) NOT NULL"
+                    )
+                )
+        if inspector.has_table("chat_sessions"):
+            chat_session_columns = {column["name"] for column in inspector.get_columns("chat_sessions")}
+            for column_name, definition in {
+                "image_model_id": "BIGINT NULL",
+                "auto_image_generation_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+            }.items():
+                if column_name not in chat_session_columns:
+                    connection.execute(text(f"ALTER TABLE chat_sessions ADD COLUMN {column_name} {definition}"))
             if inspector.has_table("document_imports"):
                 import_columns = {column["name"]: column for column in inspector.get_columns("document_imports")}
                 source_type_column = import_columns.get("source_type")
@@ -418,6 +449,14 @@ def migrate_schema() -> None:
         if "supports_disabled_thinking" not in model_columns:
             connection.execute(
                 text("ALTER TABLE ai_models ADD COLUMN supports_disabled_thinking BOOLEAN NOT NULL DEFAULT 1")
+            )
+        if "default_thinking_effort" not in model_columns:
+            connection.execute(
+                text("ALTER TABLE ai_models ADD COLUMN default_thinking_effort VARCHAR(16) NOT NULL DEFAULT 'auto'")
+            )
+        if "prompt_cache_enabled" not in model_columns:
+            connection.execute(
+                text("ALTER TABLE ai_models ADD COLUMN prompt_cache_enabled BOOLEAN NOT NULL DEFAULT 0")
             )
 
         # Custom themes originally stored their complete library directly on
@@ -1016,6 +1055,9 @@ def migrate_schema() -> None:
                 "lease_expires_at": "DATETIME",
                 "heartbeat_at": "DATETIME",
                 "cancel_requested_at": "DATETIME",
+                "worker_pid": "INTEGER",
+                "last_phase": "TEXT NOT NULL DEFAULT ''",
+                "last_progress_at": "DATETIME",
                 "event_sequence": "INTEGER NOT NULL DEFAULT 0",
             }
             if is_sqlite
@@ -1024,12 +1066,40 @@ def migrate_schema() -> None:
                 "lease_expires_at": "DATETIME(6) NULL",
                 "heartbeat_at": "DATETIME(6) NULL",
                 "cancel_requested_at": "DATETIME(6) NULL",
+                "worker_pid": "INT NULL",
+                "last_phase": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "last_progress_at": "DATETIME(6) NULL",
                 "event_sequence": "INT NOT NULL DEFAULT 0",
             }
         )
         for column_name, definition in run_column_definitions.items():
             if column_name not in run_columns:
                 connection.execute(text(f"ALTER TABLE agent_runs ADD COLUMN {column_name} {definition}"))
+        # A deployment can add ``event_sequence`` while an older worker still
+        # has events in flight.  Bring each allocation cursor up to the
+        # durable high-water mark before the new workers begin appending.
+        if inspector.has_table("agent_run_events"):
+            if is_sqlite:
+                connection.execute(
+                    text(
+                        "UPDATE agent_runs SET event_sequence = "
+                        "(SELECT MAX(sequence) FROM agent_run_events "
+                        "WHERE agent_run_events.run_id = agent_runs.id) "
+                        "WHERE COALESCE(event_sequence, 0) < COALESCE("
+                        "(SELECT MAX(sequence) FROM agent_run_events "
+                        "WHERE agent_run_events.run_id = agent_runs.id), 0)"
+                    )
+                )
+            else:
+                connection.execute(
+                    text(
+                        "UPDATE agent_runs AS runs "
+                        "JOIN (SELECT run_id, MAX(sequence) AS max_sequence "
+                        "FROM agent_run_events GROUP BY run_id) AS events "
+                        "ON events.run_id = runs.id "
+                        "SET runs.event_sequence = GREATEST(COALESCE(runs.event_sequence, 0), events.max_sequence)"
+                    )
+                )
         unassigned_runs = connection.execute(
             text("SELECT id, document_id, user_message_id FROM agent_runs WHERE session_id IS NULL")
         ).mappings().all()
@@ -1049,6 +1119,26 @@ def migrate_schema() -> None:
             connection.execute(text("CREATE INDEX ix_agent_runs_session_id ON agent_runs (session_id)"))
         if "ix_agent_runs_lease_expires_at" not in run_indexes:
             connection.execute(text("CREATE INDEX ix_agent_runs_lease_expires_at ON agent_runs (lease_expires_at)"))
+
+        if inspector.has_table("model_call_records"):
+            model_call_columns = {
+                column["name"]: column for column in inspect(engine).get_columns("model_call_records")
+            }
+            if not is_sqlite:
+                status_column = model_call_columns.get("status")
+                status_values = set(getattr(status_column["type"], "enums", ()) if status_column else ())
+                required_status_values = {"running", "completed", "failed", "cancelled", "abandoned"}
+                if not required_status_values.issubset(status_values):
+                    enum_definition = ", ".join(f"'{value}'" for value in sorted(required_status_values))
+                    connection.execute(
+                        text(
+                            "ALTER TABLE model_call_records MODIFY COLUMN "
+                            f"status ENUM({enum_definition}) NOT NULL"
+                        )
+                    )
+                finished_column = model_call_columns.get("finished_at")
+                if finished_column is not None and not bool(finished_column.get("nullable", False)):
+                    connection.execute(text("ALTER TABLE model_call_records MODIFY COLUMN finished_at DATETIME(6) NULL"))
 
         # Preserve prior document-level automatic summaries only for the
         # backfilled initial conversation. New code never reads this legacy
@@ -1390,8 +1480,8 @@ def backfill_official_deepseek_thinking_models(db: Session) -> int:
     return changed
 
 
-def recover_interrupted_agent_runs(db: Session) -> int:
-    """Finish runs abandoned by a process restart without discarding edits.
+def recover_expired_agent_runs(db: Session) -> int:
+    """Finish runs whose worker lease expired without replaying side effects.
 
     The worker itself is intentionally not resumed. A completed write tool has
     already checkpointed a full HTML candidate, so it can be committed only
@@ -1412,7 +1502,24 @@ def recover_interrupted_agent_runs(db: Session) -> int:
         .all()
     )
     recovered = 0
-    for run in active_runs:
+    for candidate in active_runs:
+        # The query above discovers candidates. Re-lock the run itself before
+        # editing its document so two workers cannot recover the same lease.
+        run = db.query(AgentRun).filter(AgentRun.id == candidate.id).with_for_update().first()
+        if run is None:
+            continue
+        lease_expires_at = getattr(run, "lease_expires_at", None)
+        if lease_expires_at is not None:
+            lease_expires_at = (
+                lease_expires_at.replace(tzinfo=timezone.utc)
+                if lease_expires_at.tzinfo is None
+                else lease_expires_at.astimezone(timezone.utc)
+            )
+        if (
+            run.status not in {AgentRunStatus.PENDING, AgentRunStatus.RUNNING, AgentRunStatus.CANCELLING}
+            or (getattr(run, "owner_id", "") and lease_expires_at is not None and lease_expires_at > now)
+        ):
+            continue
         document = (
             db.query(Document)
             .filter(Document.id == run.document_id)
@@ -1433,21 +1540,40 @@ def recover_interrupted_agent_runs(db: Session) -> int:
                 document,
                 run.user_id,
                 DocumentVersionSource.AI,
-                "AI 编辑（服务恢复）",
+                "AI 编辑（Agent 工作进程恢复）",
             )
             partial_saved = True
 
         if partial_saved:
-            detail = "服务已重启，未完成的 Agent 已停止；已保留已完成的排版修改。"
+            detail = "Agent 工作进程心跳已超时，未完成的操作已停止；已保留已完成的排版修改。"
         elif checkpoint:
-            detail = "服务已重启，未完成的 Agent 已停止；文档已被其他修改更新，候选排版未自动覆盖。"
+            detail = "Agent 工作进程心跳已超时，未完成的操作已停止；文档已被其他修改更新，候选排版未自动覆盖。"
         else:
-            detail = "服务已重启，未完成的 Agent 已停止；请重新执行本轮操作。"
+            detail = "Agent 工作进程心跳已超时，未完成的操作已停止；请重新执行本轮操作。"
+        previous_phase = str(getattr(run, "last_phase", "") or "")
         run.status = AgentRunStatus.FAILED
         run.error_message = detail
         run.finished_at = datetime.now(timezone.utc)
         run.owner_id = ""
         run.lease_expires_at = None
+        run.last_phase = "lease_expired"
+        run.last_progress_at = run.finished_at
+        running_calls = (
+            db.query(ModelCallRecord)
+            .filter(
+                ModelCallRecord.source_id == run.id,
+                ModelCallRecord.status == ModelCallStatus.RUNNING,
+            )
+            .all()
+        )
+        for call in running_calls:
+            call.status = ModelCallStatus.ABANDONED
+            call.finished_at = run.finished_at
+            call.error_message = (
+                "Agent worker lease expired before the model call completed; "
+                f"run={run.id}; worker_pid={getattr(run, 'worker_pid', None) or 'unknown'}; "
+                f"last_phase={previous_phase or 'unknown'}"
+            )[:512]
         append_operation_log(
             db,
             actor=(
@@ -1463,11 +1589,18 @@ def recover_interrupted_agent_runs(db: Session) -> int:
             session_id=run.session_id,
             status=OperationLogStatus.FAILED,
             summary="AI 对话执行失败",
-            error_summary="服务恢复时终止未完成的 AI 对话",
-            details={"document_changed": partial_saved, "recovered_after_restart": True},
+            error_summary="Agent 工作进程心跳超时",
+            details={
+                "document_changed": partial_saved,
+                "recovered_after_worker_loss": True,
+                "worker_pid": getattr(run, "worker_pid", None),
+                "last_phase": previous_phase,
+                "abandoned_model_calls": len(running_calls),
+            },
             client_ip=str(getattr(run, "origin_client_ip", "")),
             user_agent=str(getattr(run, "origin_user_agent", "")),
         )
+        assistant_content = detail
         if not run.assistant_message_id:
             events = (
                 db.query(AgentRunEvent)
@@ -1490,7 +1623,53 @@ def recover_interrupted_agent_runs(db: Session) -> int:
             db.add(assistant_message)
             db.flush()
             run.assistant_message_id = assistant_message.id
+            assistant_content = assistant_message.content
+        else:
+            assistant_message = db.get(ChatMessage, run.assistant_message_id)
+            if assistant_message:
+                assistant_content = assistant_message.content
+
+        # Recovery normally happens without the original worker's local SSE
+        # cache. Store its terminal event with the same ordered event source so
+        # a reconnect on either worker can render a definitive outcome.
+        durable_sequence = (
+            db.query(AgentRunEvent.sequence)
+            .filter(AgentRunEvent.run_id == run.id)
+            .order_by(AgentRunEvent.sequence.desc())
+            .limit(1)
+            .scalar()
+        )
+        run.event_sequence = max(int(getattr(run, "event_sequence", 0) or 0), int(durable_sequence or 0)) + 1
+        report_html = document.current_html if document else checkpoint
+        save_state = "preserved" if partial_saved else "conflict" if checkpoint else "none"
+        db.add(
+            AgentRunEvent(
+                run_id=run.id,
+                sequence=run.event_sequence,
+                event="final",
+                payload_json=json.dumps(
+                    {
+                        "content": assistant_content,
+                        "html": report_html,
+                        "html_changed": partial_saved,
+                        "compliance": run_compliance_check(report_html).to_dict(),
+                        "cancelled": False,
+                        "partial": True,
+                        "partial_save_state": save_state,
+                        "run_status": AgentRunStatus.FAILED.value,
+                        "error_message": detail,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        )
         recovered += 1
     if recovered:
         db.commit()
     return recovered
+
+
+def recover_interrupted_agent_runs(db: Session) -> int:
+    """Compatibility entry point used by startup recovery."""
+    return recover_expired_agent_runs(db)

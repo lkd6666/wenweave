@@ -3,7 +3,7 @@ import hashlib
 import ipaddress
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from bs4 import BeautifulSoup
@@ -34,8 +34,11 @@ from app.services.wechat_official_account import (
     CoverImage,
     DraftPushResult,
     DraftTarget,
+    ImagePayload,
     WeChatApiError,
+    WECHAT_EMPTY_DIGEST_PLACEHOLDER,
     WeChatOfficialAccountClient,
+    _redact_sensitive_text,
 )
 
 
@@ -461,7 +464,7 @@ class WeChatHttpClientTests(unittest.TestCase):
                     return httpx.Response(200, json={"errcode": 40001, "errmsg": "invalid credential"})
                 body = json.loads(request.content)
                 self.assertIn("mmbiz.qpic.cn/temporary-2.png", body["articles"][0]["content"])
-                self.assertEqual(body["articles"][0]["digest"], "")
+                self.assertEqual(body["articles"][0]["digest"], WECHAT_EMPTY_DIGEST_PLACEHOLDER)
                 return httpx.Response(200, json={"media_id": "draft-media"})
             raise AssertionError(f"unexpected request {request.url}")
 
@@ -813,6 +816,77 @@ class WeChatHttpClientTests(unittest.TestCase):
                 hostname, ipaddress.ip_address("10.0.0.1"), {hostname}
             )
         )
+
+    def test_large_image_payload_spools_to_disk_and_closes(self) -> None:
+        payload = ImagePayload.from_bytes(
+            b"x" * (1024 * 1024 + 1),
+            content_type="image/png",
+            filename="large.png",
+        )
+        try:
+            self.assertTrue(payload.is_file_backed)
+            self.assertEqual(payload.size, 1024 * 1024 + 1)
+            self.assertEqual(payload.content_sha256, hashlib.sha256(b"x" * (1024 * 1024 + 1)).hexdigest())
+            self.assertEqual(len(payload.read_bytes()), payload.size)
+        finally:
+            payload.close()
+        self.assertTrue(payload._stream.closed)
+
+    def test_remote_large_image_download_uses_spooled_payload(self) -> None:
+        data = b"y" * (1024 * 1024 + 1)
+        client = WeChatOfficialAccountClient()
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, headers={"content-type": "image/png"}, content=data)
+        )
+
+        async def download() -> ImagePayload:
+            async with httpx.AsyncClient(transport=transport) as http_client:
+                with patch.object(WeChatOfficialAccountClient, "_validate_public_url", new=AsyncMock()):
+                    return await client._download_image(
+                        http_client,
+                        "https://images.example.com/large.png",
+                        allowed_types={"image/png"},
+                        max_bytes=10 * 1024 * 1024,
+                        label="正文图片",
+                    )
+
+        payload = asyncio.run(download())
+        try:
+            self.assertTrue(payload.is_file_backed)
+            self.assertEqual(payload.filename, "large.png")
+            self.assertEqual(payload.content_sha256, hashlib.sha256(data).hexdigest())
+        finally:
+            payload.close()
+
+    def test_body_image_closes_spooled_payload_after_upload_failure(self) -> None:
+        payload = ImagePayload.from_bytes(
+            b"z" * (1024 * 1024 + 1),
+            content_type="image/png",
+            filename="large.png",
+        )
+        client = WeChatOfficialAccountClient()
+        client._upload_permanent_image = AsyncMock(side_effect=WeChatApiError("上传失败"))  # type: ignore[method-assign]
+        with self.assertRaisesRegex(WeChatApiError, "上传失败"):
+            asyncio.run(
+                client._replace_body_images(
+                    MagicMock(),
+                    "token",
+                    '<p><img src="https://images.example.com/large.png"></p>',
+                    local_image_loader=lambda _: payload,
+                )
+            )
+        self.assertTrue(payload._stream.closed)
+
+    def test_redacts_credential_values_from_transport_messages(self) -> None:
+        rendered = _redact_sensitive_text(
+            "GET https://api.weixin.qq.com/cgi-bin/draft/add?access_token=token-secret&signature=signed-value "
+            "api_key=provider-secret {\"app_secret\":\"app-secret\"}"
+        )
+        self.assertNotIn("token-secret", rendered)
+        self.assertNotIn("signed-value", rendered)
+        self.assertNotIn("provider-secret", rendered)
+        self.assertNotIn("app-secret", rendered)
+        self.assertEqual(rendered.count("[REDACTED]"), 4)
 
 
 if __name__ == "__main__":

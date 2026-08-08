@@ -17,7 +17,11 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       setAuth: (token, user) => set({ token, user }),
       setUser: (user) => set({ user }),
-      logout: () => set({ token: null, user: null }),
+      logout: () => {
+        set({ token: null, user: null })
+        // The refresh credential is HttpOnly, so the server clears it.
+        void fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => undefined)
+      },
     }),
     { name: 'auth-storage' },
   ),

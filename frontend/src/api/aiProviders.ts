@@ -1,5 +1,6 @@
 import { api } from './client'
 import type {
+  AIImageModelItem,
   AIModelItem,
   AIProviderItem,
   ModelDiscoveryResult,
@@ -16,8 +17,29 @@ export interface CreateProviderPayload {
 
 export interface UpdateProviderPayload {
   name?: string
+  provider_type?: ProviderType
   base_url?: string
   api_key?: string
+  image_protocol?: '' | 'openai_images' | 'dashscope_images' | 'volcengine_ark_images'
+  image_base_url?: string
+}
+
+export interface CreateImageModelPayload {
+  model_name: string
+  display_name: string
+  description?: string
+  supported_aspect_ratios?: Array<'square' | 'portrait' | 'landscape'>
+  supported_qualities?: string[]
+  is_default?: boolean
+  access_mode?: 'all' | 'restricted'
+  allowed_user_ids?: number[]
+  allowed_group_ids?: number[]
+}
+
+export interface UpdateImageModelPayload extends Partial<Omit<CreateImageModelPayload, 'model_name'>> {
+  access_mode?: 'all' | 'restricted'
+  allowed_user_ids?: number[]
+  allowed_group_ids?: number[]
 }
 
 export interface CreateModelPayload {
@@ -31,6 +53,8 @@ export interface CreateModelPayload {
   is_default: boolean
   is_multimodal: boolean
   supports_disabled_thinking: boolean
+  default_thinking_effort: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  prompt_cache_enabled: boolean
   thinking_config?: Record<string, unknown>
 }
 
@@ -44,6 +68,8 @@ export interface UpdateModelPayload {
   is_default?: boolean
   is_multimodal?: boolean
   supports_disabled_thinking?: boolean
+  default_thinking_effort?: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  prompt_cache_enabled?: boolean
   thinking_config?: Record<string, unknown>
   access_mode?: 'all' | 'restricted'
   allowed_user_ids?: number[]
@@ -52,6 +78,9 @@ export interface UpdateModelPayload {
 
 export interface InstallPresetPayload {
   api_key: string
+  image_protocol?: '' | 'openai_images' | 'dashscope_images' | 'volcengine_ark_images'
+  image_base_url?: string
+  provider_type: ProviderType
   model_names: string[]
   model_capabilities?: Array<{
     model_name: string
@@ -99,8 +128,11 @@ export interface TestConnectionResult {
 export const aiProvidersApi = {
   list: () => api.get<AIProviderItem[]>('/ai-providers'),
   listPresets: () => api.get<ProviderPresetItem[]>('/ai-providers/presets'),
-  discoverPresetModels: (presetId: string, apiKey: string) =>
-    api.post<ModelDiscoveryResult>(`/ai-providers/presets/${presetId}/discover-models`, { api_key: apiKey }),
+  discoverPresetModels: (presetId: string, apiKey: string, providerType: ProviderType) =>
+    api.post<ModelDiscoveryResult>(`/ai-providers/presets/${presetId}/discover-models`, {
+      api_key: apiKey,
+      provider_type: providerType,
+    }),
   installPreset: (presetId: string, payload: InstallPresetPayload) =>
     api.post<AIProviderItem>(`/ai-providers/presets/${presetId}/install`, payload),
   create: (payload: CreateProviderPayload) => api.post<AIProviderItem>('/ai-providers', payload),
@@ -117,4 +149,7 @@ export const aiProvidersApi = {
   updateModel: (modelId: number, payload: UpdateModelPayload) =>
     api.patch<AIModelItem>(`/ai-providers/models/${modelId}`, payload),
   removeModel: (modelId: number) => api.delete<void>(`/ai-providers/models/${modelId}`),
+  createImageModel: (providerId: number, payload: CreateImageModelPayload) => api.post<AIImageModelItem>(`/ai-providers/${providerId}/image-models`, payload),
+  updateImageModel: (modelId: number, payload: UpdateImageModelPayload) => api.patch<AIImageModelItem>(`/ai-providers/image-models/${modelId}`, payload),
+  removeImageModel: (modelId: number) => api.delete<void>(`/ai-providers/image-models/${modelId}`),
 }

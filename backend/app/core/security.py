@@ -9,6 +9,9 @@ import jwt
 
 from app.core.config import get_settings
 
+ACCESS_TOKEN_TYPE = "access"
+REFRESH_TOKEN_TYPE = "refresh"
+
 
 def hash_password(plain_password: str) -> str:
     return bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -24,9 +27,17 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def create_access_token(subject: str, extra_claims: Optional[Dict[str, Any]] = None) -> str:
     settings = get_settings()
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload: Dict[str, Any] = {"sub": subject, "exp": expire}
+    payload: Dict[str, Any] = {"sub": subject, "exp": expire, "token_type": ACCESS_TOKEN_TYPE}
     if extra_claims:
         payload.update(extra_claims)
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_refresh_token(subject: str) -> str:
+    """Create a browser-session renewal token that cannot authorize API calls."""
+    settings = get_settings()
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    payload: Dict[str, Any] = {"sub": subject, "exp": expire, "token_type": REFRESH_TOKEN_TYPE}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
@@ -46,3 +57,10 @@ def create_scoped_token(subject: str, scope: str, extra_claims: Optional[Dict[st
 def decode_access_token(token: str) -> Dict[str, Any]:
     settings = get_settings()
     return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+
+
+def decode_refresh_token(token: str) -> Dict[str, Any]:
+    payload = decode_access_token(token)
+    if payload.get("token_type") != REFRESH_TOKEN_TYPE:
+        raise jwt.InvalidTokenError("token is not a refresh token")
+    return payload

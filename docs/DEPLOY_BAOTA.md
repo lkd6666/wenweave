@@ -47,6 +47,14 @@ TRUSTED_PROXY_CIDRS=127.0.0.1/32
 
 `.env`、`backend/data/` 和 `backend/data/encryption.key` 是运行时私密文件。限制站点目录权限，且不要把它们下载、上传或提交到 Git。首次启动仅在用户表为空时创建上述管理员；首次登录后立即修改密码。
 
+对于 `CDN -> 雷池 -> 宝塔 Nginx -> Uvicorn` 链路，请在 `TRUSTED_PROXY_CIDRS` 中按照链路填写宝塔 Nginx 到 Uvicorn 的地址、雷池回源网段及 CDN 官方出口网段。例如：
+
+```dotenv
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,172.18.0.0/16,198.51.100.0/24
+```
+
+后端会在受信任的 `X-Forwarded-For` 链中从右向左跳过这些代理，以最左边的非代理 IP 作为操作日志的客户端 IP。用实际雷池回源网段和 CDN 官方 IP 段代替示例值，不要配置 `0.0.0.0/0`。需保证雷池将 CDN 传入的 `X-Forwarded-For` 继续透传到 Nginx；如果该头被丢弃，后端只能拿到 CDN/雷池 IP。
+
 ## 4. 安装 Python 依赖并启动
 
 在宝塔终端执行：
@@ -63,8 +71,26 @@ chown -R www:www /www/wwwroot/yibanpaiban
 在宝塔“Python 项目”中新增项目，项目路径选择 `backend`，运行用户选择 `www`，启动命令填写：
 
 ```bash
-/www/wwwroot/yibanpaiban/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 2 --no-proxy-headers
+/www/wwwroot/yibanpaiban/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 1 --no-proxy-headers --log-config /www/wwwroot/yibanpaiban/backend/uvicorn-log.json
 ```
+
+生产环境只启动一个 Uvicorn worker。Agent 的数据库准入并发保持由
+`CHAT_AGENT_MAX_CONCURRENT_RUNS` 和 `CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER`
+控制，不要通过增加 worker 数量来扩大 Agent 并发。若实际站点使用
+`/www/wwwroot/ybpb.dycz.cn` 和端口 `8010`，请将上面的目录和端口替换为实际值，完整命令为：
+
+```bash
+/www/wwwroot/ybpb.dycz.cn/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8010 --workers 1 --no-proxy-headers --log-config /www/wwwroot/ybpb.dycz.cn/backend/uvicorn-log.json
+```
+
+保存启动命令后，只能通过宝塔 Python 项目服务停止并启动应用，不要在 SSH 中额外使用
+`nohup` 启动 Uvicorn。重启前后执行 `pgrep -af 'uvicorn app.main:app'`；若宝塔停止后仍有旧
+PID，先在面板停止对应项目，确认业务无请求后再由运维执行 `kill -TERM <旧 PID>`，随后只从
+宝塔启动一次。不要使用 `kill -9` 测试或清理 worker。
+
+`uvicorn==0.37.0` 支持 `--timeout-worker-healthcheck`。当前单 worker 不需要该参数；未来若
+服务器内存已升级到至少 4 GiB 并恢复多 worker，启动命令必须显式增加
+`--timeout-worker-healthcheck 30`。
 
 若面板版本没有 Python 项目管理器，用 Supervisor 创建同样的启动命令，并设置开机启动和异常自动重启。不要暴露 8001 端口到公网。
 
@@ -82,10 +108,31 @@ curl http://127.0.0.1:8001/api/health/ready
 4. 在“SSL”页申请并强制启用 HTTPS；外网防火墙只放行 80 和 443。
 5. 打开 `https://example.com/api/health/ready`，再访问首页并完成管理员首次登录。
 
-配置中的 `proxy_buffering off` 和 900 秒超时不能删除，否则对话式排版的 SSE 流会被 Nginx 缓冲或提前断开。`client_max_body_size 35m` 与应用的 30 MB 文件导入限制配套。
+配置中的 SSE 专用路由会关闭代理/请求缓冲与 gzip，并强制下发 `no-store` 缓存策略，不能删除。若 CDN 有“强制缓存”“缓存一切”一类规则，另需将 `/api/documents/*/chat-runs/*/events` 配为绕过缓存，否则 CDN 规则可能覆盖源站响应头。`client_max_body_size 35m` 与应用的 30 MB 文件导入限制配套。
 
 ## 6. 数据与升级
 
 - 未配置对象存储时，上传内容位于 `backend/data/uploads`。单机部署需定期备份该目录；多实例部署需使用共享存储或对象存储。
 - 升级前先停止应用，备份 MySQL 与 `backend/data/`，再替换代码和 `frontend/dist`。保留生产 `.env` 与数据目录，不要用发布包覆盖它们。
 - 重新启动后访问 `/api/health/ready`；如果状态为 `degraded`，查看 Python 项目或 Supervisor 日志，并优先检查数据库连通性和生产环境变量。
+
+## 7. Agent 卡住或 worker 退出取证
+
+本版本会在每个 Uvicorn worker 启用 Python `faulthandler`：向具体 worker 发送 `SIGUSR2` 会把该进程全部线程栈写入 Python 项目/Supervisor 的错误日志；正常退出也会留下 PID 与 worker ID。启动时会记录 RSS 基线。`SIGKILL` 无法被 Python 捕获，因此出现进程消失时要用一次性信号跟踪确认外部来源。
+
+为避免前端静态资源、健康检查和轮询刷屏，worker 日志默认不输出成功的 `GET`、`HEAD`、`OPTIONS` access log；4xx/5xx 仍会保留。未处理的请求、线程和 asyncio 任务异常均会输出完整 traceback，并带 PID、worker ID 与请求 ID（请求异常）。
+
+先从宝塔终端确认唯一的 Uvicorn PID（不要选 Nginx，也不要停止应用）：
+
+```bash
+pgrep -af 'uvicorn app.main:app'
+kill -USR2 <uvicorn-pid>
+```
+
+复现一次问题前，以 root 或具备 ptrace 权限的运维账号附加 `strace`；这只跟踪信号和进程事件，不会修改代码、数据库或 Nginx：
+
+```bash
+strace -ff -tt -s 160 -e trace=signal,process -p <uvicorn-pid> -o /tmp/yibanpaiban-agent-<uvicorn-pid>.strace
+```
+
+复现后，用 `Ctrl-C` 停止 `strace` 本身，再检查 `/tmp/yibanpaiban-agent-<uvicorn-pid>.strace*` 和 Python 项目/Supervisor 错误日志。若记录到 `SIGKILL`、`SIGTERM` 或父进程退出，结合对应时间点的宝塔/Supervisor/systemd 日志即可定位外部终止来源；不要把 `kill -9` 用于测试中的 worker。

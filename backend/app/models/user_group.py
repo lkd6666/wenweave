@@ -30,6 +30,20 @@ model_group_access = Table(
     Column("group_id", ID_TYPE, ForeignKey("user_groups.id", ondelete="CASCADE"), primary_key=True),
 )
 
+image_model_user_access = Table(
+    "image_model_user_access",
+    Base.metadata,
+    Column("model_id", ID_TYPE, ForeignKey("ai_image_models.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", ID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+)
+
+image_model_group_access = Table(
+    "image_model_group_access",
+    Base.metadata,
+    Column("model_id", ID_TYPE, ForeignKey("ai_image_models.id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ID_TYPE, ForeignKey("user_groups.id", ondelete="CASCADE"), primary_key=True),
+)
+
 
 class UserGroup(Base):
     __tablename__ = "user_groups"
@@ -41,3 +55,4 @@ class UserGroup(Base):
 
     members = relationship("User", secondary=user_group_members, back_populates="groups")
     allowed_models = relationship("AIModel", secondary=model_group_access, back_populates="allowed_groups")
+    allowed_image_models = relationship("AIImageModel", secondary=image_model_group_access, back_populates="allowed_groups")

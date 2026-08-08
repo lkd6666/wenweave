@@ -6,6 +6,11 @@ import { AppThemeContext } from './appTheme'
 import type { AppThemeContextValue, ResolvedTheme, ThemePreference } from './appTheme'
 
 const THEME_PREFERENCE_KEY = 'yibanpaiban-theme-preference'
+const TOUCH_INTERACTION_QUERY = '(max-width: 991px), (pointer: coarse)'
+
+function hasTouchInteraction(): boolean {
+  return window.matchMedia(TOUCH_INTERACTION_QUERY).matches
+}
 
 function getSystemTheme(): ResolvedTheme {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
@@ -24,10 +29,18 @@ function getStoredPreference(): ThemePreference {
 export function AppThemeProvider({ children }: { children: ReactNode }) {
   const [preference, setPreferenceState] = useState<ThemePreference>(getStoredPreference)
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(getSystemTheme)
+  const [touchInteraction, setTouchInteraction] = useState(hasTouchInteraction)
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
     const handleChange = () => setSystemTheme(media.matches ? 'dark' : 'light')
+    media.addEventListener('change', handleChange)
+    return () => media.removeEventListener('change', handleChange)
+  }, [])
+
+  useEffect(() => {
+    const media = window.matchMedia(TOUCH_INTERACTION_QUERY)
+    const handleChange = () => setTouchInteraction(media.matches)
     media.addEventListener('change', handleChange)
     return () => media.removeEventListener('change', handleChange)
   }, [])
@@ -57,6 +70,7 @@ export function AppThemeProvider({ children }: { children: ReactNode }) {
     <AppThemeContext.Provider value={value}>
       <ConfigProvider
         locale={zhCN}
+        virtual={!touchInteraction}
         theme={{
           algorithm: resolvedTheme === 'dark' ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
           token: {

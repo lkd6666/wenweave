@@ -16,24 +16,39 @@ import {
   Switch,
   Table,
   Tag,
+  Tabs,
   Typography,
   message,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { CloudDownloadOutlined, PlusOutlined, SafetyCertificateOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { aiProvidersApi } from '../../api/aiProviders'
+import type { CreateImageModelPayload, UpdateProviderPayload } from '../../api/aiProviders'
 import { ApiError } from '../../api/client'
 import { userGroupsApi } from '../../api/userGroups'
 import { usersApi } from '../../api/users'
-import type { AIModelItem, AIProviderItem, DiscoveredModelItem, ModelDiscoveryResult, ProviderPresetItem, User, UserGroup } from '../../types'
+import type { AIImageModelItem, AIModelItem, AIProviderItem, DiscoveredModelItem, ModelDiscoveryResult, ProviderPresetItem, ProviderType, User, UserGroup } from '../../types'
 import { deriveModelTokenBudget, formatKTokens, tokensToWholeK } from '../../utils/modelTokenBudget'
 
 const { Title, Text, Paragraph } = Typography
 
 const PROVIDER_TYPE_OPTIONS = [
   { value: 'openai_compatible', label: 'OpenAI 兼容接口（DeepSeek/Qwen/Kimi/GLM/vLLM 等）' },
+  { value: 'openai_responses', label: 'OpenAI Responses API' },
   { value: 'anthropic', label: 'Anthropic（Claude 系列）' },
 ]
+
+function providerProtocolLabel(providerType: string): string {
+  if (providerType === 'anthropic') return 'Anthropic Messages'
+  if (providerType === 'openai_responses') return 'OpenAI Responses API'
+  return 'OpenAI Chat Completions 兼容'
+}
+
+function providerProtocolColor(providerType: string): string {
+  if (providerType === 'anthropic') return 'purple'
+  if (providerType === 'openai_responses') return 'green'
+  return 'geekblue'
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -43,6 +58,25 @@ function thinkingEfforts(config: Record<string, unknown> | undefined): string[] 
   const efforts = config?.efforts
   return isRecord(efforts) ? Object.keys(efforts) : []
 }
+
+function thinkingEffortsFromJson(value: unknown): string[] {
+  if (typeof value !== 'string' || !value.trim()) return []
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return isRecord(parsed) ? thinkingEfforts(parsed) : []
+  } catch {
+    return []
+  }
+}
+
+const THINKING_EFFORT_OPTIONS = [
+  { label: '极简', value: 'minimal' },
+  { label: '低', value: 'low' },
+  { label: '中', value: 'medium' },
+  { label: '高', value: 'high' },
+  { label: '超高', value: 'xhigh' },
+  { label: '最大（max）', value: 'max' },
+]
 
 export default function AdminModelsPage() {
   const [providers, setProviders] = useState<AIProviderItem[]>([])
@@ -58,6 +92,11 @@ export default function AdminModelsPage() {
   const [editingModel, setEditingModel] = useState<AIModelItem | null>(null)
   const [modelForm] = Form.useForm()
   const [savingModel, setSavingModel] = useState(false)
+  const [imageModelModalProviderId, setImageModelModalProviderId] = useState<number | null>(null)
+  const [editingImageModel, setEditingImageModel] = useState<AIImageModelItem | null>(null)
+  const [imageModelForm] = Form.useForm()
+  const [savingImageModel, setSavingImageModel] = useState(false)
+  const [providerTabs, setProviderTabs] = useState<Record<number, 'chat' | 'image'>>({})
 
   const [presetModalOpen, setPresetModalOpen] = useState(false)
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
@@ -84,13 +123,26 @@ export default function AdminModelsPage() {
   const isCompact = !screens.lg
   const inputLimitK = Form.useWatch('input_limit_k', modelForm)
   const outputLimitK = Form.useWatch('output_limit_k', modelForm)
+  const selectedThinkingEfforts = (Form.useWatch('thinking_efforts', modelForm) ?? []) as string[]
+  const thinkingConfigText = Form.useWatch('thinking_config_text', modelForm)
+  const selectedPresetProviderType = Form.useWatch('provider_type', presetForm) as ProviderType | undefined
+  const defaultThinkingEffortOptions = Array.from(new Set([
+    ...selectedThinkingEfforts,
+    ...thinkingEffortsFromJson(thinkingConfigText),
+  ])).flatMap((effort) => {
+    const option = THINKING_EFFORT_OPTIONS.find((item) => item.value === effort)
+    return option ? [option] : []
+  })
+  const modelModalProvider = providers.find((provider) => provider.id === modelModalProviderId)
+  const supportsExplicitPromptCache = modelModalProvider?.provider_type === 'openai_compatible'
+    || modelModalProvider?.provider_type === 'openai_responses'
   const automaticTokenBudget = deriveModelTokenBudget(inputLimitK, outputLimitK)
 
   const loadProviders = async () => {
     setLoading(true)
     try {
       const data = await aiProvidersApi.list()
-      setProviders(data)
+      setProviders(data.map((provider) => ({ ...provider, image_models: provider.image_models ?? [] })))
     } catch (err) {
       message.error(err instanceof ApiError ? String(err.detail) : '加载模型列表失败')
     } finally {
@@ -106,9 +158,20 @@ export default function AdminModelsPage() {
     }
   }
 
+  const loadAccessTargets = async () => {
+    try {
+      const [users, groups] = await Promise.all([usersApi.list(), userGroupsApi.list()])
+      setAccessUsers(users)
+      setAccessGroups(groups)
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '加载授权对象失败')
+    }
+  }
+
   useEffect(() => {
     void loadProviders()
     void loadPresets()
+    void loadAccessTargets()
   }, [])
 
   const openCreateProvider = () => {
@@ -124,6 +187,8 @@ export default function AdminModelsPage() {
       name: provider.name,
       provider_type: provider.provider_type,
       base_url: provider.base_url,
+      image_protocol: provider.image_protocol || '',
+      image_base_url: provider.image_base_url || '',
       api_key: '',
     })
     setProviderModalOpen(true)
@@ -134,7 +199,13 @@ export default function AdminModelsPage() {
       const values = await providerForm.validateFields()
       setSavingProvider(true)
       if (editingProvider) {
-        const payload: Record<string, unknown> = { name: values.name, base_url: values.base_url }
+        const payload: UpdateProviderPayload = {
+          name: values.name,
+          provider_type: values.provider_type,
+          base_url: values.base_url,
+          image_protocol: values.image_protocol || '',
+          image_base_url: values.image_base_url || '',
+        }
         if (values.api_key) payload.api_key = values.api_key
         await aiProvidersApi.update(editingProvider.id, payload)
         message.success('Provider 已更新')
@@ -172,9 +243,74 @@ export default function AdminModelsPage() {
       output_limit_k: 8,
       thinking_config_text: '',
       thinking_efforts: [],
+      default_thinking_effort: 'auto',
+      prompt_cache_enabled: false,
     })
     setModelModalProviderId(providerId)
   }
+
+  const openCreateImageModel = (providerId: number) => {
+    setEditingImageModel(null)
+    imageModelForm.resetFields()
+    imageModelForm.setFieldsValue({ supported_aspect_ratios: ['landscape', 'portrait', 'square'], supported_qualities: ['auto', 'medium'], is_default: false, access_mode: 'all' })
+    setImageModelModalProviderId(providerId)
+  }
+
+  const openEditImageModel = (model: AIImageModelItem) => {
+    setEditingImageModel(model)
+    imageModelForm.setFieldsValue({ ...model, allowed_user_ids: model.allowed_user_ids ?? [], allowed_group_ids: model.allowed_group_ids ?? [] })
+    setImageModelModalProviderId(model.provider_id)
+  }
+
+  const handleSaveImageModel = async () => {
+    if (imageModelModalProviderId === null) return
+    try {
+      const values = await imageModelForm.validateFields()
+      const parseIds = (value: unknown) => (Array.isArray(value) ? value : String(value ?? '').split(',')).map((item) => Number(String(item).trim())).filter((item) => Number.isInteger(item) && item > 0)
+      const normalizedValues = { ...values, allowed_user_ids: parseIds(values.allowed_user_ids), allowed_group_ids: parseIds(values.allowed_group_ids) }
+      setSavingImageModel(true)
+      if (editingImageModel) {
+        await aiProvidersApi.updateImageModel(editingImageModel.id, normalizedValues)
+      } else {
+        const payload: CreateImageModelPayload = normalizedValues
+        await aiProvidersApi.createImageModel(imageModelModalProviderId, payload)
+      }
+      message.success('图片模型已保存')
+      setImageModelModalProviderId(null)
+      void loadProviders()
+    } catch (err) {
+      if (err instanceof ApiError) message.error(String(err.detail))
+    } finally {
+      setSavingImageModel(false)
+    }
+  }
+
+  const handleDeleteImageModel = async (model: AIImageModelItem) => {
+    try {
+      await aiProvidersApi.removeImageModel(model.id)
+      message.success('图片模型已删除')
+      void loadProviders()
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '删除图片模型失败')
+    }
+  }
+
+  const imageModelList = (provider: AIProviderItem) => (
+    <div className="responsive-card-list admin-model-card-list">
+      {(() => {
+        const imageModels = provider.image_models ?? []
+        return imageModels.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无图片模型" /> : imageModels.map((model) => (
+        <article className="responsive-data-card" key={model.id}>
+          <div className="responsive-data-card-heading"><div><strong>{model.display_name}</strong><div className="responsive-data-card-secondary">{model.model_name}</div></div>{model.is_default && <Tag color="blue">默认</Tag>}</div>
+          {model.description && <div className="responsive-data-card-description">{model.description}</div>}
+          <div className="responsive-data-card-tags"><Tag>{model.supported_aspect_ratios.join(' / ')}</Tag><Tag>{model.supported_qualities.join(' / ')}</Tag>{model.access_mode === 'restricted' && <Tag color="orange">受限</Tag>}</div>
+          <Space className="responsive-data-card-actions"><Button size="small" onClick={() => openEditImageModel(model)}>编辑</Button>{!model.is_default && <Button size="small" type="link" onClick={() => void aiProvidersApi.updateImageModel(model.id, { is_default: true }).then(loadProviders)}>设为默认</Button>}<Popconfirm title="确认删除该图片模型？" onConfirm={() => void handleDeleteImageModel(model)}><Button size="small" danger>删除</Button></Popconfirm></Space>
+        </article>
+        ))
+      })()}
+      <Button type="dashed" icon={<PlusOutlined />} onClick={() => openCreateImageModel(provider.id)}>添加图片模型</Button>
+    </div>
+  )
 
   const openEditModel = (model: AIModelItem) => {
     setEditingModel(model)
@@ -189,6 +325,8 @@ export default function AdminModelsPage() {
       supports_disabled_thinking: model.supports_disabled_thinking,
       thinking_config_text: Object.keys(model.thinking_config ?? {}).length ? JSON.stringify(model.thinking_config, null, 2) : '',
       thinking_efforts: thinkingEfforts(model.thinking_config),
+      default_thinking_effort: model.default_thinking_effort,
+      prompt_cache_enabled: model.prompt_cache_enabled,
     })
     setModelModalProviderId(model.provider_id)
   }
@@ -230,6 +368,14 @@ export default function AdminModelsPage() {
           efforts: effortConfigs,
         }
       }
+      const defaultThinkingEffort = values.default_thinking_effort ?? 'auto'
+      if (defaultThinkingEffort !== 'auto' && !thinkingEfforts(thinkingConfig).includes(defaultThinkingEffort)) {
+        modelForm.setFields([{
+          name: 'default_thinking_effort',
+          errors: ['默认思考强度必须已在上方启用或高级 JSON 中配置'],
+        }])
+        return
+      }
       setSavingModel(true)
       if (editingModel) {
         await aiProvidersApi.updateModel(editingModel.id, {
@@ -239,6 +385,8 @@ export default function AdminModelsPage() {
           is_default: values.is_default,
           is_multimodal: values.is_multimodal,
           supports_disabled_thinking: values.supports_disabled_thinking,
+          default_thinking_effort: defaultThinkingEffort,
+          prompt_cache_enabled: supportsExplicitPromptCache && Boolean(values.prompt_cache_enabled),
           thinking_config: thinkingConfig,
         })
         message.success('模型已更新')
@@ -251,6 +399,8 @@ export default function AdminModelsPage() {
           is_default: values.is_default,
           is_multimodal: values.is_multimodal,
           supports_disabled_thinking: values.supports_disabled_thinking,
+          default_thinking_effort: defaultThinkingEffort,
+          prompt_cache_enabled: supportsExplicitPromptCache && Boolean(values.prompt_cache_enabled),
           thinking_config: thinkingConfig,
         })
         message.success('模型已添加')
@@ -352,6 +502,7 @@ export default function AdminModelsPage() {
     presetForm.resetFields()
     presetForm.setFieldsValue({
       preset_id: firstPreset.id,
+      provider_type: firstPreset.provider_type,
       name: firstPreset.name,
       model_names: [],
       set_as_default: providers.length === 0,
@@ -365,6 +516,7 @@ export default function AdminModelsPage() {
     setSelectedPresetId(presetId)
     setPresetDiscovery(null)
     presetForm.setFieldsValue({
+      provider_type: preset.provider_type,
       name: preset.name,
       model_names: [],
     })
@@ -373,9 +525,9 @@ export default function AdminModelsPage() {
   const handleDiscoverPresetModels = async () => {
     if (!selectedPresetId) return
     try {
-      const values = await presetForm.validateFields(['api_key'])
+      const values = await presetForm.validateFields(['api_key', 'provider_type'])
       setDiscoveringPresetModels(true)
-      const result = await aiProvidersApi.discoverPresetModels(selectedPresetId, values.api_key)
+      const result = await aiProvidersApi.discoverPresetModels(selectedPresetId, values.api_key, values.provider_type)
       setPresetDiscovery(result)
       presetForm.setFieldValue('model_names', [])
     } catch (err) {
@@ -403,6 +555,7 @@ export default function AdminModelsPage() {
       setInstallingPreset(true)
       await aiProvidersApi.installPreset(selectedPresetId, {
         api_key: values.api_key,
+        provider_type: values.provider_type,
         model_names: values.model_names,
         model_capabilities: presetDiscovery.models.filter((model) => values.model_names.includes(model.model_name)),
         name: values.name,
@@ -514,6 +667,7 @@ export default function AdminModelsPage() {
         <Space size={4} wrap>
           {model.is_multimodal ? <Tag color="green">多模态</Tag> : <Text type="secondary">文本</Text>}
           {model.supports_disabled_thinking ? <Tag color="blue">可不思考</Tag> : <Tag>仅默认思考</Tag>}
+          {model.prompt_cache_enabled && <Tag color="gold">显式缓存</Tag>}
         </Space>
       ),
     },
@@ -568,7 +722,7 @@ export default function AdminModelsPage() {
         </Card>
       )}
 
-      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={16} style={{ width: '100%' }}>
         {providers.map((provider) => (
           <Card
             key={provider.id}
@@ -576,8 +730,8 @@ export default function AdminModelsPage() {
             title={
               <Space>
                 <Text strong>{provider.name}</Text>
-                <Tag color={provider.provider_type === 'anthropic' ? 'purple' : 'geekblue'}>
-                  {provider.provider_type === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}
+                <Tag color={providerProtocolColor(provider.provider_type)}>
+                  {providerProtocolLabel(provider.provider_type)}
                 </Tag>
               </Space>
             }
@@ -605,6 +759,8 @@ export default function AdminModelsPage() {
             <Paragraph type="secondary" style={{ marginBottom: 12 }}>
               Base URL：{provider.base_url} ｜ API Key：{provider.api_key_masked}
             </Paragraph>
+            <Tabs activeKey={providerTabs[provider.id] ?? 'chat'} onChange={(key) => setProviderTabs((tabs) => ({ ...tabs, [provider.id]: key as 'chat' | 'image' }))} items={[{ key: 'chat', label: '对话模型' }, { key: 'image', label: `图片模型（${(provider.image_models ?? []).length}）` }]} />
+            <div style={{ display: (providerTabs[provider.id] ?? 'chat') === 'chat' ? 'block' : 'none' }}>
             {isCompact ? (
               <div className="responsive-card-list admin-model-card-list" aria-label={`${provider.name} 模型列表`}>
                 {provider.models.length === 0 ? (
@@ -623,7 +779,8 @@ export default function AdminModelsPage() {
                     {model.description && <div className="responsive-data-card-description">{model.description}</div>}
                     <div className="responsive-data-card-tags">
                       {Object.keys(model.thinking_config ?? {}).length ? <Tag color="cyan">推理已配置</Tag> : <Tag>自动推理</Tag>}
-                      {thinkingEfforts(model.thinking_config).map((effort) => <Tag key={effort}>{effort}</Tag>)}
+                       {thinkingEfforts(model.thinking_config).map((effort) => <Tag key={effort}>{effort}</Tag>)}
+                       {model.prompt_cache_enabled && <Tag color="gold">显式缓存</Tag>}
                       {modelAccess(model)}
                     </div>
                     <div className="responsive-data-card-actions">{modelActions(provider, model)}</div>
@@ -649,6 +806,13 @@ export default function AdminModelsPage() {
             >
               添加模型
             </Button>
+            </div>
+            <div style={{ marginTop: 24 }}>
+              <div style={{ display: (providerTabs[provider.id] ?? 'chat') === 'image' ? 'block' : 'none' }}>
+              <Space style={{ marginBottom: 8 }}><Text strong>图片模型</Text><Tag color={provider.image_protocol ? 'green' : 'default'}>{provider.image_protocol || '未配置图片端点'}</Tag></Space>
+              {imageModelList(provider)}
+              </div>
+            </div>
           </Card>
         ))}
       </Space>
@@ -667,13 +831,13 @@ export default function AdminModelsPage() {
             <Input placeholder="例如：DeepSeek 官方 / 公司自建 vLLM" />
           </Form.Item>
           <Form.Item name="provider_type" label="接口协议类型" rules={[{ required: true }]}>
-            <Select options={PROVIDER_TYPE_OPTIONS} disabled={!!editingProvider} />
+            <Select options={PROVIDER_TYPE_OPTIONS} />
           </Form.Item>
           <Form.Item
             name="base_url"
             label="Base URL"
             rules={[{ required: true, message: '请输入 Base URL' }]}
-            extra="OpenAI 兼容接口填到 /v1 级别即可，例如 https://api.deepseek.com/v1"
+            extra="OpenAI Chat Completions / Responses API 都填到 /v1 级别，例如 https://api.openai.com/v1"
           >
             <Input placeholder="https://api.deepseek.com/v1" />
           </Form.Item>
@@ -685,6 +849,33 @@ export default function AdminModelsPage() {
           >
             <Input.Password autoComplete="off" placeholder={editingProvider ? '留空则不修改' : 'sk-...'} />
           </Form.Item>
+          <Form.Item name="image_protocol" label="图片协议（可选）">
+            <Select allowClear options={[{ value: 'openai_images', label: 'OpenAI Images' }, { value: 'dashscope_images', label: '阿里百炼文生图' }, { value: 'volcengine_ark_images', label: '火山方舟图片' }]} />
+          </Form.Item>
+          <Form.Item name="image_base_url" label="图片 Base URL" extra="留空则不启用图片模型；百炼原生填 https://dashscope.aliyuncs.com/api/v1。若 Token Plan 兼容网关返回 url error，请为图片另建使用原生 DashScope API Key 的 Provider">
+            <Input placeholder="https://api.openai.com/v1" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={editingImageModel ? `编辑图片模型：${editingImageModel.display_name}` : '添加图片模型'}
+        open={imageModelModalProviderId !== null}
+        onCancel={() => setImageModelModalProviderId(null)}
+        onOk={handleSaveImageModel}
+        confirmLoading={savingImageModel}
+        destroyOnHidden
+      >
+        <Form form={imageModelForm} layout="vertical">
+          <Form.Item name="model_name" label="模型名称" rules={[{ required: true, message: '请输入模型名称' }]}><Input disabled={Boolean(editingImageModel)} placeholder="例如：gpt-image-1" /></Form.Item>
+          <Form.Item name="display_name" label="展示名称" rules={[{ required: true, message: '请输入展示名称' }]}><Input placeholder="例如：高质量配图" /></Form.Item>
+          <Form.Item name="description" label="描述"><Input.TextArea rows={2} /></Form.Item>
+          <Form.Item name="supported_aspect_ratios" label="支持比例"><Checkbox.Group options={[{ label: '方形', value: 'square' }, { label: '竖图', value: 'portrait' }, { label: '横图', value: 'landscape' }]} /></Form.Item>
+          <Form.Item name="supported_qualities" label="质量选项"><Select mode="tags" options={['auto', 'low', 'medium', 'high'].map((value) => ({ label: value, value }))} /></Form.Item>
+          <Form.Item name="is_default" valuePropName="checked"><Checkbox>设为默认图片模型</Checkbox></Form.Item>
+          <Form.Item name="access_mode" label="使用范围"><Select options={[{ value: 'all', label: '所有有权限用户' }, { value: 'restricted', label: '仅管理员（可在权限中细分）' }]} /></Form.Item>
+          <Form.Item name="allowed_user_ids" label="授权用户"><Select mode="multiple" allowClear loading={loadingAccessTargets} options={accessUsers.map((user) => ({ value: user.id, label: `${user.display_name}（${user.username}）` }))} placeholder="选择受限用户" /></Form.Item>
+          <Form.Item name="allowed_group_ids" label="授权用户组"><Select mode="multiple" allowClear loading={loadingAccessTargets} options={accessGroups.map((group) => ({ value: group.id, label: `${group.name}（${group.members.length} 人）` }))} placeholder="选择受限用户组" /></Form.Item>
         </Form>
       </Modal>
 
@@ -703,12 +894,21 @@ export default function AdminModelsPage() {
             type="info"
             showIcon
             style={{ marginBottom: 16 }}
-            message="预设已包含官方 Base URL、协议和模型思考参数，只需填写 API Key。"
+            message="预设已包含官方 Base URL 和模型思考参数，可选择接口协议；只需填写 API Key。"
           />
           <Form.Item name="preset_id" label="供应商预设" rules={[{ required: true, message: '请选择供应商' }]}>
             <Select
               options={presets.map((preset) => ({ value: preset.id, label: preset.name }))}
               onChange={handlePresetChange}
+            />
+          </Form.Item>
+          <Form.Item name="provider_type" label="接口协议类型" rules={[{ required: true, message: '请选择接口协议类型' }]}>
+            <Select
+              options={PROVIDER_TYPE_OPTIONS}
+              onChange={() => {
+                setPresetDiscovery(null)
+                presetForm.setFieldValue('model_names', [])
+              }}
             />
           </Form.Item>
           {selectedPreset && (
@@ -717,7 +917,7 @@ export default function AdminModelsPage() {
                 showIcon
                 style={{ marginBottom: 16 }}
                 message={`Base URL：${selectedPreset.base_url}`}
-                description={`协议：${selectedPreset.provider_type === 'anthropic' ? 'Anthropic Messages' : 'OpenAI 兼容'}；填写 Key 后获取当前可用模型。`}
+                description={`协议：${providerProtocolLabel(selectedPresetProviderType ?? selectedPreset.provider_type)}；填写 Key 后获取当前可用模型。`}
               />
           )}
           <Form.Item name="name" label="Provider 名称" rules={[{ required: true, message: '请输入名称' }]}>
@@ -741,7 +941,7 @@ export default function AdminModelsPage() {
           {presetDiscovery && installableModels.length > 0 && (
             <Form.Item name="model_names" label={`选择要添加的模型（${presetDiscovery.source}）`} rules={[{ required: true, message: '至少选择一个模型' }]}>
               <Checkbox.Group style={{ width: '100%' }}>
-                <Space direction="vertical" size={8} style={{ width: '100%', maxHeight: 300, overflowY: 'auto' }}>
+                <Space orientation="vertical" size={8} style={{ width: '100%', maxHeight: 300, overflowY: 'auto' }}>
                   {installableModels.map((model) => (
                     <Checkbox key={model.model_name} value={model.model_name}>
                       {model.display_name}
@@ -787,7 +987,7 @@ export default function AdminModelsPage() {
               onChange={(values) => setSelectedDiscoveredModels(values as string[])}
               style={{ width: '100%', marginTop: 12, maxHeight: 420, overflowY: 'auto' }}
             >
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                 {discovery.models.map((model: DiscoveredModelItem) => {
                   const exists = discoverModalProvider?.models.some((item) => item.model_name === model.model_name)
                   return (
@@ -883,16 +1083,32 @@ export default function AdminModelsPage() {
           <Form.Item
             name="thinking_efforts"
             label="思考强度"
-            extra="选择后会生成 OpenAI reasoning_effort 的低/中/高/超高等参数；其他厂商使用下方高级 JSON 覆盖。"
+            extra="选择后会生成 OpenAI reasoning_effort 的极简、低、中、高、超高或最大参数；其他厂商使用下方高级 JSON 覆盖。"
           >
-            <Checkbox.Group options={[
-              { label: '极简', value: 'minimal' },
-              { label: '低', value: 'low' },
-              { label: '中', value: 'medium' },
-              { label: '高', value: 'high' },
-              { label: '超高', value: 'xhigh' },
-            ]} />
+            <Checkbox.Group options={THINKING_EFFORT_OPTIONS} />
           </Form.Item>
+          <Form.Item
+            name="default_thinking_effort"
+            label="默认思考强度"
+            extra="聊天设置选择“默认”时使用；自动会沿用高级 JSON 的 enabled 参数。"
+          >
+            <Select
+              options={[
+                { value: 'auto', label: '自动（使用 enabled 参数）' },
+                ...defaultThinkingEffortOptions,
+              ]}
+            />
+          </Form.Item>
+          {supportsExplicitPromptCache && (
+            <Form.Item
+              name="prompt_cache_enabled"
+              label="显式提示缓存"
+              valuePropName="checked"
+              extra="仅在当前网关已支持 prompt_cache_key、显式断点和 prompt_cache_options 时开启。启用后只缓存 Agent 的固定规则，不缓存文档或工具历史。"
+            >
+              <Switch />
+            </Form.Item>
+          )}
           <Form.Item
             name="thinking_config_text"
             label="高级思考参数 JSON（可选）"

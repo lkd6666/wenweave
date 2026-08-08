@@ -50,3 +50,11 @@ export function clearChatComposerDraft(documentId: number, sessionId: number): v
     // Storage cleanup must never prevent a completed conversation from rendering.
   }
 }
+
+/** Removes only the draft that belongs to the completed request. */
+export function clearChatComposerDraftForRequest(documentId: number, sessionId: number, clientRequestId: string): boolean {
+  const draft = readChatComposerDraft(documentId, sessionId)
+  if (!clientRequestId || draft?.clientRequestId !== clientRequestId) return false
+  clearChatComposerDraft(documentId, sessionId)
+  return true
+}

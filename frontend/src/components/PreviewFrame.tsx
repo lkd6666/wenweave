@@ -39,6 +39,7 @@ import {
 } from '../utils/blockEditing'
 import { sanitizeSelectedElement } from '../utils/selectedElements'
 import { frameDocumentWithNewWindowLinks, markLinksToOpenInNewWindow, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { documentsApi } from '../api/documents'
 import ImageCropModal from './ImageCropModal'
 import type { CropRect } from '../utils/imageCrop'
 import { ImageCropError, cropImageBlob, isFullCropRect, parseCropRect, serializeCropRect } from '../utils/imageCrop'
@@ -49,6 +50,7 @@ type MobileEditorPanel = 'text-style' | 'block-style' | 'block-actions' | 'image
 
 export interface PreviewFrameHandle {
   flushPendingChange: () => void
+  copyArticle: () => Promise<'copied' | 'empty' | 'failed'>
   openImagePickerForInsert: () => void
   insertTemplateHtml: (html: string, placement: 'append' | 'caret') => boolean
   undo: () => boolean
@@ -58,6 +60,7 @@ export interface PreviewFrameHandle {
 interface PreviewFrameProps {
   html: string
   revision: number
+  active: boolean
   mode: PreviewMode
   brightness: number
   compact: boolean
@@ -86,6 +89,45 @@ const FONT_OPTIONS = [
   { value: 'Arial', label: 'Arial' },
 ]
 const LINE_HEIGHT_OPTIONS = ['1', '1.2', '1.4', '1.5', '1.6', '1.8', '2', '2.4']
+
+function isCrossOriginHttpSource(source: string): boolean {
+  try {
+    const parsed = new URL(source, window.location.href)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.origin !== window.location.origin
+  } catch {
+    return false
+  }
+}
+
+async function readCropSource(source: string): Promise<Blob> {
+  // A displayed cross-origin image can be perfectly valid while its bytes are
+  // unreadable to fetch/canvas. Prefer the authenticated same-origin proxy,
+  // then retain a direct fallback for sources whose server already allows CORS
+  // but cannot be reached by the application server.
+  let proxyError: unknown
+  const crossOrigin = isCrossOriginHttpSource(source)
+  if (crossOrigin) {
+    try {
+      return await documentsApi.fetchCropSource(source)
+    } catch (error) {
+      proxyError = error
+      // Fall through to the browser request below.
+    }
+  }
+
+  try {
+    const response = await fetch(source, {
+      mode: 'cors',
+      credentials: crossOrigin ? 'omit' : 'same-origin',
+    })
+    if (!response.ok) throw new ImageCropError('无法读取原图')
+    return response.blob()
+  } catch (error) {
+    if (proxyError instanceof Error) throw new ImageCropError(proxyError.message)
+    if (error instanceof ImageCropError) throw error
+    throw new ImageCropError('无法读取原图')
+  }
+}
 
 interface BlockStyleValues {
   alignment: string
@@ -179,6 +221,7 @@ function extensionForImageType(contentType: string): string {
 const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function PreviewFrame({
   html,
   revision,
+  active,
   mode,
   brightness,
   compact,
@@ -370,7 +413,8 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     clearDomSelection()
   }, [selectedElements])
 
-  const srcDoc = frameDocumentWithNewWindowLinks(`<!DOCTYPE html>
+  if (srcDocRef.current === null) {
+    srcDocRef.current = frameDocumentWithNewWindowLinks(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -392,7 +436,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       color: #000;
       word-wrap: break-word;
     }
-    img { max-width: 100%; height: auto; }
+    /* Content images keep their own layout rules so replacement only changes src. */
     table { max-width: 100%; }
     .ai-preview-selecting * { cursor: pointer !important; }
     .ai-preview-selecting *:hover { outline: 1px dashed #91caff; outline-offset: 2px; }
@@ -468,7 +512,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 </head>
 <body>${html || EMPTY_PREVIEW_HTML}</body>
 </html>`)
-  if (srcDocRef.current === null) srcDocRef.current = srcDoc
+  }
 
   const syncHeight = () => {
     const document = iframeRef.current?.contentDocument
@@ -527,14 +571,19 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return true
   }
 
+  const ensureRenderedHtml = () => {
+    if (!previewReadyRef.current || renderedHtmlRef.current === htmlRef.current) return
+    replacePreviewBody(htmlRef.current)
+  }
+
   useLayoutEffect(() => {
-    if (!previewReadyRef.current || renderedHtmlRef.current === html) return
+    if (!active || !previewReadyRef.current || renderedHtmlRef.current === html) return
     editUndoStackRef.current = []
     editRedoStackRef.current = []
     pendingInputHistoryRef.current = null
     onHistoryStateChangeRef.current({ canUndo: false, canRedo: false })
     replacePreviewBody(html)
-  }, [html])
+  }, [active, html])
 
   const cleanClone = (element: HTMLElement) => {
     const clone = element.cloneNode(true) as HTMLElement
@@ -553,6 +602,68 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     clone.querySelectorAll('[data-preview-image-action]').forEach((node) => node.remove())
     stripBlockEditingMarkup(clone)
     return clone.innerHTML
+  }
+
+  const copyArticle = async (): Promise<'copied' | 'empty' | 'failed'> => {
+    ensureRenderedHtml()
+    const frameDocument = iframeRef.current?.contentDocument
+    const body = frameDocument?.body
+    if (!frameDocument || !body) return 'failed'
+
+    const html = serialiseBody(body).trim()
+    if (!html || html === EMPTY_PREVIEW_HTML) return 'empty'
+
+    const plainTextContainer = frameDocument.createElement('div')
+    plainTextContainer.innerHTML = html
+    const plainText = plainTextContainer.textContent?.trim() ?? ''
+
+    try {
+      if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([plainText], { type: 'text/plain' }),
+          }),
+        ])
+        return 'copied'
+      }
+    } catch {
+      // Some embedded browsers reject asynchronous clipboard writes. Use the
+      // native selection path below, which preserves a rich HTML fragment.
+    }
+
+    const selection = frameDocument.defaultView?.getSelection()
+    if (!selection) return 'failed'
+    const previousRanges = Array.from(
+      { length: selection.rangeCount },
+      (_, index) => selection.getRangeAt(index).cloneRange(),
+    )
+    const copyContainer = frameDocument.createElement('div')
+    copyContainer.contentEditable = 'true'
+    copyContainer.tabIndex = -1
+    copyContainer.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;'
+    copyContainer.innerHTML = html
+
+    let copied = false
+    try {
+      body.append(copyContainer)
+      copyContainer.focus({ preventScroll: true })
+      const range = frameDocument.createRange()
+      range.selectNodeContents(copyContainer)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      copied = frameDocument.execCommand('copy')
+    } catch {
+      copied = false
+    } finally {
+      copyContainer.remove()
+      selection.removeAllRanges()
+      for (const range of previousRanges) {
+        if (range.commonAncestorContainer.isConnected) selection.addRange(range)
+      }
+    }
+
+    return copied ? 'copied' : 'failed'
   }
 
   const recordEditChange = (previousHtml: string) => {
@@ -596,6 +707,33 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return segments.join(' > ')
   }
 
+  const selectionStableAttributes = (element: HTMLElement) => {
+    const attributes: Record<string, string> = {}
+    element.getAttributeNames().forEach((name) => {
+      const key = name.toLowerCase()
+      if (!/^(id|src|srcset|href|name|data-[a-z0-9_-]+)$/.test(key)) return
+      const value = element.getAttribute(name)
+      if (value) attributes[key] = value
+    })
+    return attributes
+  }
+
+  const selectionFingerprintText = (clone: HTMLElement) => {
+    // Match the source-side parser's text normalisation. `textContent` alone
+    // joins adjacent inline nodes, while replacing tags with whitespace keeps
+    // a span/a selection stable across browser and source parsing.
+    const container = clone.ownerDocument.createElement('div')
+    container.innerHTML = clone.outerHTML.replace(/<[^>]+>/g, ' ')
+    return (container.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 1000)
+  }
+
+  const selectionSiblingIndex = (element: HTMLElement) => {
+    const siblings = Array.from(element.parentElement?.children ?? [])
+      .filter((node) => node.tagName === element.tagName)
+    const index = siblings.indexOf(element)
+    return index >= 0 ? index + 1 : 0
+  }
+
   const selectionTarget = (element: HTMLElement, body: HTMLElement): HTMLElement | null => {
     const svg = element.closest('svg')
     if (!svg || !body.contains(svg)) return element
@@ -609,11 +747,25 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
   const selectionContext = (element: HTMLElement, body: HTMLElement): SelectedElementContext => {
     const clone = cleanClone(element)
+    const selector = makeSelector(element, body)
+    const parent = element.parentElement && element.parentElement !== body ? element.parentElement : null
+    const text = (clone.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 2000)
+    const fingerprintText = selectionFingerprintText(clone)
     return sanitizeSelectedElement({
-      selector: makeSelector(element, body),
+      selector,
       tag_name: element.tagName.toLowerCase(),
       html: clone.outerHTML,
-      text: (clone.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 2000),
+      text,
+      locator: {
+        path: selector,
+        parent_path: parent ? makeSelector(parent, body) : '',
+        sibling_index: selectionSiblingIndex(element),
+        fingerprint: {
+          tag_name: element.tagName.toLowerCase(),
+          stable_attributes: selectionStableAttributes(element),
+          text: fingerprintText,
+        },
+      },
     })
   }
 
@@ -1482,11 +1634,11 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
     setCroppingImage(true)
     try {
-      const response = await fetch(session.source)
-      if (!response.ok) throw new ImageCropError('无法读取原图')
-      const sourceBlob = await response.blob()
+      const sourceBlob = await readCropSource(session.source)
       const croppedBlob = await cropImageBlob(sourceBlob, rect)
-      const file = new File([croppedBlob], 'cropped-image.png', { type: 'image/png' })
+      const contentType = croppedBlob.type || 'image/png'
+      const filename = contentType === 'image/jpeg' ? 'cropped-image.jpg' : 'cropped-image.png'
+      const file = new File([croppedBlob], filename, { type: contentType })
       const url = await onUploadImageRef.current(file)
       if (!target.isConnected || !target.ownerDocument.body) throw new ImageCropError('图片已发生变化，请重新选择裁剪')
       const previousHtml = serialiseBody(target.ownerDocument.body)
@@ -1530,6 +1682,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   }
 
   const insertTemplateHtml = (templateHtml: string, placement: 'append' | 'caret'): boolean => {
+    ensureRenderedHtml()
     const document = iframeRef.current?.contentDocument
     const body = document?.body
     if (!body || !templateHtml.trim()) return false
@@ -1690,6 +1843,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       inputTimerRef.current = null
       emitCurrentHtmlChange()
     },
+    copyArticle,
     openImagePickerForInsert,
     insertTemplateHtml,
     undo: () => restoreEditHistory('undo'),

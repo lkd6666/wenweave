@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field, model_validator
 from app.models.ai_provider import ProviderType
 
 
+ThinkingEffort = Literal["auto", "minimal", "low", "medium", "high", "xhigh", "max"]
+ImageProtocol = Literal["", "openai_images", "dashscope_images", "volcengine_ark_images"]
+
+
 def _validate_token_budget(
     context_window_tokens: int,
     context_compaction_threshold_tokens: int,
@@ -30,6 +34,8 @@ class ModelRead(BaseModel):
     is_default: bool
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True
+    default_thinking_effort: ThinkingEffort = "auto"
+    prompt_cache_enabled: bool = False
     access_mode: Literal["all", "restricted"] = "all"
     allowed_user_ids: list[int] = Field(default_factory=list)
     allowed_group_ids: list[int] = Field(default_factory=list)
@@ -50,6 +56,8 @@ class ModelCreate(BaseModel):
     is_default: bool = False
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True
+    default_thinking_effort: ThinkingEffort = "auto"
+    prompt_cache_enabled: bool = False
     thinking_config: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -73,7 +81,49 @@ class ModelUpdate(BaseModel):
     is_default: bool | None = None
     is_multimodal: bool | None = None
     supports_disabled_thinking: bool | None = None
+    default_thinking_effort: ThinkingEffort | None = None
+    prompt_cache_enabled: bool | None = None
     thinking_config: dict[str, Any] | None = None
+    access_mode: Literal["all", "restricted"] | None = None
+    allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
+    allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
+
+
+class ImageModelRead(BaseModel):
+    id: int
+    provider_id: int
+    model_name: str
+    display_name: str
+    description: str
+    supported_aspect_ratios: list[str] = Field(default_factory=list)
+    supported_qualities: list[str] = Field(default_factory=list)
+    is_default: bool
+    access_mode: Literal["all", "restricted"] = "all"
+    allowed_user_ids: list[int] = Field(default_factory=list)
+    allowed_group_ids: list[int] = Field(default_factory=list)
+
+    class Config:
+        from_attributes = True
+
+
+class ImageModelCreate(BaseModel):
+    model_name: str = Field(min_length=1, max_length=256)
+    display_name: str = Field(min_length=1, max_length=256)
+    description: str = Field(default="", max_length=1024)
+    supported_aspect_ratios: list[Literal["square", "portrait", "landscape"]] = Field(default_factory=list)
+    supported_qualities: list[str] = Field(default_factory=list, max_length=12)
+    is_default: bool = False
+    access_mode: Literal["all", "restricted"] = "all"
+    allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
+    allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
+
+
+class ImageModelUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=256)
+    description: str | None = Field(default=None, max_length=1024)
+    supported_aspect_ratios: list[Literal["square", "portrait", "landscape"]] | None = None
+    supported_qualities: list[str] | None = Field(default=None, max_length=12)
+    is_default: bool | None = None
     access_mode: Literal["all", "restricted"] | None = None
     allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
     allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
@@ -84,20 +134,28 @@ class ProviderRead(BaseModel):
     name: str
     provider_type: ProviderType
     base_url: str
+    image_protocol: ImageProtocol = ""
+    image_base_url: str = ""
     api_key_masked: str
     models: list[ModelRead] = []
+    image_models: list[ImageModelRead] = []
 
 
 class ProviderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     provider_type: ProviderType
     base_url: str = Field(min_length=1, max_length=512)
+    image_protocol: ImageProtocol = ""
+    image_base_url: str = Field(default="", max_length=512)
     api_key: str = Field(min_length=1)
 
 
 class ProviderUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
+    provider_type: ProviderType | None = None
     base_url: str | None = Field(default=None, min_length=1, max_length=512)
+    image_protocol: ImageProtocol | None = None
+    image_base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = None  # 留空表示不修改现有密钥
 
 
@@ -126,6 +184,7 @@ class ProviderPresetRead(BaseModel):
 
 class PresetInstallRequest(BaseModel):
     api_key: str = Field(min_length=1)
+    provider_type: ProviderType | None = None
     model_names: list[str] = Field(min_length=1, max_length=30)
     # Filled from the immediately preceding discovery response so that
     # provider-reported capacity is retained when a preset is installed.
@@ -136,6 +195,7 @@ class PresetInstallRequest(BaseModel):
 
 class PresetDiscoveryRequest(BaseModel):
     api_key: str = Field(min_length=1)
+    provider_type: ProviderType | None = None
 
 
 class ModelBulkCreateItem(BaseModel):

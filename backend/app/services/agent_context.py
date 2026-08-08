@@ -35,8 +35,8 @@ DEFAULT_PRESERVE_RECENT_TOKENS = 20_000
 # attempts still give slower providers enough time to respond.  The outer
 # coroutine timeout and the HTTP request timeout must stay aligned; otherwise
 # the client would still fail before the advertised compaction timeout.
-COMPACTION_MODEL_TIMEOUT_SECONDS = 180
-COMPACTION_MODEL_REQUEST_TIMEOUT_SECONDS = 180
+COMPACTION_MODEL_TIMEOUT_SECONDS = 300
+COMPACTION_MODEL_REQUEST_TIMEOUT_SECONDS = 300
 COMPACTION_MODEL_MAX_RETRIES = 0
 COMPACTION_MODEL_MAX_OUTPUT_TOKENS = 12_000
 # The same tools are bound for every editor turn. This conservative schema

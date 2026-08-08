@@ -2,6 +2,8 @@ export interface PublicDocumentShare {
   title: string
   html: string
   cover_url: string
+  cover_crop_235_1: string
+  cover_crop_1_1: string
   revision: string
   expires_at: string
   asset_refresh_at: string

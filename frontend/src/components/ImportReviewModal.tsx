@@ -5,7 +5,7 @@ import type { DirectImportProgress } from '../imports/directImportUpload'
 import { parseImportFile } from '../imports/documentImportParser'
 import { createParsedImportPreview } from '../imports/parsedImportPreview'
 import type { ParsedImport } from '../imports/types'
-import { frameDocumentWithNewWindowLinks, SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { frameDocumentWithNewWindowLinks, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 
 interface ImportReviewModalProps {
   file: File | null
@@ -97,7 +97,10 @@ export default function ImportReviewModal({ file, open, importing, progress, imp
               <iframe
                 title={`${fileTypeLabel} 内容预览`}
                 className="import-preview-iframe"
-                sandbox={SANDBOX_ALLOW_NEW_WINDOW}
+                // Parsed Word/PDF images use parent-created blob URLs. Keep the
+                // preview same-origin so those URLs remain readable; scripts
+                // are still blocked because the sandbox grants no script flag.
+                sandbox={SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW}
                 srcDoc={frameDocumentWithNewWindowLinks(`<!doctype html><html><head><meta charset="utf-8"><style>body{margin:0;padding:28px;font:15px/1.8 -apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;color:#1f2937}img{max-width:100%;height:auto}table{max-width:100%;border-collapse:collapse}td,th{border:1px solid #d1d5db;padding:6px}</style></head><body>${parsedHtml}</body></html>`)}
               />
             )}

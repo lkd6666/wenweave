@@ -508,7 +508,7 @@ export default function WeChatDraftModal({
           </Form.Item>
         </div>
         <Form.Item name="digest" label="摘要" rules={[{ max: 120, message: '摘要不能超过 120 个字' }]}>
-          <Input.TextArea autoSize={{ minRows: 2, maxRows: 4 }} maxLength={120} showCount placeholder="留空时不显示摘要" />
+          <Input.TextArea autoSize={{ minRows: 2, maxRows: 4 }} maxLength={120} showCount placeholder="可选；留空时不显示摘要，也不会从正文抓取" />
         </Form.Item>
         <Form.Item name="content_source_url" label="原文链接" rules={[{ type: 'url', message: '请输入以 http:// 或 https:// 开头的链接' }]}>
           <Input placeholder="https://example.com/article" />

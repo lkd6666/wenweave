@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { recordChatUserQuestionActivity, startChatRun } from './chat'
+import { parseSseChunk, recordChatUserQuestionActivity, startChatRun } from './chat'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -36,5 +36,23 @@ describe('startChatRun', () => {
 
     const [, request] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(JSON.parse(String(request.body))).not.toHaveProperty('template_ids')
+  })
+})
+
+describe('chat SSE event timing', () => {
+  it('extracts replay age without exposing transport metadata to event handlers', () => {
+    const parsed = parseSseChunk(
+      'id: 12\r\nevent: reasoning_delta\r\ndata: {"text":"继续分析","_event_age_ms":125430}\r\n\r\n',
+    )
+
+    expect(parsed.rest).toBe('')
+    expect(parsed.events).toEqual([
+      {
+        sequence: 12,
+        eventAgeMs: 125430,
+        event: 'reasoning_delta',
+        data: { text: '继续分析' },
+      },
+    ])
   })
 })

@@ -50,6 +50,21 @@ class TemplateItemRead(BaseModel):
     updated_at: datetime
 
 
+class TemplateImageLocalizationItem(BaseModel):
+    template_id: int
+    name: str
+    status: Literal["updated", "unchanged", "failed"]
+    localized_count: int = 0
+    message: str = ""
+
+
+class TemplateImageLocalizationResult(BaseModel):
+    items: list[TemplateImageLocalizationItem] = Field(default_factory=list)
+    updated_count: int = 0
+    failed_count: int = 0
+    localized_count: int = 0
+
+
 class TemplateGenerationCreate(BaseModel):
     model_id: int = Field(gt=0)
     prompt: str = Field(min_length=4, max_length=6000)

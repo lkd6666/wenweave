@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { Button, Space, Typography, message } from 'antd'
 import { CodeOutlined, CopyOutlined, SaveOutlined } from '@ant-design/icons'
 import CodeMirror from '@uiw/react-codemirror'
@@ -20,17 +20,30 @@ interface CodeViewerProps {
 export default function CodeViewer({ html, onChange, onSave, saving, disabled = false }: CodeViewerProps) {
   const { resolvedTheme } = useAppTheme()
   const autoFormattedSourceRef = useRef<string | null>(null)
+  const extensions = useMemo(() => [htmlLanguage()], [])
+  const basicSetup = useMemo(() => ({
+    lineNumbers: true,
+    foldGutter: true,
+    highlightActiveLine: true,
+    highlightSelectionMatches: true,
+    bracketMatching: true,
+  }), [])
 
   useEffect(() => {
     if (disabled || /[\r\n]/.test(html)) {
       autoFormattedSourceRef.current = null
-      return
+      return undefined
     }
-    const formatted = formatHtml(html)
-    if (formatted === html || autoFormattedSourceRef.current === html) return
-    autoFormattedSourceRef.current = html
-    onChange(formatted)
-    message.info('已自动格式化单行 HTML 源码')
+    // Let the editor paint before formatting a potentially large one-line
+    // document. This keeps the first switch to source view responsive.
+    const timer = window.setTimeout(() => {
+      const formatted = formatHtml(html)
+      if (formatted === html || autoFormattedSourceRef.current === html) return
+      autoFormattedSourceRef.current = html
+      onChange(formatted)
+      message.info('已自动格式化单行 HTML 源码')
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [disabled, html, onChange])
 
   const handleCopy = async () => {
@@ -72,15 +85,9 @@ export default function CodeViewer({ html, onChange, onSave, saving, disabled = 
         className="code-viewer-editor"
         value={html}
         height="100%"
-        extensions={[htmlLanguage()]}
+        extensions={extensions}
         theme={resolvedTheme === 'dark' ? githubDark : githubLight}
-        basicSetup={{
-          lineNumbers: true,
-          foldGutter: true,
-          highlightActiveLine: true,
-          highlightSelectionMatches: true,
-          bracketMatching: true,
-        }}
+        basicSetup={basicSetup}
         editable={!disabled}
         onChange={onChange}
       />

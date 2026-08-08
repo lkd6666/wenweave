@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 from app.db.types import ID_TYPE
-from app.models.user_group import model_user_access, user_group_members
+from app.models.user_group import image_model_user_access, model_user_access, user_group_members
 
 
 class UserRole(str, enum.Enum):
@@ -29,3 +29,4 @@ class User(Base):
 
     groups = relationship("UserGroup", secondary=user_group_members, back_populates="members")
     allowed_models = relationship("AIModel", secondary=model_user_access, back_populates="allowed_users")
+    allowed_image_models = relationship("AIImageModel", secondary=image_model_user_access, back_populates="allowed_users")

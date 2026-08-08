@@ -2,6 +2,7 @@ import { documentsApi, uploadToOss, uploadToServer } from '../api/documents'
 import { ApiError } from '../api/client'
 import type { DocumentDetail } from '../types'
 import { prepareWeChatBodyImage } from '../utils/wechatBodyImage'
+import { readDirectImportAssetReferences, replaceDirectImportAssetReferences } from './directImportAssetReferences'
 import { parseImportFile } from './documentImportParser'
 import type { ImportParseProgress, ParsedImport, ParsedImportAsset } from './types'
 
@@ -13,6 +14,25 @@ export interface DirectImportProgress {
 
 const RETRY_COUNT = 3
 const UPLOAD_CONCURRENCY = 3
+/** Keep the parsed asset order while discarding extraction artifacts omitted from the final HTML. */
+export function selectReferencedImportAssets(html: string, assets: ParsedImportAsset[]): ParsedImportAsset[] {
+  const assetsByClientId = new Map<string, ParsedImportAsset>()
+  for (const asset of assets) {
+    if (assetsByClientId.has(asset.clientId)) {
+      throw new Error(`解析图片标识重复：${asset.clientId}`)
+    }
+    assetsByClientId.set(asset.clientId, asset)
+  }
+
+  const referencedClientIds = new Set<string>()
+  for (const clientId of readDirectImportAssetReferences(html)) {
+    if (!assetsByClientId.has(clientId)) {
+      throw new Error(`正文引用的图片资源不存在：${clientId}`)
+    }
+    referencedClientIds.add(clientId)
+  }
+  return assets.filter((asset) => referencedClientIds.has(asset.clientId))
+}
 
 async function prepareImportAssetsForWeChat(assets: ParsedImportAsset[], signal?: AbortSignal): Promise<ParsedImportAsset[]> {
   return Promise.all(assets.map(async (asset) => {
@@ -194,17 +214,17 @@ export async function importDocumentDirectly(
   }, signal)
 
   onProgress({ phase: 'uploading', percent: 58, detail: '正在准备公众号正文图片…' })
-  const uploadAssetsForWechat = await prepareImportAssetsForWeChat(parsed.assets, signal)
+  const referencedAssets = selectReferencedImportAssets(parsed.html, parsed.assets)
+  const uploadAssetsForWechat = await prepareImportAssetsForWeChat(referencedAssets, signal)
   const assetIds = await uploadAssets(started.id, uploadAssetsForWechat, started.upload_mode, (uploaded, total, detail) => {
     const ratio = total === 0 ? 1 : uploaded / total
     onProgress({ phase: 'uploading', percent: 58 + Math.round(ratio * 36), detail })
   }, signal)
   await sourceUpload
 
-  let html = parsed.html
-  for (const [clientId, assetId] of assetIds) {
-    html = html.split(`direct-import://asset/${clientId}`).join(`direct-import://asset/${assetId}`)
-  }
+  const html = replaceDirectImportAssetReferences(parsed.html, new Map(
+    Array.from(assetIds, ([clientId, assetId]) => [clientId, `direct-import://asset/${assetId}`]),
+  ))
   onProgress({
     phase: 'finalizing',
     percent: 96,

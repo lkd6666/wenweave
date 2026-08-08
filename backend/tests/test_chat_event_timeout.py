@@ -16,7 +16,7 @@ import app.models  # noqa: F401 - register referenced tables for the isolated da
 import app.api.routes.chat as chat_module
 import app.bootstrap as bootstrap_module
 from app.db.base import Base
-from app.api.routes.chat import _agent_execution_error_message, _force_stuck_cancellation, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
+from app.api.routes.chat import _agent_execution_error_message, _force_stuck_cancellation, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _preserve_retried_tool_previews, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.chat_user_question import ChatUserQuestion, ChatUserQuestionStatus
 from app.models.chat_message import ChatMessage
@@ -173,6 +173,33 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn_blocks[0]["tool"]["status"], "success")
         self.assertEqual(tool_calls[1]["status"], "waiting")
         self.assertEqual(turn_blocks[1]["tool"]["status"], "waiting")
+
+    def test_model_retry_keeps_unexecuted_patch_visible_as_interrupted(self) -> None:
+        checkpoint_tools = [{"id": "read-1", "name": "read_blocks", "status": "success"}]
+        checkpoint_blocks = [{"id": "block-read-1", "type": "tool", "state": "done", "content": "", "tool": checkpoint_tools[0]}]
+        current_patch = {
+            "id": "patch-1",
+            "name": "apply_html_patch",
+            "status": "running",
+            "preparing": True,
+            "argument_tokens": 16393,
+        }
+        current_tools = [*checkpoint_tools, current_patch]
+        current_blocks = [*checkpoint_blocks, {"id": "block-patch-1", "type": "tool", "state": "done", "content": "", "tool": current_patch}]
+
+        tools, blocks, interrupted_ids = _preserve_retried_tool_previews(
+            checkpoint_tools,
+            checkpoint_blocks,
+            current_tools,
+            current_blocks,
+            {"attempt": 2, "reason": "stream_progress_idle_timeout"},
+        )
+
+        self.assertEqual(interrupted_ids, ["patch-1:retry-2"])
+        self.assertEqual(tools[-1]["status"], "interrupted")
+        self.assertEqual(tools[-1]["argument_tokens"], 16393)
+        self.assertIn("尚未执行", tools[-1]["result"])
+        self.assertEqual(blocks[-1]["tool"]["id"], "patch-1:retry-2")
 
     def test_settling_a_legacy_timeline_backfills_missing_block_content(self) -> None:
         tool_calls = [{"id": "call-1", "name": "ask_user", "status": "success"}]
@@ -536,6 +563,14 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             _agent_execution_error_message("上游错误"),
             "Agent 执行失败: 上游错误",
         )
+        self.assertEqual(
+            _agent_execution_error_message("Concurrency limit exceeded for account, please retry later"),
+            "当前模型服务繁忙或并发已满。请稍后重试，或更换其他可用模型后重新发送本轮请求。",
+        )
+        self.assertEqual(
+            _agent_execution_error_message("Error code: 503 - Service is too busy"),
+            "当前模型服务繁忙或并发已满。请稍后重试，或更换其他可用模型后重新发送本轮请求。",
+        )
 
     def test_recognises_provider_context_limit_errors_for_safe_retry(self) -> None:
         self.assertTrue(_is_context_limit_error("maximum context length exceeded"))
@@ -612,6 +647,35 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(received), 4)
         self.assertTrue(all(event["event"] == "heartbeat" for event in received))
 
+    async def test_preparing_tool_call_uses_the_tool_argument_idle_limit(self) -> None:
+        async def events():
+            yield {"event": "tool_call", "data": {"id": "tool-1", "preparing": True}}
+            await asyncio.sleep(0.02)
+            yield {"event": "tool_result", "data": {"id": "tool-1"}}
+
+        with (
+            patch("app.api.routes.chat.AGENT_EVENT_IDLE_TIMEOUT_SECONDS", 0.01),
+            patch("app.api.routes.chat.AGENT_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS", 0.05),
+            patch("app.api.routes.chat.AGENT_MAX_RUNTIME_SECONDS", 1.0),
+        ):
+            received = [event async for event in _iterate_agent_events_with_timeout(events())]
+
+        self.assertEqual([event["event"] for event in received], ["tool_call", "tool_result"])
+
+    async def test_preparing_tool_call_timeout_has_a_tool_argument_reason(self) -> None:
+        async def events():
+            yield {"event": "tool_call", "data": {"id": "tool-1", "preparing": True}}
+            await asyncio.sleep(1)
+
+        with (
+            patch("app.api.routes.chat.AGENT_EVENT_IDLE_TIMEOUT_SECONDS", 1.0),
+            patch("app.api.routes.chat.AGENT_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS", 0.01),
+            patch("app.api.routes.chat.AGENT_MAX_RUNTIME_SECONDS", 1.0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "工具参数"):
+                async for _ in _iterate_agent_events_with_timeout(events()):
+                    pass
+
     async def test_total_runtime_limit_stops_an_endless_heartbeat_stream(self) -> None:
         async def events():
             while True:
@@ -666,10 +730,11 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             yield SimpleNamespace(tool_call_chunks=[{"index": 0, "name": "inspect_history_images"}])
             await asyncio.sleep(1)
 
-        with patch("app.services.chat_agent.MODEL_STREAM_IDLE_TIMEOUT_SECONDS", 0.01):
-            with self.assertRaisesRegex(RuntimeError, "未产生.*输出"):
+        with patch("app.services.chat_agent.MODEL_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "工具参数") as raised:
                 async for _ in _iterate_model_stream_with_idle_limits(stream()):
                     pass
+        self.assertEqual(raised.exception.phase, "tool_argument_idle")
 
     async def test_repeated_tool_control_chunks_do_not_keep_the_run_alive(self) -> None:
         async def stream():
@@ -680,11 +745,12 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.services.chat_agent.MODEL_FIRST_PROGRESS_TIMEOUT_SECONDS", 0.02),
             patch("app.services.chat_agent.MODEL_STREAM_IDLE_TIMEOUT_SECONDS", 0.02),
+            patch("app.services.chat_agent.MODEL_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS", 0.02),
         ):
             with self.assertRaises(ModelStreamTimeoutError) as raised:
                 async for _ in _iterate_model_stream_with_idle_limits(stream()):
                     pass
-        self.assertEqual(raised.exception.phase, "progress_idle")
+        self.assertEqual(raised.exception.phase, "tool_argument_idle")
 
     async def test_continuous_tool_argument_output_is_not_limited_by_total_duration(self) -> None:
         async def stream():
@@ -692,7 +758,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 yield SimpleNamespace(tool_call_chunks=[{"index": 0, "name": "replace_document", "args": str(index)}])
                 await asyncio.sleep(0.02)
 
-        with patch("app.services.chat_agent.MODEL_STREAM_IDLE_TIMEOUT_SECONDS", 0.05):
+        with patch("app.services.chat_agent.MODEL_TOOL_ARGUMENT_IDLE_TIMEOUT_SECONDS", 0.05):
             received = [chunk async for chunk in _iterate_model_stream_with_idle_limits(stream())]
 
         self.assertEqual(len(received), 12)
@@ -781,9 +847,10 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def query(self, _model):
+                result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
-                        with_for_update=lambda: SimpleNamespace(first=lambda: document)
+                        with_for_update=lambda: SimpleNamespace(first=lambda: result)
                     )
                 )
 
@@ -821,6 +888,8 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.closed)
         self.assertEqual(run.status, AgentRunStatus.CANCELLED)
         self.assertEqual(run.assistant_message_id, 11)
+        self.assertEqual(run.owner_id, "")
+        self.assertIsNone(run.lease_expires_at)
         self.assertEqual(manager.get(run.id).status, AgentRunStatus.CANCELLED.value)
 
     async def test_force_stuck_cancellation_preserves_checkpoint_when_document_is_unchanged(self) -> None:
@@ -852,9 +921,10 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def query(self, _model):
+                result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
-                        with_for_update=lambda: SimpleNamespace(first=lambda: document)
+                        with_for_update=lambda: SimpleNamespace(first=lambda: result)
                     )
                 )
 
@@ -924,9 +994,10 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def query(self, _model):
+                result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
-                        with_for_update=lambda: SimpleNamespace(first=lambda: document)
+                        with_for_update=lambda: SimpleNamespace(first=lambda: result)
                     )
                 )
 
@@ -996,6 +1067,12 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             def order_by(self, *_args):
                 return self
 
+            def limit(self, *_args):
+                return self
+
+            def scalar(self):
+                return getattr(self.rows[0], "sequence", None) if self.rows else None
+
             def with_for_update(self):
                 return self
 
@@ -1008,6 +1085,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         class FakeSession:
             def __init__(self) -> None:
                 self.message = None
+                self.events = []
                 self.committed = False
 
             def query(self, model):
@@ -1017,7 +1095,10 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return request_message if model is ChatMessage else None
 
             def add(self, message) -> None:
-                self.message = message
+                if isinstance(message, ChatMessage):
+                    self.message = message
+                else:
+                    self.events.append(message)
 
             def flush(self) -> None:
                 self.message.id = 11
@@ -1038,6 +1119,8 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.status, AgentRunStatus.FAILED)
         self.assertEqual(session.message.html_before, source_html)
         self.assertEqual(session.message.html_after, checkpoint_html)
+        terminal_events = [event for event in session.events if getattr(event, "event", "") == "final"]
+        self.assertEqual(len(terminal_events), 1)
         self.assertIn("已保留", run.error_message)
 
 

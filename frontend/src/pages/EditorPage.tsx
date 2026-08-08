@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react'
-import { Button, Drawer, Dropdown, Grid, Input, Modal, Popover, Segmented, Slider, Space, Spin, Tooltip, message } from 'antd'
-import { AppstoreOutlined, ArrowLeftOutlined, BulbOutlined, EditOutlined, FileSearchOutlined, HistoryOutlined, LinkOutlined, MoreOutlined, PictureOutlined, RedoOutlined, ReloadOutlined, SafetyCertificateOutlined, SaveOutlined, SelectOutlined, SendOutlined, UndoOutlined } from '@ant-design/icons'
+import { Button, Drawer, Grid, Input, Modal, Popconfirm, Popover, Segmented, Slider, Space, Spin, Tooltip, message } from 'antd'
+import { AppstoreOutlined, ArrowLeftOutlined, BulbOutlined, CloudDownloadOutlined, CopyOutlined, EditOutlined, FileSearchOutlined, HistoryOutlined, LinkOutlined, MoreOutlined, PictureOutlined, RedoOutlined, ReloadOutlined, SafetyCertificateOutlined, SaveOutlined, SelectOutlined, SendOutlined, UndoOutlined } from '@ant-design/icons'
 import { useNavigate, useParams } from 'react-router'
 import ChatPanel, { type ChatRunNotice, type QueuedChatMessage, type ReaskConflictNotice } from '../components/ChatPanel'
 import type { UserQuestionAnswer } from '../components/UserQuestionPanel'
@@ -10,6 +10,7 @@ import type { PreviewFrameHandle, PreviewMode } from '../components/PreviewFrame
 import CompliancePanel from '../components/CompliancePanel'
 import VersionHistoryDrawer from '../components/VersionHistoryDrawer'
 import TemplateLibraryPanel from '../components/TemplateLibraryPanel'
+import AIImageGenerationModal from '../components/AIImageGenerationModal'
 import { documentsApi } from '../api/documents'
 import { modelsApi } from '../api/models'
 import { aiProvidersApi } from '../api/aiProviders'
@@ -21,7 +22,8 @@ import { ApiError } from '../api/client'
 import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, ReasoningTrace, SelectedElementContext, TemplateItem, ToolExecution, VisibilitySettings, WeChatArticleMetadata, WeChatAvailableAccount } from '../types'
 import { sanitizeSelectedElement, sanitizeSelectedElements } from '../utils/selectedElements'
 import { formatWeChatImageSize, prepareWeChatBodyImage } from '../utils/wechatBodyImage'
-import { clearChatComposerDraft, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
+import { clearChatComposerDraft, clearChatComposerDraftForRequest, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
+import { moveQueuedChatItem, updateQueuedChatContent } from '../utils/chatQueue'
 import { useAuthStore } from '../store/authStore'
 
 const CodeViewer = lazy(() => import('../components/CodeViewer'))
@@ -37,6 +39,7 @@ const STREAM_RENDER_INTERVAL_MS = 48
 const MAX_STREAM_RECONNECT_ATTEMPTS = 12
 const MIN_CHAT_PANE_WIDTH = 300
 const MIN_CENTER_PANE_WIDTH = 440
+const MIN_TOUCH_CENTER_PANE_WIDTH = 320
 const MIN_RESOURCE_PANE_WIDTH = 260
 const COLUMN_RESIZER_WIDTH = 8
 const AUTO_SAVE_DELAY_MS = 5000
@@ -132,11 +135,11 @@ function clearLastSelectedModelId(userId: number | null | undefined): void {
   }
 }
 
-function finishActiveTextBlock(blocks: AssistantTurnBlock[]): AssistantTurnBlock[] {
+function finishActiveTextBlock(blocks: AssistantTurnBlock[], endedAtMs = Date.now()): AssistantTurnBlock[] {
   const last = blocks.at(-1)
   if (!last || (last.type !== 'thought' && last.type !== 'content') || last.state === 'done') return blocks
   const duration_ms = last.type === 'thought' && last.started_at_ms
-    ? Math.max(0, Date.now() - last.started_at_ms)
+    ? Math.max(0, endedAtMs - last.started_at_ms)
     : last.duration_ms
   return [...blocks.slice(0, -1), { ...last, state: 'done', duration_ms }]
 }
@@ -145,6 +148,7 @@ function appendStreamTextBlock(
   blocks: AssistantTurnBlock[],
   type: Extract<AssistantTurnBlock['type'], 'thought' | 'content'>,
   text: string,
+  occurredAtMs = Date.now(),
 ): AssistantTurnBlock[] {
   if (!text) return blocks
   const last = blocks.at(-1)
@@ -152,34 +156,89 @@ function appendStreamTextBlock(
     return [...blocks.slice(0, -1), { ...last, content: last.content + text }]
   }
   return [
-    ...finishActiveTextBlock(blocks),
+    ...finishActiveTextBlock(blocks, occurredAtMs),
     {
       id: `${type}-${blocks.length + 1}`,
       type,
       state: 'active',
       content: text,
       duration_ms: null,
-      ...(type === 'thought' ? { started_at_ms: Date.now() } : {}),
+      ...(type === 'thought' ? { started_at_ms: occurredAtMs } : {}),
       tool: null,
     },
   ]
 }
 
-function startThinkingBlock(blocks: AssistantTurnBlock[]): AssistantTurnBlock[] {
+function startThinkingBlock(blocks: AssistantTurnBlock[], occurredAtMs = Date.now()): AssistantTurnBlock[] {
   const last = blocks.at(-1)
   if (last?.type === 'thought' && last.state === 'active') return blocks
   return [
-    ...finishActiveTextBlock(blocks),
+    ...finishActiveTextBlock(blocks, occurredAtMs),
     {
       id: `thought-${blocks.length + 1}`,
       type: 'thought',
       state: 'active',
       content: '',
       duration_ms: null,
-      started_at_ms: Date.now(),
+      started_at_ms: occurredAtMs,
       tool: null,
     },
   ]
+}
+
+function preserveRetriedToolPreviews(
+  checkpoint: {
+    tools: ToolExecution[]
+    blocks: AssistantTurnBlock[]
+  },
+  currentTools: ToolExecution[],
+  currentBlocks: AssistantTurnBlock[],
+  retryAttempt: number,
+): { tools: ToolExecution[]; blocks: AssistantTurnBlock[] } {
+  const checkpointToolIds = new Set(checkpoint.tools.map((tool) => tool.id))
+  const retrySuffix = `:retry-${Math.max(1, retryAttempt)}`
+  const interruptedBySourceId = new Map<string, ToolExecution>()
+
+  currentTools.forEach((tool) => {
+    if (checkpointToolIds.has(tool.id) || tool.status !== 'running' || !tool.preparing) return
+    interruptedBySourceId.set(tool.id, {
+      ...tool,
+      id: `${tool.id}${retrySuffix}`,
+      status: 'interrupted',
+      preparing: false,
+      result: '本次工具参数生成被模型重试中断，尚未执行任何修改。',
+      activity: {
+        kind: 'retry',
+        summary: '参数生成中断，正在重新请求模型',
+      },
+    })
+  })
+
+  if (interruptedBySourceId.size === 0) return checkpoint
+
+  const interruptedBlocks = currentBlocks.flatMap((block) => {
+    const sourceId = block.type === 'tool' ? block.tool?.id : null
+    const interrupted = sourceId ? interruptedBySourceId.get(sourceId) : undefined
+    return interrupted
+      ? [{ ...block, id: `${block.id}${retrySuffix}`, tool: interrupted }]
+      : []
+  })
+  const blockedSourceIds = new Set(interruptedBlocks.map((block) => block.tool?.id))
+  const missingBlocks = [...interruptedBySourceId.entries()]
+    .filter(([, tool]) => !blockedSourceIds.has(tool.id))
+    .map(([sourceId, tool]) => ({
+      id: `block-${sourceId}${retrySuffix}`,
+      type: 'tool' as const,
+      state: 'done' as const,
+      content: '',
+      duration_ms: null,
+      tool,
+    }))
+
+  return {
+    tools: [...checkpoint.tools, ...interruptedBySourceId.values()],
+    blocks: [...checkpoint.blocks, ...interruptedBlocks, ...missingBlocks],
+  }
 }
 
 function createClientRequestId(): string {
@@ -290,12 +349,16 @@ export default function EditorPage() {
   })
   const [wechatAccounts, setWechatAccounts] = useState<WeChatAvailableAccount[]>([])
   const [saving, setSaving] = useState(false)
+  const [materializingTemplateImages, setMaterializingTemplateImages] = useState(false)
+  const [localizingArticleImages, setLocalizingArticleImages] = useState(false)
   const [chatPaneWidth, setChatPaneWidth] = useState<number | null>(null)
   const [resizingChatPane, setResizingChatPane] = useState(false)
   const [resourcePaneWidth, setResourcePaneWidth] = useState<number | null>(null)
   const [resizingResourcePane, setResizingResourcePane] = useState(false)
   const [resourceCollapsed, setResourceCollapsed] = useState(false)
   const [resourceDrawerOpen, setResourceDrawerOpen] = useState(false)
+  const [mobileActionsDrawerOpen, setMobileActionsDrawerOpen] = useState(false)
+  const [aiImageModalOpen, setAiImageModalOpen] = useState(false)
 
   const [models, setModels] = useState<AIModelItem[]>([])
   const [modelId, setModelId] = useState<number | null>(null)
@@ -329,6 +392,7 @@ export default function EditorPage() {
   const [resolvingReaskConflict, setResolvingReaskConflict] = useState(false)
 
   const [centerView, setCenterView] = useState<CenterView>('preview')
+  const [codeViewMounted, setCodeViewMounted] = useState(false)
   const [mobileWorkspace, setMobileWorkspace] = useState<MobileWorkspace>('preview')
   const [previewMode, setPreviewMode] = useState<PreviewMode>('browse')
   const [previewBrightness, setPreviewBrightness] = useState(100)
@@ -364,6 +428,7 @@ export default function EditorPage() {
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const saveRequestRef = useRef<Promise<string | null> | null>(null)
   const previewFrameRef = useRef<PreviewFrameHandle>(null)
+  const codeViewerHtmlRef = useRef('')
   const creatingChatSessionRef = useRef(false)
   const modelIdRef = useRef<number | null>(null)
   const modelsRef = useRef<AIModelItem[]>([])
@@ -371,6 +436,7 @@ export default function EditorPage() {
   const chatImageDocumentIdRef = useRef<number | null>(null)
   const chatImagesRef = useRef<ChatImageAttachment[]>([])
   const observedDocumentIdRef = useRef<number | null>(docId || null)
+  const selectedElementsDocumentIdRef = useRef<number | null>(docId || null)
   const chatImageDraftEpochRef = useRef(0)
   const chatImageUploadInProgressRef = useRef(false)
   const chatStartInProgressRef = useRef(false)
@@ -424,6 +490,17 @@ export default function EditorPage() {
         clearChatComposerDraft(documentId, sessionId)
         return null
       }
+      if (run?.status === 'failed') {
+        // A failed run is terminal, so retrying it needs a fresh idempotency
+        // key instead of replaying the same failed request.
+        const retry = {
+          message: saved.message,
+          reaskFromMessageId: saved.reaskFromMessageId,
+          phase: 'retry' as const,
+        }
+        writeChatComposerDraft(documentId, sessionId, retry)
+        return retry
+      }
     } catch {
       // A disconnected backend is precisely when the original instruction
       // must remain available for retry.
@@ -435,7 +512,7 @@ export default function EditorPage() {
   }, [])
 
   useEffect(() => {
-    if (!docId || !activeChatSessionId || loading || chatSubmitting || streaming) return
+    if (!docId || !activeChatSessionId || loading || chatSubmitting) return
     const saved = readChatComposerDraft(docId, activeChatSessionId)
     if (!contextDraft.trim()) {
       if (saved?.phase === 'editing' || saved?.phase === 'retry') clearChatComposerDraft(docId, activeChatSessionId)
@@ -450,17 +527,28 @@ export default function EditorPage() {
       phase: retainRetryIdentity ? 'retry' : 'editing',
       ...(retainRetryIdentity && saved.clientRequestId ? { clientRequestId: saved.clientRequestId } : {}),
     })
-  }, [activeChatSessionId, chatSubmitting, contextDraft, docId, loading, pendingReaskMessageId, streaming])
+  }, [activeChatSessionId, chatSubmitting, contextDraft, docId, loading, pendingReaskMessageId])
 
   const handleChatPaneResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || window.matchMedia('(max-width: 720px)').matches) return
+    if (!event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0) || window.matchMedia('(max-width: 720px)').matches) return
     const columns = columnsRef.current
     if (!columns) return
     const bounds = columns.getBoundingClientRect()
-    const maximumWidth = bounds.width - MIN_CENTER_PANE_WIDTH - COLUMN_RESIZER_WIDTH
+    const minimumCenterWidth = window.matchMedia('(pointer: coarse)').matches
+      ? MIN_TOUCH_CENTER_PANE_WIDTH
+      : MIN_CENTER_PANE_WIDTH
+    const resourceWidth = columns.querySelector<HTMLElement>('.editor-col-resource')?.getBoundingClientRect().width ?? 0
+    const resizerWidth = columns.querySelectorAll<HTMLElement>('.editor-col-resizer').length * COLUMN_RESIZER_WIDTH
+    const maximumWidth = bounds.width - resourceWidth - minimumCenterWidth - resizerWidth
     if (maximumWidth < MIN_CHAT_PANE_WIDTH) return
 
     event.preventDefault()
+    const resizer = event.currentTarget
+    try {
+      resizer.setPointerCapture(event.pointerId)
+    } catch {
+      // Some older touch browsers do not implement pointer capture.
+    }
     resizeCleanupRef.current?.()
     setResizingChatPane(true)
     const previousUserSelect = document.body.style.userSelect
@@ -475,6 +563,7 @@ export default function EditorPage() {
       window.removeEventListener('pointerup', finish)
       window.removeEventListener('pointercancel', finish)
       document.body.style.userSelect = previousUserSelect
+      if (resizer.hasPointerCapture(event.pointerId)) resizer.releasePointerCapture(event.pointerId)
       resizeCleanupRef.current = null
       setResizingChatPane(false)
     }
@@ -484,14 +573,25 @@ export default function EditorPage() {
   }, [])
 
   const handleResourcePaneResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || resourceCollapsed || window.matchMedia('(max-width: 991px)').matches) return
+    if (!event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0) || resourceCollapsed || window.matchMedia('(max-width: 991px)').matches) return
     const columns = columnsRef.current
     if (!columns) return
     const bounds = columns.getBoundingClientRect()
-    const maximumWidth = bounds.width - MIN_CHAT_PANE_WIDTH - MIN_CENTER_PANE_WIDTH - COLUMN_RESIZER_WIDTH * 2
+    const minimumCenterWidth = window.matchMedia('(pointer: coarse)').matches
+      ? MIN_TOUCH_CENTER_PANE_WIDTH
+      : MIN_CENTER_PANE_WIDTH
+    const chatWidth = columns.querySelector<HTMLElement>('.editor-col-chat')?.getBoundingClientRect().width ?? MIN_CHAT_PANE_WIDTH
+    const resizerWidth = columns.querySelectorAll<HTMLElement>('.editor-col-resizer').length * COLUMN_RESIZER_WIDTH
+    const maximumWidth = bounds.width - chatWidth - minimumCenterWidth - resizerWidth
     if (maximumWidth < MIN_RESOURCE_PANE_WIDTH) return
 
     event.preventDefault()
+    const resizer = event.currentTarget
+    try {
+      resizer.setPointerCapture(event.pointerId)
+    } catch {
+      // Some older touch browsers do not implement pointer capture.
+    }
     resizeCleanupRef.current?.()
     setResizingResourcePane(true)
     const previousUserSelect = document.body.style.userSelect
@@ -506,6 +606,7 @@ export default function EditorPage() {
       window.removeEventListener('pointerup', finish)
       window.removeEventListener('pointercancel', finish)
       document.body.style.userSelect = previousUserSelect
+      if (resizer.hasPointerCapture(event.pointerId)) resizer.releasePointerCapture(event.pointerId)
       resizeCleanupRef.current = null
       setResizingResourcePane(false)
     }
@@ -558,7 +659,15 @@ export default function EditorPage() {
       setWechatMetadata(doc.wechat_metadata)
       applyExternalHtml(doc.current_html)
       setPreviewRevision((value) => value + 1)
-      setSelectedElements([])
+      // A refresh rehydrates the same article, not the user's selection
+      // intent. Keep its anchor so the next turn resolves it against this
+      // latest HTML; only discard anchors when navigating to another article.
+      const selectionBelongsToAnotherDocument = (
+        selectedElementsDocumentIdRef.current !== null
+        && selectedElementsDocumentIdRef.current !== docId
+      )
+      selectedElementsDocumentIdRef.current = docId
+      setSelectedElements((items) => (selectionBelongsToAnotherDocument ? [] : items))
       setVersionRefreshToken((value) => value + 1)
       setMessages(msgs)
       setChatSessions(sessions)
@@ -752,33 +861,81 @@ export default function EditorPage() {
   }, [cancelAutoSave, persistDraftHtml])
 
   const handleHtmlChange = useCallback((next: string) => {
-    if (streaming || next === draftHtmlRef.current) return
+    if (streaming || localizingArticleImages || next === draftHtmlRef.current) return
     draftHtmlRef.current = next
     setDraftHtml(next)
     scheduleComplianceCheck(next)
     scheduleAutoSave()
-  }, [scheduleAutoSave, scheduleComplianceCheck, streaming])
+  }, [localizingArticleImages, scheduleAutoSave, scheduleComplianceCheck, streaming])
 
-  const handleAppendTemplate = useCallback((template: TemplateItem) => {
-    if (streaming || saving) return
-    const inserted = previewFrameRef.current?.insertTemplateHtml(template.html, 'append')
-    if (!inserted) {
-      message.error('画布尚未准备好，无法添加模板')
+  const handleAppendTemplate = useCallback(async (template: TemplateItem) => {
+    if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
+    setMaterializingTemplateImages(true)
+    try {
+      const result = await documentsApi.materializeTemplateImages(docId, template.id)
+      const inserted = previewFrameRef.current?.insertTemplateHtml(result.html, 'append')
+      if (!inserted) {
+        message.error('画布尚未准备好，无法添加模板')
+        return
+      }
+      message.success(result.localized_count ? `已转存 ${result.localized_count} 张图片并添加「${template.name}」` : `已将「${template.name}」添加到文末`)
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '组件图片转存失败，未插入文章')
+    } finally {
+      setMaterializingTemplateImages(false)
+    }
+  }, [docId, localizingArticleImages, materializingTemplateImages, saving, streaming])
+
+  const handleInsertTemplateAtCaret = useCallback(async (template: TemplateItem) => {
+    if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
+    setMaterializingTemplateImages(true)
+    try {
+      const result = await documentsApi.materializeTemplateImages(docId, template.id)
+      const inserted = previewFrameRef.current?.insertTemplateHtml(result.html, 'caret')
+      if (!inserted) {
+        setHasPreviewCaret(false)
+        message.warning('请在直接编辑模式中将真实文本光标放到画布内，再插入模板')
+        return
+      }
+      message.success(result.localized_count ? `已转存 ${result.localized_count} 张图片并插入「${template.name}」` : `已将「${template.name}」插入光标处`)
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '组件图片转存失败，未插入文章')
+    } finally {
+      setMaterializingTemplateImages(false)
+    }
+  }, [docId, localizingArticleImages, materializingTemplateImages, saving, streaming])
+
+  const handleLocalizeArticleImages = useCallback(async () => {
+    if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
+    setLocalizingArticleImages(true)
+    try {
+      previewFrameRef.current?.flushPendingChange()
+      if (await persistDraftHtml(false) === null) return
+      const result = await documentsApi.localizeExternalImages(docId)
+      applyExternalHtml(result.html)
+      setPreviewRevision((value) => value + 1)
+      setVersionRefreshToken((value) => value + 1)
+      scheduleComplianceCheck(result.html)
+      message.success(result.localized_count ? `已转存 ${result.localized_count} 张外链图片` : '未发现需要转存的外链图片')
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '文章图片转存失败，正文未修改')
+    } finally {
+      setLocalizingArticleImages(false)
+    }
+  }, [applyExternalHtml, docId, localizingArticleImages, materializingTemplateImages, persistDraftHtml, saving, scheduleComplianceCheck, streaming])
+
+  const handleCopyPreviewArticle = useCallback(async () => {
+    const result = await previewFrameRef.current?.copyArticle()
+    if (result === 'copied') {
+      message.success('文章已复制，可直接粘贴到公众号编辑器')
       return
     }
-    message.success(`已将「${template.name}」添加到文末`)
-  }, [saving, streaming])
-
-  const handleInsertTemplateAtCaret = useCallback((template: TemplateItem) => {
-    if (streaming || saving) return
-    const inserted = previewFrameRef.current?.insertTemplateHtml(template.html, 'caret')
-    if (!inserted) {
-      setHasPreviewCaret(false)
-      message.warning('请在直接编辑模式中将真实文本光标放到画布内，再插入模板')
+    if (result === 'empty') {
+      message.info('暂无文章内容可复制')
       return
     }
-    message.success(`已将「${template.name}」插入光标处`)
-  }, [saving, streaming])
+    message.error('复制失败，请检查浏览器剪贴板权限后重试')
+  }, [])
 
   useEffect(() => {
     const handleCanvasHistoryShortcut = (event: KeyboardEvent) => {
@@ -1164,11 +1321,29 @@ export default function EditorPage() {
     let streamRenderFrame: number | null = null
     let lastStreamRenderAt = 0
     const savedComposerDraft = isNewRun ? readChatComposerDraft(docId, sessionId) : null
-    const reusableRequestId = savedComposerDraft?.phase === 'retry'
+    let reusableRequestId = savedComposerDraft?.phase === 'retry'
       && savedComposerDraft.message === text
       && savedComposerDraft.reaskFromMessageId === reaskFromMessageId
       ? savedComposerDraft.clientRequestId
       : undefined
+    if (reusableRequestId) {
+      try {
+        const savedRun = savedComposerDraft?.runId
+          ? await chatApi.getRun(docId, savedComposerDraft.runId)
+          : await chatApi.getRunByClientRequest(docId, reusableRequestId)
+        if (savedRun && ['completed', 'cancelled', 'failed'].includes(savedRun.status)) {
+          reusableRequestId = undefined
+          writeChatComposerDraft(docId, sessionId, {
+            message: text,
+            reaskFromMessageId,
+            phase: 'retry',
+          })
+        }
+      } catch {
+        // Keep the key when status reconciliation is unavailable; the POST
+        // still needs idempotency protection if the original request exists.
+      }
+    }
     const clientRequestId = existingRunId ? null : reusableRequestId ?? createClientRequestId()
     const submittedDraft = isNewRun
       ? { message: text, reaskFromMessageId, clientRequestId: clientRequestId as string }
@@ -1176,11 +1351,27 @@ export default function EditorPage() {
     if (submittedDraft) {
       writeChatComposerDraft(docId, sessionId, { ...submittedDraft, phase: 'starting' })
     }
-    const restoreSubmittedDraft = () => {
+    const restoreSubmittedDraft = (withFreshRequestId = false) => {
       if (!submittedDraft) return
+      const storedDraft = readChatComposerDraft(docId, sessionId)
+      const hasNewerDraft = Boolean(
+        storedDraft?.message.trim()
+        && storedDraft.clientRequestId !== submittedDraft.clientRequestId,
+      )
+      if (hasNewerDraft) return
       setContextDraft(submittedDraft.message)
       setPendingReaskMessageId(submittedDraft.reaskFromMessageId)
-      writeChatComposerDraft(docId, sessionId, { ...submittedDraft, phase: 'retry' })
+      writeChatComposerDraft(
+        docId,
+        sessionId,
+        withFreshRequestId
+          ? {
+              message: submittedDraft.message,
+              reaskFromMessageId: submittedDraft.reaskFromMessageId,
+              phase: 'retry',
+            }
+          : { ...submittedDraft, phase: 'retry' },
+      )
     }
 
     const commitStreamRender = () => {
@@ -1258,8 +1449,9 @@ export default function EditorPage() {
       if (isNewRun && submittedDraft) {
         finishStarting()
         writeChatComposerDraft(docId, sessionId, { ...submittedDraft, phase: 'running', runId: run.run_id })
-        setContextDraft('')
-        setSelectedElements([])
+        // The composer becomes editable while a run is active. Do not erase
+        // anything the user has entered after submitting this request.
+        setContextDraft((current) => current === submittedDraft.message ? '' : current)
         setComposerTemplates([])
         detachSentDraftImages()
       }
@@ -1301,17 +1493,47 @@ export default function EditorPage() {
       }
 
       let reconnectAttempts = 0
+      let pendingTransientContent = ''
+      let pendingTransientReasoning = ''
       while (!completed) {
         try {
           for await (const received of streamChatRunEvents(docId, run.run_id, lastSequence, controller.signal)) {
             if (received.sequence && received.sequence <= lastSequence) continue
             if (received.sequence) lastSequence = received.sequence
+            const eventOccurredAtMs = Date.now() - received.eventAgeMs
             const evt = received
+        if (evt.event === 'text_delta' || evt.event === 'reasoning_delta') {
+          const key = evt.event === 'text_delta' ? 'content' : 'reasoning'
+          const rawText = typeof evt.data.text === 'string' ? evt.data.text : ''
+          const transient = '_transient' in evt.data && evt.data._transient === true
+          let nextText = rawText
+          if (transient) {
+            if (key === 'content') pendingTransientContent += rawText
+            else pendingTransientReasoning += rawText
+          } else {
+            const pendingTransient = key === 'content' ? pendingTransientContent : pendingTransientReasoning
+            if (pendingTransient) {
+              if (pendingTransient.startsWith(rawText)) {
+                const remaining = pendingTransient.slice(rawText.length)
+                if (key === 'content') pendingTransientContent = remaining
+                else pendingTransientReasoning = remaining
+                continue
+              }
+              if (rawText.startsWith(pendingTransient)) {
+                nextText = rawText.slice(pendingTransient.length)
+              }
+              if (key === 'content') pendingTransientContent = ''
+              else pendingTransientReasoning = ''
+            }
+          }
+          if (!nextText) continue
+          evt.data = { ...evt.data, text: nextText }
+        }
         if (evt.event !== 'heartbeat') reconnectAttempts = 0
         if (['text_delta', 'reasoning_delta', 'tool_call', 'tool_result'].includes(evt.event)) setStreamNotice(null)
         if (evt.event === 'text_delta') {
           accumulated += evt.data.text
-          activeBlocks = appendStreamTextBlock(activeBlocks, 'content', evt.data.text)
+          activeBlocks = appendStreamTextBlock(activeBlocks, 'content', evt.data.text, eventOccurredAtMs)
           scheduleStreamRender()
         } else if (evt.event === 'reasoning_delta') {
           activeReasoning = {
@@ -1319,20 +1541,28 @@ export default function EditorPage() {
             content: activeReasoning.content + evt.data.text,
             detail: activeReasoning.detail,
           }
-          activeBlocks = appendStreamTextBlock(activeBlocks, 'thought', evt.data.text)
+          activeBlocks = appendStreamTextBlock(activeBlocks, 'thought', evt.data.text, eventOccurredAtMs)
           scheduleStreamRender()
         } else if (evt.event === 'tool_call') {
           const toolId = evt.data.id ?? `tool-${Date.now()}-${activeTools.length}`
           const replacesId = typeof evt.data.replaces_id === 'string' ? evt.data.replaces_id : null
+          const argumentTokens = typeof evt.data.argument_tokens === 'number' && Number.isFinite(evt.data.argument_tokens)
+            ? Math.max(0, Math.round(evt.data.argument_tokens))
+            : null
           const existingIndex = activeTools.findIndex((item) => item.id === toolId || item.id === replacesId)
           if (existingIndex >= 0) {
             const previousToolId = activeTools[existingIndex].id
+            const previousArgumentTokens = activeTools[existingIndex].argument_tokens ?? 0
             const nextTool = {
               ...activeTools[existingIndex],
               id: toolId,
               name: evt.data.name,
               arguments: evt.data.arguments,
               preparing: Boolean(evt.data.preparing),
+              // Provider chunks may be replayed after a newer durable event.
+              // Keep the visible count monotonic so an older small fragment
+              // cannot pin a large patch at its initial token value.
+              ...(argumentTokens === null ? {} : { argument_tokens: Math.max(previousArgumentTokens, argumentTokens) }),
             }
             activeTools = activeTools.map((item, index) => index === existingIndex ? nextTool : item)
             activeBlocks = activeBlocks.map((block) =>
@@ -1341,13 +1571,14 @@ export default function EditorPage() {
                 : block,
             )
           } else {
-            activeBlocks = finishActiveTextBlock(activeBlocks)
+            activeBlocks = finishActiveTextBlock(activeBlocks, eventOccurredAtMs)
             const nextTool: ToolExecution = {
               id: toolId,
               name: evt.data.name,
               arguments: evt.data.arguments,
               status: 'running',
               preparing: Boolean(evt.data.preparing),
+              ...(argumentTokens === null ? {} : { argument_tokens: argumentTokens }),
               result: null,
               html_changed: false,
               activity: null,
@@ -1401,7 +1632,6 @@ export default function EditorPage() {
           if (evt.data.html) {
             latestHtml = evt.data.html
             applyExternalHtml(latestHtml)
-            setSelectedElements([])
             setPreviewRevision((value) => value + 1)
             scheduleComplianceCheck(latestHtml)
           }
@@ -1415,6 +1645,53 @@ export default function EditorPage() {
             activeTools = Array.isArray(pendingQuestion.timeline.tool_calls) ? pendingQuestion.timeline.tool_calls : []
             activeBlocks = Array.isArray(pendingQuestion.timeline.turn_blocks) ? pendingQuestion.timeline.turn_blocks : []
             activeReasoning = pendingQuestion.timeline.reasoning ?? { status: 'idle', content: '', detail: '' }
+          }
+          // The question event pauses before a normal tool_result is emitted.
+          // Synchronize the ask_user card from its durable timeline so it
+          // leaves the parameter-token state and clearly waits for the answer.
+          const waitingTimelineTools = Array.isArray(pendingQuestion.timeline?.tool_calls)
+            ? pendingQuestion.timeline.tool_calls
+            : []
+          const waitingQuestionTool = [...waitingTimelineTools].reverse().find((tool) => tool.name === 'ask_user')
+          const activeQuestionToolIndex = [...activeTools].reverse().findIndex((tool) => (
+            tool.name === 'ask_user' && (tool.status === 'running' || tool.status === 'waiting')
+          ))
+          const questionToolIndex = activeQuestionToolIndex >= 0
+            ? activeTools.length - 1 - activeQuestionToolIndex
+            : -1
+          const settledQuestionTool: ToolExecution | null = waitingQuestionTool
+            ? {
+                ...waitingQuestionTool,
+                status: 'waiting',
+                preparing: false,
+                result: waitingQuestionTool.result || '等待用户回答',
+                activity: waitingQuestionTool.activity ?? { kind: 'question', summary: '等待用户回答' },
+              }
+            : questionToolIndex >= 0
+              ? {
+                  ...activeTools[questionToolIndex],
+                  status: 'waiting',
+                  preparing: false,
+                  result: activeTools[questionToolIndex].result || '等待用户回答',
+                  activity: activeTools[questionToolIndex].activity ?? { kind: 'question', summary: '等待用户回答' },
+                }
+              : null
+          if (settledQuestionTool) {
+            if (questionToolIndex >= 0) {
+              const previousQuestionToolId = activeTools[questionToolIndex].id
+              activeTools = activeTools.map((tool, index) => index === questionToolIndex ? settledQuestionTool : tool)
+              activeBlocks = activeBlocks.map((block) => (
+                block.type === 'tool' && block.tool?.id === previousQuestionToolId
+                  ? { ...block, tool: settledQuestionTool }
+                  : block
+              ))
+            } else {
+              activeTools = [...activeTools, settledQuestionTool]
+              activeBlocks = [
+                ...activeBlocks,
+                { id: `block-${settledQuestionTool.id}`, type: 'tool', state: 'done', content: '', tool: settledQuestionTool },
+              ]
+            }
           }
           setPendingUserQuestion(pendingQuestion)
           setQuestionSubmitting(false)
@@ -1432,26 +1709,38 @@ export default function EditorPage() {
               detail: evt.data.thinking.detail,
             }
             if (evt.data.thinking.applied) {
-              activeBlocks = startThinkingBlock(activeBlocks)
+              activeBlocks = startThinkingBlock(activeBlocks, eventOccurredAtMs)
             }
           }
           flushStreamRender()
         } else if (evt.event === 'thinking_capability_fallback') {
           handleThinkingCapabilityFallback(evt.data)
         } else if (evt.event === 'model_turn_retry') {
+          pendingTransientContent = ''
+          pendingTransientReasoning = ''
           if (modelTurnCheckpoint && (evt.data.turn === undefined || evt.data.turn === modelTurnCheckpoint.turn)) {
+            const restored = preserveRetriedToolPreviews(
+              modelTurnCheckpoint,
+              activeTools,
+              activeBlocks,
+              evt.data.attempt,
+            )
             accumulated = modelTurnCheckpoint.accumulated
-            activeTools = [...modelTurnCheckpoint.tools]
-            activeBlocks = [...modelTurnCheckpoint.blocks]
+            activeTools = restored.tools
+            activeBlocks = restored.blocks
             activeReasoning = { ...modelTurnCheckpoint.reasoning }
             flushStreamRender()
           }
           const retryReason = formatModelRetryReason(evt.data.reason)
           const retryDelay = evt.data.retry_after_seconds ?? evt.data.delay_seconds
+          const returnedError = evt.data.detail?.trim() || retryReason
+          const errorCode = evt.data.reason?.trim()
+          const remainingAttempts = Math.max(0, evt.data.max_attempts - evt.data.attempt)
+          const retrySchedule = `${retryDelay} 秒后重试（第 ${evt.data.attempt}/${evt.data.max_attempts} 次，剩余 ${remainingAttempts} 次）`
           setStreamNotice({
             kind: 'retrying',
             title: '正在重新连接模型服务',
-            detail: `${retryReason}，${retryDelay} 秒后重试（第 ${evt.data.attempt}/${evt.data.max_attempts} 次，剩余 ${evt.data.remaining_attempts} 次）。`,
+            detail: `${returnedError}；${retrySchedule}。${errorCode ? `（错误码：${errorCode}）` : ''}`,
             attempt: evt.data.attempt,
             maxAttempts: evt.data.max_attempts,
           })
@@ -1503,7 +1792,7 @@ export default function EditorPage() {
           if (activeReasoning.content) {
             activeReasoning = { ...activeReasoning, status: 'complete' }
           }
-          activeBlocks = finishActiveTextBlock(activeBlocks)
+          activeBlocks = finishActiveTextBlock(activeBlocks, eventOccurredAtMs)
           flushStreamRender()
           const assistant: ChatMessageItem = {
             id: Date.now() + 1,
@@ -1521,10 +1810,12 @@ export default function EditorPage() {
             created_at: new Date().toISOString(),
           }
           setMessages((prev) => [...prev, assistant])
-          setSelectedElements([])
           if (evt.data.html_changed) setVersionRefreshToken((value) => value + 1)
-          if (isNewRun) {
-            clearChatComposerDraft(docId, sessionId)
+          if (isNewRun && evt.data.run_status === 'failed') {
+            restoreSubmittedDraft(true)
+            setConversationError(evt.data.error_message || '对话请求失败')
+          } else if (isNewRun) {
+            clearChatComposerDraftForRequest(docId, sessionId, submittedDraft?.clientRequestId ?? '')
           }
           completed = true
           break
@@ -1549,10 +1840,10 @@ export default function EditorPage() {
               scheduleComplianceCheck(freshDocument.current_html)
               setMessages(freshMessages)
               if (runState.status === 'failed') {
-                restoreSubmittedDraft()
-                setConversationError(runState.error_message || '对话请求失败')
+                restoreSubmittedDraft(true)
+              setConversationError(runState.error_message || '对话请求失败')
               } else if ((runState.status === 'completed' || runState.status === 'cancelled') && isNewRun) {
-                clearChatComposerDraft(docId, sessionId)
+                clearChatComposerDraftForRequest(docId, sessionId, submittedDraft?.clientRequestId ?? '')
               }
               completed = true
               break
@@ -1660,7 +1951,6 @@ export default function EditorPage() {
     }
     setQueuedChatRequests((items) => [...items, queuedRequest])
     setContextDraft('')
-    setSelectedElements([])
     setComposerTemplates([])
     setPendingReaskMessageId(null)
     clearChatComposerDraft(docId, activeChatSessionId)
@@ -1679,6 +1969,16 @@ export default function EditorPage() {
       void Promise.allSettled(queuedRequest.images.map((image) => chatApi.deleteImage(docId, image.id)))
     }
   }, [docId])
+
+  const updateQueuedChatRequest = useCallback((requestId: string, nextContent: string) => {
+    const content = nextContent.trim()
+    if (!content) return
+    setQueuedChatRequests((items) => updateQueuedChatContent(items, requestId, content))
+  }, [])
+
+  const moveQueuedChatRequest = useCallback((fromIndex: number, toIndex: number) => {
+    setQueuedChatRequests((items) => moveQueuedChatItem(items, fromIndex, toIndex))
+  }, [])
 
   useEffect(() => {
     if (streaming || stopping || chatSubmitting || pendingUserQuestion) return
@@ -2228,7 +2528,6 @@ export default function EditorPage() {
     setTitle(document.title)
     applyExternalHtml(document.current_html)
     setPreviewRevision((value) => value + 1)
-    setSelectedElements([])
     setComposerTemplates([])
     setPendingReaskMessageId(null)
     if (docId && activeChatSessionId) clearChatComposerDraft(docId, activeChatSessionId)
@@ -2255,14 +2554,25 @@ export default function EditorPage() {
 
   const complianceButtonStatus = getComplianceButtonStatus(compliance, complianceLoading)
   const complianceButtonLabel = getComplianceButtonLabel(complianceButtonStatus)
+  const selectCenterView = (nextView: CenterView) => {
+    // Keep CodeMirror alive after its first use so switching back does not
+    // recreate the language state and reparse the whole document.
+    codeViewerHtmlRef.current = draftHtmlRef.current
+    if (nextView === 'code') setCodeViewMounted(true)
+    setCenterView(nextView)
+    setMobileWorkspace(nextView)
+  }
   const selectMobileWorkspace = (workspace: MobileWorkspace) => {
-    setMobileWorkspace(workspace)
-    if (workspace !== 'chat') setCenterView(workspace)
+    if (workspace === 'chat') {
+      setMobileWorkspace(workspace)
+      return
+    }
+    selectCenterView(workspace)
   }
   const resourceLibrary = (
     <TemplateLibraryPanel
       modelId={modelId}
-      disabled={streaming || saving}
+      disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
       canInsertAtCaret={centerView === 'preview' && previewMode === 'edit' && hasPreviewCaret}
       attachedTemplateIds={attachedTemplates.map((item) => item.id)}
       themeContext={activeChatSession?.theme_context ?? null}
@@ -2283,11 +2593,12 @@ export default function EditorPage() {
   return (
     <div className="editor-workbench">
       <div className="editor-toolbar">
-        <Space className="editor-toolbar-title">
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/workbench')}>
-            返回
+        <div className="editor-toolbar-title">
+          <Button aria-label="返回工作台" icon={<ArrowLeftOutlined />} onClick={() => navigate('/workbench')}>
+            <span className="editor-toolbar-back-label">返回</span>
           </Button>
           <Input
+            className="editor-toolbar-title-input"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             onBlur={handleSaveTitle}
@@ -2295,204 +2606,247 @@ export default function EditorPage() {
             style={{ width: 280 }}
             placeholder="文档标题"
           />
-        </Space>
-        <Space className="editor-toolbar-controls" wrap>
-          <Segmented
-            className="editor-mobile-workspace-switcher"
-            value={mobileWorkspace}
-            onChange={(value) => selectMobileWorkspace(value as MobileWorkspace)}
-            options={[
-              { label: 'AI 对话', value: 'chat' },
-              { label: '预览', value: 'preview' },
-              { label: '源码', value: 'code' },
-            ]}
-          />
-          <Segmented
-            className="editor-desktop-view-switcher"
-            value={centerView}
-            onChange={(v) => {
-              const nextView = v as CenterView
-              setCenterView(nextView)
-              setMobileWorkspace(nextView)
-            }}
-            options={[
-              { label: '实时预览', value: 'preview' },
-              { label: '源码编辑', value: 'code' },
-            ]}
-          />
-          {centerView === 'preview' ? (
+          {isCompact && (
+            <Tooltip title="更多文章操作">
+              <Button
+                aria-label="更多文章操作"
+                className="editor-mobile-toolbar-action"
+                icon={<MoreOutlined />}
+                onClick={() => setMobileActionsDrawerOpen(true)}
+              />
+            </Tooltip>
+          )}
+        </div>
+        {isCompact ? (
+          <div className="editor-mobile-toolbar-actions">
             <Segmented
-              size="small"
-              value={previewMode}
-              disabled={streaming}
-              onChange={(value) => setPreviewMode(value as PreviewMode)}
+              className="editor-mobile-workspace-switcher"
+              value={mobileWorkspace}
+              onChange={(value) => selectMobileWorkspace(value as MobileWorkspace)}
               options={[
-                { label: '浏览', value: 'browse' },
-                { label: <><SelectOutlined /> 选择</>, value: 'select' },
-                { label: <><EditOutlined /> 直接编辑</>, value: 'edit' },
+                { label: '对话', value: 'chat' },
+                { label: '预览', value: 'preview' },
+                { label: '源码', value: 'code' },
               ]}
             />
-          ) : (
-            <Tooltip title="直接编辑仅在实时预览页可用">
-              <Button aria-label="直接编辑" icon={<EditOutlined />} disabled />
+            <Tooltip title="打开资源库">
+              <Button
+                aria-label="资源库"
+                className="editor-mobile-toolbar-action"
+                icon={<AppstoreOutlined />}
+                disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+                onClick={() => setResourceDrawerOpen(true)}
+              />
             </Tooltip>
-          )}
-          {!isCompact && centerView === 'preview' && previewMode === 'edit' && (
-            <>
-              <Tooltip title="撤销（Ctrl+Z）">
-                <Button
-                  aria-label="撤销"
-                  icon={<UndoOutlined />}
-                  disabled={streaming || saving || !editHistoryState.canUndo}
-                  onClick={() => previewFrameRef.current?.undo()}
-                />
+            <Tooltip title="保存预览或源码中的手动修改">
+              <Button
+                aria-label="保存手动修改"
+                className="editor-mobile-toolbar-action"
+                icon={<SaveOutlined />}
+                type={draftHtml !== html ? 'primary' : 'default'}
+                disabled={streaming || saving || draftHtml === html}
+                loading={saving}
+                onClick={handleSaveHtml}
+              />
+            </Tooltip>
+          </div>
+        ) : (
+          <Space className="editor-toolbar-controls" wrap>
+            <Segmented
+              className="editor-desktop-view-switcher"
+              value={centerView}
+              onChange={(v) => selectCenterView(v as CenterView)}
+              options={[
+                { label: '实时预览', value: 'preview' },
+                { label: '源码编辑', value: 'code' },
+              ]}
+            />
+            {centerView === 'preview' ? (
+              <Segmented
+                size="small"
+                value={previewMode}
+                disabled={streaming}
+                onChange={(value) => setPreviewMode(value as PreviewMode)}
+                options={[
+                  { label: '浏览', value: 'browse' },
+                  { label: <><SelectOutlined /> 选择</>, value: 'select' },
+                  { label: <><EditOutlined /> 直接编辑</>, value: 'edit' },
+                ]}
+              />
+            ) : (
+              <Tooltip title="直接编辑仅在实时预览页可用">
+                <Button aria-label="直接编辑" icon={<EditOutlined />} disabled />
               </Tooltip>
-              <Tooltip title="恢复（Ctrl+Y）">
-                <Button
-                  aria-label="恢复"
-                  icon={<RedoOutlined />}
-                  disabled={streaming || saving || !editHistoryState.canRedo}
-                  onClick={() => previewFrameRef.current?.redo()}
-                />
-              </Tooltip>
-              <Tooltip title="插入图片">
-                <Button
-                  aria-label="插入图片"
-                  icon={<PictureOutlined />}
-                  disabled={streaming || saving}
-                  onClick={() => previewFrameRef.current?.openImagePickerForInsert()}
-                />
-              </Tooltip>
-            </>
-          )}
-          {centerView === 'preview' && (
-            <Popover
-              title="预览亮度"
-              trigger="click"
-              content={(
-                <div className="preview-brightness-control">
-                  <Slider
-                    aria-label="预览亮度"
-                    min={40}
-                    max={140}
-                    value={previewBrightness}
-                    tooltip={{ formatter: (value) => `${value ?? 100}%` }}
-                    onChange={setPreviewBrightness}
+            )}
+            {centerView === 'preview' && previewMode === 'edit' && (
+              <>
+                <Tooltip title="撤销（Ctrl+Z）">
+                  <Button
+                    aria-label="撤销"
+                    icon={<UndoOutlined />}
+                    disabled={streaming || saving || !editHistoryState.canUndo}
+                    onClick={() => previewFrameRef.current?.undo()}
                   />
-                  <Tooltip title="恢复默认亮度">
+                </Tooltip>
+                <Tooltip title="恢复（Ctrl+Y）">
+                  <Button
+                    aria-label="恢复"
+                    icon={<RedoOutlined />}
+                    disabled={streaming || saving || !editHistoryState.canRedo}
+                    onClick={() => previewFrameRef.current?.redo()}
+                  />
+                </Tooltip>
+                <Tooltip title="插入图片">
+                  <Button
+                    aria-label="插入图片"
+                    icon={<PictureOutlined />}
+                    disabled={streaming || saving}
+                    onClick={() => previewFrameRef.current?.openImagePickerForInsert()}
+                  />
+                </Tooltip>
+              </>
+            )}
+            <Tooltip title="AI 配图">
+              <Button aria-label="AI 配图" icon={<PictureOutlined />} disabled={streaming || saving} onClick={() => setAiImageModalOpen(true)}>AI 配图</Button>
+            </Tooltip>
+            {centerView === 'preview' && (
+              <>
+                <Popover
+                  title="预览亮度"
+                  trigger="click"
+                  content={(
+                    <div className="preview-brightness-control">
+                      <Slider
+                        aria-label="预览亮度"
+                        min={40}
+                        max={140}
+                        value={previewBrightness}
+                        tooltip={{ formatter: (value) => `${value ?? 100}%` }}
+                        onChange={setPreviewBrightness}
+                      />
+                      <Tooltip title="恢复默认亮度">
+                        <Button
+                          aria-label="恢复默认亮度"
+                          type="text"
+                          size="small"
+                          icon={<ReloadOutlined />}
+                          disabled={previewBrightness === 100}
+                          onClick={() => setPreviewBrightness(100)}
+                        />
+                      </Tooltip>
+                    </div>
+                  )}
+                >
+                  <Tooltip title="调节预览亮度">
                     <Button
-                      aria-label="恢复默认亮度"
-                      type="text"
-                      size="small"
-                      icon={<ReloadOutlined />}
-                      disabled={previewBrightness === 100}
-                      onClick={() => setPreviewBrightness(100)}
+                      aria-label="调节预览亮度"
+                      icon={<BulbOutlined />}
+                      type={previewBrightness === 100 ? 'default' : 'primary'}
                     />
                   </Tooltip>
-                </div>
-              )}
-            >
-              <Tooltip title="调节预览亮度">
+                </Popover>
+                <Tooltip title="复制当前预览为可粘贴的富文本文章">
+                  <Button
+                    aria-label="复制文章"
+                    icon={<CopyOutlined />}
+                    disabled={!draftHtml.trim()}
+                    onClick={() => { void handleCopyPreviewArticle() }}
+                  >
+                    复制文章
+                  </Button>
+                </Tooltip>
+              </>
+            )}
+            <Tooltip title={resourceCollapsed ? '展开资源库' : '收起资源库'}>
+              <Button
+                icon={<AppstoreOutlined />}
+                aria-label="资源库"
+                type={!resourceCollapsed ? 'primary' : 'default'}
+                disabled={streaming || saving}
+                onClick={() => setResourceCollapsed((value) => !value)}
+              >
+                资源库
+              </Button>
+            </Tooltip>
+            <Tooltip title="批量转存当前文章的外链图片">
+              <span>
+                <Popconfirm
+                  title="转存当前文章中的外链图片？"
+                  description="任一图片转存失败时，文章将保持原样。"
+                  okText="开始转存"
+                  cancelText="取消"
+                  onConfirm={() => handleLocalizeArticleImages()}
+                >
+                  <Button
+                    aria-label="批量转存当前文章的外链图片"
+                    icon={<CloudDownloadOutlined />}
+                    disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+                    loading={localizingArticleImages}
+                  />
+                </Popconfirm>
+              </span>
+            </Tooltip>
+            {(currentUser?.role === 'admin' || wechatAccounts.length > 0) && (
+              <Tooltip title={wechatAccounts.length ? '推送至公众号草稿箱' : '请先在后台配置并启用公众号账号'}>
                 <Button
-                  aria-label="调节预览亮度"
-                  icon={<BulbOutlined />}
-                  type={previewBrightness === 100 ? 'default' : 'primary'}
+                  aria-label="推送至公众号草稿箱"
+                  icon={<SendOutlined />}
+                  disabled={streaming || saving || wechatAccounts.length === 0}
+                  onClick={() => setWechatDraftOpen(true)}
                 />
               </Tooltip>
-            </Popover>
-          )}
-          <Tooltip title={isCompact ? '打开资源库' : resourceCollapsed ? '展开资源库' : '收起资源库'}>
-            <Button
-              icon={<AppstoreOutlined />}
-              aria-label="资源库"
-              type={!isCompact && !resourceCollapsed ? 'primary' : 'default'}
-              disabled={streaming || saving}
-              onClick={() => {
-                if (isCompact) setResourceDrawerOpen(true)
-                else setResourceCollapsed((value) => !value)
-              }}
-            >
-              资源库
-            </Button>
-          </Tooltip>
-          {(currentUser?.role === 'admin' || wechatAccounts.length > 0) && (
-            <Tooltip title={wechatAccounts.length ? '推送至公众号草稿箱' : '请先在后台配置并启用公众号账号'}>
+            )}
+            <Tooltip title="保存预览或源码中的手动修改">
               <Button
-                aria-label="推送至公众号草稿箱"
-                icon={<SendOutlined />}
-                disabled={streaming || saving || wechatAccounts.length === 0}
-                onClick={() => setWechatDraftOpen(true)}
+                aria-label="保存手动修改"
+                icon={<SaveOutlined />}
+                type={draftHtml !== html ? 'primary' : 'default'}
+                disabled={streaming || saving || draftHtml === html}
+                loading={saving}
+                onClick={handleSaveHtml}
               />
             </Tooltip>
-          )}
-          <Tooltip title="保存预览或源码中的手动修改">
-            <Button
-              aria-label="保存手动修改"
-              icon={<SaveOutlined />}
-              type={draftHtml !== html ? 'primary' : 'default'}
-              disabled={streaming || saving || draftHtml === html}
-              loading={saving}
-              onClick={handleSaveHtml}
-            />
-          </Tooltip>
-          <Tooltip title={complianceButtonLabel}>
-            <Button
-              aria-label={`打开合规检测：${complianceButtonLabel}`}
-              className={`compliance-status-trigger is-${complianceButtonStatus}`}
-              icon={<SafetyCertificateOutlined />}
-              disabled={streaming}
-              onClick={() => setComplianceDrawerOpen(true)}
-            />
-          </Tooltip>
-          <Tooltip title="版本历史">
-            <Button
-              aria-label="打开版本历史"
-              icon={<HistoryOutlined />}
-              type={versionDrawerOpen ? 'primary' : 'default'}
-              disabled={streaming}
-              onClick={() => setVersionDrawerOpen(true)}
-            />
-          </Tooltip>
-          <Tooltip title="分享只读预览">
-            <Button
-              aria-label="分享只读预览"
-              icon={<LinkOutlined />}
-              disabled={streaming || saving}
-              onClick={() => setDocumentShareOpen(true)}
-            />
-          </Tooltip>
-          {!isCompact && hasSourceFile && (
-            <Tooltip title="原文校审">
+            <Tooltip title={complianceButtonLabel}>
               <Button
-                aria-label="打开原文校审"
-                icon={<FileSearchOutlined />}
+                aria-label={`打开合规检测：${complianceButtonLabel}`}
+                className={`compliance-status-trigger is-${complianceButtonStatus}`}
+                icon={<SafetyCertificateOutlined />}
                 disabled={streaming}
-                onClick={() => setSourcePreviewOpen(true)}
+                onClick={() => setComplianceDrawerOpen(true)}
               />
             </Tooltip>
-          )}
-          {!isCompact ? (
+            <Tooltip title="版本历史">
+              <Button
+                aria-label="打开版本历史"
+                icon={<HistoryOutlined />}
+                type={versionDrawerOpen ? 'primary' : 'default'}
+                disabled={streaming}
+                onClick={() => setVersionDrawerOpen(true)}
+              />
+            </Tooltip>
+            <Tooltip title="分享只读预览">
+              <Button
+                aria-label="分享只读预览"
+                icon={<LinkOutlined />}
+                disabled={streaming || saving}
+                onClick={() => setDocumentShareOpen(true)}
+              />
+            </Tooltip>
+            {hasSourceFile && (
+              <Tooltip title="原文校审">
+                <Button
+                  aria-label="打开原文校审"
+                  icon={<FileSearchOutlined />}
+                  disabled={streaming}
+                  onClick={() => setSourcePreviewOpen(true)}
+                />
+              </Tooltip>
+            )}
             <Button icon={<ReloadOutlined />} disabled={streaming || saving} onClick={loadDocument}>
               刷新
             </Button>
-          ) : (
-            <Dropdown
-              trigger={['click']}
-              menu={{
-                items: [
-                  ...(hasSourceFile ? [{ key: 'source', label: '原文校审', icon: <FileSearchOutlined /> }] : []),
-                  { key: 'refresh', label: '刷新文章', icon: <ReloadOutlined /> },
-                ],
-                onClick: ({ key }) => {
-                  if (key === 'source') setSourcePreviewOpen(true)
-                  if (key === 'refresh') void loadDocument()
-                },
-              }}
-            >
-              <Button aria-label="更多文章操作" icon={<MoreOutlined />} disabled={streaming || saving} />
-            </Dropdown>
-          )}
-        </Space>
+          </Space>
+        )}
       </div>
 
       <div
@@ -2574,6 +2928,8 @@ export default function EditorPage() {
             onRemoveAttachedTemplate={(templateId) => { void removeAttachedTemplate(templateId) }}
             onRemoveComposerTemplate={(templateId) => setComposerTemplates((items) => items.filter((item) => item.id !== templateId))}
             onRemoveQueuedMessage={removeQueuedChatRequest}
+            onUpdateQueuedMessage={updateQueuedChatRequest}
+            onMoveQueuedMessage={moveQueuedChatRequest}
             onEditRequest={handleEditRequest}
             onSend={(text, references, images) => {
               if (streaming || chatSubmitting) {
@@ -2620,7 +2976,8 @@ export default function EditorPage() {
               ref={previewFrameRef}
               html={draftHtml}
               revision={previewRevision}
-              mode={streaming ? 'browse' : previewMode}
+              active={centerView === 'preview'}
+              mode={streaming || localizingArticleImages ? 'browse' : previewMode}
               brightness={previewBrightness}
               compact={isCompact}
               selectedElements={selectedElements}
@@ -2653,9 +3010,9 @@ export default function EditorPage() {
             />
           </div>
           <div className={`editor-center-panel${centerView === 'code' ? '' : ' is-hidden'}`}>
-            {centerView === 'code' && (
+            {codeViewMounted && (
               <Suspense fallback={<div className="editor-panel-loading" aria-busy="true" />}>
-                <CodeViewer html={draftHtml} onChange={handleHtmlChange} onSave={handleSaveHtml} saving={saving} disabled={streaming} />
+                <CodeViewer html={centerView === 'code' ? draftHtml : codeViewerHtmlRef.current} onChange={handleHtmlChange} onSave={handleSaveHtml} saving={saving || localizingArticleImages} disabled={streaming || localizingArticleImages} />
               </Suspense>
             )}
           </div>
@@ -2689,6 +3046,168 @@ export default function EditorPage() {
         {resourceLibrary}
       </Drawer>
       <Drawer
+        title="文章工具"
+        placement="bottom"
+        height={centerView === 'preview' ? 360 : 268}
+        open={isCompact && mobileActionsDrawerOpen}
+        onClose={() => setMobileActionsDrawerOpen(false)}
+        destroyOnHidden
+        className="editor-mobile-actions-drawer"
+      >
+        {centerView === 'preview' && (
+          <section className="editor-mobile-actions-section" aria-label="预览工具">
+            <span className="editor-mobile-actions-heading">预览</span>
+            <Segmented
+              block
+              value={previewMode}
+              disabled={streaming}
+              onChange={(value) => {
+                setPreviewMode(value as PreviewMode)
+                setMobileActionsDrawerOpen(false)
+              }}
+              options={[
+                { label: '浏览', value: 'browse' },
+                { label: '选择', value: 'select' },
+                { label: '直接编辑', value: 'edit' },
+              ]}
+            />
+            <div className="editor-mobile-brightness-control">
+              <span>预览亮度 {previewBrightness}%</span>
+              <Slider
+                aria-label="预览亮度"
+                min={40}
+                max={140}
+                value={previewBrightness}
+                tooltip={{ formatter: (value) => `${value ?? 100}%` }}
+                onChange={setPreviewBrightness}
+              />
+              <Tooltip title="恢复默认亮度">
+                <Button
+                  aria-label="恢复默认亮度"
+                  type="text"
+                  icon={<ReloadOutlined />}
+                  disabled={previewBrightness === 100}
+                  onClick={() => setPreviewBrightness(100)}
+                />
+              </Tooltip>
+            </div>
+          </section>
+        )}
+        <section className="editor-mobile-actions-section" aria-label="文章操作">
+          <span className="editor-mobile-actions-heading">文章</span>
+          <div className="editor-mobile-actions-grid">
+            <Button
+              icon={<PictureOutlined />}
+              disabled={streaming || saving}
+              onClick={() => {
+                setMobileActionsDrawerOpen(false)
+                setAiImageModalOpen(true)
+              }}
+            >
+              AI 配图
+            </Button>
+            <Button
+              icon={<CopyOutlined />}
+              disabled={!draftHtml.trim()}
+              onClick={() => {
+                setMobileActionsDrawerOpen(false)
+                void handleCopyPreviewArticle()
+              }}
+            >
+              复制文章
+            </Button>
+            <Popconfirm
+              title="转存当前文章中的外链图片？"
+              description="任一图片转存失败时，文章将保持原样。"
+              okText="开始转存"
+              cancelText="取消"
+              onConfirm={() => {
+                setMobileActionsDrawerOpen(false)
+                return handleLocalizeArticleImages()
+              }}
+            >
+              <Button
+                icon={<CloudDownloadOutlined />}
+                disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+                loading={localizingArticleImages}
+              >
+                转存外链图片
+              </Button>
+            </Popconfirm>
+            <Button
+              icon={<SafetyCertificateOutlined />}
+              className={`compliance-status-trigger is-${complianceButtonStatus}`}
+              disabled={streaming}
+              onClick={() => {
+                setMobileActionsDrawerOpen(false)
+                setComplianceDrawerOpen(true)
+              }}
+            >
+              合规检测
+            </Button>
+            <Button
+              icon={<HistoryOutlined />}
+              disabled={streaming}
+              onClick={() => {
+                setMobileActionsDrawerOpen(false)
+                setVersionDrawerOpen(true)
+              }}
+            >
+              版本历史
+            </Button>
+            <Button
+              icon={<LinkOutlined />}
+              disabled={streaming || saving}
+              onClick={() => {
+                setMobileActionsDrawerOpen(false)
+                setDocumentShareOpen(true)
+              }}
+            >
+              分享预览
+            </Button>
+            {hasSourceFile && (
+              <Button
+                icon={<FileSearchOutlined />}
+                disabled={streaming}
+                onClick={() => {
+                  setMobileActionsDrawerOpen(false)
+                  setSourcePreviewOpen(true)
+                }}
+              >
+                原文校审
+              </Button>
+            )}
+            <Button
+              icon={<ReloadOutlined />}
+              disabled={streaming || saving}
+              onClick={() => {
+                setMobileActionsDrawerOpen(false)
+                void loadDocument()
+              }}
+            >
+              刷新文章
+            </Button>
+          </div>
+        </section>
+        {(currentUser?.role === 'admin' || wechatAccounts.length > 0) && (
+          <section className="editor-mobile-actions-section" aria-label="发布操作">
+            <span className="editor-mobile-actions-heading">发布</span>
+            <div className="editor-mobile-actions-grid">
+              <Button
+                icon={<SendOutlined />}
+                disabled={streaming || saving || wechatAccounts.length === 0}
+                onClick={() => {
+                  setMobileActionsDrawerOpen(false)
+                  setWechatDraftOpen(true)
+                }}
+              >
+                推送至公众号草稿箱
+              </Button>
+            </div>
+          </section>
+        )}
+      </Drawer>
+      <Drawer
         title="合规检测"
         placement="right"
         size={isCompact ? '100vw' : 360}
@@ -2697,6 +3216,16 @@ export default function EditorPage() {
       >
         <CompliancePanel report={compliance} loading={complianceLoading} />
       </Drawer>
+      <AIImageGenerationModal
+        open={aiImageModalOpen}
+        documentId={docId}
+        sessionId={activeChatSessionId}
+        initialModelId={activeChatSession?.image_model_id}
+        initialAutoEnabled={activeChatSession?.auto_image_generation_enabled}
+        selectedBlock={selectedElements[0] ?? null}
+        onClose={() => setAiImageModalOpen(false)}
+        onApplied={() => { void loadDocument() }}
+      />
       <VersionHistoryDrawer
         documentId={docId}
         open={versionDrawerOpen}

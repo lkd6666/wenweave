@@ -15,7 +15,7 @@ from app.db.base import Base
 from app.models.document import Document
 from app.models.document_version import DocumentVersionSource
 from app.models.user import User, UserRole
-from app.services.document_history_workspace import DocumentHistoryWorkspace
+from app.services.document_history_workspace import DocumentHistoryWorkspace, _HistoryWorkspaceCache
 from app.services.document_versions import create_document_version
 from app.services.html_workspace import HtmlWorkspace
 from app.services.token_budget import estimate_tokens
@@ -54,10 +54,11 @@ class DocumentHistoryWorkspaceTests(unittest.TestCase):
         self.db.flush()
         return document
 
-    def commit_version(self, document: Document, html: str, label: str) -> None:
+    def commit_version(self, document: Document, html: str, label: str):
         document.current_html = html
-        create_document_version(self.db, document, self.user.id, DocumentVersionSource.MANUAL, label)
+        version = create_document_version(self.db, document, self.user.id, DocumentVersionSource.MANUAL, label)
         self.db.flush()
+        return version
 
     def test_all_versions_are_reachable_beyond_first_page(self) -> None:
         document = self.make_document("<p>版本 0</p>")
@@ -171,6 +172,41 @@ class DocumentHistoryWorkspaceTests(unittest.TestCase):
         self.assertEqual(inventory["images"][1]["source_kind"], "missing")
         self.assertEqual(workspace.source_html, current)
         self.assertNotIn("https://", json.dumps(inventory, ensure_ascii=False))
+
+    def test_history_workspace_cache_reuses_and_evicts_immutable_versions(self) -> None:
+        document = self.make_document("<p>版本 1</p>")
+        first = create_document_version(self.db, document, self.user.id, DocumentVersionSource.INITIAL, "v1")
+        self.db.flush()
+        second = self.commit_version(document, "<p>版本 2</p>", "v2")
+        third = self.commit_version(document, "<p>版本 3</p>", "v3")
+        cache = _HistoryWorkspaceCache(max_entries=2, max_source_bytes=1_024)
+        history = DocumentHistoryWorkspace(self.db, document.id, 4_096, workspace_cache=cache)
+
+        history.search_version(first.id, "版本")
+        history.search_version(second.id, "版本")
+        history.search_version(third.id, "版本")
+        history.search_version(second.id, "版本")
+
+        metrics = history.cache_metrics()
+        self.assertEqual(metrics["entries"], 2)
+        self.assertEqual(metrics["evictions"], 1)
+        self.assertGreaterEqual(metrics["hits"], 1)
+
+    def test_history_workspace_cache_skips_oversized_source(self) -> None:
+        oversized_html = "<p>" + ("x" * 256) + "</p>"
+        document = self.make_document(oversized_html)
+        version = create_document_version(self.db, document, self.user.id, DocumentVersionSource.INITIAL, "large")
+        self.db.flush()
+        cache = _HistoryWorkspaceCache(max_entries=2, max_source_bytes=64)
+        history = DocumentHistoryWorkspace(self.db, document.id, 4_096, workspace_cache=cache)
+
+        history.search_version(version.id, "x")
+        history.search_version(version.id, "x")
+
+        metrics = history.cache_metrics()
+        self.assertEqual(metrics["entries"], 0)
+        self.assertEqual(metrics["skipped_oversize"], 2)
+        self.assertEqual(metrics["misses"], 2)
 
     def test_concurrent_history_reads_are_serialized_per_database_session(self) -> None:
         """ToolNode 并发调度时，不能并发使用同一个 SQLAlchemy Session。"""

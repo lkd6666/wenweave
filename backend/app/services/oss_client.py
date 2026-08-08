@@ -507,6 +507,11 @@ def _source_url_key(config: StorageConfig, source: str) -> str | None:
     return key if key and ".." not in key.split("/") else None
 
 
+def storage_object_key_for_url(config: StorageConfig, source: str) -> str | None:
+    """Return the object key only when a URL belongs to this configured storage."""
+    return _source_url_key(config, source)
+
+
 def refresh_document_image_url(config: StorageConfig, source: str, expires: int = IMAGE_URL_EXPIRE_SECONDS) -> str:
     """Refresh a storage-backed image URL while leaving external images unchanged."""
     object_key = _source_url_key(config, source)

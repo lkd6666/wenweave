@@ -1,5 +1,8 @@
+import asyncio
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -11,7 +14,14 @@ from app.db.base import Base
 from app.models.document import Document
 from app.models.operation_log import OperationLog, OperationLogStatus
 from app.models.user import User, UserRole
-from app.services.operation_logs import _safe_request_details, append_operation_log, classify_operation, resolve_client_ip
+from app.core.security import create_refresh_token
+from app.services.operation_logs import (
+    _safe_request_details,
+    append_operation_log,
+    capture_request_context,
+    classify_operation,
+    resolve_client_ip,
+)
 
 
 class OperationLogTests(unittest.TestCase):
@@ -144,6 +154,38 @@ class OperationLogTests(unittest.TestCase):
         self.assertEqual(link_import.action if link_import else "", "document.link_import.complete")
         self.assertEqual(fallback.action if fallback else "", "api.patch")
 
+    def test_classifies_auth_refresh_as_account_operation(self) -> None:
+        route = classify_operation("POST", "/api/auth/refresh")
+        self.assertIsNotNone(route)
+        assert route is not None
+        self.assertEqual(route.action, "auth.refresh")
+        self.assertEqual(route.resource_type, "account")
+
+    def test_refresh_request_records_cookie_user_as_actor(self) -> None:
+        user = SimpleNamespace(id=17, username="refresh-user", display_name="刷新用户", is_active=True)
+        db = SimpleNamespace(get=lambda _model, user_id: user if user_id == user.id else None, close=lambda: None)
+        refresh_token = create_refresh_token(str(user.id))
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/auth/refresh",
+                "headers": [(b"cookie", f"refresh_token={refresh_token}".encode())],
+                "client": ("127.0.0.1", 1234),
+                "server": ("testserver", 80),
+            }
+        )
+
+        with patch("app.services.operation_logs.SessionLocal", return_value=db):
+            context = asyncio.run(capture_request_context(request))
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.actor_user_id, user.id)
+        self.assertEqual(context.actor_username, user.username)
+        self.assertEqual(context.actor_display_name, user.display_name)
+
     def test_resolves_real_ip_only_for_trusted_proxy(self) -> None:
         def request(peer: str, headers: dict[str, str]) -> Request:
             return Request(
@@ -165,6 +207,30 @@ class OperationLogTests(unittest.TestCase):
         self.assertEqual(resolve_client_ip(trusted, cidrs), "198.51.100.8")
         self.assertEqual(resolve_client_ip(untrusted, cidrs), "203.0.113.9")
         self.assertEqual(resolve_client_ip(cloudflare, cidrs), "2001:db8::8")
+
+    def test_resolves_client_ip_through_cdn_waf_and_nginx(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/documents",
+                "headers": [
+                    (b"x-forwarded-for", b"203.0.113.42, 198.51.100.37, 172.18.0.5"),
+                ],
+                # Uvicorn receives the request from the local Nginx proxy.
+                "client": ("127.0.0.1", 8001),
+                "server": ("testserver", 80),
+            }
+        )
+
+        self.assertEqual(
+            resolve_client_ip(
+                request,
+                ["127.0.0.1/32", "172.18.0.0/16", "198.51.100.0/24"],
+            ),
+            "203.0.113.42",
+        )
 
     def test_login_form_extracts_only_username(self) -> None:
         request = Request(

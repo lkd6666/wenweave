@@ -12,6 +12,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage
 
 from app.services.chat_agent import (
+    build_agent_prompt_cache_key,
     build_static_system_prompt,
     build_system_message,
     build_system_prompt,
@@ -29,6 +30,15 @@ def _anthropic() -> ChatAnthropic:
 
 def _openai() -> OpenAICompatibleChatModel:
     return OpenAICompatibleChatModel(model="gpt-5", api_key="test-key")
+
+
+def _explicit_cache_openai() -> OpenAICompatibleChatModel:
+    return OpenAICompatibleChatModel(
+        model="gpt-5.6",
+        api_key="test-key",
+        prompt_cache_options={"mode": "explicit"},
+        model_kwargs={"prompt_cache_key": "test-cache-key"},
+    )
 
 
 class PromptCachingTests(unittest.TestCase):
@@ -72,6 +82,39 @@ class PromptCachingTests(unittest.TestCase):
         # 部分兼容服务会拒绝 block 形式的 system 内容；它们自动缓存长前缀。
         self.assertIsInstance(message.content, str)
         self.assertTrue(message.content.startswith(build_static_system_prompt()))
+
+    def test_explicit_openai_cache_marks_only_the_static_system_block(self) -> None:
+        message = build_system_message(_explicit_cache_openai(), "标题", _HTML)
+
+        self.assertIsInstance(message.content, list)
+        blocks = message.content
+        self.assertEqual(blocks[0]["prompt_cache_breakpoint"], {"mode": "explicit"})
+        self.assertEqual(blocks[0]["text"], build_static_system_prompt())
+        self.assertNotIn("prompt_cache_breakpoint", blocks[1])
+        self.assertIn("## 当前文档", blocks[1]["text"])
+
+    def test_agent_cache_key_is_stable_and_does_not_include_the_user_id(self) -> None:
+        from app.models.ai_model import AIModel
+        from app.models.ai_provider import AIProvider, ProviderType
+
+        provider = AIProvider(id=7, name="OpenAI", provider_type=ProviderType.OPENAI_RESPONSES, base_url="https://example.test/v1")
+        model = AIModel(id=11, provider_id=7, model_name="gpt-5.6", display_name="GPT", prompt_cache_enabled=True)
+
+        key = build_agent_prompt_cache_key(provider, model, 41)
+
+        self.assertEqual(key, "yb-agent-v1-p7-m11-s9")
+        self.assertNotIn("41", key or "")
+
+    def test_agent_cache_key_is_disabled_for_unsupported_or_opted_out_models(self) -> None:
+        from app.models.ai_model import AIModel
+        from app.models.ai_provider import AIProvider, ProviderType
+
+        provider = AIProvider(id=7, name="Claude", provider_type=ProviderType.ANTHROPIC, base_url="https://example.test")
+        model = AIModel(id=11, provider_id=7, model_name="claude", display_name="Claude", prompt_cache_enabled=True)
+
+        self.assertIsNone(build_agent_prompt_cache_key(provider, model, 9))
+        model.prompt_cache_enabled = False
+        self.assertIsNone(build_agent_prompt_cache_key(provider, model, 9))
 
     def test_volatile_content_never_reaches_the_cached_block(self) -> None:
         message = build_system_message(

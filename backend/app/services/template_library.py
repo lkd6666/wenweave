@@ -7,6 +7,7 @@ import binascii
 import ipaddress
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
@@ -28,6 +29,8 @@ from app.models.template_library import (
     TemplateSourceType,
 )
 from app.services import local_uploads, oss_client
+from app.services.external_fetch import PublicFetchError, fetch_public_image
+from app.services.image_localization import ImageLocalizationError, StoredImage, localize_html_images
 
 
 MAX_TEMPLATE_HTML_CHARS = 400_000
@@ -56,6 +59,19 @@ _VOID_TAGS = {"br", "hr", "img"}
 
 class TemplateLibraryError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class TemplateImageLocalization:
+    html: str
+    localized_count: int
+    stored_images: tuple[StoredImage, ...]
+
+
+@dataclass(frozen=True)
+class TemplateAssetStorageObject:
+    object_key: str
+    storage_mode: str
 
 
 def _utcnow() -> datetime:
@@ -122,31 +138,10 @@ def _browser_headers() -> dict[str, str]:
 
 
 async def _fetch_remote_image(client: httpx.AsyncClient, source: str) -> tuple[bytes, local_uploads.ImageInfo]:
-    current = _normalise_https_url(source)
-    for redirect_count in range(REMOTE_MAX_REDIRECTS + 1):
-        await _ensure_public_host(current)
-        try:
-            async with client.stream("GET", current, headers=_browser_headers()) as response:
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location")
-                    if not location or redirect_count >= REMOTE_MAX_REDIRECTS:
-                        raise TemplateLibraryError("图片重定向失败")
-                    current = _normalise_https_url(urljoin(current, location))
-                    continue
-                if response.status_code >= 400:
-                    raise TemplateLibraryError(f"图片无法访问（HTTP {response.status_code}）")
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > MAX_TEMPLATE_IMAGE_BYTES:
-                        raise TemplateLibraryError("图片超过 10MB 限制")
-                try:
-                    return bytes(data), local_uploads.inspect_image(bytes(data))
-                except local_uploads.LocalUploadError as exc:
-                    raise TemplateLibraryError(str(exc)) from exc
-        except httpx.RequestError as exc:
-            raise TemplateLibraryError(f"获取图片失败：{exc}") from exc
-    raise TemplateLibraryError("图片重定向失败")
+    try:
+        return await fetch_public_image(client, source)
+    except PublicFetchError as exc:
+        raise TemplateLibraryError(str(exc)) from exc
 
 
 def _decode_data_image(source: str) -> tuple[bytes, local_uploads.ImageInfo]:
@@ -193,6 +188,10 @@ def _store_asset(db: Session, template_id: int, data: bytes, image: local_upload
 
 
 def delete_asset_object(db: Session, asset: TemplateImageAsset) -> None:
+    delete_asset_storage_object(db, TemplateAssetStorageObject(object_key=asset.object_key, storage_mode=asset.storage_mode))
+
+
+def delete_asset_storage_object(db: Session, asset: TemplateAssetStorageObject) -> None:
     try:
         if asset.storage_mode == "local":
             local_uploads.delete(asset.object_key)
@@ -204,6 +203,11 @@ def delete_asset_object(db: Session, asset: TemplateImageAsset) -> None:
         # DB deletion still makes the URL unusable; a later storage lifecycle
         # cleanup can collect an unreachable object if the provider is down.
         return
+
+
+def delete_asset_storage_objects(db: Session, assets: tuple[TemplateAssetStorageObject, ...]) -> None:
+    for asset in assets:
+        delete_asset_storage_object(db, asset)
 
 
 def read_asset_bytes(db: Session, asset: TemplateImageAsset) -> bytes:
@@ -242,7 +246,7 @@ def _normalise_html(raw_html: str) -> BeautifulSoup:
             if lower.startswith("on") or (lower == "style" and _DANGEROUS_STYLE.search(rendered)):
                 del tag.attrs[attr]
                 continue
-            if lower not in {"style", "href", "src", "alt", "title", "target", "rel", "referrerpolicy", "width", "height", "colspan", "rowspan", "align", "valign", "leaf", "data-crop-source", "data-crop-rect"}:
+            if lower not in {"style", "href", "src", "srcset", "alt", "title", "target", "rel", "referrerpolicy", "width", "height", "colspan", "rowspan", "align", "valign", "leaf", "data-crop-source", "data-crop-rect"}:
                 del tag.attrs[attr]
                 continue
             if lower in {"href", "src"} and _DANGEROUS_URL.match(rendered):
@@ -260,54 +264,98 @@ def _html_fragment(soup: BeautifulSoup) -> str:
     return "".join(str(node) for node in soup.contents).strip()
 
 
-async def localize_template_html(db: Session, template: TemplateLibraryItem, raw_html: str) -> tuple[str, list[dict[str, str]]]:
+def _template_asset_id(source: str) -> str | None:
+    path = urlsplit(source).path if source.lower().startswith(("http://", "https://")) else source
+    match = re.fullmatch(re.escape(ASSET_URL_PREFIX) + r"([0-9a-fA-F-]{36})", path)
+    return match.group(1) if match else None
+
+
+async def localize_template_html(db: Session, template: TemplateLibraryItem, raw_html: str) -> TemplateImageLocalization:
     soup = _normalise_html(raw_html)
-    images = list(soup.find_all("img"))
-    if len(images) > MAX_TEMPLATE_IMAGES:
-        raise TemplateLibraryError(f"单个模板最多包含 {MAX_TEMPLATE_IMAGES} 张图片")
-    warnings: list[dict[str, str]] = []
-    total_size = 0
-    semaphore = asyncio.Semaphore(REMOTE_FETCH_CONCURRENCY)
-    timeout = httpx.Timeout(REMOTE_TIMEOUT_SECONDS, connect=REMOTE_TIMEOUT_SECONDS)
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-        async def convert(image_tag) -> None:
-            nonlocal total_size
-            source = str(image_tag.get("src") or "").strip()
-            if not source or source.startswith(ASSET_URL_PREFIX):
-                return
-            try:
-                async with semaphore:
-                    data, image = _decode_data_image(source) if source.lower().startswith("data:") else await _fetch_remote_image(client, source)
-                total_size += len(data)
-                if total_size > MAX_TEMPLATE_IMAGE_TOTAL_BYTES:
-                    raise TemplateLibraryError("模板图片总大小超过 50MB 限制")
-                asset = _store_asset(db, template.id, data, image, source)
-                image_tag["src"] = asset_url(asset.id)
-            except TemplateLibraryError as exc:
-                if source.lower().startswith(("http://", "https://")):
-                    image_tag["referrerpolicy"] = "no-referrer"
-                warnings.append({"source": source[:2048], "message": str(exc)})
-
-        await asyncio.gather(*(convert(image) for image in images))
-
-    html = _html_fragment(soup)
-    if not html:
+    normalized_html = _html_fragment(soup)
+    if not normalized_html:
         raise TemplateLibraryError("模板不包含可用内容")
-    return html, warnings
+
+    def is_existing_own_asset(source: str) -> bool:
+        asset_id = _template_asset_id(source)
+        if not asset_id:
+            return False
+        asset = db.get(TemplateImageAsset, asset_id)
+        return bool(asset and asset.template_id == template.id)
+
+    async def load_image(source: str, client: httpx.AsyncClient):
+        asset_id = _template_asset_id(source)
+        if asset_id:
+            asset = db.get(TemplateImageAsset, asset_id)
+            if asset is None:
+                raise ImageLocalizationError("模板图片不存在")
+            try:
+                data = read_asset_bytes(db, asset)
+                return data, local_uploads.inspect_image(data)
+            except (TemplateLibraryError, local_uploads.LocalUploadError) as exc:
+                raise ImageLocalizationError(str(exc) or "模板图片不存在") from exc
+        try:
+            return await fetch_public_image(client, source)
+        except PublicFetchError as exc:
+            raise ImageLocalizationError(str(exc)) from exc
+
+    def store_image(data: bytes, image: local_uploads.ImageInfo, source: str) -> StoredImage:
+        asset = _store_asset(db, template.id, data, image, source)
+        return StoredImage(url=asset_url(asset.id), handle=asset)
+
+    def cleanup_image(persisted: StoredImage) -> None:
+        if isinstance(persisted.handle, TemplateImageAsset):
+            delete_asset_object(db, persisted.handle)
+            db.delete(persisted.handle)
+
+    try:
+        result = await localize_html_images(
+            normalized_html,
+            load_image=load_image,
+            store_image=store_image,
+            cleanup_image=cleanup_image,
+            is_local_source=is_existing_own_asset,
+            max_images=MAX_TEMPLATE_IMAGES,
+            max_total_bytes=MAX_TEMPLATE_IMAGE_TOTAL_BYTES,
+            fetch_concurrency=REMOTE_FETCH_CONCURRENCY,
+        )
+    except ImageLocalizationError as exc:
+        raise TemplateLibraryError(str(exc)) from exc
+    return TemplateImageLocalization(
+        html=result.html,
+        localized_count=result.localized_count,
+        stored_images=result.stored_images,
+    )
+
+
+def cleanup_template_localization(db: Session, result: TemplateImageLocalization) -> None:
+    for persisted in reversed(result.stored_images):
+        if isinstance(persisted.handle, TemplateImageAsset):
+            delete_asset_object(db, persisted.handle)
+            db.delete(persisted.handle)
 
 
 def referenced_asset_ids(html: str) -> set[str]:
     return set(re.findall(re.escape(ASSET_URL_PREFIX) + r"([0-9a-fA-F-]{36})", html))
 
 
-def remove_unreferenced_assets(db: Session, template: TemplateLibraryItem, html: str) -> None:
+def remove_unreferenced_assets(
+    db: Session,
+    template: TemplateLibraryItem,
+    html: str,
+    *,
+    cleanup_objects: bool = True,
+) -> tuple[TemplateAssetStorageObject, ...]:
     kept = referenced_asset_ids(html)
     assets = db.query(TemplateImageAsset).filter(TemplateImageAsset.template_id == template.id).all()
+    removed: list[TemplateAssetStorageObject] = []
     for asset in assets:
         if asset.id not in kept:
-            delete_asset_object(db, asset)
+            removed.append(TemplateAssetStorageObject(object_key=asset.object_key, storage_mode=asset.storage_mode))
+            if cleanup_objects:
+                delete_asset_object(db, asset)
             db.delete(asset)
+    return tuple(removed)
 
 
 def category_or_error(db: Session, category_id: int | None) -> TemplateCategory | None:

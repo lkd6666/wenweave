@@ -113,7 +113,7 @@ uvicorn app.main:app --no-proxy-headers --host 0.0.0.0 --port 8001
 | `DEFAULT_ADMIN_USERNAME` | 首次启动管理员用户名 | `admin` |
 | `DEFAULT_ADMIN_PASSWORD` | 首次启动管理员密码 | `admin123` |
 | `CORS_ORIGINS` | 允许跨域的前端地址（逗号分隔） | `http://localhost:5173,...` |
-| `TRUSTED_PROXY_CIDRS` | 可提供客户端地址的反向代理/CDN CIDR（逗号分隔）；启动 Uvicorn 时须使用 `--no-proxy-headers` | 留空，不信任转发头 |
+| `TRUSTED_PROXY_CIDRS` | 可提供客户端地址的反向代理/CDN CIDR（逗号分隔）；多级代理需包含 Nginx、雷池与 CDN 网段；启动 Uvicorn 时须使用 `--no-proxy-headers` | 留空，不信任转发头 |
 | `DOCUMENT_SHARE_IMAGE_URL_EXPIRE_SECONDS` | 只读分享页中对象存储图片签名 URL 的最长有效期（秒） | `3600` |
 
 ## 对象存储配置
@@ -222,6 +222,7 @@ python -m app.services.wechat_compliance path/to/article.html
 
 - Anthropic：开启时映射为 extended thinking（2048 token 预算），关闭时不发送 thinking 参数。
 - 已识别的 OpenAI reasoning 模型：映射为 `reasoning_effort`。
+- OpenAI Responses API Provider 使用 `/v1/responses`，并将 `reasoning_effort` 映射为 Responses 的 `reasoning.effort`；模型发现仍使用 `/v1/models`。
 - Qwen3 / QwQ：映射为 `enable_thinking`。
 - 其他 OpenAI 兼容模型：管理员可在「AI 模型管理」的模型编辑中填入 JSON，例如 `{"enabled":{"enable_thinking":true},"disabled":{"enable_thinking":false}}`。未配置且无法识别时，界面会明确提示已回退到自动模式。
 
@@ -265,6 +266,6 @@ rule.prompt.md                  # AI 排版生成规范（系统提示词来源�
 
 - 前端：React + TypeScript + Vite + Ant Design
 - 后端：Python + FastAPI + SQLAlchemy + MySQL（PyMySQL）
-- AI：OpenAI 兼容接口 / Anthropic Claude（httpx 直连）
+- AI：OpenAI Chat Completions 兼容接口 / OpenAI Responses API / Anthropic Claude（httpx 直连）
 - 存储：阿里云 OSS（oss2）、腾讯云 COS、华为云 OBS、火山引擎 TOS、七牛云 Kodo（官方 SDK）
 - 文档解析：PyMuPDF（PDF）、python-docx（Word）

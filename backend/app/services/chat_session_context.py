@@ -4,7 +4,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.models.chat_session import ChatSessionTemplateAttachment, ChatSessionThemeContext
-from app.models.gzh_theme_proposal import GzhThemeProposal
+from app.models.gzh_theme_proposal import GzhThemeProposal, GzhThemeProposalStatus
 from app.models.template_library import TemplateLibraryItem
 
 
@@ -69,6 +69,12 @@ def session_theme_proposal(db: Session, session_id: int) -> GzhThemeProposal | N
         .filter(ChatSessionThemeContext.session_id == session_id)
         .one_or_none()
     )
+
+
+def session_approved_theme_proposal(db: Session, session_id: int) -> GzhThemeProposal | None:
+    """Return the session's approved proposal while its initial application is unfinished."""
+    proposal = session_theme_proposal(db, session_id)
+    return proposal if proposal and proposal.status == GzhThemeProposalStatus.APPROVED else None
 
 
 def bind_session_theme_proposal(db: Session, session_id: int, proposal_id: str) -> GzhThemeProposal:

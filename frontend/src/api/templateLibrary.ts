@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { TemplateCategory, TemplateGeneration, TemplateItem, TemplateSourceType } from '../types'
+import type { TemplateCategory, TemplateGeneration, TemplateImageLocalizationResult, TemplateItem, TemplateSourceType } from '../types'
 
 export interface TemplateWritePayload {
   name: string
@@ -26,6 +26,7 @@ export const templateLibraryApi = {
   updateTemplate: (templateId: number, payload: TemplateWritePayload) =>
     api.patch<TemplateItem>(`/template-library/templates/${templateId}`, payload),
   deleteTemplate: (templateId: number) => api.delete<void>(`/template-library/templates/${templateId}`),
+  localizeExternalImages: () => api.post<TemplateImageLocalizationResult>('/template-library/templates/localize-external-images', {}),
   createGeneration: (payload: { model_id: number; prompt: string }) =>
     api.post<TemplateGeneration>('/template-library/generations', payload),
   getGeneration: (generationId: string) => api.get<TemplateGeneration>(`/template-library/generations/${encodeURIComponent(generationId)}`),

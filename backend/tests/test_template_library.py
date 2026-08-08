@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import app.models  # noqa: F401 - register the full metadata graph for SQLite.
@@ -13,6 +13,7 @@ from app.api.routes.chat import _attached_template_payload
 from app.api.routes.template_library import delete_category, delete_template, list_templates
 from app.db.base import Base
 from app.models.template_library import TemplateCategory, TemplateImageAsset, TemplateLibraryItem, TemplateSourceType
+from app.services.local_uploads import ImageInfo
 from app.services.template_library import (
     TemplateLibraryError,
     _fetch_remote_image,
@@ -76,22 +77,62 @@ class TemplateLibraryServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_failed_image_transfer_keeps_original_source_and_records_warning(self) -> None:
+    def test_failed_image_transfer_rejects_component_without_mutating_it(self) -> None:
         template = self._template()
 
         async def rejected(*_args, **_kwargs):
-            raise TemplateLibraryError("图片无法访问")
+            raise Exception("图片无法访问")
 
-        with patch("app.services.template_library._fetch_remote_image", new=rejected):
-            html, warnings = asyncio.run(localize_template_html(
+        with patch("app.services.template_library.fetch_public_image", new=rejected):
+            with self.assertRaisesRegex(TemplateLibraryError, "图片无法访问"):
+                asyncio.run(localize_template_html(
+                    self.db,
+                    template,
+                    '<section><img src="https://images.example.test/hero.png" /><p>正文</p></section>',
+                ))
+
+        self.assertEqual(template.html, "<p>原始内容</p>")
+        self.assertEqual(self.db.query(TemplateImageAsset).count(), 0)
+
+    def test_localizes_src_srcset_and_background_images_once_per_source(self) -> None:
+        template = self._template()
+        image = ImageInfo("image/png", "png")
+        stored: list[TemplateImageAsset] = []
+
+        def store_asset(_db, template_id, _data, _image, source):
+            asset = TemplateImageAsset(
+                id=f"00000000-0000-0000-0000-{len(stored) + 1:012d}",
+                template_id=template_id,
+                original_url=source,
+                object_key=f"local/template-library/{len(stored)}.png",
+                storage_mode="local",
+                content_type="image/png",
+                size=1,
+            )
+            stored.append(asset)
+            self.db.add(asset)
+            return asset
+
+        fetch = AsyncMock(return_value=(b"image", image))
+        with (
+            patch("app.services.template_library.fetch_public_image", new=fetch),
+            patch("app.services.template_library._store_asset", side_effect=store_asset),
+        ):
+            result = asyncio.run(localize_template_html(
                 self.db,
                 template,
-                '<section><img src="https://images.example.test/hero.png" /><p>正文</p></section>',
+                '<section style="background-image:url(https://images.example.test/hero.png)">'
+                '<img src="https://images.example.test/hero.png" '
+                'srcset="https://images.example.test/hero.png 1x, https://images.example.test/card.png 2x" />'
+                '</section>',
             ))
 
-        self.assertIn('src="https://images.example.test/hero.png"', html)
-        self.assertIn('referrerpolicy="no-referrer"', html)
-        self.assertEqual(warnings, [{"source": "https://images.example.test/hero.png", "message": "图片无法访问"}])
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(result.localized_count, 2)
+        self.assertEqual(len(stored), 2)
+        self.assertNotIn("images.example.test", result.html)
+        self.assertIn("srcset=", result.html)
+        self.assertIn("background-image:url(/api/template-library/assets/", result.html)
 
     def test_category_delete_moves_templates_to_uncategorized_for_every_user(self) -> None:
         category = TemplateCategory(name="活动", sort_order=1)

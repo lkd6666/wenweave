@@ -1,5 +1,5 @@
 export const CROP_RECT_SCALE = 100_000
-export const MAX_CROPPED_IMAGE_BYTES = 10 * 1024 * 1024
+const JPEG_CROP_QUALITY = 0.92
 
 export interface CropRect {
   x: number
@@ -113,14 +113,29 @@ function cropPixels(rect: CropRect, width: number, height: number) {
   return { x, y, width: right - x, height: bottom - y }
 }
 
-async function canvasToPng(canvas: OffscreenCanvas | HTMLCanvasElement): Promise<Blob> {
-  if ('convertToBlob' in canvas) return canvas.convertToBlob({ type: 'image/png' })
+function cropOutputContentType(source: Blob): 'image/jpeg' | 'image/png' {
+  const contentType = source.type.toLowerCase()
+  return contentType === 'image/jpeg' || contentType === 'image/jpg' || contentType === 'image/bmp'
+    ? 'image/jpeg'
+    : 'image/png'
+}
+
+async function canvasToImageBlob(
+  canvas: OffscreenCanvas | HTMLCanvasElement,
+  contentType: 'image/jpeg' | 'image/png',
+): Promise<Blob> {
+  if ('convertToBlob' in canvas) {
+    return canvas.convertToBlob({
+      type: contentType,
+      quality: contentType === 'image/jpeg' ? JPEG_CROP_QUALITY : undefined,
+    })
+  }
   const htmlCanvas = canvas as HTMLCanvasElement
   return new Promise<Blob>((resolve, reject) => {
     htmlCanvas.toBlob((blob: Blob | null) => {
       if (blob) resolve(blob)
       else reject(new ImageCropError('无法生成裁剪图片'))
-    }, 'image/png')
+    }, contentType, contentType === 'image/jpeg' ? JPEG_CROP_QUALITY : undefined)
   })
 }
 
@@ -132,7 +147,7 @@ async function cropWithImageBitmap(source: Blob, rect: CropRect): Promise<Blob> 
     const context = canvas.getContext('2d')
     if (!context) throw new ImageCropError('浏览器无法创建图片画布')
     context.drawImage(bitmap, pixels.x, pixels.y, pixels.width, pixels.height, 0, 0, pixels.width, pixels.height)
-    return canvasToPng(canvas)
+    return canvasToImageBlob(canvas, cropOutputContentType(source))
   } finally {
     bitmap.close()
   }
@@ -155,7 +170,7 @@ async function cropWithHtmlImage(source: Blob, rect: CropRect): Promise<Blob> {
     const context = canvas.getContext('2d')
     if (!context) throw new ImageCropError('浏览器无法创建图片画布')
     context.drawImage(image, pixels.x, pixels.y, pixels.width, pixels.height, 0, 0, pixels.width, pixels.height)
-    return canvasToPng(canvas)
+    return canvasToImageBlob(canvas, cropOutputContentType(source))
   } finally {
     URL.revokeObjectURL(url)
   }
@@ -173,9 +188,6 @@ export async function cropImageBlob(source: Blob, rect: CropRect): Promise<Blob>
   } catch (error) {
     if (error instanceof ImageCropError) throw error
     throw new ImageCropError('无法解码原图或生成裁剪图片')
-  }
-  if (result.size > MAX_CROPPED_IMAGE_BYTES) {
-    throw new ImageCropError('裁剪后的图片超过 10MB，请缩小裁剪范围或更换图片')
   }
   return result
 }

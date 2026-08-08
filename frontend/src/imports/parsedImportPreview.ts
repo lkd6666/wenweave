@@ -1,4 +1,5 @@
 import type { ParsedImport } from './types'
+import { replaceDirectImportAssetReferences } from './directImportAssetReferences'
 
 export interface ParsedImportPreview {
   html: string
@@ -10,10 +11,9 @@ export function createParsedImportPreview(parsed: ParsedImport): ParsedImportPre
     clientId: asset.clientId,
     url: URL.createObjectURL(asset.blob),
   }))
-  let html = parsed.html
-  for (const asset of urls) {
-    html = html.split(`direct-import://asset/${asset.clientId}`).join(asset.url)
-  }
+  const html = replaceDirectImportAssetReferences(parsed.html, new Map(
+    urls.map((asset) => [asset.clientId, asset.url]),
+  ))
   return {
     html,
     revoke: () => urls.forEach((asset) => URL.revokeObjectURL(asset.url)),

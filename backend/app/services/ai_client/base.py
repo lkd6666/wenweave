@@ -1,4 +1,4 @@
-"""AI Provider 客户端的统一抽象：不同厂商/协议（OpenAI 兼容、Anthropic）通过各自的
+"""AI Provider 客户端的统一抽象：不同厂商/协议（OpenAI 兼容、Responses、Anthropic）通过各自的
 适配器实现同一套接口，上层业务代码（模型管理测试连接、对话编辑 Agent）不用关心差异。
 """
 from __future__ import annotations
@@ -28,8 +28,10 @@ class StreamEvent:
 
     type: str
     text_delta: str = ""
+    reasoning_delta: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
     finish_reason: Optional[str] = None
+    usage: Optional[Dict[str, int]] = None
 
 
 class AIClient(Protocol):

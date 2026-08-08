@@ -28,14 +28,19 @@ from app.schemas.template_library import (
     TemplateGenerationRead,
     TemplateGenerationSave,
     TemplateItemCreate,
+    TemplateImageLocalizationResult,
     TemplateItemRead,
     TemplateItemUpdate,
 )
 from app.services.model_access import can_access_model
 from app.services.template_library import (
     TemplateLibraryError,
+    TemplateImageLocalization,
+    TemplateAssetStorageObject,
     category_or_error,
+    cleanup_template_localization,
     delete_asset_object,
+    delete_asset_storage_objects,
     generation_payload,
     localize_template_html,
     read_asset_bytes,
@@ -173,20 +178,26 @@ async def _write_template(
     html: str,
     source_type: str,
     user_id: int,
-) -> TemplateLibraryItem:
+) -> tuple[TemplateLibraryItem, TemplateImageLocalization, tuple[TemplateAssetStorageObject, ...]]:
     clean_name = name.strip()
     if not clean_name:
         raise TemplateLibraryError("模板名称不能为空")
     category_or_error(db, category_id)
-    rendered_html, warnings = await localize_template_html(db, template, html)
-    template.name = clean_name
-    template.category_id = category_id
-    template.html = rendered_html
-    template.source_type = TemplateSourceType(source_type)
-    template.image_warnings_json = json.dumps(warnings, ensure_ascii=False, separators=(",", ":"))
-    template.updated_by_id = user_id
-    remove_unreferenced_assets(db, template, rendered_html)
-    return template
+    localization = await localize_template_html(db, template, html)
+    try:
+        template.name = clean_name
+        template.category_id = category_id
+        template.html = localization.html
+        template.source_type = TemplateSourceType(source_type)
+        # Keep the legacy response field, but new and repaired components are
+        # never persisted with an external-image warning.
+        template.image_warnings_json = "[]"
+        template.updated_by_id = user_id
+        removed_assets = remove_unreferenced_assets(db, template, localization.html, cleanup_objects=False)
+        return template, localization, removed_assets
+    except Exception:
+        cleanup_template_localization(db, localization)
+        raise
 
 
 @router.post("/templates", response_model=TemplateItemRead, status_code=status.HTTP_201_CREATED)
@@ -198,15 +209,22 @@ async def create_template(
     template = TemplateLibraryItem(name=payload.name.strip() or "未命名模板", html="", source_type=TemplateSourceType(payload.source_type), created_by_id=current_user.id, updated_by_id=current_user.id)
     db.add(template)
     db.flush()
+    localization = None
+    removed_assets: tuple[TemplateAssetStorageObject, ...] = ()
     try:
-        await _write_template(db, template, name=payload.name, category_id=payload.category_id, html=payload.html, source_type=payload.source_type, user_id=current_user.id)
+        _, localization, removed_assets = await _write_template(db, template, name=payload.name, category_id=payload.category_id, html=payload.html, source_type=payload.source_type, user_id=current_user.id)
         db.commit()
+        delete_asset_storage_objects(db, removed_assets)
         db.refresh(template)
         return template_payload(template)
     except TemplateLibraryError as exc:
+        if localization is not None:
+            cleanup_template_localization(db, localization)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     except Exception:
+        if localization is not None:
+            cleanup_template_localization(db, localization)
         db.rollback()
         raise
 
@@ -219,17 +237,81 @@ async def update_template(
     db: Session = Depends(get_db),
 ) -> dict:
     template = _template_or_404(db, template_id)
+    localization = None
+    removed_assets: tuple[TemplateAssetStorageObject, ...] = ()
     try:
-        await _write_template(db, template, name=payload.name, category_id=payload.category_id, html=payload.html, source_type=payload.source_type, user_id=current_user.id)
+        _, localization, removed_assets = await _write_template(db, template, name=payload.name, category_id=payload.category_id, html=payload.html, source_type=payload.source_type, user_id=current_user.id)
         db.commit()
+        delete_asset_storage_objects(db, removed_assets)
         db.refresh(template)
         return template_payload(template)
     except TemplateLibraryError as exc:
+        if localization is not None:
+            cleanup_template_localization(db, localization)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     except Exception:
+        if localization is not None:
+            cleanup_template_localization(db, localization)
         db.rollback()
         raise
+
+
+@router.post("/templates/localize-external-images", response_model=TemplateImageLocalizationResult)
+async def localize_template_images(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Repair legacy component images one component at a time."""
+    items: list[dict] = []
+    updated_count = 0
+    failed_count = 0
+    localized_count = 0
+    templates = db.query(TemplateLibraryItem).order_by(TemplateLibraryItem.id).all()
+    for template in templates:
+        template_id = template.id
+        name = template.name
+        localization = None
+        try:
+            _, localization, removed_assets = await _write_template(
+                db,
+                template,
+                name=template.name,
+                category_id=template.category_id,
+                html=template.html,
+                source_type=template.source_type.value,
+                user_id=current_user.id,
+            )
+            if localization.localized_count:
+                db.commit()
+                delete_asset_storage_objects(db, removed_assets)
+                updated_count += 1
+                localized_count += localization.localized_count
+                items.append({"template_id": template_id, "name": name, "status": "updated", "localized_count": localization.localized_count})
+            else:
+                db.rollback()
+                items.append({"template_id": template_id, "name": name, "status": "unchanged"})
+        except TemplateLibraryError as exc:
+            if localization is not None:
+                cleanup_template_localization(db, localization)
+            db.rollback()
+            failed_count += 1
+            items.append({"template_id": template_id, "name": name, "status": "failed", "message": str(exc)})
+        except Exception:
+            if localization is not None:
+                cleanup_template_localization(db, localization)
+            db.rollback()
+            failed_count += 1
+            items.append({"template_id": template_id, "name": name, "status": "failed", "message": "图片转存失败"})
+        finally:
+            # Keep later items independent after a rollback from a failed one.
+            db.expire_all()
+    return {
+        "items": items,
+        "updated_count": updated_count,
+        "failed_count": failed_count,
+        "localized_count": localized_count,
+    }
 
 
 @router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
@@ -324,12 +406,22 @@ async def save_generation(
     template = TemplateLibraryItem(name=payload.name.strip() or "未命名模板", html="", source_type=TemplateSourceType.AI, created_by_id=current_user.id, updated_by_id=current_user.id)
     db.add(template)
     db.flush()
+    localization = None
+    removed_assets: tuple[TemplateAssetStorageObject, ...] = ()
     try:
-        await _write_template(db, template, name=payload.name, category_id=payload.category_id, html=generation.output_html, source_type="ai", user_id=current_user.id)
+        _, localization, removed_assets = await _write_template(db, template, name=payload.name, category_id=payload.category_id, html=generation.output_html, source_type="ai", user_id=current_user.id)
         generation.status = TemplateGenerationStatus.SAVED
         db.commit()
+        delete_asset_storage_objects(db, removed_assets)
         db.refresh(template)
         return template_payload(template)
     except TemplateLibraryError as exc:
+        if localization is not None:
+            cleanup_template_localization(db, localization)
         db.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except Exception:
+        if localization is not None:
+            cleanup_template_localization(db, localization)
+        db.rollback()
+        raise

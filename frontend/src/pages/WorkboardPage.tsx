@@ -149,6 +149,7 @@ export default function WorkboardPage() {
                 dataSource={data.model_ranking}
                 rowKey="model_id"
                 pagination={false}
+                scroll={{ x: 'max-content' }}
                 locale={{ emptyText: '当前权限下暂无模型调用' }}
               />
             </Card>
@@ -159,6 +160,7 @@ export default function WorkboardPage() {
                 dataSource={data.user_ranking}
                 rowKey={(row) => row.user_id ?? `deleted-${row.display_name}`}
                 pagination={false}
+                scroll={{ x: 'max-content' }}
                 locale={{ emptyText: '当前权限下暂无用户调用' }}
               />
             </Card>

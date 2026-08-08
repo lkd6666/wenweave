@@ -8,7 +8,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
-from app.core.security import decode_access_token
+from app.core.security import ACCESS_TOKEN_TYPE, decode_access_token
 from app.db.session import get_db
 from app.models.user import User, UserRole
 
@@ -25,6 +25,10 @@ def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session 
         raise credentials_exception
     try:
         payload = decode_access_token(token)
+        # Tokens issued before refresh support have no type and remain valid
+        # until they naturally expire. Refresh tokens cannot be Bearer tokens.
+        if payload.get("token_type", ACCESS_TOKEN_TYPE) != ACCESS_TOKEN_TYPE:
+            raise credentials_exception
         user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exception

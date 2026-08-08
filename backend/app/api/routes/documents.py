@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
+import httpx
 import jwt
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -14,6 +15,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user
+from app.api.sse import SSE_RESPONSE_HEADERS
 from app.core.security import create_scoped_token, decode_access_token
 from app.db.session import get_db
 from app.models.agent_run import AgentRun, AgentRunStatus
@@ -24,6 +26,7 @@ from app.models.document_group import DocumentGroup
 from app.models.document_import import DocumentImport, DocumentImportAsset, DocumentImportStatus
 from app.models.document_version import DocumentVersion, DocumentVersionSource
 from app.models.storage_config import StorageConfig
+from app.models.template_library import TemplateLibraryItem
 from app.models.document_visibility import VisibilityMode
 from app.models.user import User, UserRole
 from app.models.user_group import UserGroup
@@ -40,6 +43,7 @@ from app.schemas.document import (
     DocumentAiEditingStatus,
     DocumentDetail,
     DocumentHtmlPatch,
+    DocumentImageLocalizationResult,
     DocumentImageUpload,
     DocumentImportAssetCreate,
     DocumentImportAssetUpload,
@@ -80,6 +84,12 @@ from app.services.document_versions import (
     materialize_document_version,
 )
 from app.services.document_images import DocumentImageStorageError, store_document_image
+from app.services.document_image_localization import (
+    cleanup_document_localization,
+    localize_document_html,
+)
+from app.services.external_fetch import PublicFetchError, fetch_public_image
+from app.services.image_localization import ImageLocalizationError
 from app.services.chat_images import ChatImageError, delete_document_attachments
 from app.services.document_shares import revoke_document_shares
 from app.services.web_article_import import (
@@ -140,7 +150,7 @@ def _ensure_document_not_being_edited_by_ai(db: Session, document_id: int) -> No
     if _is_document_being_edited_by_ai(db, document_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="当前推文正在由 AI 编辑，完成或停止后才能同步公众号草稿",
+            detail="当前推文正在由 AI 编辑，完成或停止后才能执行此操作",
         )
 
 
@@ -809,11 +819,13 @@ def complete_direct_import(
 
     assets_by_id = {asset.id: asset for asset in import_session.assets}
     referenced_asset_ids = set(IMPORT_ASSET_TOKEN_PATTERN.findall(payload.html))
-    if referenced_asset_ids != set(assets_by_id):
+    unknown_asset_ids = referenced_asset_ids - set(assets_by_id)
+    if unknown_asset_ids:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="解析图片清单与正文占位符不一致")
 
     html = payload.html
-    for asset_id, asset in assets_by_id.items():
+    for asset_id in referenced_asset_ids:
+        asset = assets_by_id[asset_id]
         if storage is None:
             _validate_local_asset(asset)
             image_url = _local_import_image_url(asset.id)
@@ -858,6 +870,22 @@ def complete_direct_import(
     import_session.document_id = document.id
     db.commit()
     db.refresh(document)
+
+    # Some Word parsers produce crop source assets that Mammoth later omits from HTML.
+    # They are not part of the completed document, so remove them after its transaction commits.
+    for asset_id, asset in assets_by_id.items():
+        if asset_id in referenced_asset_ids:
+            continue
+        if local_uploads.is_local_key(asset.object_key):
+            local_uploads.delete(asset.object_key)
+        elif storage is not None:
+            try:
+                oss_client.delete_object(storage, asset.object_key)
+            except Exception:
+                pass
+        db.delete(asset)
+    if any(asset_id not in referenced_asset_ids for asset_id in assets_by_id):
+        db.commit()
     return document
 
 
@@ -948,6 +976,36 @@ def create_document(
     db.commit()
     db.refresh(document)
     return document
+
+
+@router.get("/crop-source")
+async def get_crop_source_image(
+    url: str = Query(min_length=1, max_length=8_192),
+    _current_user: User = Depends(get_current_user),
+) -> Response:
+    """Read an external image through the application for the browser cropper.
+
+    Image display does not require CORS, but exporting a crop requires readable
+    bytes. Keep this authenticated endpoint behind the same bounded public-image
+    fetcher used during article import so crop operations do not depend on the
+    source server's browser CORS headers.
+    """
+    timeout = httpx.Timeout(10.0, connect=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            data, image = await fetch_public_image(client, url)
+    except PublicFetchError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="图片读取失败，请稍后重试") from exc
+    return Response(
+        content=data,
+        media_type=image.content_type,
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentDetail)
@@ -1223,6 +1281,54 @@ def get_local_manual_image(image_name: str) -> FileResponse:
     )
 
 
+@router.post("/{document_id}/templates/{template_id}/materialize-images", response_model=DocumentImageLocalizationResult)
+async def materialize_template_images(
+    document_id: int,
+    template_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DocumentImageLocalizationResult:
+    """Copy reusable component images into document storage before editor insertion."""
+    document = _get_accessible_document(db, document_id, current_user)
+    template = db.get(TemplateLibraryItem, template_id)
+    if template is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模板不存在")
+    try:
+        result = await localize_document_html(db, document, template.html)
+        return DocumentImageLocalizationResult(html=result.html, localized_count=result.localized_count)
+    except ImageLocalizationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+
+@router.post("/{document_id}/images/localize-external", response_model=DocumentImageLocalizationResult)
+async def localize_document_images(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DocumentImageLocalizationResult:
+    """Atomically copy every non-document image in the active article."""
+    document = _get_accessible_document(db, document_id, current_user)
+    _ensure_document_not_being_edited_by_ai(db, document.id)
+    try:
+        result = await localize_document_html(db, document, document.current_html)
+    except ImageLocalizationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    if not result.localized_count:
+        return DocumentImageLocalizationResult(html=document.current_html, localized_count=0)
+
+    try:
+        document.current_html = result.html
+        touch_document(document, current_user.id)
+        create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "转存外链图片")
+        db.commit()
+        db.refresh(document)
+        return DocumentImageLocalizationResult(html=document.current_html, localized_count=result.localized_count)
+    except Exception:
+        cleanup_document_localization(db, result)
+        db.rollback()
+        raise
+
+
 @router.post("/{document_id}/images", response_model=DocumentImageUpload)
 async def upload_document_image(
     document_id: int,
@@ -1369,6 +1475,7 @@ async def _push_wechat_draft(
     metadata = WeChatArticleMetadata.model_validate({**document.wechat_metadata, "title": title})
     client = WeChatOfficialAccountClient()
     trusted_image_hosts = _trusted_oss_image_hosts(db)
+    cover: CoverImage | None = None
     try:
         await report("validating", 29, "正在校验微信字段、正文结构和图片地址…")
         WeChatOfficialAccountClient.validate_draft_input(metadata, document.current_html)
@@ -1428,6 +1535,8 @@ async def _push_wechat_draft(
         else:
             result = await client.create_draft(account, **push_kwargs)
     except WeChatApiError as exc:
+        if cover is not None:
+            cover.close()
         draft = WeChatDraft(
             document_id=document.id,
             account_id=account.id,
@@ -1459,6 +1568,15 @@ async def _push_wechat_draft(
         db.refresh(draft)
         http_status = status.HTTP_502_BAD_GATEWAY if exc.code is not None else status.HTTP_422_UNPROCESSABLE_ENTITY
         raise HTTPException(status_code=http_status, detail=str(exc)) from exc
+    except BaseException:
+        if cover is not None:
+            cover.close()
+        raise
+    else:
+        # The real client also closes its cover stream; route-level cleanup
+        # keeps mocked clients and future alternate implementations leak-free.
+        assert cover is not None
+        cover.close()
 
     if result.cover_media_was_uploaded and cached_material is None:
         db.add(
@@ -1602,7 +1720,7 @@ async def stream_wechat_draft(
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=SSE_RESPONSE_HEADERS,
     )
 
 

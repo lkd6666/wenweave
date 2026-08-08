@@ -1,7 +1,7 @@
 """主流聊天模型的可安装预设。
 
 目录依据 models.dev（MIT，https://models.dev）公开维护的模型能力信息整理；
-Base URL 以各供应商的 OpenAI 兼容 / Anthropic Messages 官方接口为准。这里刻意只
+Base URL 以各供应商的 OpenAI Chat Completions / Responses / Anthropic Messages 官方接口为准。这里刻意只
 收录当前应用两种客户端协议可以实际调用的聊天模型，向量、语音、图像模型不在此列。
 
 ``thinking_config`` 是发送给模型 SDK 的请求参数映射：
@@ -17,7 +17,7 @@ OFFICIAL_DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com/v1"
 
 # 模型发现协议与聊天协议并不完全相同。预设显式标记发现适配器，避免把所有厂商都假定为
 # Bearer + /models：Gemini 的原生列表接口使用 x-goog-api-key 且响应为 models[]，
-# Anthropic 使用 x-api-key / anthropic-version，其他预设采用各自 OpenAI 兼容端点。
+# Anthropic 使用 x-api-key / anthropic-version，其他预设采用各自 OpenAI 兼容或 Responses 端点。
 OPENAI_COMPATIBLE_DISCOVERY = {"adapter": "openai_compatible", "path": "/models", "response_key": "data"}
 ANTHROPIC_DISCOVERY = {"adapter": "anthropic", "path": "/v1/models", "response_key": "data"}
 GEMINI_DISCOVERY = {
@@ -63,6 +63,7 @@ def _openai_reasoning_config() -> dict[str, Any]:
             "low": {"reasoning_effort": "low"},
             "medium": {"reasoning_effort": "medium"},
             "high": {"reasoning_effort": "high"},
+            "max": {"reasoning_effort": "max"},
         },
     }
 
@@ -155,6 +156,21 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "id": "openai",
         "name": "OpenAI",
         "provider_type": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_hint": "sk-...",
+        "model_discovery": OPENAI_COMPATIBLE_DISCOVERY,
+        "models": _models(
+            ("gpt-5", "GPT-5", _openai_reasoning_config()),
+            ("gpt-5-mini", "GPT-5 mini", _openai_reasoning_config()),
+            ("o3", "o3", _openai_reasoning_config()),
+            ("gpt-4.1", "GPT-4.1", None),
+            ("gpt-4o", "GPT-4o", None),
+        ),
+    },
+    {
+        "id": "openai_responses",
+        "name": "OpenAI Responses API",
+        "provider_type": "openai_responses",
         "base_url": "https://api.openai.com/v1",
         "api_key_hint": "sk-...",
         "model_discovery": OPENAI_COMPATIBLE_DISCOVERY,

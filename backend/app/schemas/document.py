@@ -250,6 +250,11 @@ class DocumentHtmlPatch(BaseModel):
         return value
 
 
+class DocumentImageLocalizationResult(BaseModel):
+    html: str
+    localized_count: int
+
+
 class DocumentShareCreate(BaseModel):
     expires_at: datetime
 
@@ -297,6 +302,8 @@ class PublicDocumentShareRead(BaseModel):
     title: str
     html: str
     cover_url: str
+    cover_crop_235_1: str
+    cover_crop_1_1: str
     revision: str
     expires_at: datetime
     asset_refresh_at: datetime

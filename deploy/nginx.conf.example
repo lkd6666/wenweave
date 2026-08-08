@@ -7,6 +7,33 @@ server {
     # Let the application enforce its 30 MB import limit with multipart overhead.
     client_max_body_size 35m;
 
+    # Keep agent tokens unbuffered and prohibit cache/CDN storage for SSE.
+    location ~ ^/api/documents/[0-9]+/(?:chat-runs/[A-Za-z0-9-]+/events|wechat-drafts/stream)$ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_read_timeout 900s;
+        proxy_send_timeout 900s;
+
+        # Enforce this at the proxy as well, even when an upstream setting changes.
+        proxy_hide_header Cache-Control;
+        proxy_hide_header Pragma;
+        proxy_hide_header Expires;
+        proxy_hide_header Surrogate-Control;
+        add_header Cache-Control "no-store, no-cache, max-age=0, must-revalidate, no-transform" always;
+        add_header Pragma "no-cache" always;
+        add_header Expires "0" always;
+        add_header Surrogate-Control "no-store" always;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8001;
         proxy_http_version 1.1;

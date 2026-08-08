@@ -39,6 +39,7 @@ const resourceOptions = [
 
 const actionLabels: Record<string, string> = {
   'auth.login': '登录',
+  'auth.refresh': '刷新登录会话',
   'account.password.change': '修改密码',
   'document.create': '创建文档',
   'document.update': '编辑文档信息',

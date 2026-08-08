@@ -43,6 +43,7 @@ from app.services.chat_session_context import (
     clear_session_theme_proposal,
     replace_session_attached_templates,
     session_attached_templates,
+    session_approved_theme_proposal,
 )
 
 
@@ -361,6 +362,31 @@ class ChatSessionRouteTests(unittest.TestCase):
         self.assertTrue(clear_session_theme_proposal(self.db, self.primary.id))
         self.db.commit()
         self.assertIsNone(_session_read(self.db, self.primary)["theme_context"])
+
+    def test_approved_theme_remains_available_to_continue_its_initial_application(self) -> None:
+        proposal = GzhThemeProposal(
+            id="06e19145-6613-47d8-9bd1-e9ea6a7b9a28",
+            document_id=self.document.id,
+            session_id=self.primary.id,
+            user_id=self.user.id,
+            theme_key="news-standard",
+            theme_name="新闻主题",
+            theme_markdown="# theme",
+            base_checksum="a" * 64,
+            status=GzhThemeProposalStatus.APPROVED,
+            expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        )
+        self.db.add(proposal)
+        self.db.flush()
+        bind_session_theme_proposal(self.db, self.primary.id, proposal.id)
+
+        continued_proposal = session_approved_theme_proposal(self.db, self.primary.id)
+        self.assertIsNotNone(continued_proposal)
+        assert continued_proposal is not None
+        self.assertEqual(continued_proposal.id, proposal.id)
+
+        proposal.status = GzhThemeProposalStatus.APPLIED
+        self.assertIsNone(session_approved_theme_proposal(self.db, self.primary.id))
 
 
 if __name__ == "__main__":

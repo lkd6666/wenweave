@@ -129,7 +129,7 @@ def usage_from_message(message: BaseMessage | object) -> ModelUsage | None:
 
 
 class ModelCallTracker:
-    """Collect one attempt and append its terminal accounting row in a short DB session."""
+    """Persist a model attempt at start and update its eventual terminal state."""
 
     def __init__(
         self,
@@ -145,15 +145,42 @@ class ModelCallTracker:
         self.source_id = str(source_id or "")[:64]
         self.started_at = utcnow()
         self._finished = False
+        self.record_id: int | None = None
+        self._start()
 
     def complete(self, response: BaseMessage | object | None = None) -> None:
-        self._append(ModelCallStatus.COMPLETED, response=response)
+        self._finish(ModelCallStatus.COMPLETED, response=response)
 
     def fail(self, exc: BaseException) -> None:
         status = ModelCallStatus.CANCELLED if isinstance(exc, asyncio.CancelledError) else ModelCallStatus.FAILED
-        self._append(status, error_message=str(exc)[:512])
+        self._finish(status, error_message=str(exc)[:512])
 
-    def _append(
+    def _start(self) -> None:
+        """Record an in-flight request before the provider can outlive this worker."""
+        db = SessionLocal()
+        try:
+            record = ModelCallRecord(
+                model_id=self.model_id,
+                user_id=self.user_id,
+                source=self.source,
+                source_id=self.source_id,
+                status=ModelCallStatus.RUNNING,
+                usage_reported=False,
+                error_message="",
+                started_at=self.started_at,
+                finished_at=None,
+            )
+            db.add(record)
+            db.commit()
+            self.record_id = int(record.id)
+        except Exception:
+            # Model accounting remains non-critical. A failed accounting write
+            # must not prevent the user request from reaching its provider.
+            db.rollback()
+        finally:
+            db.close()
+
+    def _finish(
         self,
         status: ModelCallStatus,
         *,
@@ -166,23 +193,26 @@ class ModelCallTracker:
         usage = usage_from_message(response) if response is not None else None
         db = SessionLocal()
         try:
-            db.add(
-                ModelCallRecord(
+            record = db.get(ModelCallRecord, self.record_id) if self.record_id is not None else None
+            if record is None:
+                # Keep the historical best-effort behavior if writing the
+                # start record failed but the terminal record can be stored.
+                record = ModelCallRecord(
                     model_id=self.model_id,
                     user_id=self.user_id,
                     source=self.source,
                     source_id=self.source_id,
-                    status=status,
-                    usage_reported=usage is not None,
-                    input_tokens=usage.input_tokens if usage else None,
-                    output_tokens=usage.output_tokens if usage else None,
-                    cache_read_tokens=usage.cache_read_tokens if usage else None,
-                    cache_write_tokens=usage.cache_write_tokens if usage else None,
-                    error_message=error_message,
                     started_at=self.started_at,
-                    finished_at=utcnow(),
                 )
-            )
+                db.add(record)
+            record.status = status
+            record.usage_reported = usage is not None
+            record.input_tokens = usage.input_tokens if usage else None
+            record.output_tokens = usage.output_tokens if usage else None
+            record.cache_read_tokens = usage.cache_read_tokens if usage else None
+            record.cache_write_tokens = usage.cache_write_tokens if usage else None
+            record.error_message = error_message
+            record.finished_at = utcnow()
             db.commit()
         except Exception:
             # Accounting must never turn a successful provider response into a

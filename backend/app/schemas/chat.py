@@ -128,6 +128,19 @@ class AssistantTurnBlockRead(BaseModel):
     tool: ToolExecutionRead | None = None
 
 
+class SelectedElementFingerprint(BaseModel):
+    tag_name: str = Field(default="", max_length=64)
+    stable_attributes: dict[str, str] = Field(default_factory=dict, max_length=16)
+    text: str = Field(default="", max_length=MAX_SELECTED_ELEMENT_TEXT_CHARS)
+
+
+class SelectedElementLocator(BaseModel):
+    path: str = Field(default="", max_length=1024)
+    parent_path: str = Field(default="", max_length=1024)
+    sibling_index: int = Field(default=0, ge=0, le=10_000)
+    fingerprint: SelectedElementFingerprint = Field(default_factory=SelectedElementFingerprint)
+
+
 class SelectedElementInput(BaseModel):
     """浏览器预览中用户明确选中的元素源码，仅作为本轮 Agent 的定位上下文。"""
 
@@ -135,6 +148,7 @@ class SelectedElementInput(BaseModel):
     tag_name: str = Field(min_length=1, max_length=64)
     html: str = Field(min_length=1, max_length=MAX_SELECTED_ELEMENT_HTML_CHARS)
     text: str = Field(default="", max_length=MAX_SELECTED_ELEMENT_TEXT_CHARS)
+    locator: SelectedElementLocator | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -226,6 +240,8 @@ class ChatSessionRead(BaseModel):
     layout_reference: ChatSessionLayoutReferenceRead | None = None
     attached_templates: list[ChatSessionTemplateAttachmentRead] = Field(default_factory=list)
     theme_context: ChatSessionThemeContextRead | None = None
+    image_model_id: int | None = None
+    auto_image_generation_enabled: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -236,6 +252,11 @@ class ChatSessionCreate(BaseModel):
 
 class ChatSessionUpdate(BaseModel):
     title: str = Field(min_length=1, max_length=160)
+
+
+class ChatSessionImageSettingsUpdate(BaseModel):
+    image_model_id: int | None = Field(default=None, gt=0)
+    auto_image_generation_enabled: bool = False
 
 
 class ChatSessionTemplateAttachmentsUpdate(BaseModel):

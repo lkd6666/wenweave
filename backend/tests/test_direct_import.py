@@ -75,7 +75,7 @@ class DirectImportRouteTests(unittest.TestCase):
         self.sign_upload.start()
         self.sign_read.start()
         self.inspect.start()
-        self.delete.start()
+        self.delete_object = self.delete.start()
         self.uploaded_objects: dict[str, dict[str, object]] = {}
 
     def tearDown(self) -> None:
@@ -207,6 +207,56 @@ class DirectImportRouteTests(unittest.TestCase):
         self.assertNotIn("direct-import://asset/", result.current_html)
         self.assertIn("data-crop-source=\"https://read.test/", result.current_html)
         self.assertIn("src=\"https://read.test/", result.current_html)
+
+    def test_direct_import_allows_and_removes_unused_declared_assets(self) -> None:
+        started = documents.create_direct_import(
+            DocumentImportCreate(
+                filename="with-auxiliary-image.docx",
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                size=1024,
+            ),
+            self.user,
+            self.db,
+        )
+        assets = documents.create_direct_import_assets(
+            started.id,
+            DocumentImportAssetsCreate(
+                assets=[
+                    DocumentImportAssetCreate(
+                        client_id="word-display-1",
+                        filename="word-display-1.png",
+                        content_type="image/png",
+                        size=12,
+                    ),
+                    DocumentImportAssetCreate(
+                        client_id="word-auxiliary-1",
+                        filename="word-auxiliary-1.png",
+                        content_type="image/png",
+                        size=16,
+                    ),
+                ]
+            ),
+            self.user,
+            self.db,
+        )
+        display_asset, unused_asset = assets.assets
+        self.uploaded_objects[started.source_upload.object_key] = {
+            "size": 1024,
+            "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }
+        self.uploaded_objects[display_asset.upload.object_key] = {"size": 12, "content_type": "image/png"}
+
+        result = documents.complete_direct_import(
+            started.id,
+            DocumentImportComplete(html=f'<img src="direct-import://asset/{display_asset.asset_id}" />'),
+            self.user,
+            self.db,
+        )
+
+        self.assertIn("https://read.test/", result.current_html)
+        self.assertIsNone(self.db.get(documents.DocumentImportAsset, unused_asset.asset_id))
+        self.delete_object.assert_called_once()
+        self.assertEqual(self.delete_object.call_args.args[1], unused_asset.upload.object_key)
 
     def test_blank_document_starts_with_an_active_chat_session(self) -> None:
         document = documents.create_document(DocumentCreate(title="空白稿"), self.user, self.db)

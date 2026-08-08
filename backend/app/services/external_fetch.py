@@ -68,17 +68,22 @@ def normalize_public_https_url(raw_url: str) -> str:
     return urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
 
 
-def _is_allowed_address(host: str, address: str) -> bool:
+def _is_allowed_address(host: str, address: str, trusted_proxy_hosts: frozenset[str] = frozenset()) -> bool:
     try:
         parsed_address = ipaddress.ip_address(address)
     except ValueError:
         return False
     if parsed_address.is_global:
         return True
-    return host.lower().rstrip(".") in _WECHAT_PROXY_HOSTS and parsed_address in _WECHAT_PROXY_NETWORK
+    hostname = host.lower().rstrip(".")
+    return (
+        parsed_address.version == 4
+        and parsed_address in _WECHAT_PROXY_NETWORK
+        and (hostname in _WECHAT_PROXY_HOSTS or hostname in trusted_proxy_hosts)
+    )
 
 
-async def ensure_public_host(url: str) -> None:
+async def ensure_public_host(url: str, *, trusted_proxy_hosts: frozenset[str] = frozenset()) -> None:
     parsed = urlsplit(url)
     host = parsed.hostname
     if not host:
@@ -98,7 +103,7 @@ async def ensure_public_host(url: str) -> None:
     except OSError as exc:
         raise PublicFetchError("无法解析链接域名") from exc
     addresses = {record[4][0] for record in records}
-    if not addresses or any(not _is_allowed_address(host, address) for address in addresses):
+    if not addresses or any(not _is_allowed_address(host, address, trusted_proxy_hosts) for address in addresses):
         raise PublicFetchError("链接指向了不允许访问的网络地址")
 
 
@@ -162,18 +167,26 @@ def _decode_data_image(source: str) -> tuple[bytes, local_uploads.ImageInfo]:
 
 
 async def fetch_public_image(
-    client: httpx.AsyncClient, source: str, canonical_url: str
+    client: httpx.AsyncClient,
+    source: str,
+    canonical_url: str | None = None,
+    *,
+    trusted_proxy_hosts: set[str] | frozenset[str] | None = None,
 ) -> tuple[bytes, local_uploads.ImageInfo]:
     if source.lower().startswith("data:"):
         return _decode_data_image(source)
-    current_url = normalize_public_https_url(urljoin(canonical_url, source))
+    trusted_hosts = frozenset(
+        str(host).lower().rstrip(".") for host in (trusted_proxy_hosts or set()) if str(host).strip()
+    )
+    current_url = normalize_public_https_url(urljoin(canonical_url or "", source))
     for redirect_count in range(MAX_REDIRECTS + 1):
-        await ensure_public_host(current_url)
+        await ensure_public_host(current_url, trusted_proxy_hosts=trusted_hosts)
         headers = {
             **browser_headers(),
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Referer": canonical_url,
         }
+        if canonical_url:
+            headers["Referer"] = canonical_url
         try:
             async with client.stream("GET", current_url, headers=headers) as response:
                 if response.status_code in {301, 302, 303, 307, 308}:

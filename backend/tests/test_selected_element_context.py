@@ -67,6 +67,40 @@ class SelectedElementContextTests(unittest.TestCase):
         # 回给模型的补丁摘要同样不得泄漏 Base64。
         self.assertNotIn("data:image", json.dumps(summary, ensure_ascii=False))
 
+    def test_request_preserves_structured_locator_and_redacts_stable_attributes(self) -> None:
+        request = ChatSendRequest.model_validate(
+            {
+                "message": "移动选中图片",
+                "model_id": 1,
+                "session_id": 1,
+                "client_request_id": "locator-request-1",
+                "selected_elements": [
+                    {
+                        "selector": "p:nth-of-type(1) > img:nth-of-type(1)",
+                        "tag_name": "img",
+                        "html": '<img src="data:image/png;base64,AAAA">',
+                        "text": "",
+                        "locator": {
+                            "path": "p:nth-of-type(1) > img:nth-of-type(1)",
+                            "parent_path": "p:nth-of-type(1)",
+                            "sibling_index": 1,
+                            "fingerprint": {
+                                "tag_name": "img",
+                                "stable_attributes": {"src": "data:image/png;base64,AAAA"},
+                                "text": "",
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+
+        locator = request.selected_elements[0].locator
+        self.assertIsNotNone(locator)
+        assert locator is not None
+        self.assertEqual(locator.path, "p:nth-of-type(1) > img:nth-of-type(1)")
+        self.assertRegex(locator.fingerprint.stable_attributes["src"], r"^\[inline image data identity:[a-f0-9]{16}\]$")
+
 
 if __name__ == "__main__":
     unittest.main()

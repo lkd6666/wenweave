@@ -4,12 +4,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import logging
+import re
 import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any
+from tempfile import SpooledTemporaryFile
+from typing import Any, BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -18,7 +21,9 @@ from bs4 import BeautifulSoup
 from app.core.crypto import decrypt_secret
 from app.models.wechat_account import WeChatAccount
 from app.schemas.wechat import WeChatArticleMetadata
+from app.services.agent_run_manager import WORKER_ID
 from app.services.html_validation import validate_html_structure
+from app.services.runtime_diagnostics import log_process_memory
 
 
 WECHAT_API_BASE = "https://api.weixin.qq.com"
@@ -28,9 +33,14 @@ BODY_IMAGE_LIMIT = PERMANENT_IMAGE_LIMIT
 TEMPORARY_BODY_IMAGE_LIMIT = 1 * 1024 * 1024
 COVER_IMAGE_LIMIT = PERMANENT_IMAGE_LIMIT
 MAX_REDIRECTS = 3
+IMAGE_MEMORY_BUFFER_LIMIT = 1 * 1024 * 1024
 TOKEN_ERROR_CODES = {40001, 40014, 42001}
 BODY_IMAGE_CACHE_RETRY_ERROR_CODES = {40007, 40008, 47001}
 TRUSTED_OSS_BENCHMARK_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+# WeChat generates a digest from the article content when this field is empty.
+# A zero-width space is accepted as a text value but remains visually blank in
+# the draft editor, allowing an intentionally empty digest to stay empty.
+WECHAT_EMPTY_DIGEST_PLACEHOLDER = "\u200b"
 COVER_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/bmp"}
 BODY_IMAGE_TYPES = COVER_IMAGE_TYPES
 TEMPORARY_BODY_IMAGE_TYPES = {"image/jpeg", "image/png"}
@@ -43,6 +53,74 @@ IMAGE_EXTENSIONS = {
     "image/gif": ".gif",
     "image/bmp": ".bmp",
 }
+SENSITIVE_QUERY_VALUE_PATTERN = re.compile(
+    r"([?&](?:access_token|app_secret|secret|api[_-]?key|signature|sign)=)[^&#\s]+",
+    re.IGNORECASE,
+)
+SENSITIVE_FIELD_VALUE_PATTERN = re.compile(
+    r"((?:[\"']?)(?:access_token|app_secret|secret|api[_-]?key|signature|sign)(?:[\"']?)\s*[=:]\s*(?:[\"']?))([^\s,}&\"']+)",
+    re.IGNORECASE,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def _redact_sensitive_text(value: str) -> str:
+    """Keep request failures useful without leaking credential values to logs or clients."""
+    value = SENSITIVE_QUERY_VALUE_PATTERN.sub(r"\1[REDACTED]", value)
+    return SENSITIVE_FIELD_VALUE_PATTERN.sub(r"\1[REDACTED]", value)
+
+
+class ImagePayload:
+    """A rewindable image body that spills to disk above one MiB."""
+
+    def __init__(
+        self,
+        stream: BinaryIO,
+        *,
+        content_type: str,
+        filename: str,
+        size: int,
+        content_sha256: str,
+    ) -> None:
+        self._stream = stream
+        self.content_type = content_type
+        self.filename = filename
+        self.size = size
+        self.content_sha256 = content_sha256
+
+    @classmethod
+    def from_bytes(cls, content: bytes, *, content_type: str, filename: str) -> "ImagePayload":
+        stream = SpooledTemporaryFile(max_size=IMAGE_MEMORY_BUFFER_LIMIT, mode="w+b")
+        try:
+            stream.write(content)
+            stream.seek(0)
+            return cls(
+                stream,
+                content_type=content_type,
+                filename=filename,
+                size=len(content),
+                content_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        except BaseException:
+            stream.close()
+            raise
+
+    @property
+    def is_file_backed(self) -> bool:
+        return bool(getattr(self._stream, "_rolled", False))
+
+    def rewind(self) -> BinaryIO:
+        self._stream.seek(0)
+        return self._stream
+
+    def read_bytes(self) -> bytes:
+        stream = self.rewind()
+        return stream.read()
+
+    def close(self) -> None:
+        self._stream.close()
 
 
 class WeChatApiError(Exception):
@@ -51,15 +129,33 @@ class WeChatApiError(Exception):
         self.code = code
 
 
-@dataclass(frozen=True)
 class CoverImage:
-    content: bytes
-    content_type: str
-    filename: str
+    """Publicly compatible cover wrapper backed by a rewindable image stream."""
+
+    def __init__(self, content: bytes | ImagePayload, content_type: str, filename: str) -> None:
+        self._payload = (
+            content
+            if isinstance(content, ImagePayload)
+            else ImagePayload.from_bytes(content, content_type=content_type, filename=filename)
+        )
+        self.content_type = content_type
+        self.filename = filename
+
+    @property
+    def content(self) -> bytes:
+        """Compatibility accessor; the upload path uses ``payload`` to avoid a copy."""
+        return self._payload.read_bytes()
+
+    @property
+    def payload(self) -> ImagePayload:
+        return self._payload
 
     @property
     def content_sha256(self) -> str:
-        return hashlib.sha256(self.content).hexdigest()
+        return self._payload.content_sha256
+
+    def close(self) -> None:
+        self._payload.close()
 
 
 @dataclass(frozen=True)
@@ -101,7 +197,7 @@ class DraftTarget:
 
 
 ProgressCallback = Callable[[str, int, str], Awaitable[None]]
-LocalImageLoader = Callable[[str], tuple[bytes, str, str] | None]
+LocalImageLoader = Callable[[str], tuple[bytes, str, str] | ImagePayload | None]
 
 
 class WeChatOfficialAccountClient:
@@ -123,7 +219,7 @@ class WeChatOfficialAccountClient:
         self, source_url: str, *, trusted_image_hosts: set[str] | None = None
     ) -> CoverImage:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=False) as client:
-            content, content_type, filename = await self._download_image(
+            payload = await self._download_image(
                 client,
                 source_url,
                 allowed_types=COVER_IMAGE_TYPES,
@@ -131,7 +227,14 @@ class WeChatOfficialAccountClient:
                 label="封面",
                 trusted_image_hosts=trusted_image_hosts,
             )
-        return CoverImage(content=content, content_type=content_type, filename=filename)
+        log_process_memory(
+            logger,
+            stage="wechat_cover_downloaded",
+            worker_id=WORKER_ID,
+            size=payload.size,
+            file_backed=payload.is_file_backed,
+        )
+        return CoverImage(content=payload, content_type=payload.content_type, filename=payload.filename)
 
     async def create_draft(
         self,
@@ -146,7 +249,7 @@ class WeChatOfficialAccountClient:
         local_image_loader: LocalImageLoader | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> DraftPushResult:
-        return await self._push_draft(
+        return await self._push_draft_with_cleanup(
             account,
             html=html,
             metadata=metadata,
@@ -175,7 +278,7 @@ class WeChatOfficialAccountClient:
         target_media_id = target_media_id.strip()
         if not target_media_id:
             raise WeChatApiError("覆盖原图文时必须选择要覆盖的草稿")
-        return await self._push_draft(
+        return await self._push_draft_with_cleanup(
             account,
             html=html,
             metadata=metadata,
@@ -187,6 +290,27 @@ class WeChatOfficialAccountClient:
             local_image_loader=local_image_loader,
             progress_callback=progress_callback,
         )
+
+    async def _push_draft_with_cleanup(self, account: WeChatAccount, **kwargs: Any) -> DraftPushResult:
+        cover = kwargs["cover"]
+        assert isinstance(cover, CoverImage)
+        log_process_memory(
+            logger,
+            stage="wechat_draft_start",
+            worker_id=WORKER_ID,
+            account_id=account.id,
+            cover_file_backed=cover.payload.is_file_backed,
+        )
+        try:
+            return await self._push_draft(account, **kwargs)
+        finally:
+            cover.close()
+            log_process_memory(
+                logger,
+                stage="wechat_draft_end",
+                worker_id=WORKER_ID,
+                account_id=account.id,
+            )
 
     async def list_draft_targets(self, account: WeChatAccount) -> list[DraftTarget]:
         """Return the account's most recently updated drafts for overwrite selection."""
@@ -513,7 +637,7 @@ class WeChatOfficialAccountClient:
             )
             payload = self._response_json(response)
         except httpx.HTTPError as exc:
-            raise WeChatApiError(f"无法连接微信接口：{exc}") from exc
+            raise WeChatApiError(f"无法连接微信接口：{_redact_sensitive_text(str(exc))}") from exc
         self._raise_wechat_error(payload, response.status_code)
         token = str(payload.get("access_token") or "").strip()
         expires_in = int(payload.get("expires_in") or 0)
@@ -576,8 +700,10 @@ class WeChatOfficialAccountClient:
                 f"正文图片 {index}/{total}：正在下载并校验格式与大小…",
             )
             local_image = local_image_loader(source) if local_image_loader is not None else None
-            if local_image is None:
-                content, content_type, filename = await self._download_image(
+            if isinstance(local_image, ImagePayload):
+                payload = local_image
+            elif local_image is None:
+                payload = await self._download_image(
                     client,
                     source,
                     allowed_types=BODY_IMAGE_TYPES,
@@ -587,82 +713,96 @@ class WeChatOfficialAccountClient:
                 )
             else:
                 content, content_type, filename = local_image
+                payload = ImagePayload.from_bytes(content, content_type=content_type, filename=filename)
+
+            log_process_memory(
+                logger,
+                stage="wechat_body_image_ready",
+                worker_id=WORKER_ID,
+                size=payload.size,
+                file_backed=payload.is_file_backed,
+                image_index=index,
+            )
+            try:
+                content_type = payload.content_type
                 if content_type not in BODY_IMAGE_TYPES:
                     raise WeChatApiError(f"正文图片仅支持 {'、'.join(sorted(BODY_IMAGE_TYPES))} 格式")
-                if not content:
+                if payload.size <= 0:
                     raise WeChatApiError("正文图片为空")
-                if len(content) > BODY_IMAGE_LIMIT:
+                if payload.size > BODY_IMAGE_LIMIT:
                     raise WeChatApiError(f"正文图片不能超过 {BODY_IMAGE_LIMIT // (1024 * 1024)} MB")
-            content_hash = hashlib.sha256(content).hexdigest()
-            content_cached_entry = cached_by_content.get(content_hash)
-            if content_cached_entry is not None and source_hash not in force_reupload_source_hashes:
-                replacements[source] = content_cached_entry.wechat_url
-                cached_source_hashes.add(source_hash)
-                cache_entries.append(
-                    BodyImageCacheEntry(
-                        source_url_sha256=source_hash,
-                        content_sha256=content_hash,
-                        content_type=content_type,
-                        wechat_url=content_cached_entry.wechat_url,
-                        upload_mode=content_cached_entry.upload_mode,
+                content_hash = payload.content_sha256
+                content_cached_entry = cached_by_content.get(content_hash)
+                if content_cached_entry is not None and source_hash not in force_reupload_source_hashes:
+                    replacements[source] = content_cached_entry.wechat_url
+                    cached_source_hashes.add(source_hash)
+                    cache_entries.append(
+                        BodyImageCacheEntry(
+                            source_url_sha256=source_hash,
+                            content_sha256=content_hash,
+                            content_type=content_type,
+                            wechat_url=content_cached_entry.wechat_url,
+                            upload_mode=content_cached_entry.upload_mode,
+                        )
                     )
+                    await self._report_progress(
+                        progress_callback,
+                        "body-images",
+                        47 + (index * 29 // total),
+                        f"正文图片 {index}/{total}：内容未变化，已复用微信图片素材…",
+                    )
+                    continue
+
+                if content_type in TEMPORARY_BODY_IMAGE_TYPES and payload.size <= TEMPORARY_BODY_IMAGE_LIMIT:
+                    await self._report_progress(
+                        progress_callback,
+                        "body-images",
+                        49 + ((index - 1) * 29 // total),
+                        f"正文图片 {index}/{total}：正在上传微信正文图片素材（{content_type}，{payload.size // 1024} KB）…",
+                    )
+                    wechat_url = await self._upload_article_image(client, token, payload=payload)
+                    upload_mode = "temporary"
+                else:
+                    await self._report_progress(
+                        progress_callback,
+                        "body-images",
+                        49 + ((index - 1) * 29 // total),
+                        f"正文图片 {index}/{total}：正在上传微信永久素材（{content_type}，{payload.size // 1024} KB）…",
+                    )
+                    permanent_image = await self._upload_permanent_image(
+                        client,
+                        token,
+                        payload=payload,
+                        require_url=True,
+                    )
+                    wechat_url = permanent_image.url
+                    upload_mode = "permanent"
+                log_process_memory(
+                    logger,
+                    stage="wechat_body_image_uploaded",
+                    worker_id=WORKER_ID,
+                    size=payload.size,
+                    file_backed=payload.is_file_backed,
+                    image_index=index,
                 )
+                replacements[source] = wechat_url
+                cache_entry = BodyImageCacheEntry(
+                    source_url_sha256=source_hash,
+                    content_sha256=content_hash,
+                    content_type=content_type,
+                    wechat_url=wechat_url,
+                    upload_mode=upload_mode,
+                )
+                cache_entries.append(cache_entry)
+                cached_by_content.setdefault(content_hash, cache_entry)
                 await self._report_progress(
                     progress_callback,
                     "body-images",
                     47 + (index * 29 // total),
-                    f"正文图片 {index}/{total}：内容未变化，已复用微信图片素材…",
+                    f"正文图片 {index}/{total} 已同步到微信…",
                 )
-                continue
-
-            if content_type in TEMPORARY_BODY_IMAGE_TYPES and len(content) <= TEMPORARY_BODY_IMAGE_LIMIT:
-                await self._report_progress(
-                    progress_callback,
-                    "body-images",
-                    49 + ((index - 1) * 29 // total),
-                    f"正文图片 {index}/{total}：正在上传微信正文图片素材（{content_type}，{len(content) // 1024} KB）…",
-                )
-                wechat_url = await self._upload_article_image(
-                    client,
-                    token,
-                    content=content,
-                    content_type=content_type,
-                    filename=filename,
-                )
-                upload_mode = "temporary"
-            else:
-                await self._report_progress(
-                    progress_callback,
-                    "body-images",
-                    49 + ((index - 1) * 29 // total),
-                    f"正文图片 {index}/{total}：正在上传微信永久素材（{content_type}，{len(content) // 1024} KB）…",
-                )
-                permanent_image = await self._upload_permanent_image(
-                    client,
-                    token,
-                    content=content,
-                    content_type=content_type,
-                    filename=filename,
-                    require_url=True,
-                )
-                wechat_url = permanent_image.url
-                upload_mode = "permanent"
-            replacements[source] = wechat_url
-            cache_entry = BodyImageCacheEntry(
-                source_url_sha256=source_hash,
-                content_sha256=content_hash,
-                content_type=content_type,
-                wechat_url=wechat_url,
-                upload_mode=upload_mode,
-            )
-            cache_entries.append(cache_entry)
-            cached_by_content.setdefault(content_hash, cache_entry)
-            await self._report_progress(
-                progress_callback,
-                "body-images",
-                47 + (index * 29 // total),
-                f"正文图片 {index}/{total} 已同步到微信…",
-            )
+            finally:
+                payload.close()
 
         for image in soup.find_all("img"):
             source = image.get("src")
@@ -688,9 +828,7 @@ class WeChatOfficialAccountClient:
         permanent_image = await self._upload_permanent_image(
             client,
             token,
-            content=cover.content,
-            content_type=cover.content_type,
-            filename=cover.filename,
+            payload=cover.payload,
             require_url=False,
         )
         return permanent_image.media_id
@@ -700,18 +838,16 @@ class WeChatOfficialAccountClient:
         client: httpx.AsyncClient,
         token: str,
         *,
-        content: bytes,
-        content_type: str,
-        filename: str,
+        payload: ImagePayload,
     ) -> str:
-        payload = await self._wechat_json(
+        response_payload = await self._wechat_json(
             client,
             "POST",
             "/cgi-bin/media/uploadimg",
             token,
-            files={"media": (filename, content, content_type)},
+            files={"media": (payload.filename, payload.rewind(), payload.content_type)},
         )
-        url = str(payload.get("url") or "").strip()
+        url = str(response_payload.get("url") or "").strip()
         if not url:
             raise WeChatApiError("微信未返回正文临时素材 URL")
         return url
@@ -721,23 +857,22 @@ class WeChatOfficialAccountClient:
         client: httpx.AsyncClient,
         token: str,
         *,
-        content: bytes,
-        content_type: str,
-        filename: str,
+        payload: ImagePayload,
         require_url: bool,
     ) -> PermanentImage:
-        payload = await self._wechat_json(
+        payload.rewind()
+        response_payload = await self._wechat_json(
             client,
             "POST",
             "/cgi-bin/material/add_material",
             token,
             params={"type": "image"},
-            files={"media": (filename, content, content_type)},
+            files={"media": (payload.filename, payload.rewind(), payload.content_type)},
         )
-        media_id = str(payload.get("media_id") or "").strip()
+        media_id = str(response_payload.get("media_id") or "").strip()
         if not media_id:
             raise WeChatApiError("微信未返回图片永久素材 media_id")
-        url = str(payload.get("url") or "").strip()
+        url = str(response_payload.get("url") or "").strip()
         if require_url and not url:
             raise WeChatApiError("微信未返回正文永久素材 URL")
         return PermanentImage(media_id=media_id, url=url)
@@ -756,7 +891,7 @@ class WeChatOfficialAccountClient:
             response = await client.request(method, f"{WECHAT_API_BASE}{path}", params=params, **kwargs)
             payload = self._response_json(response)
         except httpx.HTTPError as exc:
-            raise WeChatApiError(f"微信接口请求失败：{exc}") from exc
+            raise WeChatApiError(f"微信接口请求失败：{_redact_sensitive_text(str(exc))}") from exc
         self._raise_wechat_error(payload, response.status_code)
         return payload
 
@@ -780,7 +915,7 @@ class WeChatOfficialAccountClient:
         except (TypeError, ValueError):
             error_code = None
         if status_code >= 400 or (error_code is not None and error_code != 0):
-            message = str(payload.get("errmsg") or f"微信接口错误（HTTP {status_code}）")
+            message = _redact_sensitive_text(str(payload.get("errmsg") or f"微信接口错误（HTTP {status_code}）"))
             if error_code is not None:
                 message = f"微信错误 {error_code}：{message}"
             raise WeChatApiError(message, error_code)
@@ -794,7 +929,7 @@ class WeChatOfficialAccountClient:
         max_bytes: int,
         label: str,
         trusted_image_hosts: set[str] | None = None,
-    ) -> tuple[bytes, str, str]:
+    ) -> ImagePayload:
         url = source_url.strip()
         for _ in range(MAX_REDIRECTS + 1):
             await self._validate_public_url(url, trusted_image_hosts=trusted_image_hosts)
@@ -820,19 +955,34 @@ class WeChatOfficialAccountClient:
                             declared_size = 0
                         if declared_size > max_bytes:
                             raise WeChatApiError(f"{label}不能超过 {max_bytes // (1024 * 1024)} MB")
-                    content = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        content.extend(chunk)
-                        if len(content) > max_bytes:
-                            raise WeChatApiError(f"{label}不能超过 {max_bytes // (1024 * 1024)} MB")
-                    if not content:
-                        raise WeChatApiError(f"{label}为空")
+                    stream = SpooledTemporaryFile(max_size=IMAGE_MEMORY_BUFFER_LIMIT, mode="w+b")
+                    digest = hashlib.sha256()
+                    size = 0
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > max_bytes:
+                                raise WeChatApiError(f"{label}不能超过 {max_bytes // (1024 * 1024)} MB")
+                            stream.write(chunk)
+                            digest.update(chunk)
+                        if size <= 0:
+                            raise WeChatApiError(f"{label}为空")
+                        stream.seek(0)
+                    except BaseException:
+                        stream.close()
+                        raise
             except httpx.HTTPError as exc:
-                raise WeChatApiError(f"下载{label}失败：{exc}") from exc
+                raise WeChatApiError(f"下载{label}失败：{_redact_sensitive_text(str(exc))}") from exc
             filename = PurePosixPath(urlsplit(url).path).name or f"image{IMAGE_EXTENSIONS[content_type]}"
             if not filename.lower().endswith(IMAGE_EXTENSIONS[content_type]):
                 filename = f"{filename}{IMAGE_EXTENSIONS[content_type]}"
-            return bytes(content), content_type, filename
+            return ImagePayload(
+                stream,
+                content_type=content_type,
+                filename=filename,
+                size=size,
+                content_sha256=digest.hexdigest(),
+            )
         raise WeChatApiError(f"{label}重定向次数过多")
 
     @staticmethod
@@ -885,7 +1035,7 @@ class WeChatOfficialAccountClient:
             "article_type": "news",
             "title": metadata.title,
             "author": metadata.author,
-            "digest": metadata.digest,
+            "digest": metadata.digest or WECHAT_EMPTY_DIGEST_PLACEHOLDER,
             "content": content,
             "content_source_url": metadata.content_source_url,
             "thumb_media_id": cover_media_id,

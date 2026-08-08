@@ -1,5 +1,11 @@
 import asyncio
+import atexit
+import faulthandler
 import logging
+import os
+import signal
+import sys
+import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +24,7 @@ from app.bootstrap import (
     SCHEMA_REVISION,
     backfill_official_deepseek_thinking_models,
     migrate_schema,
+    recover_expired_agent_runs,
     recover_interrupted_agent_runs,
     schema_migration_lock,
     seed_default_admin,
@@ -25,12 +32,13 @@ from app.bootstrap import (
 from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
-from app.services.agent_run_manager import cleanup_expired_agent_run_events
+from app.services.agent_run_manager import WORKER_ID, cleanup_expired_agent_run_events
 from app.services.tool_output_store import cleanup_expired_tool_outputs
 from app.services.chat_images import cleanup_expired_drafts
 from app.services.gzh_theme_generation import cleanup_expired_reference_assets
 from app.services.layout_reference import cleanup_expired_layout_references, layout_reference_cache
 from app.services.web_article_import import cleanup_expired_web_article_imports
+from app.services.image_generation import cleanup_unused_assets, recover_pending_generations, start_generation
 from app.services.operation_logs import (
     capture_request_context,
     persist_request_audit,
@@ -41,9 +49,134 @@ from app.services.operation_logs import (
     set_operation_request_id,
     with_request_id,
 )
+from app.services.runtime_diagnostics import log_process_memory, read_process_memory
 
 
 logger = logging.getLogger(__name__)
+LOG_TIMESTAMP_FORMAT = "%(asctime)s %(levelname)s [pid=%(process)d] %(name)s: %(message)s"
+LOG_TIMESTAMP_DATE_FORMAT = "%Y-%m-%d %H:%M:%S%z"
+
+
+def _timestamped_log_formatter() -> logging.Formatter:
+    """Keep all ordinary worker logs on one locally sortable timeline."""
+    return logging.Formatter(LOG_TIMESTAMP_FORMAT, datefmt=LOG_TIMESTAMP_DATE_FORMAT)
+
+
+def _configure_timestamped_logging() -> None:
+    """Apply timestamps to app, Uvicorn and Supervisor-inherited handlers."""
+    handlers: list[logging.Handler] = []
+    seen_handler_ids: set[int] = set()
+    for logger_name in (None, "uvicorn", "uvicorn.error", "uvicorn.access"):
+        target = logging.getLogger(logger_name)
+        for handler in target.handlers:
+            if id(handler) not in seen_handler_ids:
+                handlers.append(handler)
+                seen_handler_ids.add(id(handler))
+    for handler in handlers:
+        handler.setFormatter(_timestamped_log_formatter())
+
+
+class _SuccessfulReadAccessLogFilter(logging.Filter):
+    """Keep the worker log focused on writes and failed read requests."""
+
+    _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Uvicorn's access logger uses
+        # (client_addr, method, path, http_version, status_code) as args.
+        # Keep this defensive so an upstream Uvicorn format change cannot hide
+        # a request unexpectedly.
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        method = str(args[1]).upper()
+        try:
+            status_code = int(args[4])
+        except (TypeError, ValueError):
+            return True
+        return not (method in self._READ_METHODS and 200 <= status_code < 400)
+
+
+def _configure_worker_logging() -> None:
+    """Avoid normal frontend polling/static reads drowning out failure evidence."""
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, _SuccessfulReadAccessLogFilter) for item in access_logger.filters):
+        access_logger.addFilter(_SuccessfulReadAccessLogFilter())
+
+
+def _report_unhandled_process_exception(exc_type, exc_value, exc_traceback) -> None:
+    if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+        return
+    logger.critical(
+        "unhandled_process_exception pid=%s worker_id=%s",
+        os.getpid(),
+        WORKER_ID,
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
+def _report_unhandled_thread_exception(args: threading.ExceptHookArgs) -> None:
+    if issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
+        return
+    logger.critical(
+        "unhandled_thread_exception pid=%s worker_id=%s thread=%s",
+        os.getpid(),
+        WORKER_ID,
+        args.thread.name if args.thread else "unknown",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def _install_asyncio_exception_reporting() -> None:
+    """Report detached task failures with their complete traceback."""
+    loop = asyncio.get_running_loop()
+
+    def report(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        if isinstance(exc, BaseException):
+            logger.error(
+                "unhandled_asyncio_exception pid=%s worker_id=%s message=%s",
+                os.getpid(),
+                WORKER_ID,
+                context.get("message", ""),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return
+        logger.error(
+            "unhandled_asyncio_error pid=%s worker_id=%s context=%r",
+            os.getpid(),
+            WORKER_ID,
+            context,
+        )
+
+    loop.set_exception_handler(report)
+
+
+def _configure_worker_diagnostics() -> None:
+    """Enable process-local crash evidence for each Uvicorn worker."""
+    try:
+        faulthandler.enable(all_threads=True)
+        sigusr2 = getattr(signal, "SIGUSR2", None)
+        if sigusr2 is not None:
+            faulthandler.register(sigusr2, all_threads=True)
+    except (OSError, RuntimeError, ValueError):
+        # Diagnostics must never prevent the application from starting on a
+        # restricted runtime or local Windows development environment.
+        logger.exception("agent_worker_diagnostics_setup_failed pid=%s", os.getpid())
+
+
+def _log_worker_exit() -> None:
+    # SIGKILL and a hard process crash cannot reach this handler. It provides
+    # a positive signal for orderly worker shutdowns in the supervisor log.
+    logger.warning("agent_worker_exit pid=%s worker_id=%s", os.getpid(), WORKER_ID)
+
+
+_configure_worker_diagnostics()
+_configure_timestamped_logging()
+_configure_worker_logging()
+sys.excepthook = _report_unhandled_process_exception
+threading.excepthook = _report_unhandled_thread_exception
+atexit.register(_log_worker_exit)
 
 
 def _utcnow() -> datetime:
@@ -60,6 +193,7 @@ def _run_cleanup_cycle(app: FastAPI) -> None:
         ("agent_run_events", cleanup_expired_agent_run_events),
         ("layout_references", cleanup_expired_layout_references),
         ("web_article_imports", cleanup_expired_web_article_imports),
+        ("generated_image_assets", cleanup_unused_assets),
     )
     for name, cleaner in cleaners:
         db = SessionLocal()
@@ -86,6 +220,22 @@ def _run_cleanup_cycle(app: FastAPI) -> None:
         app.state.cleanup_last_success_at = completed_at
 
 
+def _recover_expired_agent_runs() -> int:
+    """Finish lost workers promptly instead of waiting for an SSE reconnect."""
+    db = SessionLocal()
+    try:
+        recovered = recover_expired_agent_runs(db)
+        if recovered:
+            logger.warning("agent_run_lease_recovered count=%s", recovered)
+        return recovered
+    except Exception:  # noqa: BLE001 - a later interval retries transient database failures.
+        db.rollback()
+        logger.exception("agent_run_lease_recovery_failed")
+        return 0
+    finally:
+        db.close()
+
+
 def _check_database() -> None:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
@@ -99,6 +249,21 @@ def _check_database() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _install_asyncio_exception_reporting()
+    memory = read_process_memory()
+    logger.warning(
+        "agent_worker_started pid=%s worker_id=%s rss_kib=%s swap_kib=%s",
+        os.getpid(),
+        WORKER_ID,
+        memory.rss_kib,
+        memory.swap_kib,
+    )
+    log_process_memory(
+        logger,
+        stage="worker_startup",
+        worker_id=WORKER_ID,
+        level=logging.WARNING,
+    )
     app.state.cleanup_last_attempt_at = None
     app.state.cleanup_last_success_at = None
     app.state.cleanup_last_error = ""
@@ -110,6 +275,7 @@ async def lifespan(app: FastAPI):
         db = SessionLocal()
         try:
             recover_interrupted_agent_runs(db)
+            pending_image_generation_ids = recover_pending_generations()
             backfill_official_deepseek_thinking_models(db)
             seed_default_admin(db)
         finally:
@@ -120,6 +286,8 @@ async def lifespan(app: FastAPI):
     from app.api.routes.chat import restore_waiting_user_question_timeouts
 
     await restore_waiting_user_question_timeouts()
+    for generation_id in pending_image_generation_ids:
+        start_generation(generation_id)
     interval = max(60, int(settings.CHAT_TOOL_OUTPUT_CLEANUP_INTERVAL_SECONDS))
 
     async def cleanup_loop() -> None:
@@ -127,14 +295,24 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(interval)
             await asyncio.to_thread(_run_cleanup_cycle, app)
 
+    recovery_interval = max(1, int(settings.CHAT_AGENT_LEASE_RECOVERY_INTERVAL_SECONDS))
+
+    async def lease_recovery_loop() -> None:
+        while True:
+            await asyncio.sleep(recovery_interval)
+            await asyncio.to_thread(_recover_expired_agent_runs)
+
     await asyncio.to_thread(_run_cleanup_cycle, app)
     cleanup_task = asyncio.create_task(cleanup_loop())
+    recovery_task = asyncio.create_task(lease_recovery_loop())
     try:
         yield
     finally:
-        cleanup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await cleanup_task
+        for task in (cleanup_task, recovery_task):
+            task.cancel()
+        for task in (cleanup_task, recovery_task):
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 settings = get_settings()

@@ -14,7 +14,7 @@ from fastapi import Request
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, decode_refresh_token
 from app.db.session import SessionLocal
 from app.models.ai_model import AIModel
 from app.models.ai_provider import AIProvider
@@ -206,6 +206,8 @@ def classify_operation(method: str, raw_path: str) -> AuditRoute | None:
         return AuditRoute("chat.run.cancel_request", "chat_run", document_id, resource_id=run_id, deferred_terminal=True)
     if path == "/api/auth/login":
         return AuditRoute("auth.login", "account")
+    if path == "/api/auth/refresh":
+        return AuditRoute("auth.refresh", "account")
     if path == "/api/documents":
         return AuditRoute("document.create", "document")
     if path.startswith("/api/documents/link-imports"):
@@ -446,6 +448,25 @@ def _login_actor_snapshot(username: str) -> tuple[int | None, str, str]:
         db.close()
 
 
+def _refresh_actor_snapshot(refresh_token: str) -> tuple[int | None, str, str]:
+    """Resolve the user represented by the HttpOnly refresh cookie for auditing."""
+    if not refresh_token:
+        return None, "", ""
+    try:
+        payload = decode_refresh_token(refresh_token)
+        user_id = int(payload.get("sub"))
+    except Exception:  # noqa: BLE001 - invalid refresh credentials must not break auditing.
+        return None, "", ""
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if not user or not user.is_active:
+            return None, "", ""
+        return user.id, user.username, user.display_name
+    finally:
+        db.close()
+
+
 async def capture_request_context(
     request: Request, metadata: OperationRequestMetadata | None = None
 ) -> AuditRequestContext | None:
@@ -463,6 +484,10 @@ async def capture_request_context(
     actor_user_id, actor_username, actor_display_name = _actor_snapshot(request.headers.get("authorization", ""))
     if route.action == "auth.login":
         actor_user_id, actor_username, actor_display_name = _login_actor_snapshot(str(details.get("username", "")))
+    elif route.action == "auth.refresh":
+        actor_user_id, actor_username, actor_display_name = _refresh_actor_snapshot(
+            request.cookies.get("refresh_token", "")
+        )
     resource_name = _target_snapshot(route)
     if not resource_name:
         resource_name = _safe_text(

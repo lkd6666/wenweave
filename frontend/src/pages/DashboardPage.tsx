@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button, Card, Dropdown, Empty, Grid, Input, List, Modal, Pagination, Select, Space, Tag, Tooltip, Typography, message } from 'antd'
+import { Button, Card, Dropdown, Empty, Grid, Input, List, Modal, Pagination, Select, Space, Tabs, Tag, Tooltip, Typography, message } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
@@ -20,6 +20,8 @@ import {
 import { useNavigate } from 'react-router'
 import { documentGroupsApi } from '../api/documentGroups'
 import { documentsApi } from '../api/documents'
+import { workbenchApi } from '../api/workbench'
+import type { Page, WorkbenchDocument, WorkbenchGroupedPage } from '../api/workbench'
 import { wechatAccountsApi } from '../api/wechatAccounts'
 import { ApiError } from '../api/client'
 import ImportReviewModal from '../components/ImportReviewModal'
@@ -61,12 +63,31 @@ type DocumentPaginationState = {
   pageSize: number
 }
 
+type WorkspaceView = 'grouped' | 'all'
+
+const firstValidPage = (total: number, pageSize: number, requestedPage: number) =>
+  Math.min(requestedPage, Math.max(1, Math.ceil(total / pageSize)))
+
+const GROUP_DOCUMENT_PAGE_SIZE_OPTIONS = [5, 10, 20, 50, 100]
+
+function replaceDocumentInPage<T extends DocumentSummary>(page: Page<T>, documentId: number, update: (document: T) => T): Page<T>
+function replaceDocumentInPage<T extends DocumentSummary>(page: Page<T> | null, documentId: number, update: (document: T) => T): Page<T> | null
+function replaceDocumentInPage<T extends DocumentSummary>(page: Page<T> | null, documentId: number, update: (document: T) => T) {
+  if (!page) return page
+  return {
+    ...page,
+    items: page.items.map((document) => document.id === documentId ? update(document) : document),
+  }
+}
+
 export default function DashboardPage() {
   const navigate = useNavigate()
   const currentUserId = useAuthStore((state) => state.user?.id)
   const isAdmin = useAuthStore((state) => state.user?.role === 'admin')
-  const [documents, setDocuments] = useState<DocumentSummary[]>([])
-  const [groups, setGroups] = useState<DocumentGroup[]>([])
+  const [groupOptions, setGroupOptions] = useState<DocumentGroup[]>([])
+  const [groupedWorkspace, setGroupedWorkspace] = useState<WorkbenchGroupedPage | null>(null)
+  const [allDocuments, setAllDocuments] = useState<Page<WorkbenchDocument> | null>(null)
+  const [searchResults, setSearchResults] = useState<Page<WorkbenchDocument> | null>(null)
   const [loading, setLoading] = useState(false)
   const [creating, setCreating] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -80,6 +101,11 @@ export default function DashboardPage() {
   const [linkImportPreview, setLinkImportPreview] = useState<WebArticleImportPreview | null>(null)
   const [linkImportError, setLinkImportError] = useState('')
   const [search, setSearch] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [view, setView] = useState<WorkspaceView>('grouped')
+  const [groupPagination, setGroupPagination] = useState<DocumentPaginationState>({ page: 1, pageSize: 10 })
+  const [allPagination, setAllPagination] = useState<DocumentPaginationState>({ page: 1, pageSize: 20 })
+  const [searchPagination, setSearchPagination] = useState<DocumentPaginationState>({ page: 1, pageSize: 20 })
   const [documentPagination, setDocumentPagination] = useState<Record<string, DocumentPaginationState>>({})
   const [visibilityTarget, setVisibilityTarget] = useState<VisibilityTarget | null>(null)
   const [wechatAccounts, setWechatAccounts] = useState<WeChatAvailableAccount[]>([])
@@ -89,20 +115,56 @@ export default function DashboardPage() {
   const importAbortRef = useRef<AbortController | null>(null)
   const screens = Grid.useBreakpoint()
   const isCompact = !screens.lg
-  const hasAiEditingDocument = documents.some((document) => document.is_ai_editing)
+  const hasAiEditingDocument = Boolean(
+    groupedWorkspace?.groups.items.some((item) => item.documents.items.some((document) => document.is_ai_editing))
+    || groupedWorkspace?.ungrouped.items.some((document) => document.is_ai_editing)
+    || allDocuments?.items.some((document) => document.is_ai_editing)
+    || searchResults?.items.some((document) => document.is_ai_editing),
+  )
 
-  const load = async () => {
+  const loadGroupOptions = async () => {
+    setGroupOptions(await documentGroupsApi.list())
+  }
+
+  const loadGroupedWorkspace = async (
+    requestedPage = groupPagination.page,
+    requestedPageSize = groupPagination.pageSize,
+    retainDocumentPages = true,
+  ) => {
     setLoading(true)
     try {
-      const [documentList, groupList, availableWeChatAccounts] = await Promise.all([
-        documentsApi.list(),
-        documentGroupsApi.list(),
-        wechatAccountsApi.available().catch(() => []),
-      ])
-      setDocuments(documentList)
-      setGroups(groupList)
-      setWechatAccounts(availableWeChatAccounts)
-      setDocumentPagination({})
+      let workspace = await workbenchApi.groups(requestedPage, requestedPageSize, 5)
+      const resolvedPage = firstValidPage(workspace.groups.total, requestedPageSize, requestedPage)
+      if (workspace.groups.total > 0 && resolvedPage !== requestedPage) {
+        workspace = await workbenchApi.groups(resolvedPage, requestedPageSize, 5)
+      }
+
+      if (retainDocumentPages) {
+        const groupItems = await Promise.all(workspace.groups.items.map(async (item) => {
+          const pagination = documentPagination[`group:${item.group.id}`]
+          if (!pagination || (pagination.page === 1 && pagination.pageSize === 5)) return item
+          let documents = await workbenchApi.groupDocuments(item.group.id, pagination.page, pagination.pageSize)
+          const page = firstValidPage(documents.total, pagination.pageSize, pagination.page)
+          if (documents.total > 0 && page !== pagination.page) {
+            documents = await workbenchApi.groupDocuments(item.group.id, page, pagination.pageSize)
+            setDocumentPagination((states) => ({ ...states, [`group:${item.group.id}`]: { page, pageSize: pagination.pageSize } }))
+          }
+          return { ...item, documents }
+        }))
+        const ungroupedPagination = documentPagination.ungrouped
+        let ungrouped = workspace.ungrouped
+        if (ungroupedPagination && (ungroupedPagination.page !== 1 || ungroupedPagination.pageSize !== 5)) {
+          ungrouped = await workbenchApi.ungroupedDocuments(ungroupedPagination.page, ungroupedPagination.pageSize)
+          const page = firstValidPage(ungrouped.total, ungroupedPagination.pageSize, ungroupedPagination.page)
+          if (ungrouped.total > 0 && page !== ungroupedPagination.page) {
+            ungrouped = await workbenchApi.ungroupedDocuments(page, ungroupedPagination.pageSize)
+            setDocumentPagination((states) => ({ ...states, ungrouped: { page, pageSize: ungroupedPagination.pageSize } }))
+          }
+        }
+        workspace = { ...workspace, groups: { ...workspace.groups, items: groupItems }, ungrouped }
+      }
+      setGroupedWorkspace(workspace)
+      setGroupPagination({ page: workspace.groups.page, pageSize: workspace.groups.page_size })
     } catch (err) {
       message.error(err instanceof ApiError ? String(err.detail) : '加载推文列表失败')
     } finally {
@@ -110,9 +172,64 @@ export default function DashboardPage() {
     }
   }
 
+  const loadFlatDocuments = async (
+    requestedPage: number,
+    requestedPageSize: number,
+    query: string,
+    target: 'all' | 'search',
+  ) => {
+    setLoading(true)
+    try {
+      let result = await workbenchApi.documents(requestedPage, requestedPageSize, query)
+      const resolvedPage = firstValidPage(result.total, requestedPageSize, requestedPage)
+      if (result.total > 0 && resolvedPage !== requestedPage) {
+        result = await workbenchApi.documents(resolvedPage, requestedPageSize, query)
+      }
+      if (target === 'search') {
+        setSearchResults(result)
+        setSearchPagination({ page: result.page, pageSize: result.page_size })
+      } else {
+        setAllDocuments(result)
+        setAllPagination({ page: result.page, pageSize: result.page_size })
+      }
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '加载推文列表失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const load = async () => {
+    try {
+      await Promise.all([
+        loadGroupOptions(),
+        wechatAccountsApi.available().then(setWechatAccounts).catch(() => setWechatAccounts([])),
+      ])
+      if (searchQuery) {
+        await loadFlatDocuments(searchPagination.page, searchPagination.pageSize, searchQuery, 'search')
+      } else if (view === 'all') {
+        await loadFlatDocuments(allPagination.page, allPagination.pageSize, '', 'all')
+      } else {
+        await loadGroupedWorkspace()
+      }
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '加载工作台失败')
+    }
+  }
+
   useEffect(() => {
-    load()
+    void load()
   }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSearchQuery(search.trim()), 250)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  useEffect(() => {
+    if (!searchQuery) return
+    void loadFlatDocuments(1, searchPagination.pageSize, searchQuery, 'search')
+  }, [searchQuery])
 
   useEffect(() => {
     if (!hasAiEditingDocument) return
@@ -120,10 +237,24 @@ export default function DashboardPage() {
       try {
         const { active_document_ids: activeDocumentIds } = await documentsApi.aiEditingStatus()
         const activeIds = new Set(activeDocumentIds)
-        setDocuments((items) => items.map((item) => {
-          const isAiEditing = activeIds.has(item.id)
-          return item.is_ai_editing === isAiEditing ? item : { ...item, is_ai_editing: isAiEditing }
+        const setAiEditing = <T extends DocumentSummary>(document: T): T => (
+          document.is_ai_editing === activeIds.has(document.id)
+            ? document
+            : { ...document, is_ai_editing: activeIds.has(document.id) }
+        )
+        setGroupedWorkspace((workspace) => workspace && ({
+          ...workspace,
+          groups: {
+            ...workspace.groups,
+            items: workspace.groups.items.map((item) => ({
+              ...item,
+              documents: { ...item.documents, items: item.documents.items.map(setAiEditing) },
+            })),
+          },
+          ungrouped: { ...workspace.ungrouped, items: workspace.ungrouped.items.map(setAiEditing) },
         }))
+        setAllDocuments((page) => page && ({ ...page, items: page.items.map(setAiEditing) }))
+        setSearchResults((page) => page && ({ ...page, items: page.items.map(setAiEditing) }))
       } catch {
         // The next polling cycle will retry without interrupting the workspace.
       }
@@ -186,12 +317,12 @@ export default function DashboardPage() {
     Modal.confirm({
       title: '新建空白推文',
       content: (
-        <Space direction="vertical" style={{ display: 'flex' }}>
+        <Space orientation="vertical" style={{ display: 'flex' }}>
           <Input defaultValue={title} placeholder="请输入标题" onChange={(event) => (title = event.target.value)} />
           <Select
             allowClear
             placeholder="选择分组（可选）"
-            options={groups.map((group) => ({ value: group.id, label: group.name }))}
+            options={groupOptions.map((group) => ({ value: group.id, label: group.name }))}
             onChange={(value) => (groupId = value ?? null)}
           />
         </Space>
@@ -383,27 +514,71 @@ export default function DashboardPage() {
       ...wechatDraftTarget,
       document: { ...wechatDraftTarget.document, title, wechat_metadata: metadata },
     })
-    setDocuments((items) => items.map((item) => (
-      item.id === documentId ? { ...item, title, wechat_cover_url: metadata.cover_url } : item
-    )))
+    const updateDocument = <T extends DocumentSummary>(document: T): T => (
+      document.id === documentId ? { ...document, title, wechat_cover_url: metadata.cover_url } : document
+    )
+    setGroupedWorkspace((workspace) => workspace && ({
+      ...workspace,
+      groups: {
+        ...workspace.groups,
+        items: workspace.groups.items.map((item) => ({
+          ...item,
+          documents: replaceDocumentInPage(item.documents, documentId, updateDocument),
+        })),
+      },
+      ungrouped: replaceDocumentInPage(workspace.ungrouped, documentId, updateDocument),
+    }))
+    setAllDocuments((page) => replaceDocumentInPage(page, documentId, updateDocument))
+    setSearchResults((page) => replaceDocumentInPage(page, documentId, updateDocument))
   }
 
-  const renderDocuments = (items: DocumentSummary[], sectionKey: string) => {
-    if (items.length === 0) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="此分组暂无推文" />
-
-    const pagination = documentPagination[sectionKey] ?? { page: 1, pageSize: 20 }
-    const pageCount = Math.ceil(items.length / pagination.pageSize)
-    const currentPage = Math.min(pagination.page, pageCount)
-    const pagedItems = items.slice((currentPage - 1) * pagination.pageSize, currentPage * pagination.pageSize)
-    const changePage = (nextPage: number, nextPageSize: number) => {
-      setDocumentPagination((states) => ({
-        ...states,
-        [sectionKey]: {
-          page: nextPageSize === pagination.pageSize ? nextPage : 1,
-          pageSize: nextPageSize,
+  const loadGroupedDocumentPage = async (groupId: number, requestedPage: number, requestedPageSize: number) => {
+    setLoading(true)
+    try {
+      let documents = await workbenchApi.groupDocuments(groupId, requestedPage, requestedPageSize)
+      const page = firstValidPage(documents.total, requestedPageSize, requestedPage)
+      if (documents.total > 0 && page !== requestedPage) {
+        documents = await workbenchApi.groupDocuments(groupId, page, requestedPageSize)
+      }
+      setDocumentPagination((states) => ({ ...states, [`group:${groupId}`]: { page: documents.page, pageSize: documents.page_size } }))
+      setGroupedWorkspace((workspace) => workspace && ({
+        ...workspace,
+        groups: {
+          ...workspace.groups,
+          items: workspace.groups.items.map((item) => item.group.id === groupId ? { ...item, documents } : item),
         },
       }))
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '加载分组推文失败')
+    } finally {
+      setLoading(false)
     }
+  }
+
+  const loadUngroupedDocumentPage = async (requestedPage: number, requestedPageSize: number) => {
+    setLoading(true)
+    try {
+      let documents = await workbenchApi.ungroupedDocuments(requestedPage, requestedPageSize)
+      const page = firstValidPage(documents.total, requestedPageSize, requestedPage)
+      if (documents.total > 0 && page !== requestedPage) {
+        documents = await workbenchApi.ungroupedDocuments(page, requestedPageSize)
+      }
+      setDocumentPagination((states) => ({ ...states, ungrouped: { page: documents.page, pageSize: documents.page_size } }))
+      setGroupedWorkspace((workspace) => workspace && ({ ...workspace, ungrouped: documents }))
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '加载未分组推文失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const renderDocuments = (
+    pageData: Page<DocumentSummary>,
+    onPageChange: (page: number, pageSize: number) => void,
+    showGroupName = false,
+    pageSizeOptions = [20, 50, 100],
+  ) => {
+    if (pageData.total === 0) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="此分组暂无推文" />
 
     const renderDocument = (doc: DocumentSummary) => {
           const tag = SOURCE_TAG[doc.source_type]
@@ -421,11 +596,11 @@ export default function DashboardPage() {
             )
           const groupMenu: MenuProps['items'] = [
             { key: 'ungrouped', label: '移至未分组', disabled: doc.group_id === null },
-            ...groups.map((group) => ({ key: String(group.id), label: group.name, disabled: doc.group_id === group.id })),
+            ...groupOptions.map((group) => ({ key: String(group.id), label: group.name, disabled: doc.group_id === group.id })),
           ]
           const compactMoveMenu: MenuProps['items'] = [
             { key: 'move-ungrouped', label: '移至未分组', disabled: doc.group_id === null },
-            ...groups.map((group) => ({ key: `move-${group.id}`, label: group.name, disabled: doc.group_id === group.id })),
+            ...groupOptions.map((group) => ({ key: `move-${group.id}`, label: group.name, disabled: doc.group_id === group.id })),
           ]
           const canConfigureDocumentVisibility = isAdmin || doc.created_by?.id === currentUserId
           const canOpenWeChatDraft = isAdmin || wechatAccounts.length > 0
@@ -543,6 +718,7 @@ export default function DashboardPage() {
                     <Button type="link" onClick={() => navigate(`/editor/${doc.id}`)}>{doc.title}</Button>
                     <div className="dashboard-document-card-tags">
                       <Tag color={tag.color}>{tag.label}</Tag>
+                      {showGroupName && <Tag>{(doc as WorkbenchDocument).group_name || '未分组'}</Tag>}
                       {doc.is_ai_editing && <Tag color="processing">AI 编辑中</Tag>}
                       {doc.visibility_mode === 'restricted' && <Tag color="gold" icon={<LockOutlined />}>受限可见</Tag>}
                     </div>
@@ -573,6 +749,7 @@ export default function DashboardPage() {
                       {doc.title}
                     </Button>
                     <Tag color={tag.color}>{tag.label}</Tag>
+                    {showGroupName && <Tag>{(doc as WorkbenchDocument).group_name || '未分组'}</Tag>}
                     {doc.is_ai_editing && <Tag color="processing">AI 编辑中</Tag>}
                     {doc.visibility_mode === 'restricted' && (
                       <Tooltip title="仅指定用户或用户组可见">
@@ -597,18 +774,18 @@ export default function DashboardPage() {
     if (isCompact) {
       return (
         <>
-          <div className="dashboard-document-card-list">{pagedItems.map(renderDocument)}</div>
-          {items.length > 20 && (
+          <div className="dashboard-document-card-list">{pageData.items.map(renderDocument)}</div>
+          {pageData.total > pageData.page_size && (
             <div className="dashboard-group-pagination">
               <Pagination
                 size="small"
-                current={currentPage}
-                pageSize={pagination.pageSize}
-                total={items.length}
+                current={pageData.page}
+                pageSize={pageData.page_size}
+                total={pageData.total}
                 showSizeChanger
-                pageSizeOptions={[20, 50, 100]}
+                pageSizeOptions={pageSizeOptions}
                 showTotal={(total) => `共 ${total} 篇`}
-                onChange={changePage}
+                onChange={onPageChange}
               />
             </div>
           )}
@@ -618,17 +795,17 @@ export default function DashboardPage() {
 
     return (
       <>
-        <List itemLayout="horizontal" dataSource={pagedItems} renderItem={renderDocument} />
-        {items.length > 20 && (
+        <List itemLayout="horizontal" dataSource={pageData.items} renderItem={renderDocument} />
+        {pageData.total > pageData.page_size && (
           <div className="dashboard-group-pagination">
             <Pagination
-              current={currentPage}
-              pageSize={pagination.pageSize}
-              total={items.length}
+              current={pageData.page}
+              pageSize={pageData.page_size}
+              total={pageData.total}
               showSizeChanger
-              pageSizeOptions={[20, 50, 100]}
+              pageSizeOptions={pageSizeOptions}
               showTotal={(total) => `共 ${total} 篇`}
-              onChange={changePage}
+              onChange={onPageChange}
             />
           </div>
         )}
@@ -636,7 +813,8 @@ export default function DashboardPage() {
     )
   }
 
-  const renderGroup = (group: DocumentGroup, groupItems: DocumentSummary[], isFirst: boolean) => {
+  const renderGroup = (item: WorkbenchGroupedPage['groups']['items'][number], isFirst: boolean) => {
+    const { group } = item
     const canConfigureGroupVisibility = isAdmin || group.created_by?.id === currentUserId
     const groupMenu: MenuProps['items'] = [
       { key: 'rename', label: '修改名称', icon: <EditOutlined /> },
@@ -650,6 +828,7 @@ export default function DashboardPage() {
           <Space size={10} wrap>
             <FolderOpenOutlined style={{ color: '#1677ff' }} />
             <Text strong>{group.name}</Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>共 {item.document_total} 篇</Text>
             {group.visibility_mode === 'restricted' && (
               <Tooltip title="仅指定用户或用户组可见">
                 <Tag color="gold" icon={<LockOutlined />}>受限可见</Tag>
@@ -676,28 +855,32 @@ export default function DashboardPage() {
             </Dropdown>
           )}
         </div>
-        {renderDocuments(groupItems, `group:${group.id}`)}
+        {renderDocuments(item.documents, (page, pageSize) => {
+          void loadGroupedDocumentPage(group.id, pageSize === item.documents.page_size ? page : 1, pageSize)
+        }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
       </section>
     )
   }
 
-  const normalizedSearch = search.trim().toLocaleLowerCase()
-  const matchesDocument = (doc: DocumentSummary) =>
-    !normalizedSearch || doc.title.toLocaleLowerCase().includes(normalizedSearch)
-  const filteredGroups = groups
-    .map((group) => {
-      const groupDocuments = documents.filter((doc) => doc.group_id === group.id)
-      const groupMatches = group.name.toLocaleLowerCase().includes(normalizedSearch)
-      return {
-        group,
-        documents: groupMatches ? groupDocuments : groupDocuments.filter(matchesDocument),
-        visible: groupMatches || groupDocuments.some(matchesDocument),
-      }
-    })
-    .filter(({ visible }) => visible)
-  const ungroupedDocuments = documents.filter((doc) => doc.group_id === null && matchesDocument(doc))
-  const hasContent = groups.length > 0 || documents.length > 0
-  const hasSearchResults = filteredGroups.length > 0 || ungroupedDocuments.length > 0
+  const handleViewChange = (nextView: string) => {
+    const value = nextView as WorkspaceView
+    setView(value)
+    if (value === 'all' && !allDocuments) {
+      void loadFlatDocuments(allPagination.page, allPagination.pageSize, '', 'all')
+    }
+    if (value === 'grouped' && !groupedWorkspace) {
+      void loadGroupedWorkspace()
+    }
+  }
+
+  const renderFlatDocuments = (pageData: Page<WorkbenchDocument> | null, target: 'all' | 'search') => {
+    if (!pageData) return null
+    if (pageData.total === 0) return <Empty description={target === 'search' ? '没有找到匹配的推文或分组' : '还没有任何推文，点击右上角新建或导入'} />
+    return renderDocuments(pageData, (page, pageSize) => {
+      const current = target === 'search' ? searchPagination : allPagination
+      void loadFlatDocuments(pageSize === current.pageSize ? page : 1, pageSize, target === 'search' ? searchQuery : '', target)
+    }, true)
+  }
 
   return (
     <div className="dashboard-page">
@@ -710,8 +893,9 @@ export default function DashboardPage() {
           aria-label="搜索推文或分组"
           value={search}
           onChange={(event) => {
-            setSearch(event.target.value)
-            setDocumentPagination({})
+            const value = event.target.value
+            setSearch(value)
+            if (!value.trim()) setSearchQuery('')
           }}
           placeholder="搜索推文标题或分组名称"
           className="dashboard-search"
@@ -740,27 +924,60 @@ export default function DashboardPage() {
       </div>
 
       <Card loading={loading}>
-        {!hasContent ? (
-          <Empty description="还没有任何推文，点击右上角新建、导入或创建分组" />
-        ) : !hasSearchResults ? (
-          <Empty description="没有找到匹配的推文或分组" />
+        {searchQuery ? (
+          <section className="dashboard-flat-results" aria-label="搜索结果">
+            <Text strong>搜索结果</Text>
+            {renderFlatDocuments(searchResults, 'search')}
+          </section>
         ) : (
           <>
-            {filteredGroups.map(({ group, documents: groupDocuments }, index) =>
-              renderGroup(group, groupDocuments, index === 0),
-            )}
-            {ungroupedDocuments.length > 0 && (
-              <section
-                className="dashboard-group dashboard-ungrouped"
-                style={{
-                  paddingTop: filteredGroups.length > 0 ? 20 : 0,
-                  marginTop: filteredGroups.length > 0 ? 20 : 0,
-                  borderTop: filteredGroups.length > 0 ? '1px solid var(--app-border)' : undefined,
-                }}
-              >
-                <Text strong>未分组</Text>
-                {renderDocuments(ungroupedDocuments, 'ungrouped')}
-              </section>
+            <Tabs
+              activeKey={view}
+              onChange={handleViewChange}
+              className="dashboard-view-tabs"
+              items={[
+                { key: 'grouped', label: '分组浏览' },
+                { key: 'all', label: '全部推文' },
+              ]}
+            />
+            {view === 'all' ? renderFlatDocuments(allDocuments, 'all') : (
+              !groupedWorkspace ? null : groupedWorkspace.groups.total === 0 && groupedWorkspace.ungrouped.total === 0 ? (
+                <Empty description="还没有任何推文，点击右上角新建、导入或创建分组" />
+              ) : (
+                <>
+                  {groupedWorkspace.groups.items.map((item, index) => renderGroup(item, index === 0))}
+                  {groupedWorkspace.ungrouped.total > 0 && (
+                    <section
+                      className="dashboard-group dashboard-ungrouped"
+                      style={{
+                        paddingTop: groupedWorkspace.groups.items.length > 0 ? 20 : 0,
+                        marginTop: groupedWorkspace.groups.items.length > 0 ? 20 : 0,
+                        borderTop: groupedWorkspace.groups.items.length > 0 ? '1px solid var(--app-border)' : undefined,
+                      }}
+                    >
+                      <Text strong>未分组</Text>
+                      {renderDocuments(groupedWorkspace.ungrouped, (page, pageSize) => {
+                        void loadUngroupedDocumentPage(pageSize === groupedWorkspace.ungrouped.page_size ? page : 1, pageSize)
+                      }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+                    </section>
+                  )}
+                  {groupedWorkspace.groups.total > groupedWorkspace.groups.page_size && (
+                    <div className="dashboard-workspace-pagination">
+                      <Pagination
+                        current={groupedWorkspace.groups.page}
+                        pageSize={groupedWorkspace.groups.page_size}
+                        total={groupedWorkspace.groups.total}
+                        showSizeChanger
+                        pageSizeOptions={[10, 20, 50]}
+                        showTotal={(total) => `共 ${total} 个分组`}
+                        onChange={(page, pageSize) => {
+                          void loadGroupedWorkspace(pageSize === groupedWorkspace.groups.page_size ? page : 1, pageSize)
+                        }}
+                      />
+                    </div>
+                  )}
+                </>
+              )
             )}
           </>
         )}

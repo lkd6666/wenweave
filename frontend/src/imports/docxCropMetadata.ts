@@ -6,6 +6,10 @@ import { wordSourceRectToCropRect } from '../utils/imageCrop'
 export interface WordImageOccurrence {
   cropRect: CropRect | null
   relationshipId: string | null
+  displaySize?: {
+    widthPx: number
+    heightPx: number
+  }
 }
 
 const WORD_DOCUMENT_PATH = 'word/document.xml'
@@ -52,11 +56,28 @@ function cropForBlip(blip: Element): CropRect | null {
   })
 }
 
+function displaySizeForDrawing(drawing: Element): WordImageOccurrence['displaySize'] {
+  const container = descendantElements(drawing, 'inline')[0] ?? descendantElements(drawing, 'anchor')[0]
+  if (!container) return undefined
+  const extent = childElements(container).find((child) => localName(child) === 'extent')
+  if (!extent) return undefined
+  const cx = Number(attribute(extent, 'cx'))
+  const cy = Number(attribute(extent, 'cy'))
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || cx <= 0 || cy <= 0) return undefined
+  // DrawingML stores dimensions in EMUs; CSS pixels use 96 DPI.
+  return {
+    widthPx: Math.round((cx * 96) / 914_400),
+    heightPx: Math.round((cy * 96) / 914_400),
+  }
+}
+
 function appendDrawingOccurrences(drawing: Element, occurrences: WordImageOccurrence[]) {
+  const displaySize = displaySizeForDrawing(drawing)
   for (const blip of descendantElements(drawing, 'blip')) {
     occurrences.push({
       cropRect: cropForBlip(blip),
       relationshipId: attribute(blip, 'embed', RELATIONSHIPS_NAMESPACE) ?? attribute(blip, 'link', RELATIONSHIPS_NAMESPACE),
+      ...(displaySize ? { displaySize } : {}),
     })
   }
 }

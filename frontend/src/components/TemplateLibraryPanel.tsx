@@ -3,6 +3,7 @@ import { Alert, Button, Empty, Input, Modal, Pagination, Popconfirm, Segmented, 
 import {
   AppstoreAddOutlined,
   CheckOutlined,
+  CloudDownloadOutlined,
   CodeOutlined,
   DeleteOutlined,
   EditOutlined,
@@ -39,8 +40,8 @@ interface TemplateLibraryPanelProps {
   canInsertAtCaret: boolean
   attachedTemplateIds: number[]
   themeContext: ChatSessionItem['theme_context']
-  onAppend: (template: TemplateItem) => void
-  onInsertAtCaret: (template: TemplateItem) => void
+  onAppend: (template: TemplateItem) => void | Promise<void>
+  onInsertAtCaret: (template: TemplateItem) => void | Promise<void>
   onToggleAttach: (template: TemplateItem) => void
   onClearThemeContext: () => void
   onOpenThemeGallery: (themeKey?: string) => void
@@ -180,6 +181,7 @@ export default function TemplateLibraryPanel({
   const [error, setError] = useState<string | null>(null)
   const [draft, setDraft] = useState<TemplateDraft | null>(null)
   const [savingTemplate, setSavingTemplate] = useState(false)
+  const [localizingTemplateImages, setLocalizingTemplateImages] = useState(false)
   const [categoryModal, setCategoryModal] = useState<{ id?: number; name: string } | null>(null)
   const [categoryManagerOpen, setCategoryManagerOpen] = useState(false)
   const [savingCategory, setSavingCategory] = useState(false)
@@ -441,6 +443,22 @@ export default function TemplateLibraryPanel({
     }
   }
 
+  const localizeExternalTemplateImages = async () => {
+    if (disabled || localizingTemplateImages) return
+    setLocalizingTemplateImages(true)
+    try {
+      const result = await templateLibraryApi.localizeExternalImages()
+      const summary = `已转存 ${result.updated_count} 个组件中的 ${result.localized_count} 张图片`
+      if (result.failed_count) message.warning(`${summary}；${result.failed_count} 个组件未修改`)
+      else message.success(summary)
+      await loadTemplates()
+    } catch (err) {
+      message.error(asErrorMessage(err, '批量转存组件图片失败'))
+    } finally {
+      setLocalizingTemplateImages(false)
+    }
+  }
+
   const readClipboard = async () => {
     try {
       const clipboard = navigator.clipboard
@@ -499,7 +517,14 @@ export default function TemplateLibraryPanel({
               }}
               options={[{ label: '最近', value: 'updated' }, { label: '名称', value: 'name' }]}
             />
-            <Button aria-label="新建模板" title="新建模板" type="primary" icon={<PlusOutlined />} disabled={disabled} onClick={openCreate} />
+            <Tooltip title="批量转存组件外链图片">
+              <span>
+                <Popconfirm title="批量转存全部组件中的外链图片？" description="单个组件任一图片失败时，该组件将保持原样。" okText="开始转存" cancelText="取消" onConfirm={() => void localizeExternalTemplateImages()}>
+                  <Button aria-label="批量转存组件外链图片" icon={<CloudDownloadOutlined />} disabled={disabled || localizingTemplateImages} loading={localizingTemplateImages} />
+                </Popconfirm>
+              </span>
+            </Tooltip>
+            <Button aria-label="新建模板" title="新建模板" type="primary" icon={<PlusOutlined />} disabled={disabled || localizingTemplateImages} onClick={openCreate} />
           </div>
           <div className="template-category-row">
             <button type="button" className={`template-category-chip${categoryFilter === 'all' ? ' is-active' : ''}`} onClick={() => { setCategoryFilter('all'); resetTemplatePage() }}>全部</button>
@@ -537,10 +562,10 @@ export default function TemplateLibraryPanel({
                       </div>
                       <div className="template-library-actions">
                         <Tooltip title="添加到当前文章文末">
-                          <Button aria-label={`添加 ${template.name} 到文末`} icon={<FileAddOutlined />} disabled={disabled} onClick={() => onAppend(template)} />
+                          <Button aria-label={`添加 ${template.name} 到文末`} icon={<FileAddOutlined />} disabled={disabled || localizingTemplateImages} onClick={() => { void onAppend(template) }} />
                         </Tooltip>
                         <Tooltip title={canInsertAtCaret ? '插入当前直接编辑光标处' : '仅直接编辑模式且画布有真实光标时可用'}>
-                          <Button aria-label={`插入 ${template.name} 到光标处`} icon={<AppstoreAddOutlined />} disabled={disabled || !canInsertAtCaret} onClick={() => onInsertAtCaret(template)} />
+                          <Button aria-label={`插入 ${template.name} 到光标处`} icon={<AppstoreAddOutlined />} disabled={disabled || localizingTemplateImages || !canInsertAtCaret} onClick={() => { void onInsertAtCaret(template) }} />
                         </Tooltip>
                         <Tooltip title={attached ? '从 AI 对话移除' : attachedTemplateIds.length >= 6 ? '每次对话最多附加 6 个模板' : '附到 AI 对话'}>
                           <Button aria-label={`${attached ? '移除' : '附加'}模板 ${template.name}`} icon={attached ? <CheckOutlined /> : <PaperClipOutlined />} type={attached ? 'primary' : 'default'} disabled={disabled || (!attached && attachedTemplateIds.length >= 6)} onClick={() => onToggleAttach(template)} />

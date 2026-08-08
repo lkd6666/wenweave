@@ -15,7 +15,9 @@ from app.models.ai_model import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_TOOL_RESULT_MAX_TOKENS,
 )
-from app.models.ai_provider import AIProvider
+from app.models.ai_image_model import AIImageModel
+from app.models.image_generation import ImageGeneration
+from app.models.ai_provider import AIProvider, ProviderType
 from app.models.user import User
 from app.models.user_group import UserGroup
 from app.schemas.ai_provider import (
@@ -26,6 +28,9 @@ from app.schemas.ai_provider import (
     ModelDiscoveryResult,
     ModelRead,
     ModelUpdate,
+    ImageModelCreate,
+    ImageModelRead,
+    ImageModelUpdate,
     PresetDiscoveryRequest,
     PresetInstallRequest,
     ProviderPresetRead,
@@ -80,6 +85,29 @@ def _effective_thinking_config(base_url: str, thinking_config: dict[str, Any] | 
     return thinking_config or {}
 
 
+def _validate_default_thinking_effort(thinking_config: dict[str, Any], default_effort: str) -> None:
+    """Require concrete defaults to have a provider request mapping."""
+    if default_effort == "auto":
+        return
+    efforts = thinking_config.get("efforts")
+    if not isinstance(efforts, dict) or not isinstance(efforts.get(default_effort), dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="默认思考强度必须是该模型已配置的思考强度",
+        )
+
+
+def _validate_prompt_cache_provider(provider: AIProvider, enabled: bool) -> None:
+    if enabled and provider.provider_type not in {
+        ProviderType.OPENAI_COMPATIBLE,
+        ProviderType.OPENAI_RESPONSES,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="显式提示缓存仅适用于 OpenAI Responses 或 OpenAI-compatible Provider",
+        )
+
+
 def _to_provider_read(provider: AIProvider) -> ProviderRead:
     api_key_plain = decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else ""
     return ProviderRead(
@@ -87,8 +115,11 @@ def _to_provider_read(provider: AIProvider) -> ProviderRead:
         name=provider.name,
         provider_type=provider.provider_type,
         base_url=provider.base_url,
+        image_protocol=provider.image_protocol,
+        image_base_url=provider.image_base_url,
         api_key_masked=mask_secret(api_key_plain),
         models=[ModelRead.model_validate(m) for m in provider.models],
+        image_models=[ImageModelRead.model_validate(m) for m in provider.image_models],
     )
 
 
@@ -318,6 +349,8 @@ def _model_discovery_config(provider_type: str, preset: dict[str, Any] | None) -
         return preset["model_discovery"]
     if provider_type == "anthropic":
         return {"adapter": "anthropic", "path": "/v1/models", "response_key": "data"}
+    if provider_type in {"openai_compatible", "openai_responses"}:
+        return {"adapter": "openai_compatible", "path": "/models", "response_key": "data"}
     return {"adapter": "openai_compatible", "path": "/models", "response_key": "data"}
 
 
@@ -432,6 +465,8 @@ def install_preset(
     if not preset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型预设不存在")
 
+    provider_type = payload.provider_type.value if payload.provider_type else preset["provider_type"]
+
     models_by_name = {model["model_name"]: model for model in preset["models"]}
     discovered_by_name = {item.model_name: item for item in payload.model_capabilities}
     unexpected_capabilities = set(discovered_by_name) - set(payload.model_names)
@@ -462,7 +497,7 @@ def install_preset(
 
     provider = AIProvider(
         name=payload.name or preset["name"],
-        provider_type=preset["provider_type"],
+        provider_type=provider_type,
         base_url=preset["base_url"],
         api_key_encrypted=encrypt_secret(payload.api_key),
     )
@@ -506,9 +541,10 @@ async def discover_preset_models(
     preset = get_provider_preset(preset_id)
     if not preset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型预设不存在")
+    provider_type = payload.provider_type.value if payload.provider_type else preset["provider_type"]
     try:
         models = await _fetch_connection_models(
-            str(preset["provider_type"]), preset["base_url"], payload.api_key, preset
+            provider_type, preset["base_url"], payload.api_key, preset
         )
     except ModelDiscoveryUnsupported as exc:
         # 预期情况，不是故障：这类套餐端点只有 /v1/messages。直接展示内置模型，
@@ -558,6 +594,8 @@ def create_provider(payload: ProviderCreate, db: Session = Depends(get_db)) -> P
         name=payload.name,
         provider_type=payload.provider_type,
         base_url=payload.base_url.rstrip("/"),
+        image_protocol=payload.image_protocol,
+        image_base_url=payload.image_base_url.rstrip("/") if payload.image_base_url else "",
         api_key_encrypted=encrypt_secret(payload.api_key),
     )
     db.add(provider)
@@ -574,8 +612,14 @@ def update_provider(provider_id: int, payload: ProviderUpdate, db: Session = Dep
 
     if payload.name is not None:
         provider.name = payload.name
+    if payload.provider_type is not None:
+        provider.provider_type = payload.provider_type
     if payload.base_url is not None:
         provider.base_url = payload.base_url.rstrip("/")
+    if payload.image_protocol is not None:
+        provider.image_protocol = payload.image_protocol
+    if payload.image_base_url is not None:
+        provider.image_base_url = payload.image_base_url.rstrip("/")
     if payload.api_key:
         provider.api_key_encrypted = encrypt_secret(payload.api_key)
 
@@ -608,6 +652,9 @@ def create_model(provider_id: int, payload: ModelCreate, db: Session = Depends(g
         max_output_tokens=payload.max_output_tokens,
         tool_result_max_tokens=payload.tool_result_max_tokens,
     )
+    thinking_config = _effective_thinking_config(provider.base_url, payload.thinking_config)
+    _validate_default_thinking_effort(thinking_config, payload.default_thinking_effort)
+    _validate_prompt_cache_provider(provider, payload.prompt_cache_enabled)
 
     model = AIModel(
         provider_id=provider_id,
@@ -621,7 +668,9 @@ def create_model(provider_id: int, payload: ModelCreate, db: Session = Depends(g
         is_default=payload.is_default,
         is_multimodal=payload.is_multimodal,
         supports_disabled_thinking=payload.supports_disabled_thinking,
-        thinking_config=_effective_thinking_config(provider.base_url, payload.thinking_config),
+        default_thinking_effort=payload.default_thinking_effort,
+        prompt_cache_enabled=payload.prompt_cache_enabled,
+        thinking_config=thinking_config,
     )
     db.add(model)
     db.commit()
@@ -651,6 +700,22 @@ def update_model(model_id: int, payload: ModelUpdate, db: Session = Depends(get_
             else model.tool_result_max_tokens
         ),
     )
+    thinking_config = _effective_thinking_config(
+        model.provider.base_url,
+        payload.thinking_config if payload.thinking_config is not None else model.thinking_config,
+    )
+    default_thinking_effort = (
+        payload.default_thinking_effort
+        if payload.default_thinking_effort is not None
+        else model.default_thinking_effort
+    )
+    _validate_default_thinking_effort(thinking_config, default_thinking_effort)
+    prompt_cache_enabled = (
+        payload.prompt_cache_enabled
+        if payload.prompt_cache_enabled is not None
+        else model.prompt_cache_enabled
+    )
+    _validate_prompt_cache_provider(model.provider, prompt_cache_enabled)
     if payload.display_name is not None:
         model.display_name = payload.display_name
     if payload.description is not None:
@@ -669,8 +734,12 @@ def update_model(model_id: int, payload: ModelUpdate, db: Session = Depends(get_
         model.is_multimodal = payload.is_multimodal
     if payload.supports_disabled_thinking is not None:
         model.supports_disabled_thinking = payload.supports_disabled_thinking
+    if payload.default_thinking_effort is not None:
+        model.default_thinking_effort = payload.default_thinking_effort
+    if payload.prompt_cache_enabled is not None:
+        model.prompt_cache_enabled = payload.prompt_cache_enabled
     if payload.thinking_config is not None:
-        model.thinking_config = _effective_thinking_config(model.provider.base_url, payload.thinking_config)
+        model.thinking_config = thinking_config
     if payload.access_mode is not None:
         model.access_mode = payload.access_mode
     allowed_users, allowed_groups = _validate_access_targets(db, payload.allowed_user_ids, payload.allowed_group_ids)
@@ -786,6 +855,76 @@ def delete_model(model_id: int, db: Session = Depends(get_db)) -> None:
     model = db.get(AIModel, model_id)
     if not model:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
+    db.delete(model)
+    db.commit()
+
+
+@router.post("/{provider_id}/image-models", response_model=ImageModelRead)
+def create_image_model(provider_id: int, payload: ImageModelCreate, db: Session = Depends(get_db)) -> AIImageModel:
+    provider = db.get(AIProvider, provider_id)
+    if not provider:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider 不存在")
+    if not provider.image_protocol or not provider.image_base_url:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请先配置 Provider 的图片协议和 Base URL")
+    if payload.is_default:
+        db.query(AIImageModel).update({AIImageModel.is_default: False})
+    model = AIImageModel(
+        provider_id=provider_id,
+        model_name=payload.model_name,
+        display_name=payload.display_name,
+        description=payload.description,
+        supported_aspect_ratios=list(payload.supported_aspect_ratios) or ["square", "portrait", "landscape"],
+        supported_qualities=list(payload.supported_qualities) or ["auto", "low", "medium", "high"],
+        is_default=payload.is_default,
+        access_mode=payload.access_mode,
+    )
+    users, groups = _validate_access_targets(db, payload.allowed_user_ids, payload.allowed_group_ids)
+    if users is not None:
+        model.allowed_users = users
+    if groups is not None:
+        model.allowed_groups = groups
+    db.add(model)
+    db.commit()
+    db.refresh(model)
+    return model
+
+
+@router.patch("/image-models/{model_id}", response_model=ImageModelRead)
+def update_image_model(model_id: int, payload: ImageModelUpdate, db: Session = Depends(get_db)) -> AIImageModel:
+    model = db.get(AIImageModel, model_id)
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="图片模型不存在")
+    if payload.is_default:
+        db.query(AIImageModel).update({AIImageModel.is_default: False})
+    if payload.display_name is not None:
+        model.display_name = payload.display_name
+    if payload.description is not None:
+        model.description = payload.description
+    if payload.supported_aspect_ratios is not None:
+        model.supported_aspect_ratios = list(payload.supported_aspect_ratios)
+    if payload.supported_qualities is not None:
+        model.supported_qualities = list(payload.supported_qualities)
+    if payload.is_default is not None:
+        model.is_default = payload.is_default
+    if payload.access_mode is not None:
+        model.access_mode = payload.access_mode
+    users, groups = _validate_access_targets(db, payload.allowed_user_ids, payload.allowed_group_ids)
+    if users is not None:
+        model.allowed_users = users
+    if groups is not None:
+        model.allowed_groups = groups
+    db.commit()
+    db.refresh(model)
+    return model
+
+
+@router.delete("/image-models/{model_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+def delete_image_model(model_id: int, db: Session = Depends(get_db)) -> None:
+    model = db.get(AIImageModel, model_id)
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="图片模型不存在")
+    if db.query(ImageGeneration.id).filter(ImageGeneration.model_id == model.id).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该图片模型已有生成记录，不能删除")
     db.delete(model)
     db.commit()
 

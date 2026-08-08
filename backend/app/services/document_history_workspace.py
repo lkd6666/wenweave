@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any
 
@@ -21,6 +23,73 @@ from app.services.token_budget import estimate_tokens
 HISTORY_VERSION_PAGE_SIZE = 20
 HISTORY_SEARCH_PAGE_SIZE = 8
 HISTORY_COMPARE_PAGE_SIZE = 8
+HISTORY_WORKSPACE_CACHE_MAX_ENTRIES = 2
+HISTORY_WORKSPACE_CACHE_MAX_SOURCE_BYTES = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _HistoryWorkspaceCacheEntry:
+    workspace: HtmlWorkspace
+    source_bytes: int
+
+
+class _HistoryWorkspaceCache:
+    """A bounded, run-local cache for immutable historical version indexes."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = HISTORY_WORKSPACE_CACHE_MAX_ENTRIES,
+        max_source_bytes: int = HISTORY_WORKSPACE_CACHE_MAX_SOURCE_BYTES,
+    ) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.max_source_bytes = max(1, int(max_source_bytes))
+        self._entries: OrderedDict[int, _HistoryWorkspaceCacheEntry] = OrderedDict()
+        self._source_bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._skipped_oversize = 0
+        self._evictions = 0
+        self._lock = threading.RLock()
+
+    def get(self, version_id: int) -> HtmlWorkspace | None:
+        with self._lock:
+            entry = self._entries.pop(version_id, None)
+            if entry is None:
+                self._misses += 1
+                return None
+            self._entries[version_id] = entry
+            self._hits += 1
+            return entry.workspace
+
+    def put(self, version_id: int, workspace: HtmlWorkspace, source_bytes: int) -> None:
+        if source_bytes > self.max_source_bytes:
+            with self._lock:
+                self._skipped_oversize += 1
+            return
+        with self._lock:
+            previous = self._entries.pop(version_id, None)
+            if previous is not None:
+                self._source_bytes -= previous.source_bytes
+            while self._entries and (
+                len(self._entries) >= self.max_entries or self._source_bytes + source_bytes > self.max_source_bytes
+            ):
+                _, evicted = self._entries.popitem(last=False)
+                self._source_bytes -= evicted.source_bytes
+                self._evictions += 1
+            self._entries[version_id] = _HistoryWorkspaceCacheEntry(workspace, source_bytes)
+            self._source_bytes += source_bytes
+
+    def metrics(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "skipped_oversize": self._skipped_oversize,
+                "evictions": self._evictions,
+                "entries": len(self._entries),
+                "source_bytes": self._source_bytes,
+            }
 
 
 def _is_retryable_db_disconnect(exc: DBAPIError) -> bool:
@@ -61,6 +130,7 @@ def _with_isolated_read_session(method: Callable[..., dict[str, Any]]) -> Callab
                         db,
                         self.document_id,
                         self.tool_result_max_tokens,
+                        workspace_cache=self._workspace_cache,
                     )
                     return method(isolated, *args, **kwargs)
                 except DBAPIError as exc:
@@ -98,11 +168,13 @@ class DocumentHistoryWorkspace:
         document_id: int,
         tool_result_max_tokens: int,
         session_factory: Callable[[], Session] | None = None,
+        workspace_cache: _HistoryWorkspaceCache | None = None,
     ):
         self.db = db
         self.document_id = document_id
         self.tool_result_max_tokens = max(1, int(tool_result_max_tokens))
         self._session_factory = session_factory
+        self._workspace_cache = workspace_cache or _HistoryWorkspaceCache()
         # LangGraph 的 ToolNode 会把同一条助手消息里的只读工具放到多个
         # 线程执行，但一个 SQLAlchemy Session / PyMySQL 连接不能并发读写。
         # 历史版本操作均为只读，按此锁串行化可避免 MySQL 数据包交错。
@@ -110,7 +182,15 @@ class DocumentHistoryWorkspace:
 
     def set_tool_result_limit(self, limit: int) -> None:
         """Apply the active per-tool preview budget before a ToolNode batch."""
-        self.tool_result_max_tokens = max(1, int(limit))
+        with self._db_lock:
+            self.tool_result_max_tokens = max(1, int(limit))
+
+    def cache_metrics(self) -> dict[str, int]:
+        return self._workspace_cache.metrics()
+
+    def _workspace_budget(self) -> int:
+        # Version metadata and the read-only marker wrap the workspace result.
+        return max(1, self.tool_result_max_tokens - 180)
 
     @staticmethod
     def _version_metadata(version: DocumentVersion) -> dict[str, Any]:
@@ -159,17 +239,20 @@ class DocumentHistoryWorkspace:
 
     def _workspace(self, version_id: int) -> tuple[DocumentVersion, HtmlWorkspace]:
         version = self._version(version_id)
+        cached = self._workspace_cache.get(version.id)
+        if cached is not None:
+            return version, cached
         try:
             html = materialize_document_version(self.db, version)
         except DocumentVersionStorageError as exc:
             raise WorkspaceError("历史版本内容无法读取", {"version_id": version_id}) from exc
-        return version, HtmlWorkspace(
+        workspace = HtmlWorkspace(
             html,
             redact=redact_inline_data,
-            # Version metadata and the read-only marker wrap the workspace
-            # response, so reserve a small fixed budget for that envelope.
-            tool_result_max_tokens=max(1, self.tool_result_max_tokens - 180),
+            tool_result_max_tokens=self._workspace_budget(),
         )
+        self._workspace_cache.put(version.id, workspace, len(html.encode("utf-8")))
+        return version, workspace
 
     def _fit_page_entries(
         self,
@@ -244,7 +327,7 @@ class DocumentHistoryWorkspace:
             scanned = 0
             for version in versions:
                 _, workspace = self._workspace(version.id)
-                result = workspace.search(query, limit=1)
+                result = workspace.search(query, limit=1, tool_result_max_tokens=self._workspace_budget())
                 items = result.get("results", []) if isinstance(result, dict) else []
                 entry: dict[str, Any] | None = None
                 if items:
@@ -311,7 +394,7 @@ class DocumentHistoryWorkspace:
             version, workspace = self._workspace(version_id)
             return {
                 "version": self._version_metadata(version),
-                **workspace.search(query, limit),
+                **workspace.search(query, limit, tool_result_max_tokens=self._workspace_budget()),
                 "read_only": True,
             }
 
@@ -332,7 +415,7 @@ class DocumentHistoryWorkspace:
             version, workspace = self._workspace(version_id)
             return {
                 "version": self._version_metadata(version),
-                **workspace.read(block_ids, cursor),
+                **workspace.read(block_ids, cursor, tool_result_max_tokens=self._workspace_budget()),
                 "read_only": True,
             }
 

@@ -79,6 +79,14 @@ TRUSTED_PROXY_CIDRS=127.0.0.1/32
 
 下一步创建虚拟环境后，再生成随机密钥填入 `.env`。首次启动只会在用户表为空时创建管理员，首次登录后应立即修改密码。`.env` 和 `/var/lib/yibanpaiban/data` 均为私密运行时数据，不应提交、复制进新发布包或提供给其他人。
 
+如果公网链路是 `CDN -> 雷池 -> Nginx -> Uvicorn`，后端可以自行从 `X-Forwarded-For` 还原客户端 IP，但必须将整个代理链上的节点受限地列入信任网段。例如 Nginx 代理到本机 Uvicorn，雷池位于 Docker `172.18.0.0/16`，CDN 的官方出口网段为 `198.51.100.0/24` 时：
+
+```dotenv
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,172.18.0.0/16,198.51.100.0/24
+```
+
+代码会从右向左跳过 Nginx、雷池和 CDN，记录第一个非可信地址（即访客 IP）。实际部署中必须以雷池容器/回源网段和 CDN 官方 IP 段替换示例值，不要使用 `0.0.0.0/0`。同时需确认雷池未丢弃 `X-Forwarded-For`；若 CDN 未传入访客地址，后端无法从 CDN IP 反推出真实访客。
+
 ## 5. 安装 Python 依赖并配置 systemd
 
 ```bash
@@ -106,7 +114,7 @@ User=yibanpaiban
 Group=yibanpaiban
 WorkingDirectory=/opt/yibanpaiban/backend
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/yibanpaiban/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 2 --no-proxy-headers
+ExecStart=/opt/yibanpaiban/backend/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 1 --no-proxy-headers --log-config /opt/yibanpaiban/backend/uvicorn-log.json
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -139,7 +147,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-该配置反向代理前端和 API，应用自身托管 `frontend/dist`。其中 `proxy_buffering off` 与 900 秒读写超时用于 SSE；不得删除。`client_max_body_size 35m` 与应用的 30 MB 文档导入限制配套。
+该配置反向代理前端和 API，应用自身托管 `frontend/dist`。其中 SSE 专用路由会关闭代理/请求缓冲与 gzip，并强制下发 `no-store` 缓存策略；不得删除。若 CDN 有“强制缓存”“缓存一切”一类规则，另需将 `/api/documents/*/chat-runs/*/events` 配为绕过缓存，否则 CDN 规则可能覆盖源站响应头。`client_max_body_size 35m` 与应用的 30 MB 文档导入限制配套。
 
 申请证书后将 HTTP 重定向到 HTTPS。以 Certbot 为例：
 

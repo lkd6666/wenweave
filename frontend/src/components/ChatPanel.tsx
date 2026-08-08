@@ -1,13 +1,17 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { CSSProperties, UIEvent } from 'react'
-import { Alert, Button, Collapse, Dropdown, Image, Input, Modal, Popover, Select, Tag, Tooltip, Typography, message } from 'antd'
+import { Alert, Button, Collapse, Drawer, Dropdown, Grid, Image, Input, Modal, Popover, Select, Tag, Tooltip, Typography, message } from 'antd'
 import {
   AppstoreOutlined,
+  ArrowDownOutlined,
+  ArrowUpOutlined,
   BulbOutlined,
+  CheckOutlined,
   CheckCircleFilled,
   CodeOutlined,
   ClockCircleOutlined,
   DownOutlined,
+  DragOutlined,
   EditOutlined,
   ExclamationCircleFilled,
   EyeOutlined,
@@ -24,6 +28,7 @@ import {
   SafetyCertificateOutlined,
   SearchOutlined,
   SendOutlined,
+  SettingOutlined,
   StopOutlined,
   SyncOutlined,
   ReloadOutlined,
@@ -134,6 +139,19 @@ const TASK_PLAN_STATUS_LABELS: Record<TaskPlanItem['status'], string> = {
   pending: '待办',
   in_progress: '进行中',
   done: '已完成',
+}
+
+const THINKING_EFFORT_LABELS: Record<string, string> = {
+  minimal: '极简',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '超高',
+  max: '最大（max）',
+}
+
+function formatThinkingEffort(effort: string): string {
+  return THINKING_EFFORT_LABELS[effort] ?? effort
 }
 
 interface TaskPlan {
@@ -365,6 +383,8 @@ interface ChatPanelProps {
   onRemoveAttachedTemplate: (templateId: number) => void
   onRemoveComposerTemplate: (templateId: number) => void
   onRemoveQueuedMessage: (id: string) => void
+  onUpdateQueuedMessage: (id: string, content: string) => void
+  onMoveQueuedMessage: (fromIndex: number, toIndex: number) => void
   onEditRequest: (message: ChatMessageItem) => void
   onSend: (text: string, references: SelectedElementContext[], images: ChatImageAttachment[]) => void
   onAnswerUserQuestion: (answer: UserQuestionAnswer) => void
@@ -432,6 +452,8 @@ export default function ChatPanel({
   onRemoveAttachedTemplate,
   onRemoveComposerTemplate,
   onRemoveQueuedMessage,
+  onUpdateQueuedMessage,
+  onMoveQueuedMessage,
   onEditRequest,
   onSend,
   onAnswerUserQuestion,
@@ -458,9 +480,16 @@ export default function ChatPanel({
   onClearThemeContext,
 }: ChatPanelProps) {
   const currentUserId = useAuthStore((state) => state.user?.id)
+  const screens = Grid.useBreakpoint()
+  const isCompact = !screens.lg
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameTitle, setRenameTitle] = useState('')
   const [hiddenHistoryOpen, setHiddenHistoryOpen] = useState(false)
+  const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false)
+  const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null)
+  const [editingQueuedContent, setEditingQueuedContent] = useState('')
+  const [draggedQueuedMessageId, setDraggedQueuedMessageId] = useState<string | null>(null)
+  const [queuedDropTargetId, setQueuedDropTargetId] = useState<string | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const listContentRef = useRef<HTMLDivElement>(null)
   const composerRef = useRef<PromptComposerHandle>(null)
@@ -597,6 +626,43 @@ export default function ChatPanel({
     onContextDraftChange(message.content)
   }, [onContextDraftChange, onEditRequest])
 
+  const beginQueuedMessageEdit = (queuedMessage: QueuedChatMessage) => {
+    setEditingQueuedMessageId(queuedMessage.id)
+    setEditingQueuedContent(queuedMessage.content)
+  }
+
+  const cancelQueuedMessageEdit = () => {
+    setEditingQueuedMessageId(null)
+    setEditingQueuedContent('')
+  }
+
+  const saveQueuedMessageEdit = () => {
+    if (!editingQueuedMessageId) return
+    const content = editingQueuedContent.trim()
+    if (!content) {
+      message.warning('待处理内容不能为空')
+      return
+    }
+    onUpdateQueuedMessage(editingQueuedMessageId, content)
+    cancelQueuedMessageEdit()
+  }
+
+  const moveQueuedMessage = (fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex) return
+    onMoveQueuedMessage(fromIndex, toIndex)
+  }
+
+  const finishQueuedDrag = () => {
+    setDraggedQueuedMessageId(null)
+    setQueuedDropTargetId(null)
+  }
+
+  useEffect(() => {
+    if (editingQueuedMessageId && !queuedMessages.some((item) => item.id === editingQueuedMessageId)) {
+      cancelQueuedMessageEdit()
+    }
+  }, [editingQueuedMessageId, queuedMessages])
+
   const handleMessageScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     if (event.target !== event.currentTarget) return
     const container = event.currentTarget
@@ -645,9 +711,78 @@ export default function ChatPanel({
   const effortOptions = effortConfig && typeof effortConfig === 'object' && !Array.isArray(effortConfig)
     ? Object.keys(effortConfig)
     : []
+  const modelDefaultThinkingEffort = selectedModel?.default_thinking_effort ?? 'auto'
   const canDisableThinking = supportsDisabledThinkingOption(
     selectedModel,
     temporarilyUnsupportedThinkingModelIds,
+  )
+  const chatSettingsContent = (
+    <div className="chat-settings-panel">
+      <label className="chat-settings-field">
+        <span>AI 模型</span>
+        <ModelSelector models={models} value={modelId} onChange={onModelChange} disabled={conversationControlsDisabled} />
+      </label>
+      <label className="chat-settings-field">
+        <span>思考强度</span>
+        <Select
+          aria-label="思考强度"
+          value={thinkingMode === 'disabled' ? 'disabled' : thinkingEffort}
+          disabled={streaming || activeChatSession?.is_archived}
+          onChange={(value) => {
+            if (value === 'disabled') {
+              onThinkingModeChange('disabled')
+              return
+            }
+            onThinkingModeChange('enabled')
+            onThinkingEffortChange(value as ThinkingEffort)
+          }}
+          options={[
+            {
+              value: 'auto',
+              label: modelDefaultThinkingEffort === 'auto'
+                ? '默认'
+                : `默认（${formatThinkingEffort(modelDefaultThinkingEffort)}）`,
+            },
+            ...effortOptions.map((effort) => ({ value: effort, label: formatThinkingEffort(effort) })),
+            ...(canDisableThinking ? [{ value: 'disabled', label: '不思考' }] : []),
+          ]}
+        />
+      </label>
+    </div>
+  )
+  const thinkingEffortLabel = thinkingMode === 'disabled'
+    ? '不思考'
+    : thinkingEffort === 'auto'
+      ? modelDefaultThinkingEffort === 'auto'
+        ? '默认'
+        : formatThinkingEffort(modelDefaultThinkingEffort)
+      : formatThinkingEffort(thinkingEffort)
+  const modelSettingsLabel = selectedModel?.display_name ?? '选择模型'
+  const chatSettingsTrigger = isCompact ? (
+    <Tooltip title="会话设置">
+      <Button
+        aria-label={`会话设置：${modelSettingsLabel}，${thinkingEffortLabel}`}
+        className="chat-settings-trigger"
+        type="text"
+        icon={<SettingOutlined />}
+        onClick={() => setSettingsDrawerOpen(true)}
+      >
+        <span className="chat-settings-trigger-model">{modelSettingsLabel}</span>
+        <span className="chat-settings-trigger-effort">{thinkingEffortLabel}</span>
+      </Button>
+    </Tooltip>
+  ) : (
+    <Popover title="会话设置" trigger="click" content={chatSettingsContent} overlayClassName="chat-settings-popover">
+      <Button
+        aria-label={`会话设置：${modelSettingsLabel}，${thinkingEffortLabel}`}
+        className="chat-settings-trigger"
+        type="text"
+        icon={<SettingOutlined />}
+      >
+        <span className="chat-settings-trigger-model">{modelSettingsLabel}</span>
+        <span className="chat-settings-trigger-effort">{thinkingEffortLabel}</span>
+      </Button>
+    </Popover>
   )
   const activeTool = getRunningTool(streamBlocks)
   const showActiveAssistantTurn = streaming || Boolean(pendingUserQuestion)
@@ -876,29 +1011,6 @@ export default function ChatPanel({
             }]}
           />
         )}
-        <div className="chat-panel-controls">
-          <ModelSelector models={models} value={modelId} onChange={onModelChange} disabled={conversationControlsDisabled} />
-          <Select
-            className="thinking-effort-select"
-            aria-label="思考强度"
-            size="small"
-            value={thinkingMode === 'disabled' ? 'disabled' : thinkingEffort}
-            disabled={streaming || activeChatSession?.is_archived}
-            onChange={(value) => {
-              if (value === 'disabled') {
-                onThinkingModeChange('disabled')
-                return
-              }
-              onThinkingModeChange('enabled')
-              onThinkingEffortChange(value as ThinkingEffort)
-            }}
-            options={[
-              { value: 'auto', label: '思考强度：默认' },
-              ...effortOptions.map((effort) => ({ value: effort, label: `思考强度：${effort}` })),
-              ...(canDisableThinking ? [{ value: 'disabled', label: '不思考' }] : []),
-            ]}
-          />
-        </div>
         {contextStats?.requires_compaction && !contextCannotFit && !streaming && (
           <Alert
             className="chat-context-notice"
@@ -1004,7 +1116,6 @@ export default function ChatPanel({
                     <i /> <span className="chat-streaming-label-text">{liveLabel}</span>
                   </div>
                 )}
-                {streamNotice && <AgentRunNotice notice={streamNotice} />}
                 <AssistantTurnTimeline
                   blocks={streamBlocks}
                   fallbackContent={streamText}
@@ -1026,35 +1137,121 @@ export default function ChatPanel({
                 ) : streaming && streamBlocks.length === 0 && !streamText && reasoningTrace.status === 'idle' && toolActivities.length === 0 ? (
                   <div className="chat-streaming-placeholder">正在准备排版方案…</div>
                 ) : null}
+                {streamNotice && <AgentRunNotice notice={streamNotice} />}
               </div>
               <div className="chat-turn-meta"><span>排版助手</span></div>
             </div>
           </article>
         )}
 
-        {queuedMessages.map((queuedMessage) => (
-          <article className="chat-turn chat-turn-user chat-turn-queued" key={queuedMessage.id}>
-            <div className="chat-turn-body">
-              <div className="chat-turn-bubble">
-                <div className="chat-turn-content">{queuedMessage.content}</div>
-              </div>
-              <div className="chat-turn-meta">
-                <span>你 · 待处理</span>
-                <Tooltip title="取消待处理要求">
-                  <Button
-                    className="chat-edit-request"
-                    aria-label="取消待处理要求"
-                    type="text"
-                    size="small"
-                    icon={<CloseOutlined />}
-                    disabled={stopping}
-                    onClick={() => onRemoveQueuedMessage(queuedMessage.id)}
-                  />
-                </Tooltip>
-              </div>
+        {queuedMessages.length > 0 && (
+          <section className="chat-queue" aria-label="待处理队列">
+            <div className="chat-queue-header">
+              <span className="chat-queue-title"><UnorderedListOutlined aria-hidden="true" />待处理队列</span>
+              <span className="chat-queue-count">{queuedMessages.length}</span>
             </div>
-          </article>
-        ))}
+            <div className="chat-queue-list" role="list">
+              {queuedMessages.map((queuedMessage, index) => {
+                const isEditing = editingQueuedMessageId === queuedMessage.id
+                const isDragging = draggedQueuedMessageId === queuedMessage.id
+                const isDropTarget = queuedDropTargetId === queuedMessage.id && !isDragging
+                return (
+                  <article
+                    className={`chat-queue-item${isDragging ? ' is-dragging' : ''}${isDropTarget ? ' is-drop-target' : ''}`}
+                    key={queuedMessage.id}
+                    role="listitem"
+                    onDragOver={(event) => {
+                      if (!draggedQueuedMessageId || isDragging) return
+                      event.preventDefault()
+                      event.dataTransfer.dropEffect = 'move'
+                      setQueuedDropTargetId(queuedMessage.id)
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault()
+                      const fromIndex = queuedMessages.findIndex((item) => item.id === draggedQueuedMessageId)
+                      finishQueuedDrag()
+                      moveQueuedMessage(fromIndex, index)
+                    }}
+                  >
+                    <div className="chat-queue-item-leading">
+                      <span className="chat-queue-order" aria-label={index === 0 ? '下一项' : `第 ${index + 1} 项`}>
+                        {index === 0 ? '下一项' : index + 1}
+                      </span>
+                      <span
+                        className="chat-queue-drag-handle"
+                        aria-hidden="true"
+                        draggable={!isEditing}
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = 'move'
+                          event.dataTransfer.setData('text/plain', queuedMessage.id)
+                          setDraggedQueuedMessageId(queuedMessage.id)
+                        }}
+                        onDragEnd={finishQueuedDrag}
+                      >
+                        <DragOutlined />
+                      </span>
+                    </div>
+                    <div className="chat-queue-content">
+                      {isEditing ? (
+                        <Input.TextArea
+                          aria-label={`编辑待处理任务 ${index + 1}`}
+                          autoFocus
+                          autoSize={{ minRows: 2, maxRows: 6 }}
+                          className="chat-queue-editor"
+                          value={editingQueuedContent}
+                          onChange={(event) => setEditingQueuedContent(event.target.value)}
+                          onKeyDown={(event) => {
+                            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                              event.preventDefault()
+                              saveQueuedMessageEdit()
+                            }
+                            if (event.key === 'Escape') {
+                              event.preventDefault()
+                              cancelQueuedMessageEdit()
+                            }
+                          }}
+                        />
+                      ) : (
+                        <div className="chat-queue-message">{queuedMessage.content}</div>
+                      )}
+                    </div>
+                    <div className="chat-queue-actions">
+                      {isEditing ? (
+                        <>
+                          <Tooltip title="保存待处理内容">
+                            <Button aria-label="保存待处理内容" type="text" size="small" icon={<CheckOutlined />} onClick={saveQueuedMessageEdit} />
+                          </Tooltip>
+                          <Tooltip title="取消编辑">
+                            <Button aria-label="取消编辑" type="text" size="small" icon={<CloseOutlined />} onClick={cancelQueuedMessageEdit} />
+                          </Tooltip>
+                        </>
+                      ) : (
+                        <>
+                          {queuedMessages.length > 1 && (
+                            <Tooltip title="上移任务">
+                              <Button aria-label="上移任务" type="text" size="small" icon={<ArrowUpOutlined />} disabled={index === 0 || stopping} onClick={() => moveQueuedMessage(index, index - 1)} />
+                            </Tooltip>
+                          )}
+                          {queuedMessages.length > 1 && (
+                            <Tooltip title="下移任务">
+                              <Button aria-label="下移任务" type="text" size="small" icon={<ArrowDownOutlined />} disabled={index === queuedMessages.length - 1 || stopping} onClick={() => moveQueuedMessage(index, index + 1)} />
+                            </Tooltip>
+                          )}
+                          <Tooltip title="编辑待处理内容">
+                            <Button aria-label="编辑待处理内容" type="text" size="small" icon={<EditOutlined />} disabled={stopping} onClick={() => beginQueuedMessageEdit(queuedMessage)} />
+                          </Tooltip>
+                          <Tooltip title="取消待处理要求">
+                            <Button aria-label="取消待处理要求" type="text" size="small" icon={<CloseOutlined />} disabled={stopping} onClick={() => onRemoveQueuedMessage(queuedMessage.id)} />
+                          </Tooltip>
+                        </>
+                      )}
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          </section>
+        )}
         </div>
       </div>
 
@@ -1135,6 +1332,7 @@ export default function ChatPanel({
               <Text type="secondary">Enter 发送，Shift+Enter 换行</Text>
             </div>
             <div className="chat-input-actions-submit">
+              {chatSettingsTrigger}
               {contextStats && <ContextUsage stats={contextStats} runtimeTokens={runtimeTokens} onCompactContext={onCompactContext} />}
               {streaming && (
                 <Tooltip title="停止生成">
@@ -1165,6 +1363,17 @@ export default function ChatPanel({
         )}
       </div>
     </div>
+    <Drawer
+      title="会话设置"
+      placement="bottom"
+      height={244}
+      open={isCompact && settingsDrawerOpen}
+      onClose={() => setSettingsDrawerOpen(false)}
+      destroyOnHidden
+      className="chat-settings-drawer"
+    >
+      {chatSettingsContent}
+    </Drawer>
     <Modal
       title="重命名对话"
       open={renameOpen}
@@ -1402,9 +1611,19 @@ function taskPlanFromTool(tool: ToolExecution): TaskPlan | null {
 }
 
 function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
+  const [detailExpanded, setDetailExpanded] = useState(false)
   const retryLabel = notice.kind === 'retrying' && notice.attempt && notice.maxAttempts
     ? `第 ${notice.attempt}/${notice.maxAttempts} 次`
     : ''
+  const detail = notice.detail.trim()
+  const collapsible = detail.length > 220
+  const displayedDetail = collapsible && !detailExpanded
+    ? `${detail.slice(0, 220).trimEnd()}…`
+    : detail
+
+  useEffect(() => {
+    setDetailExpanded(false)
+  }, [notice.detail])
 
   return (
     <div className={`chat-run-notice is-${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
@@ -1414,7 +1633,20 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
           <strong>{notice.title}</strong>
           {retryLabel && <span>{retryLabel}</span>}
         </div>
-        <div className="chat-run-notice-detail">{notice.detail}</div>
+        <div className={`chat-run-notice-detail${collapsible ? ' is-collapsible' : ''}`}>
+          <span>{displayedDetail}</span>
+          {collapsible && (
+            <Button
+              type="text"
+              size="small"
+              className="chat-run-notice-detail-toggle"
+              icon={detailExpanded ? <UpOutlined /> : <DownOutlined />}
+              onClick={() => setDetailExpanded((expanded) => !expanded)}
+            >
+              {detailExpanded ? '收起完整信息' : '展开完整错误'}
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -1895,7 +2127,7 @@ function toolVisualKind(name: string): ToolVisualKind {
   if (['search_html', 'search_layout_reference'].includes(name)) return 'search'
   if (['list_history_versions', 'search_history_versions', 'search_history_version', 'compare_history_version', 'read_history_blocks', 'search_session_history', 'read_session_detail'].includes(name)) return 'history'
   if (name === 'read_tool_output') return 'read'
-  if (['inspect_current_images', 'inspect_history_images'].includes(name)) return 'image'
+  if (['inspect_current_images', 'inspect_history_images', 'generate_article_images', 'apply_generated_image'].includes(name)) return 'image'
   if (['apply_html_patch', 'replace_document'].includes(name)) return 'edit'
   if (name === 'check_compliance' || name === 'validate_gzh_html') return 'check'
   if (name === 'update_task_plan') return 'plan'
@@ -1918,6 +2150,41 @@ function ToolGlyph({ name }: { name: string }) {
   }
 }
 
+function ToolArgumentTokenCount({ value }: { value: number }) {
+  const [displayValue, setDisplayValue] = useState(value)
+  const displayedValueRef = useRef(value)
+
+  useEffect(() => {
+    const from = displayedValueRef.current
+    if (value <= from) {
+      displayedValueRef.current = value
+      setDisplayValue(value)
+      return
+    }
+    const startedAt = performance.now()
+    const duration = Math.min(360, Math.max(120, (value - from) * 12))
+    let frame = 0
+    const render = (now: number) => {
+      const progress = Math.min(1, (now - startedAt) / duration)
+      const nextValue = Math.round(from + (value - from) * progress)
+      displayedValueRef.current = nextValue
+      setDisplayValue(nextValue)
+      if (progress < 1) frame = window.requestAnimationFrame(render)
+    }
+    frame = window.requestAnimationFrame(render)
+    return () => window.cancelAnimationFrame(frame)
+  }, [value])
+
+  return (
+    <span
+      className="tool-argument-token-count"
+      title="模型已输出的工具参数 token 估算，随流式参数持续更新"
+    >
+      {displayValue.toLocaleString()} tokens
+    </span>
+  )
+}
+
 function ToolTrace({
   tool,
   onProcessScroll,
@@ -1933,8 +2200,19 @@ function ToolTrace({
       setExpanded(true)
     } else if (tool.status === 'error') {
       setExpanded(true)
-    } else if (previousStatus.current === 'running' && tool.status === 'success') {
+    } else if (
+      tool.status === 'success'
+      && ['running', 'waiting', 'error'].includes(previousStatus.current)
+    ) {
+      // A paused ask_user call is rendered as an error while the question
+      // panel is waiting for its resumed stream. Its eventual success must
+      // collapse just like an ordinary running tool, otherwise the answered
+      // preference card remains expanded for the rest of the turn.
       const timer = window.setTimeout(() => setExpanded(false), 1200)
+      previousStatus.current = tool.status
+      return () => window.clearTimeout(timer)
+    } else if (tool.status === 'interrupted' && previousStatus.current === 'running') {
+      const timer = window.setTimeout(() => setExpanded(false), 600)
       previousStatus.current = tool.status
       return () => window.clearTimeout(timer)
     }
@@ -1945,7 +2223,11 @@ function ToolTrace({
   const isRunning = tool.status === 'running'
   const activity = tool.activity
   const detailResult = toolDetailResult(tool)
+  const generatedImages = generatedImagePreviews(tool)
   const statusTone = status.tone
+  const argumentTokens = tool.status === 'running' && tool.preparing && typeof tool.argument_tokens === 'number' && tool.argument_tokens > 0
+    ? tool.argument_tokens
+    : null
   const summary = isRunning
     ? tool.preparing ? '正在准备工具参数' : '正在执行操作'
     : toolActionTarget(tool)
@@ -1967,7 +2249,9 @@ function ToolTrace({
               <span className="tool-trace-summary-text" title={summary}>{summary}</span>
               {tool.change_summary && !activity && <ChangeSummaryInline summary={tool.change_summary} />}
             </span>
-            <span className={`tool-trace-status is-${statusTone}`}>{status.label}</span>
+            <span className={`tool-trace-status is-${statusTone}`}>
+              {argumentTokens !== null ? <ToolArgumentTokenCount value={argumentTokens} /> : status.label}
+            </span>
           </span>
         ),
         children: (
@@ -1981,6 +2265,7 @@ function ToolTrace({
                 ))}
               </div>
             )}
+            {generatedImages.length > 0 && <GeneratedImagePreviews images={generatedImages} />}
             {activity?.html_validation?.valid === false && activity.html_validation.errors?.length ? (
               <div className="tool-trace-result">{activity.html_validation.errors.join('；')}</div>
             ) : null}
@@ -2008,6 +2293,54 @@ function ToolTrace({
         ),
       }]}
     />
+  )
+}
+
+interface GeneratedImagePreview {
+  id: string
+  url: string
+}
+
+function generatedImagePreviews(tool: ToolExecution): GeneratedImagePreview[] {
+  if (tool.activity?.kind !== 'image_generation') return []
+  const assets = tool.activity.details?.assets
+  if (!Array.isArray(assets)) return []
+  return assets.flatMap((asset, index) => {
+    if (!asset || typeof asset !== 'object' || Array.isArray(asset)) return []
+    const value = asset as Record<string, unknown>
+    const url = typeof value.url === 'string' ? value.url.trim() : ''
+    if (!isSafeImagePreviewUrl(url)) return []
+    return [{
+      id: typeof value.id === 'string' && value.id ? value.id : `generated-image-${index}`,
+      url,
+    }]
+  }).slice(0, 4)
+}
+
+function isSafeImagePreviewUrl(value: string): boolean {
+  try {
+    const url = new URL(value, window.location.origin)
+    return url.protocol === 'https:' || url.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
+function GeneratedImagePreviews({ images }: { images: GeneratedImagePreview[] }) {
+  return (
+    <div className="tool-generated-image-grid">
+      {images.map((image, index) => (
+        <figure className="tool-generated-image" key={image.id}>
+          <Image
+            alt={`AI 生成候选图 ${index + 1}`}
+            className="tool-generated-image-preview"
+            preview={{ mask: <EyeOutlined /> }}
+            src={image.url}
+          />
+          <figcaption>候选图 {index + 1}</figcaption>
+        </figure>
+      ))}
+    </div>
   )
 }
 
@@ -2045,8 +2378,10 @@ function toolErrorMetadata(tool: ToolExecution): string {
 }
 
 function toolStatusSummary(tool: ToolExecution): { label: string; tone: 'running' | 'error' | 'changed' | 'success' } {
+  if (tool.status === 'interrupted') return { label: '已重试', tone: 'changed' }
   if (tool.status === 'running' && tool.preparing) return { label: '准备中', tone: 'running' }
   if (tool.status === 'running') return { label: '执行中', tone: 'running' }
+  if (tool.status === 'waiting') return { label: '等待回复', tone: 'running' }
   if (tool.status === 'error') return { label: '执行失败', tone: 'error' }
   if (tool.html_changed) return { label: '已更新', tone: 'changed' }
   return { label: '完成', tone: 'success' }
@@ -2155,7 +2490,13 @@ function useLiveThoughtDuration(isThinking: boolean, startedAtMs?: number): numb
     const update = () => setNow(Date.now())
     update()
     const timer = window.setInterval(update, 100)
-    return () => window.clearInterval(timer)
+    document.addEventListener('visibilitychange', update)
+    window.addEventListener('focus', update)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', update)
+      window.removeEventListener('focus', update)
+    }
   }, [isThinking, startedAtMs])
 
   return isThinking && startedAtMs ? Math.max(0, now - startedAtMs) : null

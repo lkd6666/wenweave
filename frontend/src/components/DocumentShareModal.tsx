@@ -27,6 +27,10 @@ function formatDate(value: string | null): string {
   return value ? new Date(value).toLocaleString() : '无'
 }
 
+function formatReferer(value: string): string {
+  return value.trim() || '直接访问或浏览器未提供来源'
+}
+
 async function copyShareUrl(token: string) {
   const url = `${window.location.origin}/share/${token}`
   try {
@@ -228,7 +232,7 @@ export default function DocumentShareModal({ open, documentId, documentTitle, on
         </Spin>
       </Modal>
       <Modal
-        title={`访客记录${visitShare ? ` - ${visitShare.document_title}` : ''}`}
+        title={`访客记录${visitShare ? ` - ${documentTitle}` : ''}`}
         open={Boolean(visitShare)}
         width={960}
         footer={null}
@@ -250,7 +254,7 @@ export default function DocumentShareModal({ open, documentId, documentTitle, on
             { title: '最近访问', dataIndex: 'last_seen_at', width: 175, render: formatDate },
             { title: 'IP', dataIndex: 'ip_address', width: 145 },
             { title: 'UA', dataIndex: 'user_agent', ellipsis: true },
-            { title: '来源', dataIndex: 'referer', ellipsis: true },
+            { title: '来源', dataIndex: 'referer', ellipsis: true, render: formatReferer },
           ]}
         />
       </Modal>

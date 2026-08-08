@@ -67,7 +67,9 @@ def _to_share_read(db: Session, share: DocumentShare) -> DocumentShareRead:
     return DocumentShareRead(
         id=share.id,
         document_id=share.document_id,
-        document_title=share.document_title,
+        # The stored title is retained for a deleted document, but active shares
+        # must always reflect the document's latest title.
+        document_title=share.document.title if share.document is not None else share.document_title,
         token=share_token(share),
         created_by_id=share.created_by_id,
         created_by_username=share.created_by_username,
@@ -226,6 +228,8 @@ def get_public_document_share(
         title=document.title,
         html=html,
         cover_url=public_document_cover_url(db, share),
+        cover_crop_235_1=document.wechat_pic_crop_235_1,
+        cover_crop_1_1=document.wechat_pic_crop_1_1,
         revision=document_revision(document),
         expires_at=as_utc(share.expires_at),
         asset_refresh_at=asset_refresh_at,

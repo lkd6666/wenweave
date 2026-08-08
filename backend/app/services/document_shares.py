@@ -37,7 +37,15 @@ def token_hash(token: str) -> str:
 
 
 def document_revision(document: Document) -> str:
-    material = f"{document.title}\0{document.current_html}\0{document.wechat_cover_url}".encode("utf-8")
+    material = "\0".join(
+        (
+            document.title,
+            document.current_html,
+            document.wechat_cover_url,
+            document.wechat_pic_crop_235_1,
+            document.wechat_pic_crop_1_1,
+        )
+    ).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
 
 

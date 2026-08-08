@@ -72,6 +72,11 @@ export interface DocumentHtmlPatch {
   replacement: string
 }
 
+export interface DocumentImageLocalizationResult {
+  html: string
+  localized_count: number
+}
+
 export interface WeChatDraftPushProgressEvent {
   stage: 'validating' | 'metadata' | 'token' | 'body-images' | 'cover' | 'draft' | 'history' | 'completed'
   percent: number
@@ -192,6 +197,12 @@ export const documentsApi = {
     formData.append('file', file)
     return api.upload<{ url: string }>(`/documents/${id}/images`, formData)
   },
+  fetchCropSource: (source: string, signal?: AbortSignal) =>
+    api.blob(`/documents/crop-source?url=${encodeURIComponent(source)}`, { signal }),
+  materializeTemplateImages: (documentId: number, templateId: number) =>
+    api.post<DocumentImageLocalizationResult>(`/documents/${documentId}/templates/${templateId}/materialize-images`, {}),
+  localizeExternalImages: (documentId: number) =>
+    api.post<DocumentImageLocalizationResult>(`/documents/${documentId}/images/localize-external`, {}),
   uploadWeChatCover: (id: number, file: File) => {
     const formData = new FormData()
     formData.append('file', file)

@@ -1,20 +1,20 @@
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 import type { ImportParseProgress, ParsedImport, ParsedImportAsset } from './types'
+import {
+  buildPdfTextBlocks,
+  createPdfImageBlock,
+  orderPdfBlocks,
+  renderPdfBlocks,
+  shouldRasterizePdfPage,
+  type PdfTextItemLike,
+  type PdfTextStyleLike,
+} from './pdfLayout'
 
-type PdfTextItem = { str: string; transform: number[] }
 type PdfImageObject = {
   width?: number
   height?: number
   data?: Uint8ClampedArray | Uint8Array
   bitmap?: ImageBitmap
-}
-
-const htmlEscape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-
-const isPdfTextItem = (value: unknown): value is PdfTextItem => {
-  if (!value || typeof value !== 'object') return false
-  const item = value as Partial<PdfTextItem>
-  return typeof item.str === 'string' && Array.isArray(item.transform) && item.transform.length >= 6
 }
 
 const multiplyMatrix = (left: number[], right: number[]) => [
@@ -38,6 +38,18 @@ async function resolvePdfObject(objects: { get: (id: string, callback?: (value: 
 
 function canvasToBlob(canvas: HTMLCanvasElement) {
   return new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
+}
+
+async function renderPdfPageToPng(page: { getViewport: (options: { scale: number }) => { width: number; height: number }; render: (options: any) => { promise: Promise<unknown> } }, width: number, height: number) {
+  const scale = Math.max(0.75, Math.min(1.5, Math.sqrt(2400000 / Math.max(1, width * height))))
+  const viewport = page.getViewport({ scale })
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.ceil(viewport.width)
+  canvas.height = Math.ceil(viewport.height)
+  const context = canvas.getContext('2d')
+  if (!context) return null
+  await page.render({ canvasContext: context, viewport }).promise
+  return canvasToBlob(canvas)
 }
 
 async function imageObjectToPng(value: unknown): Promise<Blob | null> {
@@ -101,32 +113,58 @@ export async function parsePdfInBrowser(
   const assets: ParsedImportAsset[] = []
   const htmlParts: string[] = []
   let skippedImages = 0
+  let rasterizedPages = 0
 
   try {
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
       if (signal?.aborted) throw new DOMException('导入已取消', 'AbortError')
       const page = await pdf.getPage(pageNumber)
       const [textContent, operatorList] = await Promise.all([page.getTextContent(), page.getOperatorList()])
-      const blocks: Array<{ x: number; y: number; html: string }> = []
-      const lines = new Map<number, PdfTextItem[]>()
-      for (const item of textContent.items) {
-        if (!isPdfTextItem(item) || !item.str.trim()) continue
-        const lineY = Math.round(item.transform[5] / 3) * 3
-        const items = lines.get(lineY) ?? []
-        items.push(item)
-        lines.set(lineY, items)
-      }
-      for (const [y, items] of lines) {
-        items.sort((left, right) => left.transform[4] - right.transform[4])
-        const text = items.map((item) => item.str).join('').trim()
-        if (text) blocks.push({ x: items[0]?.transform[4] ?? 0, y, html: `<p>${htmlEscape(text)}</p>` })
-      }
-
-      const objects = (page as unknown as { objs: { get: (id: string, callback?: (value: unknown) => void) => unknown } }).objs
-      const stateStack: number[][] = []
-      let transform = [1, 0, 0, 1, 0, 0]
+      const viewport = page.getViewport({ scale: 1 })
+      const pageView = page.view as unknown as number[]
+      const pageWidth = pageView.length >= 4 ? Math.abs(pageView[2] - pageView[0]) : viewport.width
+      const pageHeight = pageView.length >= 4 ? Math.abs(pageView[3] - pageView[1]) : viewport.height
+      const textItemCount = textContent.items.filter((item) => typeof (item as { str?: unknown }).str === 'string' && Boolean((item as { str: string }).str.trim())).length
+      const imageOps = new Set([pdfjs.OPS.paintImageXObject, pdfjs.OPS.paintXObject, pdfjs.OPS.paintInlineImageXObject, pdfjs.OPS.paintImageMaskXObject, pdfjs.OPS.paintInlineImageXObjectGroup, pdfjs.OPS.paintImageXObjectRepeat, pdfjs.OPS.paintImageMaskXObjectGroup, pdfjs.OPS.paintImageMaskXObjectRepeat])
+      const imageCount = operatorList.fnArray.filter((fn) => imageOps.has(fn)).length
+      const pathCount = operatorList.fnArray.filter((fn) => fn === pdfjs.OPS.constructPath || fn === pdfjs.OPS.rectangle).length
+      const rasterizePage = shouldRasterizePdfPage({ textItemCount, imageCount, pathCount, rotation: page.rotate })
+      const blocks = rasterizePage ? [] : buildPdfTextBlocks(
+        textContent.items as PdfTextItemLike[],
+        textContent.styles as Record<string, PdfTextStyleLike>,
+        pageHeight,
+      )
       let pageImageCount = 0
-      for (let index = 0; index < operatorList.fnArray.length; index += 1) {
+      if (rasterizePage) {
+        const blob = await renderPdfPageToPng(page, pageWidth, pageHeight)
+        if (blob) {
+          pageImageCount += 1
+          const clientId = `pdf-p${pageNumber}-page-${pageImageCount}`
+          assets.push({ clientId, filename: `${clientId}.png`, contentType: 'image/png', blob })
+          blocks.push(createPdfImageBlock(clientId, [1, 0, 0, 1, 0, 0], pageHeight, 0, { width: pageWidth, height: pageHeight }))
+        }
+      }
+      if (!rasterizePage || blocks.length === 0) {
+        const objects = (page as unknown as { objs: { get: (id: string, callback?: (value: unknown) => void) => unknown } }).objs
+        const stateStack: number[][] = []
+        let transform = [1, 0, 0, 1, 0, 0]
+        const imageAssets = new Map<string, string>()
+        const appendImage = async (imageValue: unknown, imageTransform: number[], objectId: string, rect?: { x?: number; y?: number; width?: number; height?: number }) => {
+        let clientId = objectId ? imageAssets.get(objectId) : undefined
+        if (!clientId) {
+          const blob = await imageObjectToPng(imageValue)
+          if (!blob) {
+            skippedImages += 1
+            return
+          }
+          pageImageCount += 1
+          clientId = `pdf-p${pageNumber}-image-${pageImageCount}`
+          if (objectId) imageAssets.set(objectId, clientId)
+          assets.push({ clientId, filename: `${clientId}.png`, contentType: 'image/png', blob })
+        }
+          blocks.push(createPdfImageBlock(clientId, imageTransform, pageHeight, operatorList.fnArray.length + blocks.length, rect))
+        }
+        for (let index = 0; index < operatorList.fnArray.length; index += 1) {
         const fn = operatorList.fnArray[index]
         const args = (operatorList.argsArray[index] ?? []) as unknown[]
         if (fn === pdfjs.OPS.save) {
@@ -135,6 +173,45 @@ export async function parsePdfInBrowser(
           transform = stateStack.pop() ?? [1, 0, 0, 1, 0, 0]
         } else if (fn === pdfjs.OPS.transform && args.length >= 6) {
           transform = multiplyMatrix(transform, args.slice(0, 6).map(Number))
+        } else if (fn === pdfjs.OPS.paintImageXObjectRepeat) {
+          try {
+            const objectId = typeof args[0] === 'string' ? args[0] : ''
+            const imageValue = objectId ? await resolvePdfObject(objects, objectId) : null
+            const image = imageValue as PdfImageObject
+            const scaleX = Number(args[1]) || 1
+            const scaleY = Number(args[2]) || 1
+            const positions = Array.isArray(args[3]) ? args[3] : []
+            for (let position = 0; position + 1 < positions.length; position += 2) {
+              await appendImage(
+                imageValue,
+                multiplyMatrix(transform, [scaleX, 0, 0, scaleY, Number(positions[position]), Number(positions[position + 1])]),
+                objectId,
+                { width: image.width, height: image.height },
+              )
+            }
+          } catch (error) {
+            skippedImages += 1
+            console.warn('PDF repeated image conversion failed', error)
+          }
+        } else if (fn === pdfjs.OPS.paintInlineImageXObjectGroup) {
+          try {
+            const imageValue = args[0]
+            const map = Array.isArray(args[1]) ? args[1] : []
+            for (const entry of map) {
+              if (!entry || typeof entry !== 'object') continue
+              const groupEntry = entry as { transform?: number[]; x?: number; y?: number; w?: number; h?: number }
+              const entryTransform = Array.isArray(groupEntry.transform) ? groupEntry.transform : [1, 0, 0, 1, 0, 0]
+              await appendImage(imageValue, multiplyMatrix(transform, entryTransform), '', {
+                x: Number(groupEntry.x) || 0,
+                y: Number(groupEntry.y) || 0,
+                width: Number(groupEntry.w) || 1,
+                height: Number(groupEntry.h) || 1,
+              })
+            }
+          } catch (error) {
+            skippedImages += 1
+            console.warn('PDF image group conversion failed', error)
+          }
         } else if (
           fn === pdfjs.OPS.paintImageXObject ||
           fn === pdfjs.OPS.paintXObject ||
@@ -144,27 +221,16 @@ export async function parsePdfInBrowser(
           try {
             const objectId = typeof args[0] === 'string' ? args[0] : ''
             const imageValue = objectId ? await resolvePdfObject(objects, objectId) : args[0]
-            const blob = await imageObjectToPng(imageValue)
-            if (!blob) {
-              skippedImages += 1
-              continue
-            }
-            pageImageCount += 1
-            const clientId = `pdf-p${pageNumber}-image-${pageImageCount}`
-            assets.push({ clientId, filename: `${clientId}.png`, contentType: 'image/png', blob })
-            blocks.push({
-              x: transform[4],
-              y: transform[5],
-              html: `<p><img src="direct-import://asset/${clientId}" alt="图片" style="max-width:100%;height:auto;" /></p>`,
-            })
+            await appendImage(imageValue, transform, objectId)
           } catch (error) {
             skippedImages += 1
             console.warn('PDF embedded image conversion failed', error)
           }
         }
+        }
       }
-      blocks.sort((left, right) => right.y - left.y || left.x - right.x)
-      htmlParts.push(...blocks.map((block) => block.html))
+      if (rasterizePage && blocks.length > 0) rasterizedPages += 1
+      htmlParts.push(renderPdfBlocks(orderPdfBlocks(blocks, pageWidth, pageHeight), pageWidth))
       const skippedDetail = skippedImages ? `，已跳过 ${skippedImages} 张不兼容图片` : ''
       onProgress({
         stage: 'parsing',
@@ -177,5 +243,8 @@ export async function parsePdfInBrowser(
     await pdf.destroy()
   }
   onProgress({ stage: 'extracting', percent: 92, detail: 'PDF 解析完成，正在准备上传…' })
-  return { html: htmlParts.join('\n') || '<p>（PDF 未提取到正文内容）</p>', assets }
+  const warnings = rasterizedPages > 0
+    ? [`PDF 中有 ${rasterizedPages} 页版面过于复杂，已按页面图像导入以保留表格、线框和原始颜色。`]
+    : undefined
+  return { html: htmlParts.join('\n') || '<p>（PDF 未提取到正文内容）</p>', assets, warnings }
 }

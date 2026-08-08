@@ -95,3 +95,23 @@ class ModelCallAccountingTests(unittest.TestCase):
         self.assertEqual(rows[1].status, ModelCallStatus.FAILED)
         self.assertEqual(rows[1].error_message, "upstream unavailable")
         self.assertIsNotNone(rows[0].started_at)
+
+    def test_tracker_persists_running_record_then_updates_the_same_row(self) -> None:
+        with patch("app.services.model_call_accounting.SessionLocal", return_value=self.db):
+            tracker = ModelCallTracker(
+                model_id=7,
+                user_id=3,
+                source=ModelCallSource.AGENT,
+                source_id="run-inflight",
+            )
+            row = self.db.get(ModelCallRecord, tracker.record_id)
+            assert row is not None
+            self.assertEqual(row.status, ModelCallStatus.RUNNING)
+            self.assertIsNone(row.finished_at)
+
+            tracker.complete(AIMessage(content="done"))
+
+        rows = self.db.query(ModelCallRecord).filter(ModelCallRecord.source_id == "run-inflight").all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, ModelCallStatus.COMPLETED)
+        self.assertIsNotNone(rows[0].finished_at)

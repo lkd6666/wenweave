@@ -60,7 +60,7 @@ export interface TokenResponse {
   token_type: string
 }
 
-export type ProviderType = 'openai_compatible' | 'anthropic'
+export type ProviderType = 'openai_compatible' | 'openai_responses' | 'anthropic'
 
 export interface AIModelItem {
   id: number
@@ -75,6 +75,8 @@ export interface AIModelItem {
   is_default: boolean
   is_multimodal: boolean
   supports_disabled_thinking: boolean
+  default_thinking_effort: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  prompt_cache_enabled: boolean
   access_mode: 'all' | 'restricted'
   allowed_user_ids: number[]
   allowed_group_ids: number[]
@@ -133,8 +135,25 @@ export interface AIProviderItem {
   name: string
   provider_type: ProviderType
   base_url: string
+  image_protocol: '' | 'openai_images' | 'dashscope_images' | 'volcengine_ark_images'
+  image_base_url: string
   api_key_masked: string
   models: AIModelItem[]
+  image_models: AIImageModelItem[]
+}
+
+export interface AIImageModelItem {
+  id: number
+  provider_id: number
+  model_name: string
+  display_name: string
+  description: string
+  supported_aspect_ratios: Array<'square' | 'portrait' | 'landscape'>
+  supported_qualities: string[]
+  is_default: boolean
+  access_mode: 'all' | 'restricted'
+  allowed_user_ids: number[]
+  allowed_group_ids: number[]
 }
 
 export interface ModelPresetItem {
@@ -367,7 +386,7 @@ export type ChatRole = 'user' | 'assistant' | 'tool'
 
 export type AgentRunStatus = 'pending' | 'running' | 'waiting_for_input' | 'cancelling' | 'completed' | 'cancelled' | 'failed'
 
-export type ToolExecutionStatus = 'running' | 'waiting' | 'success' | 'error'
+export type ToolExecutionStatus = 'running' | 'waiting' | 'success' | 'error' | 'interrupted'
 
 export interface ChatUserQuestionOption {
   id: string
@@ -422,6 +441,7 @@ export interface ToolExecution {
   arguments: Record<string, unknown>
   status: ToolExecutionStatus
   preparing?: boolean
+  argument_tokens?: number
   result?: string | null
   html_changed: boolean
   activity?: ToolActivity | null
@@ -605,8 +625,62 @@ export interface ChatSessionItem {
     apply_mode: GzhApplyMode
     status: string
   } | null
+  image_model_id: number | null
+  auto_image_generation_enabled: boolean
   created_at: string
   updated_at: string
+}
+
+export type ImageGenerationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export type ImageGenerationPurpose = 'cover' | 'body'
+
+export interface GeneratedImageAsset {
+  id: string
+  generation_id: string
+  url: string
+  content_type: string
+  size: number
+  width: number
+  height: number
+  revised_prompt: string
+  is_applied: boolean
+  applied_at: string | null
+  created_at: string
+}
+
+export interface ImageGenerationItem {
+  id: string
+  document_id: number
+  session_id: number | null
+  model_id: number
+  source: 'editor' | 'agent'
+  purpose: ImageGenerationPurpose
+  prompt: string
+  quantity: number
+  aspect_ratio: 'square' | 'portrait' | 'landscape'
+  quality: string
+  anchor_block_id: string
+  direct_insert: boolean
+  status: ImageGenerationStatus
+  error_message: string
+  usage: Record<string, unknown>
+  created_at: string
+  updated_at: string
+  finished_at: string | null
+  assets: GeneratedImageAsset[]
+}
+
+export interface SelectedElementFingerprint {
+  tag_name: string
+  stable_attributes: Record<string, string>
+  text: string
+}
+
+export interface SelectedElementLocator {
+  path: string
+  parent_path: string
+  sibling_index: number
+  fingerprint: SelectedElementFingerprint
 }
 
 export interface SelectedElementContext {
@@ -614,6 +688,7 @@ export interface SelectedElementContext {
   tag_name: string
   html: string
   text: string
+  locator?: SelectedElementLocator
 }
 
 export interface ComplianceReport {
@@ -776,6 +851,21 @@ export interface TemplateItem {
   image_warnings: TemplateImageWarning[]
   created_at: string
   updated_at: string
+}
+
+export interface TemplateImageLocalizationItem {
+  template_id: number
+  name: string
+  status: 'updated' | 'unchanged' | 'failed'
+  localized_count: number
+  message: string
+}
+
+export interface TemplateImageLocalizationResult {
+  items: TemplateImageLocalizationItem[]
+  updated_count: number
+  failed_count: number
+  localized_count: number
 }
 
 export interface TemplateGeneration {

@@ -4,6 +4,7 @@ import { ClockCircleOutlined, CloudServerOutlined, FileUnknownOutlined } from '@
 import { useParams } from 'react-router'
 import { publicSharesApi, PublicShareError, type PublicDocumentShare } from '../api/publicShares'
 import { frameDocumentWithNewWindowLinks, SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { ARTICLE_RENDER_CSS, ARTICLE_RENDER_ROOT_CLASS, ARTICLE_RENDER_VIEWPORT } from '../utils/articleFrame'
 
 const POLL_INTERVAL_MS = 15_000
 const ASSET_REFRESH_MARGIN_MS = 30_000
@@ -158,8 +159,38 @@ export default function PublicSharePage() {
       ? `<section class="share-covers" aria-label="文章封面">${coverCropMarkup(share.cover_url, title, parseCoverCrop(share.cover_crop_235_1), 2.35, '2.35 : 1')}${coverCropMarkup(share.cover_url, title, parseCoverCrop(share.cover_crop_1_1), 1, '1 : 1')}</section>`
       : ''
     const body = share?.html ?? ''
-    return frameDocumentWithNewWindowLinks(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><style>html,body{margin:0;min-height:100%;background:#fff;scrollbar-width:none;-ms-overflow-style:none}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none}body{overflow-wrap:anywhere;font:15px/2 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#171717}.share-header{padding:18px 20px 14px;background:#f4f6f8}.share-header h1{margin:0;color:#15191d;font-size:22px;font-weight:650;line-height:1.35}.share-header time{display:block;margin-top:5px;color:#687480;font-size:12px;line-height:1.5}.share-covers{display:grid;grid-template-columns:minmax(0,2.35fr) minmax(92px,1fr);gap:12px;padding:0 20px 14px;background:#fff}.share-cover{min-width:0;margin:0}.share-cover-frame{position:relative;overflow:hidden;background:#eef1f4}.share-cover-frame img{display:block;width:100%;height:100%;object-fit:cover}.share-cover-frame img.is-cropped{max-width:none;height:auto;object-fit:initial}.share-cover figcaption{margin-top:5px;color:#7a8591;font-size:11px;line-height:1.4}.share-content{box-sizing:border-box;min-height:100%;padding:18px 14px 36px;border-top:1px solid #dfe4e8}img,video,table{max-width:100%;height:auto}table{display:block;overflow-x:auto}a{color:#1677ff}@media (max-width:720px){.share-header{padding:14px 16px 10px}.share-header h1{font-size:19px}.share-covers{gap:8px;padding:0 16px 10px}.share-cover figcaption{margin-top:4px;font-size:10px}}</style></head><body><header class="share-header"><h1>${title}</h1><time>链接有效至 ${expiry}</time></header>${cover}<article class="share-content">${body}</article></body></html>`)
-  }, [share?.cover_crop_1_1, share?.cover_crop_235_1, share?.cover_url, share?.expires_at, share?.html, share?.title])
+    return frameDocumentWithNewWindowLinks(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="${ARTICLE_RENDER_VIEWPORT}">
+  <meta name="referrer" content="no-referrer">
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #fff; scrollbar-width: none; -ms-overflow-style: none; }
+    html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }
+    .share-header, .share-covers { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .share-header { padding: 18px 20px 14px; background: #f4f6f8; }
+    .share-header h1 { margin: 0; color: #15191d; font-size: 22px; font-weight: 650; line-height: 1.35; }
+    .share-header time { display: block; margin-top: 5px; color: #687480; font-size: 12px; line-height: 1.5; }
+    .share-covers { display: grid; grid-template-columns: minmax(0, 2.35fr) minmax(92px, 1fr); gap: 12px; padding: 0 20px 14px; background: #fff; }
+    .share-cover { min-width: 0; margin: 0; }
+    .share-cover-frame { position: relative; overflow: hidden; background: #eef1f4; }
+    .share-cover-frame img { display: block; width: 100%; height: 100%; object-fit: cover; }
+    .share-cover-frame img.is-cropped { max-width: none; height: auto; object-fit: initial; }
+    .share-cover figcaption { margin-top: 5px; color: #7a8591; font-size: 11px; line-height: 1.4; }
+    .share-content-divider { height: 1px; background: #dfe4e8; }
+    ${ARTICLE_RENDER_CSS}
+    @media (max-width: 720px) {
+      .share-header { padding: 14px 16px 10px; }
+      .share-header h1 { font-size: 19px; }
+      .share-covers { gap: 8px; padding: 0 16px 10px; }
+      .share-cover figcaption { margin-top: 4px; font-size: 10px; }
+    }
+  </style>
+</head>
+<body><header class="share-header"><h1>${title}</h1><time>链接有效至 ${expiry}</time></header>${cover}<div class="share-content-divider"></div><article class="${ARTICLE_RENDER_ROOT_CLASS}">${body}</article></body>
+</html>`)
+  }, [share])
 
   if (loading) {
     return <main className="public-share-status"><Spin size="large" /></main>

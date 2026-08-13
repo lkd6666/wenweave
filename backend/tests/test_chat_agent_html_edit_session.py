@@ -363,12 +363,13 @@ class HtmlEditSessionSafetyTests(unittest.TestCase):
         self.assertIn("同一次 Agent run 内", prompt)
         self.assertIn("不要为单个局部目标重新读取整张地图", prompt)
 
-    def test_prompt_uses_current_semantic_image_locator_for_explicit_replacements(self) -> None:
+    def test_prompt_uses_current_semantic_image_locator_for_model_decided_replacements(self) -> None:
         prompt = build_system_prompt("测试", "<p><img src='https://cdn.example/image.png'></p>")
 
         self.assertIn("涉及现有图片时先调用 `inspect_current_images`", prompt)
         self.assertIn("不得用历史图片 URL、历史 block_id 或臆测的 alt", prompt)
         self.assertIn("同一目标下的一批配图替换是单步操作", prompt)
+        self.assertIn("模型根据任务目标自行判断是否需要编辑或替换", prompt)
 
     def test_prompt_restricts_parallel_tool_calls_to_read_only_tools(self) -> None:
         prompt = build_system_prompt("测试", "<p>正文</p>")

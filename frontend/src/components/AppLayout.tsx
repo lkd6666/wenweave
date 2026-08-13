@@ -14,6 +14,7 @@ import {
   HistoryOutlined,
   DashboardOutlined,
   SettingOutlined,
+  PictureOutlined,
 } from '@ant-design/icons'
 import { DesktopOutlined, MoonOutlined, SunOutlined } from '@ant-design/icons'
 import { Outlet, useLocation, useNavigate } from 'react-router'
@@ -54,6 +55,7 @@ export default function AppLayout() {
         { key: '/admin/models', icon: <RobotOutlined />, label: 'AI 模型管理' },
         { key: '/admin/storage', icon: <CloudOutlined />, label: '存储设置' },
         { key: '/admin/branding', icon: <SettingOutlined />, label: '品牌设置' },
+        { key: '/admin/image-library', icon: <PictureOutlined />, label: '图片库设置' },
         { key: '/admin/wechat-accounts', icon: <SendOutlined />, label: '公众号账号' },
         { key: '/admin/operation-logs', icon: <HistoryOutlined />, label: '操作日志' },
         { key: '/admin/users', icon: <TeamOutlined />, label: '用户管理' },

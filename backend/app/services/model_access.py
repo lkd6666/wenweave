@@ -36,6 +36,8 @@ def accessible_models_query(query: Query, user: User) -> Query:
 
 
 def can_access_image_model(user: User, model: AIImageModel) -> bool:
+    if model.deleted_at is not None:
+        return False
     if user.role == UserRole.ADMIN or model.access_mode != "restricted":
         return True
     if any(allowed_user.id == user.id for allowed_user in model.allowed_users):
@@ -45,6 +47,7 @@ def can_access_image_model(user: User, model: AIImageModel) -> bool:
 
 
 def accessible_image_models_query(query: Query, user: User) -> Query:
+    query = query.filter(AIImageModel.deleted_at.is_(None))
     if user.role == UserRole.ADMIN:
         return query
     conditions = [

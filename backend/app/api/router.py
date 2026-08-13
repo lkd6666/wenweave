@@ -2,7 +2,7 @@
 在此处 include 即可，main.py 不需要再改动。"""
 from fastapi import APIRouter
 
-from app.api.routes import ai_providers, auth, branding, chat, compliance, document_groups, document_shares, documents, gzh_themes, image_generations, layout_references, models, operation_logs, storage, template_library, user_groups, users, wechat_accounts, workbench, workboard
+from app.api.routes import ai_providers, auth, branding, chat, compliance, document_groups, document_shares, documents, gzh_themes, image_generations, image_library, image_searches, layout_references, models, operation_logs, storage, template_library, user_groups, users, wechat_accounts, workbench, workboard
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -16,6 +16,8 @@ api_router.include_router(storage.public_router)
 api_router.include_router(document_groups.router)
 api_router.include_router(documents.router)
 api_router.include_router(image_generations.router)
+api_router.include_router(image_library.router)
+api_router.include_router(image_searches.router)
 api_router.include_router(workbench.router)
 api_router.include_router(document_shares.router)
 api_router.include_router(document_shares.public_router)

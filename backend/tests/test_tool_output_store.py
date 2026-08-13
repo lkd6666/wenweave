@@ -59,6 +59,22 @@ class ToolOutputStoreTests(unittest.TestCase):
         self.assertEqual(row.content, source)
         self.assertEqual(row.content_lines, 300)
 
+    def test_force_store_persists_a_small_capability_payload(self) -> None:
+        source = '{"items":[{"token":"short-lived-capability"}]}'
+        with patch("app.services.tool_output_store.SessionLocal", self.Factory):
+            binding = self.store.bind(
+                tool_call_id="call-capability",
+                tool_name="search_article_images",
+                content=source,
+                max_preview_tokens=512,
+                force_store=True,
+            )
+
+        self.assertTrue(binding.stored)
+        self.assertIsNotNone(binding.output_id)
+        self.assertNotEqual(binding.content, source)
+        self.assertEqual(self.db.get(ChatToolOutput, binding.output_id).content, source)
+
     def test_large_chinese_preview_keeps_the_tail_without_spinning(self) -> None:
         """Theme libraries need a head/tail preview even when they exceed the cap."""
         source = ("主题组件示例：" + ("排版内容" * 48) + "\n") * 300 + "THEME-TAIL-MARKER"

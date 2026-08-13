@@ -126,7 +126,15 @@ class ToolOutputStore:
         self.retention_days = max(1, int(retention_days or settings.CHAT_TOOL_OUTPUT_RETENTION_DAYS))
         self.storage_max_bytes = max(1, int(storage_max_bytes or settings.CHAT_TOOL_OUTPUT_MAX_BYTES))
 
-    def bind(self, *, tool_call_id: str, tool_name: str, content: str, max_preview_tokens: int) -> ToolOutputBinding:
+    def bind(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        content: str,
+        max_preview_tokens: int,
+        force_store: bool = False,
+    ) -> ToolOutputBinding:
         """Persist an oversized result and return provider-safe content.
 
         This method intentionally owns a short-lived Session. ToolNode executes
@@ -137,7 +145,7 @@ class ToolOutputStore:
         original_tokens = estimate_tokens(content)
         original_bytes = len(content.encode("utf-8"))
         preview_limit = max(MIN_PREVIEW_TOKENS, int(max_preview_tokens))
-        if original_tokens <= preview_limit:
+        if original_tokens <= preview_limit and not force_store:
             return ToolOutputBinding(content=content, original_tokens=original_tokens, original_bytes=original_bytes)
 
         # LangGraph normally guarantees a call ID. Do not associate a payload

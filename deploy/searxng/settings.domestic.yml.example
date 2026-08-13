@@ -1,0 +1,40 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - baidu images
+      - bing images
+      - sogou images
+
+engines:
+  - name: baidu images
+    disabled: false
+  - name: bing images
+    disabled: false
+    # SearXNG supports the China endpoint for instances hosted in China.
+    base_url: https://cn.bing.com
+  - name: sogou images
+    disabled: false
+
+general:
+  instance_name: yibanpaiban-domestic-image-search
+
+search:
+  safe_search: 1
+  default_lang: zh-CN
+  formats:
+    - html
+    - json
+
+outgoing:
+  request_timeout: 3.2
+  max_request_timeout: 3.5
+
+server:
+  secret_key: "replace-with-a-random-64-character-secret"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: true
+
+ui:
+  static_use_hash: true

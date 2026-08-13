@@ -10,6 +10,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from html import unescape
 from pathlib import PurePosixPath
 from tempfile import SpooledTemporaryFile
 from typing import Any, BinaryIO
@@ -46,7 +47,6 @@ BODY_IMAGE_TYPES = COVER_IMAGE_TYPES
 TEMPORARY_BODY_IMAGE_TYPES = {"image/jpeg", "image/png"}
 MAX_DRAFT_TARGETS = 100
 DRAFT_TARGET_PAGE_SIZE = 20
-MINI_PROGRAM_ATTRIBUTE_PREFIX = "data-miniprogram-"
 IMAGE_EXTENSIONS = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -59,6 +59,11 @@ SENSITIVE_QUERY_VALUE_PATTERN = re.compile(
 )
 SENSITIVE_FIELD_VALUE_PATTERN = re.compile(
     r"((?:[\"']?)(?:access_token|app_secret|secret|api[_-]?key|signature|sign)(?:[\"']?)\s*[=:]\s*(?:[\"']?))([^\s,}&\"']+)",
+    re.IGNORECASE,
+)
+BACKGROUND_IMAGE_URL_PATTERN = re.compile(
+    r"(?P<prefix>\bbackground-image\s*:\s*[^;]*?url\(\s*(?P<quote>[\"']?))"
+    r"(?P<url>[^\s\"')]+)(?P=quote)(?P<suffix>\s*\))",
     re.IGNORECASE,
 )
 
@@ -407,7 +412,6 @@ class WeChatOfficialAccountClient:
         local_image_loader: LocalImageLoader | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> DraftPushResult:
-        html = self.downgrade_mini_program_text_links(html)
         self.validate_draft_input(metadata, html)
 
         last_error: WeChatApiError | None = None
@@ -559,55 +563,26 @@ class WeChatOfficialAccountClient:
         WeChatOfficialAccountClient._validate_article(metadata, html)
 
     @staticmethod
-    def downgrade_mini_program_text_links(html: str) -> str:
-        """Keep pasted mini-program link text, but prevent attachment-card rendering."""
-        soup = BeautifulSoup(html, "html.parser")
-        for link in soup.find_all("a"):
-            classes = link.get("class") or []
-            has_mini_program_class = "weapp_text_link" in classes
-            mini_program_attributes = [
-                name for name in link.attrs if name.lower().startswith(MINI_PROGRAM_ATTRIBUTE_PREFIX)
-            ]
-            if not has_mini_program_class and not mini_program_attributes:
-                continue
-
-            remaining_classes = [name for name in classes if name != "weapp_text_link"]
-            if remaining_classes:
-                link["class"] = remaining_classes
-            else:
-                link.attrs.pop("class", None)
-            for name in mini_program_attributes:
-                link.attrs.pop(name, None)
-
-            style = str(link.get("style") or "").strip().rstrip(";")
-            style_properties = {
-                declaration.split(":", 1)[0].strip().lower()
-                for declaration in style.split(";")
-                if ":" in declaration
-            }
-            defaults: list[str] = []
-            if "font-size" not in style_properties:
-                defaults.append("font-size:15px")
-            if "color" not in style_properties:
-                defaults.append("color:#576b95")
-            if not any(name.startswith("text-decoration") for name in style_properties):
-                defaults.append("text-decoration:none")
-            if defaults:
-                style = ";".join(part for part in (style, *defaults) if part)
-                link["style"] = f"{style};"
-        return "".join(str(node) for node in soup.contents)
-
-    @staticmethod
     def body_image_sources(html: str) -> list[str]:
         soup = BeautifulSoup(html, "html.parser")
         sources: list[str] = []
+
+        def add_source(value: str) -> None:
+            source = unescape(value).strip()
+            if source and source not in sources:
+                sources.append(source)
+
         for image in soup.find_all("img"):
             source = image.get("src")
             if not isinstance(source, str) or not source.strip():
                 raise WeChatApiError("正文存在未设置 src 的图片")
-            source = source.strip()
-            if source not in sources:
-                sources.append(source)
+            add_source(source)
+        for element in soup.find_all(style=True):
+            style = element.get("style")
+            if not isinstance(style, str):
+                continue
+            for match in BACKGROUND_IMAGE_URL_PATTERN.finditer(style):
+                add_source(match.group("url"))
         return sources
 
     @staticmethod
@@ -671,7 +646,8 @@ class WeChatOfficialAccountClient:
         cached_by_source = cached_body_images or {}
         cached_by_content: dict[str, BodyImageCacheEntry] = {}
         for entry in cached_by_source.values():
-            cached_by_content.setdefault(entry.content_sha256, entry)
+            if self._is_reusable_body_image(entry):
+                cached_by_content.setdefault(entry.content_sha256, entry)
 
         replacements: dict[str, str] = {}
         cache_entries: list[BodyImageCacheEntry] = []
@@ -683,7 +659,11 @@ class WeChatOfficialAccountClient:
         for index, source in enumerate(sources, start=1):
             source_hash = self.body_image_source_sha256(source)
             cached_entry = cached_by_source.get(source_hash)
-            if cached_entry is not None and source_hash not in force_reupload_source_hashes:
+            if (
+                cached_entry is not None
+                and self._is_reusable_body_image(cached_entry)
+                and source_hash not in force_reupload_source_hashes
+            ):
                 replacements[source] = cached_entry.wechat_url
                 cached_source_hashes.add(source_hash)
                 await self._report_progress(
@@ -761,7 +741,7 @@ class WeChatOfficialAccountClient:
                         f"正文图片 {index}/{total}：正在上传微信正文图片素材（{content_type}，{payload.size // 1024} KB）…",
                     )
                     wechat_url = await self._upload_article_image(client, token, payload=payload)
-                    upload_mode = "temporary"
+                    upload_mode = "uploadimg"
                 else:
                     await self._report_progress(
                         progress_callback,
@@ -804,15 +784,41 @@ class WeChatOfficialAccountClient:
             finally:
                 payload.close()
 
+        for element in soup.find_all(style=True):
+            style = element.get("style")
+            if isinstance(style, str):
+                element["style"] = self._replace_background_image_urls(style, replacements)
         for image in soup.find_all("img"):
             source = image.get("src")
-            if isinstance(source, str) and source in replacements:
-                image["src"] = replacements[source]
+            if isinstance(source, str):
+                replacement = replacements.get(unescape(source).strip())
+                if replacement:
+                    image["src"] = replacement
         return BodyImageReplacementResult(
             html=str(soup),
             cache_entries=tuple(cache_entries),
             cached_source_hashes=frozenset(cached_source_hashes),
         )
+
+    @staticmethod
+    def _replace_background_image_urls(style: str, replacements: dict[str, str]) -> str:
+        def replace_match(match: re.Match[str]) -> str:
+            source = unescape(match.group("url")).strip()
+            replacement = replacements.get(source)
+            if not replacement:
+                return match.group(0)
+            return f"{match.group('prefix')}{replacement}{match.group('quote')}{match.group('suffix')}"
+
+        return BACKGROUND_IMAGE_URL_PATTERN.sub(replace_match, style)
+
+    @staticmethod
+    def _is_reusable_body_image(entry: BodyImageCacheEntry) -> bool:
+        """Only trust URLs created by the current article-image upload path.
+
+        Cached URLs from prior releases use a different marker and are uploaded
+        again, preventing an old or invalid material URL from reaching a draft.
+        """
+        return entry.upload_mode == "uploadimg"
 
     @staticmethod
     async def _report_progress(

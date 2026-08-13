@@ -10,6 +10,7 @@
 - **公众号草稿同步**：管理员可维护多个公众号 AppID/AppSecret，并按用户或用户组授予推送权限；编辑器支持标题、作者、摘要、原文链接、封面裁剪和评论选项，一键创建公众号草稿并保留推送记录
 - **文档导入**：支持 PDF / Word(.docx) 在浏览器本地解析；OSS 未配置时，回退为受控服务器上传
 - **对话式排版**：多轮对话 + 工具调用（局部替换 / 整体重写 / 合规自检），SSE 流式输出
+- **统一配图**：通过 SearXNG 搜索互联网图片，或使用已配置的 AI 图片模型生成候选并应用到封面、正文和现有图片
 - **Agent 编排**：基于 LangGraph 的 `model -> tools -> model` 图，实时转发 token、工具调用和源码更新
 - **排版工作台**：对话面板、实时预览、合规检测面板、源码编辑与复制
 - **高效版本历史**：采用内容寻址、压缩快照与增量提交；相同正文只保存一次，连续增量自动限制回放深度
@@ -115,6 +116,24 @@ uvicorn app.main:app --no-proxy-headers --host 0.0.0.0 --port 8001
 | `CORS_ORIGINS` | 允许跨域的前端地址（逗号分隔） | `http://localhost:5173,...` |
 | `TRUSTED_PROXY_CIDRS` | 可提供客户端地址的反向代理/CDN CIDR（逗号分隔）；多级代理需包含 Nginx、雷池与 CDN 网段；启动 Uvicorn 时须使用 `--no-proxy-headers` | 留空，不信任转发头 |
 | `DOCUMENT_SHARE_IMAGE_URL_EXPIRE_SECONDS` | 只读分享页中对象存储图片签名 URL 的最长有效期（秒） | `3600` |
+| `SEARXNG_HOST_PORT` | 本机 SearXNG 容器监听端口，可按部署环境修改 | `8088` |
+| `SEARXNG_BASE_URL` | 独立 SearXNG 搜图服务地址；远程实例必须使用 HTTPS | `http://127.0.0.1:8088` |
+| `SEARXNG_TIMEOUT_SECONDS` | 单次搜图请求总超时（秒）；图片代理下载使用独立超时 | `4` |
+| `SEARXNG_SEARCH_CACHE_SECONDS` | 规范化 SearXNG 上游页的短期缓存时间（秒） | `300` |
+| `SEARXNG_SECRET` | 与 SearXNG `server.secret_key` 相同的随机值；默认从 `deploy/searxng/.env` 读取 | 必须配置搜图时设置 |
+
+## 搜图服务
+
+编辑器“配图”入口和 Agent 搜图工具使用独立 SearXNG 服务。仓库提供
+[`deploy/searxng`](deploy/searxng) 下的单容器配置，服务仅绑定
+`127.0.0.1:8088`，不会经过应用 Nginx 暴露到公网。先从示例生成未提交的
+`settings.yml` 和随机密钥，将同一密钥写入忽略提交的 `deploy/searxng/.env`，
+再执行 `docker compose up -d`；后端和容器会读取同一份密钥。若 8088 冲突，需同时修改
+`SEARXNG_HOST_PORT` 和 `SEARXNG_BASE_URL` 中的端口，详细命令见该目录说明。
+
+搜索结果来自互联网，系统不会推断或承诺图片授权。界面会保留来源页并要求使用者在
+发布前自行确认版权；应用图片时后端会重新校验图片格式、大小和公网地址并转存到现有
+本地/对象存储，不会把搜索引擎外链直接写进文章。
 
 ## 对象存储配置
 

@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from app.core.security import hash_password
 from app.db.session import engine
 from app.models.document_version import DocumentVersion, DocumentVersionSource
 from app.models.ai_model import AIModel
-from app.models.ai_provider import AIProvider
+from app.models.ai_provider import AIProvider, ProviderType
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.agent_run_event import AgentRunEvent
 from app.models.model_call_record import ModelCallRecord, ModelCallStatus
@@ -32,15 +33,25 @@ from app.models.app_runtime_lock import AppRuntimeLock
 from app.models.operation_log import OperationLogStatus
 from app.models.schema_migration import SchemaMigration
 from app.models.gzh_theme import GzhTheme, GzhThemeVersion
-from app.services.document_activity import touch_document, touch_group
+from app.services.document_activity import repair_document_activity_timestamps, touch_document, touch_group
 from app.services.document_versions import create_document_version, migrate_legacy_document_versions
 from app.services.operation_logs import append_operation_log
 from app.services.agent_run_recovery import recover_interrupted_turn
-from app.services.model_presets import is_official_deepseek_openai_endpoint, official_deepseek_thinking_config
+from app.services.model_presets import (
+    anthropic_adaptive_thinking_config,
+    is_official_deepseek_openai_endpoint,
+    official_deepseek_thinking_config,
+)
 from app.services.wechat_compliance import run_compliance_check
 
 
-SCHEMA_REVISION = "20260808_model_prompt_cache_v1"
+SCHEMA_REVISION = "20260812_image_library_v1"
+
+
+_MYSQL_IMAGE_MODEL_ACCESS_SPECS = (
+    ("image_model_user_access", "user_id", "users"),
+    ("image_model_group_access", "group_id", "user_groups"),
+)
 
 
 @contextmanager
@@ -78,9 +89,9 @@ def schema_migration_lock() -> Iterator[None]:
     with lock_file.open("a+b") as handle:
         handle.seek(0)
         if not handle.read(1):
-            handle.seek(0)
-            handle.write(b"0")
-            handle.flush()
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -106,6 +117,98 @@ def schema_migration_lock() -> Iterator[None]:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _mysql_image_model_access_create_sql(
+    table_name: str,
+    related_column_name: str,
+    related_table_name: str,
+    model_id_type: str,
+    related_id_type: str,
+) -> str:
+    """Build a legacy-compatible association table with matching FK types."""
+
+    def validated_column_type(value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized or not re.fullmatch(r"[A-Za-z0-9(), ]+", normalized):
+            raise RuntimeError(f"不支持的 MySQL 主键类型：{value!r}")
+        return normalized
+
+    related_label = related_column_name.removesuffix("_id")
+    return (
+        f"CREATE TABLE `{table_name}` ("
+        f"`model_id` {validated_column_type(model_id_type)} NOT NULL, "
+        f"`{related_column_name}` {validated_column_type(related_id_type)} NOT NULL, "
+        f"PRIMARY KEY (`model_id`, `{related_column_name}`), "
+        f"CONSTRAINT `fk_{table_name}_model` FOREIGN KEY (`model_id`) "
+        "REFERENCES `ai_image_models` (`id`) ON DELETE CASCADE, "
+        f"CONSTRAINT `fk_{table_name}_{related_label}` FOREIGN KEY (`{related_column_name}`) "
+        f"REFERENCES `{related_table_name}` (`id`) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+def prepare_mysql_image_model_access_tables() -> None:
+    """Create image-model access tables safely against legacy MySQL parents.
+
+    Early deployments could contain signed integer IDs or MyISAM parent tables.
+    ``create_all`` normally creates the new association tables before the
+    compatibility migrator runs, which makes MySQL reject those foreign keys
+    and abort startup. Match the already-deployed parent column types here,
+    before SQLAlchemy emits its static DDL.
+    """
+
+    if not engine.url.drivername.startswith("mysql"):
+        return
+
+    with engine.begin() as connection:
+        table_rows = connection.execute(
+            text(
+                "SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN "
+                "('ai_image_models', 'users', 'user_groups', "
+                "'image_model_user_access', 'image_model_group_access')"
+            )
+        ).mappings().all()
+        table_engines = {str(row["TABLE_NAME"]): row["ENGINE"] for row in table_rows}
+
+        missing_specs = [spec for spec in _MYSQL_IMAGE_MODEL_ACCESS_SPECS if spec[0] not in table_engines]
+        required_parents = {"ai_image_models"}
+        required_parents.update(spec[2] for spec in missing_specs)
+        if not missing_specs or not required_parents.issubset(table_engines):
+            return
+
+        for parent_table in sorted(required_parents):
+            parent_engine = str(table_engines[parent_table] or "")
+            if parent_engine.lower() == "innodb":
+                continue
+            connection.execute(text(f"ALTER TABLE `{parent_table}` ENGINE=InnoDB"))
+
+        column_rows = connection.execute(
+            text(
+                "SELECT TABLE_NAME, COLUMN_TYPE FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = 'id' "
+                "AND TABLE_NAME IN ('ai_image_models', 'users', 'user_groups')"
+            )
+        ).mappings().all()
+        id_types = {str(row["TABLE_NAME"]): str(row["COLUMN_TYPE"]) for row in column_rows}
+
+        for table_name, related_column_name, related_table_name in missing_specs:
+            model_id_type = id_types.get("ai_image_models")
+            related_id_type = id_types.get(related_table_name)
+            if not model_id_type or not related_id_type:
+                continue
+            connection.execute(
+                text(
+                    _mysql_image_model_access_create_sql(
+                        table_name,
+                        related_column_name,
+                        related_table_name,
+                        model_id_type,
+                        related_id_type,
+                    )
+                )
+            )
 
 
 def _legacy_snapshot_prefix_hash(rows: list[dict]) -> str:
@@ -333,6 +436,76 @@ def migrate_schema() -> None:
             connection.execute(
                 text("UPDATE storage_configs SET provider = 'aliyun_oss' WHERE provider IS NULL OR TRIM(provider) = ''")
             )
+        if inspector.has_table("image_generations"):
+            image_generation_columns = {column["name"] for column in inspector.get_columns("image_generations")}
+            for column_name, definition in {
+                "operation": "VARCHAR(16) NOT NULL DEFAULT 'generate'",
+                "source_image_url": "VARCHAR(4096) NOT NULL DEFAULT ''",
+                "source_image_hash": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "source_asset_url": "VARCHAR(4096) NOT NULL DEFAULT ''",
+                "source_object_key": "VARCHAR(512) NOT NULL DEFAULT ''",
+                "source_storage_mode": "VARCHAR(12) NOT NULL DEFAULT ''",
+                "target_image_index": "INTEGER NOT NULL DEFAULT -1",
+                "timeout_seconds": "INTEGER NOT NULL DEFAULT 180",
+            }.items():
+                if column_name not in image_generation_columns:
+                    connection.execute(text(f"ALTER TABLE image_generations ADD COLUMN {column_name} {definition}"))
+        if inspector.has_table("image_library_assets"):
+            image_library_columns = {column["name"] for column in inspector.get_columns("image_library_assets")}
+            for column_name, definition in {
+                "is_shared": "BOOLEAN NOT NULL DEFAULT 0",
+                "deleted_at": "DATETIME NULL",
+                "updated_at": "DATETIME NULL",
+            }.items():
+                if column_name not in image_library_columns:
+                    connection.execute(text(f"ALTER TABLE image_library_assets ADD COLUMN {column_name} {definition}"))
+            connection.execute(
+                text("UPDATE image_library_assets SET updated_at = created_at WHERE updated_at IS NULL")
+            )
+            if not is_sqlite:
+                updated_at_definition = connection.execute(
+                    text(
+                        "SELECT IS_NULLABLE, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'image_library_assets' "
+                        "AND COLUMN_NAME = 'updated_at'"
+                    )
+                ).mappings().one()
+                has_current_timestamp_default = "current_timestamp" in str(
+                    updated_at_definition["COLUMN_DEFAULT"] or ""
+                ).lower()
+                has_on_update = "on update current_timestamp" in str(
+                    updated_at_definition["EXTRA"] or ""
+                ).lower()
+                if (
+                    updated_at_definition["IS_NULLABLE"] != "NO"
+                    or not has_current_timestamp_default
+                    or not has_on_update
+                ):
+                    connection.execute(
+                        text(
+                            "ALTER TABLE image_library_assets MODIFY COLUMN updated_at "
+                            "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+                        )
+                    )
+            image_library_indexes = {index["name"] for index in inspector.get_indexes("image_library_assets")}
+            for index_name, columns in {
+                "ix_image_library_assets_is_shared": "is_shared",
+                "ix_image_library_assets_deleted_at": "deleted_at",
+            }.items():
+                if index_name not in image_library_indexes:
+                    connection.execute(text(f"CREATE INDEX {index_name} ON image_library_assets ({columns})"))
+        if inspector.has_table("image_library_settings"):
+            settings_insert = "INSERT OR IGNORE" if is_sqlite else "INSERT IGNORE"
+            connection.execute(
+                text(f"{settings_insert} INTO image_library_settings (id, mode) VALUES (1, 'personal')")
+            )
+        if inspector.has_table("ai_image_models"):
+            image_model_columns = {column["name"] for column in inspector.get_columns("ai_image_models")}
+            if "deleted_at" not in image_model_columns:
+                connection.execute(text("ALTER TABLE ai_image_models ADD COLUMN deleted_at DATETIME NULL"))
+            image_model_indexes = {index["name"] for index in inspector.get_indexes("ai_image_models")}
+            if "ix_ai_image_models_deleted_at" not in image_model_indexes:
+                connection.execute(text("CREATE INDEX ix_ai_image_models_deleted_at ON ai_image_models (deleted_at)"))
         # SQLAlchemy stores DocumentSourceType member names in native MySQL ENUM
         # columns. Existing deployments need this explicit expansion before a
         # newer import source can be persisted.
@@ -358,28 +531,28 @@ def migrate_schema() -> None:
             }.items():
                 if column_name not in provider_columns:
                     connection.execute(text(f"ALTER TABLE ai_providers ADD COLUMN {column_name} {definition}"))
-            provider_type_column = provider_columns.get("provider_type")
-            provider_enum_values = ("OPENAI_COMPATIBLE", "OPENAI_RESPONSES", "ANTHROPIC")
-            existing_provider_values = set(
-                getattr(provider_type_column["type"], "enums", ()) if provider_type_column else ()
-            )
-            if not set(provider_enum_values).issubset(existing_provider_values):
-                provider_enum_definition = ", ".join(f"'{value}'" for value in provider_enum_values)
-                connection.execute(
-                    text(
-                        "ALTER TABLE ai_providers MODIFY COLUMN provider_type "
-                        f"ENUM({provider_enum_definition}) NOT NULL"
-                    )
+            if not is_sqlite:
+                provider_type_column = provider_columns.get("provider_type")
+                provider_enum_values = ("OPENAI_COMPATIBLE", "OPENAI_RESPONSES", "ANTHROPIC")
+                existing_provider_values = set(
+                    getattr(provider_type_column["type"], "enums", ()) if provider_type_column else ()
                 )
-        if inspector.has_table("chat_sessions"):
-            chat_session_columns = {column["name"] for column in inspector.get_columns("chat_sessions")}
-            for column_name, definition in {
-                "image_model_id": "BIGINT NULL",
-                "auto_image_generation_enabled": "BOOLEAN NOT NULL DEFAULT 0",
-            }.items():
-                if column_name not in chat_session_columns:
-                    connection.execute(text(f"ALTER TABLE chat_sessions ADD COLUMN {column_name} {definition}"))
-            if inspector.has_table("document_imports"):
+                if not set(provider_enum_values).issubset(existing_provider_values):
+                    provider_enum_definition = ", ".join(f"'{value}'" for value in provider_enum_values)
+                    connection.execute(
+                        text(
+                            "ALTER TABLE ai_providers MODIFY COLUMN provider_type "
+                            f"ENUM({provider_enum_definition}) NOT NULL"
+                        )
+                    )
+            if inspector.has_table("chat_sessions"):
+                chat_session_columns = {column["name"] for column in inspector.get_columns("chat_sessions")}
+                for column_name, definition in {
+                    "image_model_id": "BIGINT NULL",
+                }.items():
+                    if column_name not in chat_session_columns:
+                        connection.execute(text(f"ALTER TABLE chat_sessions ADD COLUMN {column_name} {definition}"))
+            if not is_sqlite and inspector.has_table("document_imports"):
                 import_columns = {column["name"]: column for column in inspector.get_columns("document_imports")}
                 source_type_column = import_columns.get("source_type")
                 existing_values = set(getattr(source_type_column["type"], "enums", ()) if source_type_column else ())
@@ -1430,6 +1603,11 @@ def migrate_schema() -> None:
         finally:
             migration_session.close()
 
+        # Older AI/manual saves wrote UTC wall time into MySQL DATETIME while
+        # version rows used the database clock. Restore the invariant that a
+        # document cannot predate its latest persisted edit.
+        repair_document_activity_timestamps(connection)
+
         # Older messages did not retain an author. Every persisted user turn
         # has an AgentRun, which is the authoritative historical owner. This
         # must run after closing the bound ORM session above: SQLite rolls back
@@ -1475,6 +1653,43 @@ def backfill_official_deepseek_thinking_models(db: Session) -> int:
             if not model.supports_disabled_thinking:
                 model.supports_disabled_thinking = True
                 changed += 1
+    if changed:
+        db.commit()
+    return changed
+
+
+def migrate_anthropic_thinking_models(db: Session) -> int:
+    """Replace legacy OpenAI reasoning mappings on Anthropic providers.
+
+    Previous management UI releases generated ``reasoning_effort`` for every
+    provider. Anthropic Messages uses adaptive thinking plus ``effort``
+    instead, so repair only configurations that demonstrably use that legacy
+    OpenAI field and leave native administrator configurations untouched.
+    """
+    changed = 0
+    providers = db.query(AIProvider).filter(AIProvider.provider_type == ProviderType.ANTHROPIC).all()
+    for provider in providers:
+        for model in provider.models:
+            config = model.thinking_config if isinstance(model.thinking_config, dict) else {}
+            entries = [config.get("enabled"), config.get("disabled")]
+            effort_entries = config.get("efforts")
+            if isinstance(effort_entries, dict):
+                entries.extend(effort_entries.values())
+            if not any(isinstance(entry, dict) and "reasoning_effort" in entry for entry in entries):
+                continue
+            selected_efforts = (
+                [str(effort) for effort in effort_entries if str(effort) in {"low", "medium", "high", "xhigh", "max"}]
+                if isinstance(effort_entries, dict)
+                else None
+            )
+            enabled = config.get("enabled")
+            default_effort = enabled.get("reasoning_effort") if isinstance(enabled, dict) else None
+            model.thinking_config = anthropic_adaptive_thinking_config(
+                selected_efforts, str(default_effort or "")
+            )
+            if model.default_thinking_effort not in {"auto", "low", "medium", "high", "xhigh", "max"}:
+                model.default_thinking_effort = "auto"
+            changed += 1
     if changed:
         db.commit()
     return changed

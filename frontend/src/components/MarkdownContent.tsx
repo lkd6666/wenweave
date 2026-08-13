@@ -5,6 +5,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import CodeBlock from './CodeBlock'
+import { AiDataTable, AiTextResponse } from './AiOutput'
 
 interface MarkdownContentProps {
   content: string
@@ -48,9 +49,7 @@ export function normalizeMathMarkdown(content: string): string {
 const markdownComponents: Components = {
   pre: ({ children }) => <>{children}</>,
   table: ({ children, ...props }) => (
-    <div className="markdown-table-scroll">
-      <table {...props}>{children}</table>
-    </div>
+    <AiDataTable><table {...props}>{children}</table></AiDataTable>
   ),
   code: ({ className, children, ...props }) => {
     const code = String(children).replace(/\n$/, '')
@@ -66,7 +65,7 @@ const markdownComponents: Components = {
 /** AI 消息使用安全的 Markdown 子集渲染；不启用 raw HTML。 */
 export default function MarkdownContent({ content }: MarkdownContentProps) {
   return (
-    <div className="markdown-content">
+    <AiTextResponse><div className="markdown-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
@@ -74,6 +73,6 @@ export default function MarkdownContent({ content }: MarkdownContentProps) {
       >
         {normalizeMathMarkdown(content)}
       </ReactMarkdown>
-    </div>
+    </div></AiTextResponse>
   )
 }

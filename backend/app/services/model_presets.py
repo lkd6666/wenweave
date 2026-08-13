@@ -69,13 +69,43 @@ def _openai_reasoning_config() -> dict[str, Any]:
 
 
 def _anthropic_thinking_config() -> dict[str, Any]:
+    """Return Anthropic Messages settings for adaptive-thinking Claude models.
+
+    This is deliberately different from OpenAI's ``reasoning_effort``.
+    ``ChatAnthropic`` serializes ``effort`` into ``output_config.effort``.
+    """
+    efforts = ("low", "medium", "high", "xhigh", "max")
     return {
-        "enabled": {"thinking": {"type": "enabled", "budget_tokens": 4096}},
+        "enabled": {"thinking": {"type": "adaptive"}, "effort": "medium"},
         "disabled": {},
         "efforts": {
-            "low": {"thinking": {"type": "enabled", "budget_tokens": 1024}},
-            "medium": {"thinking": {"type": "enabled", "budget_tokens": 4096}},
-            "high": {"thinking": {"type": "enabled", "budget_tokens": 8192}},
+            effort: {"thinking": {"type": "adaptive"}, "effort": effort}
+            for effort in efforts
+        },
+    }
+
+
+def anthropic_adaptive_thinking_config(
+    efforts: list[str] | None = None, default_effort: str | None = None
+) -> dict[str, Any]:
+    """Build a native Anthropic thinking mapping, optionally narrowed by effort."""
+    supported = ("low", "medium", "high", "xhigh", "max")
+    selected = [effort for effort in (efforts or list(supported)) if effort in supported]
+    if not selected:
+        selected = list(supported)
+    if default_effort in supported and default_effort not in selected:
+        selected.append(default_effort)
+    resolved_default_effort = (
+        default_effort
+        if default_effort in selected
+        else ("medium" if "medium" in selected else selected[0])
+    )
+    return {
+        "enabled": {"thinking": {"type": "adaptive"}, "effort": resolved_default_effort},
+        "disabled": {},
+        "efforts": {
+            effort: {"thinking": {"type": "adaptive"}, "effort": effort}
+            for effort in selected
         },
     }
 

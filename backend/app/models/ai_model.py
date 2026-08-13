@@ -89,3 +89,7 @@ class AIModel(Base):
     @property
     def allowed_group_ids(self) -> list[int]:
         return [group.id for group in self.allowed_groups]
+
+    @property
+    def provider_name(self) -> str:
+        return self.provider.name if self.provider is not None else ""

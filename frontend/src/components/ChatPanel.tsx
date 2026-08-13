@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { CSSProperties, UIEvent } from 'react'
+import { useStickToBottom } from 'use-stick-to-bottom'
 import { Alert, Button, Collapse, Drawer, Dropdown, Grid, Image, Input, Modal, Popover, Select, Tag, Tooltip, Typography, message } from 'antd'
 import {
   AppstoreOutlined,
@@ -9,7 +10,6 @@ import {
   CheckOutlined,
   CheckCircleFilled,
   CodeOutlined,
-  ClockCircleOutlined,
   DownOutlined,
   DragOutlined,
   EditOutlined,
@@ -47,10 +47,23 @@ import type { AIModelItem } from '../types'
 import MarkdownContent from './MarkdownContent'
 import CodeBlock from './CodeBlock'
 import PromptComposer from './PromptComposer'
+import { resolveOutgoingReferences } from './PromptComposer'
 import type { PromptComposerHandle } from './PromptComposer'
 import ElementRenderPreview from './ElementRenderPreview'
 import UserQuestionPanel from './UserQuestionPanel'
 import type { UserQuestionAnswer } from './UserQuestionPanel'
+import {
+  AiFileDiff,
+  AiComparisonTable,
+  AiInlineCitation,
+  AiStreamingText,
+  AiTextResponse,
+  AiThinkingReasoning,
+  AiTodoList,
+  AiToolCall,
+  AiWebSearch,
+} from './AiOutput'
+import { aiDiffRows } from './aiOutputDiff'
 
 const { Text } = Typography
 
@@ -69,6 +82,7 @@ export interface ReaskConflictNotice {
 export interface QueuedChatMessage {
   id: string
   content: string
+  images: ChatImageAttachment[]
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -106,10 +120,18 @@ const TOOL_LABELS: Record<string, string> = {
   search_session_history: '检索会话历史',
   read_session_detail: '读取会话详情',
   validate_gzh_html: '主题严格检查',
+  search_article_images: '搜索文章配图',
+  view_article_images: '查看文章图片',
+  import_searched_image: '导入搜索图片',
+  apply_searched_cover: '设为搜索封面',
+  generate_article_images: '生成文章配图',
+  apply_generated_cover: '设为 AI 封面',
+  edit_article_image: '编辑文章图片',
+  apply_edited_image: '应用编辑图片',
+  edit_article_cover: '编辑文章封面',
+  apply_edited_cover: '应用编辑封面',
 }
 
-const BOTTOM_FOLLOW_THRESHOLD = 48
-const USER_SCROLL_INTENT_WINDOW_MS = 250
 const MemoMarkdownContent = memo(MarkdownContent)
 const CONTEXT_BREAKDOWN_LABELS: Record<string, string> = {
   system: '系统提示',
@@ -135,12 +157,6 @@ const CONTEXT_BREAKDOWN_COLORS: Record<string, string> = {
   selected_context: '#ba9aaf',
   runtime_output: '#5d8c5a',
 }
-const TASK_PLAN_STATUS_LABELS: Record<TaskPlanItem['status'], string> = {
-  pending: '待办',
-  in_progress: '进行中',
-  done: '已完成',
-}
-
 const THINKING_EFFORT_LABELS: Record<string, string> = {
   minimal: '极简',
   low: '低',
@@ -156,10 +172,6 @@ function formatThinkingEffort(effort: string): string {
 
 interface TaskPlan {
   items: TaskPlanItem[]
-}
-
-function isNearBottom(container: HTMLElement): boolean {
-  return container.scrollHeight - container.scrollTop - container.clientHeight < BOTTOM_FOLLOW_THRESHOLD
 }
 
 // AssistantTurnTimeline.vue renders every live delta through its Markdown
@@ -220,6 +232,15 @@ export function supportsDisabledThinkingOption(
     && model.supports_disabled_thinking !== false
     && !temporarilyUnsupportedThinkingModelIds.has(model.id),
   )
+}
+
+export function visibleTemplateReferenceIndexes(content: string, templateCount: number): Set<number> {
+  const indexes = new Set<number>()
+  for (const match of content.matchAll(/@组件(\d+)/g)) {
+    const index = Number(match[1]) - 1
+    if (index >= 0 && index < templateCount) indexes.add(index)
+  }
+  return indexes
 }
 
 function ContextUsage({
@@ -490,111 +511,24 @@ export default function ChatPanel({
   const [editingQueuedContent, setEditingQueuedContent] = useState('')
   const [draggedQueuedMessageId, setDraggedQueuedMessageId] = useState<string | null>(null)
   const [queuedDropTargetId, setQueuedDropTargetId] = useState<string | null>(null)
-  const listRef = useRef<HTMLDivElement>(null)
-  const listContentRef = useRef<HTMLDivElement>(null)
   const composerRef = useRef<PromptComposerHandle>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
-  const followStreamRef = useRef(true)
-  const lastScrollTopRef = useRef(0)
-  const lastScrollHeightRef = useRef(0)
-  const lastClientHeightRef = useRef(0)
-  const userScrollIntentUntilRef = useRef(0)
-  const scrollFrameRef = useRef<number | null>(null)
-  const scrollSettleFrameRef = useRef<number | null>(null)
-  const pendingVisibleScrollRef = useRef(false)
-  const pendingVisibleForceScrollRef = useRef(false)
-  const queuedForceScrollRef = useRef(false)
-  const hasPositionedInitialHistoryRef = useRef(false)
-
-  const forceScrollToLatest = useCallback(() => {
-    const container = listRef.current
-    if (!container) return
-    container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight)
-    followStreamRef.current = true
-    lastScrollTopRef.current = container.scrollTop
-    lastScrollHeightRef.current = container.scrollHeight
-    lastClientHeightRef.current = container.clientHeight
-  }, [])
-
-  const scheduleFollowScroll = useCallback((force = false) => {
-    if (document.hidden) {
-      pendingVisibleScrollRef.current = true
-      pendingVisibleForceScrollRef.current = pendingVisibleForceScrollRef.current || force
-      return
-    }
-    queuedForceScrollRef.current = queuedForceScrollRef.current || force
-    if (scrollFrameRef.current !== null) return
-    scrollFrameRef.current = window.requestAnimationFrame(() => {
-      scrollFrameRef.current = null
-      const shouldForce = queuedForceScrollRef.current
-      queuedForceScrollRef.current = false
-      const scrollToLatest = () => {
-        const container = listRef.current
-        if (!container) return false
-        // User intent takes precedence over content growth. Once the user has
-        // scrolled upward, only an explicit action or returning to the bottom
-        // may restore following.
-        if (!shouldForce && !followStreamRef.current) return false
-        container.scrollTop = container.scrollHeight
-        followStreamRef.current = true
-        lastScrollTopRef.current = container.scrollTop
-        lastScrollHeightRef.current = container.scrollHeight
-        lastClientHeightRef.current = container.clientHeight
-        return true
-      }
-
-      if (!scrollToLatest()) return
-      // Markdown, code highlighting and collapsed panels can grow after the
-      // first paint. Settle once more on the next frame so the visible latest
-      // message is reliably at the bottom.
-      if (scrollSettleFrameRef.current !== null) {
-        window.cancelAnimationFrame(scrollSettleFrameRef.current)
-      }
-      scrollSettleFrameRef.current = window.requestAnimationFrame(() => {
-        scrollSettleFrameRef.current = null
-        scrollToLatest()
-      })
-    })
-  }, [])
-
-  useEffect(() => {
-    const onVisibilityChange = () => {
-      if (document.hidden || !pendingVisibleScrollRef.current) return
-      const force = pendingVisibleForceScrollRef.current
-      pendingVisibleScrollRef.current = false
-      pendingVisibleForceScrollRef.current = false
-      scheduleFollowScroll(force)
-    }
-    document.addEventListener('visibilitychange', onVisibilityChange)
-    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
-  }, [scheduleFollowScroll])
-
-  useEffect(() => {
-    const content = listContentRef.current
-    if (!content || typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(() => scheduleFollowScroll())
-    observer.observe(content)
-    return () => observer.disconnect()
-  }, [scheduleFollowScroll])
-
-  useEffect(() => {
-    const content = listContentRef.current
-    if (!content || typeof MutationObserver === 'undefined') return
-    const observer = new MutationObserver(() => scheduleFollowScroll())
-    observer.observe(content, { childList: true, characterData: true, subtree: true })
-    return () => observer.disconnect()
-  }, [scheduleFollowScroll])
-
-  useEffect(() => () => {
-    if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current)
-    if (scrollSettleFrameRef.current !== null) window.cancelAnimationFrame(scrollSettleFrameRef.current)
-  }, [])
+  const {
+    scrollRef: messageListRef,
+    contentRef: messageListContentRef,
+    scrollToBottom,
+    isAtBottom,
+  } = useStickToBottom({ initial: 'instant', resize: 'instant' })
 
   const handleSend = () => {
-    const payload = composerRef.current?.getPayload() ?? {
+    const composerPayload = composerRef.current?.getPayload() ?? {
       message: composerDraft.trim(),
-      references: selectedElements,
+      references: [],
       templateIds: composerTemplates.map((template) => template.id),
+    }
+    const payload = {
+      ...composerPayload,
+      references: resolveOutgoingReferences(composerPayload.references, selectedElements),
     }
     const text = payload.message || (payload.references.length > 0
       ? '请处理所附元素。'
@@ -612,9 +546,8 @@ export default function ChatPanel({
       message.error('当前模型的压缩阈值不足以容纳此文档，请选择更大上下文模型或在模型管理中调整预算')
       return
     }
-    followStreamRef.current = true
     onSend(text, payload.references, imageAttachments)
-    scheduleFollowScroll(true)
+    void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
   }
 
   const handleInputChange = useCallback((value: string) => {
@@ -662,36 +595,6 @@ export default function ChatPanel({
       cancelQueuedMessageEdit()
     }
   }, [editingQueuedMessageId, queuedMessages])
-
-  const handleMessageScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
-    if (event.target !== event.currentTarget) return
-    const container = event.currentTarget
-    const currentTop = container.scrollTop
-    const nearBottom = isNearBottom(container)
-    const layoutChanged = (
-      container.scrollHeight !== lastScrollHeightRef.current
-      || container.clientHeight !== lastClientHeightRef.current
-    )
-    const hasRecentUserScrollIntent = performance.now() < userScrollIntentUntilRef.current
-
-    // Completing a tool can collapse its detail panel. The browser then clamps
-    // scrollTop downward, which is not user intent and must not stop following.
-    if (nearBottom) {
-      followStreamRef.current = true
-    } else if (
-      currentTop < lastScrollTopRef.current - 10
-      && (hasRecentUserScrollIntent || !layoutChanged)
-    ) {
-      followStreamRef.current = false
-    }
-    lastScrollTopRef.current = currentTop
-    lastScrollHeightRef.current = container.scrollHeight
-    lastClientHeightRef.current = container.clientHeight
-  }, [])
-
-  const markMessageListUserScrollIntent = useCallback(() => {
-    userScrollIntentUntilRef.current = performance.now() + USER_SCROLL_INTENT_WINDOW_MS
-  }, [])
 
   const selectedModel = models.find((model) => model.id === modelId)
   const isMultimodal = Boolean(selectedModel?.is_multimodal)
@@ -864,17 +767,8 @@ export default function ChatPanel({
       ]
 
   useLayoutEffect(() => {
-    if (!hasPositionedInitialHistoryRef.current && messages.length > 0) {
-      hasPositionedInitialHistoryRef.current = true
-      forceScrollToLatest()
-      const frame = window.requestAnimationFrame(forceScrollToLatest)
-      return () => {
-        window.cancelAnimationFrame(frame)
-      }
-    }
-    if (messages.length === 0) hasPositionedInitialHistoryRef.current = false
-    scheduleFollowScroll()
-  }, [conversationError, forceScrollToLatest, messages, pendingUserQuestion, queuedMessages, reasoningTrace, runtimeContextCompacting, scheduleFollowScroll, streamBlocks, streamNotice, streamText, streaming, toolActivities])
+    void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
+  }, [activeChatSession?.id, scrollToBottom])
 
   return (
     <>
@@ -1062,16 +956,9 @@ export default function ChatPanel({
 
       {taskPlan && <TaskPlanPanel plan={taskPlan} live={streaming} />}
 
-      <div
-        className="chat-messages"
-        ref={listRef}
-        onScroll={handleMessageScroll}
-        onWheelCapture={markMessageListUserScrollIntent}
-        onTouchMoveCapture={markMessageListUserScrollIntent}
-        onPointerDownCapture={markMessageListUserScrollIntent}
-        onKeyDownCapture={markMessageListUserScrollIntent}
-      >
-        <div className="chat-messages-content" ref={listContentRef}>
+      <div className="chat-messages-shell">
+        <div className="chat-messages" ref={messageListRef}>
+          <div className="chat-messages-content" ref={messageListContentRef}>
         {messages.length === 0 && !streaming && (
           <div className="chat-empty">
             <Text strong>开始排版对话</Text>
@@ -1192,28 +1079,45 @@ export default function ChatPanel({
                       </span>
                     </div>
                     <div className="chat-queue-content">
-                      {isEditing ? (
-                        <Input.TextArea
-                          aria-label={`编辑待处理任务 ${index + 1}`}
-                          autoFocus
-                          autoSize={{ minRows: 2, maxRows: 6 }}
-                          className="chat-queue-editor"
-                          value={editingQueuedContent}
-                          onChange={(event) => setEditingQueuedContent(event.target.value)}
-                          onKeyDown={(event) => {
-                            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                              event.preventDefault()
-                              saveQueuedMessageEdit()
-                            }
-                            if (event.key === 'Escape') {
-                              event.preventDefault()
-                              cancelQueuedMessageEdit()
-                            }
-                          }}
-                        />
-                      ) : (
-                        <div className="chat-queue-message">{queuedMessage.content}</div>
-                      )}
+                      <div className="chat-queue-request">
+                        {queuedMessage.images.length > 0 && (
+                          <div className="chat-queue-images" aria-label="待处理图片">
+                            <Image.PreviewGroup>
+                              {queuedMessage.images.map((image) => (
+                                <Image
+                                  className="chat-queue-image"
+                                  key={image.id}
+                                  src={image.preview_url}
+                                  alt={image.filename}
+                                  preview={{ mask: <span className="chat-history-image-mask"><ZoomInOutlined />放大</span> }}
+                                />
+                              ))}
+                            </Image.PreviewGroup>
+                          </div>
+                        )}
+                        {isEditing ? (
+                          <Input.TextArea
+                            aria-label={`编辑待处理任务 ${index + 1}`}
+                            autoFocus
+                            autoSize={{ minRows: 2, maxRows: 6 }}
+                            className="chat-queue-editor"
+                            value={editingQueuedContent}
+                            onChange={(event) => setEditingQueuedContent(event.target.value)}
+                            onKeyDown={(event) => {
+                              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                                event.preventDefault()
+                                saveQueuedMessageEdit()
+                              }
+                              if (event.key === 'Escape') {
+                                event.preventDefault()
+                                cancelQueuedMessageEdit()
+                              }
+                            }}
+                          />
+                        ) : (
+                          <div className="chat-queue-message">{queuedMessage.content}</div>
+                        )}
+                      </div>
                     </div>
                     <div className="chat-queue-actions">
                       {isEditing ? (
@@ -1252,7 +1156,21 @@ export default function ChatPanel({
             </div>
           </section>
         )}
+          </div>
         </div>
+        {!isAtBottom && (
+          <Tooltip title="回到最新">
+            <Button
+              aria-label="回到最新"
+              className="chat-scroll-to-latest"
+              shape="circle"
+              icon={<ArrowDownOutlined />}
+              onClick={() => {
+                void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
+              }}
+            />
+          </Tooltip>
+        )}
       </div>
 
       <div className="chat-input-area">
@@ -1271,21 +1189,28 @@ export default function ChatPanel({
             <>
           {imageAttachments.length > 0 && (
             <div className="chat-image-attachments" aria-label="待发送图片">
-              {imageAttachments.map((attachment) => (
-                <div className="chat-image-attachment" key={attachment.id}>
-                  <img src={attachment.preview_url} alt={attachment.filename} />
-                  <Tooltip title="移除图片">
-                    <Button
-                      aria-label={`移除图片 ${attachment.filename}`}
-                      size="small"
-                      type="text"
-                      icon={<CloseOutlined />}
-                      disabled={composerDisabled}
-                      onClick={() => onRemoveImage(attachment)}
+              <Image.PreviewGroup>
+                {imageAttachments.map((attachment) => (
+                  <div className="chat-image-attachment" key={attachment.id}>
+                    <Image
+                      className="chat-image-attachment-preview"
+                      src={attachment.preview_url}
+                      alt={attachment.filename}
+                      preview={{ mask: <span className="chat-history-image-mask"><ZoomInOutlined />放大</span> }}
                     />
-                  </Tooltip>
-                </div>
-              ))}
+                    <Tooltip title="移除图片">
+                      <Button
+                        aria-label={`移除图片 ${attachment.filename}`}
+                        size="small"
+                        type="text"
+                        icon={<CloseOutlined />}
+                        disabled={composerDisabled}
+                        onClick={() => onRemoveImage(attachment)}
+                      />
+                    </Tooltip>
+                  </div>
+                ))}
+              </Image.PreviewGroup>
             </div>
           )}
           {imageUploading && (
@@ -1603,11 +1528,16 @@ function latestTaskPlanFromTools(tools: ToolExecution[]): TaskPlan | null {
 }
 
 function taskPlanFromTool(tool: ToolExecution): TaskPlan | null {
-  if (tool.name !== 'update_task_plan' || tool.activity?.kind !== 'plan') return null
+  if (!isTaskPlanTool(tool)) return null
   const activity = tool.activity
+  if (!activity) return null
   const structuredItems = taskPlanItemsFromDetails(activity.details?.tasks)
   const items = structuredItems.length > 0 ? structuredItems : taskPlanItemsFromTargets(activity.targets)
   return items.length > 0 ? { items } : null
+}
+
+function isTaskPlanTool(tool: ToolExecution | null | undefined): tool is ToolExecution {
+  return tool?.name === 'update_task_plan' && tool.activity?.kind === 'plan'
 }
 
 function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
@@ -1684,54 +1614,7 @@ function isTaskPlanStatus(value: unknown): value is TaskPlanItem['status'] {
 }
 
 function TaskPlanPanel({ plan, live }: { plan: TaskPlan; live: boolean }) {
-  const [expanded, setExpanded] = useState(false)
-  const doneCount = plan.items.filter((item) => item.status === 'done').length
-  const activeTask = plan.items.find((item) => item.status === 'in_progress')
-  const nextTask = plan.items.find((item) => item.status === 'pending')
-  const summary = activeTask
-    ? `进行中：${activeTask.step}`
-    : doneCount === plan.items.length
-      ? '全部任务已完成'
-      : nextTask
-        ? `待办：${nextTask.step}`
-        : '等待执行'
-
-  return (
-    <section className={`task-plan-panel${live ? ' is-live' : ''}`} aria-label="任务清单" aria-live={live ? 'polite' : 'off'}>
-      <button
-        className="task-plan-disclosure"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
-      >
-        <span className="task-plan-panel-title"><UnorderedListOutlined />任务清单</span>
-        <span className={`task-plan-panel-summary${activeTask ? ' is-active' : ''}`} title={summary}>{summary}</span>
-        <span className="task-plan-panel-progress">{doneCount}/{plan.items.length}</span>
-        <span className="task-plan-expand-icon" aria-hidden="true">{expanded ? <UpOutlined /> : <DownOutlined />}</span>
-      </button>
-      {expanded && (
-        <ol className="task-plan-list">
-          {plan.items.map((item, index) => (
-            <li
-              key={`${item.status}-${item.step}-${index}`}
-              className={`is-${item.status}`}
-              aria-label={`${TASK_PLAN_STATUS_LABELS[item.status]}：${item.step}`}
-            >
-              <span className="task-plan-item-icon" aria-hidden="true">
-                {item.status === 'done'
-                  ? <CheckCircleFilled />
-                  : item.status === 'in_progress'
-                    ? <LoadingOutlined spin />
-                    : <ClockCircleOutlined />}
-              </span>
-              <span className="task-plan-item-step">{item.step}</span>
-              <span className="task-plan-item-status">{TASK_PLAN_STATUS_LABELS[item.status]}</span>
-            </li>
-          ))}
-        </ol>
-      )}
-    </section>
-  )
+  return <AiTodoList items={plan.items} live={live} />
 }
 
 function UserMessageContent({
@@ -1746,7 +1629,7 @@ function UserMessageContent({
   images?: ChatImageAttachment[]
 }) {
   const referencedElements = new Set<number>()
-  const referencedTemplates = new Set<number>()
+  const referencedTemplates = visibleTemplateReferenceIndexes(content, templates.length)
   const parts = content.split(/(@元素\d+|@组件\d+)/g)
   return (
     <>
@@ -1768,17 +1651,13 @@ function UserMessageContent({
         if (!templateMatch) return <span key={`${part}-${index}`}>{part}</span>
         const templateIndex = Number(templateMatch[1]) - 1
         const template = templates[templateIndex]
-        if (!template) return <span key={`${part}-${index}`}>{part}</span>
-        referencedTemplates.add(templateIndex)
+        if (!template || !referencedTemplates.has(templateIndex)) return <span key={`${part}-${index}`}>{part}</span>
         return <Tag key={`${part}-${index}`} className="chat-template-attachment">@组件{templateIndex + 1} &lt;{template.name}&gt;</Tag>
       })}
       {elements.map((element, index) => !referencedElements.has(index) && (
         <Tooltip key={`fallback-${index}`} title={<ElementRenderPreview html={element.html} />}>
           <Tag className="selected-element-tag">@元素{index + 1} &lt;{element.tag_name}&gt;</Tag>
         </Tooltip>
-      ))}
-      {templates.map((template, index) => !referencedTemplates.has(index) && (
-        <Tag key={`template-fallback-${template.id}`} className="chat-template-attachment">@组件{index + 1} &lt;{template.name}&gt;</Tag>
       ))}
       {images.length > 0 && (
         <span className="chat-history-images">
@@ -1824,16 +1703,17 @@ function AssistantTurnTimeline({
   // new user interaction and should not pollute the visible timeline.
   const timelineBlocks = rawTimelineBlocks.filter((block) => (
     block.type !== 'tool'
-    || block.tool?.activity?.details?.reason !== 'user_question_timed_out'
+    || (
+      block.tool?.activity?.details?.reason !== 'user_question_timed_out'
+      && !isTaskPlanTool(block.tool)
+    )
   ))
   const displayBlocks = streaming ? timelineBlocks : settleHistoricalTimeline(timelineBlocks)
   const recoveredAfterRestart = !streaming && fallbackContent.includes('服务已重启，未完成的 Agent 已停止')
   const [archiveExpanded, setArchiveExpanded] = useState(recoveredAfterRestart)
   const timelineRef = useRef<HTMLDivElement>(null)
-  const processResizeFrameRef = useRef<number | null>(null)
   const processFollowRef = useRef(new WeakMap<HTMLElement, boolean>())
   const processLastScrollTopRef = useRef(new WeakMap<HTMLElement, number>())
-  const lastLiveProcessDetailsRef = useRef<HTMLElement[]>([])
 
   // History is always terminal. Older records may have been persisted before
   // their last tool-result event reached the server, but must never render as
@@ -1852,25 +1732,13 @@ function AssistantTurnTimeline({
     `${block.id}:${block.state}:${block.content.length}:${block.tool?.status ?? ''}:${block.tool?.result?.length ?? 0}`
   )).join('|')
 
-  const getProcessDetailsToFollow = useCallback((): HTMLElement[] => {
-    const activeDetails = Array.from(
+  const getProcessDetailsToFollow = useCallback(() => (
+    Array.from(
       timelineRef.current?.querySelectorAll<HTMLElement>(
-        '.thinking-trace-detail.is-live, .tool-trace-detail.is-live',
+        '.aicss-thinking-reasoning-viewport.is-live, .tool-trace-detail.is-live',
       ) ?? [],
     )
-    if (activeDetails.length > 0) {
-      lastLiveProcessDetailsRef.current = activeDetails
-      return activeDetails
-    }
-
-    // A tool result is rendered in the same update that changes the tool from
-    // running to completed, which removes .is-live. Follow that prior live
-    // detail once so its freshly rendered result reaches the bottom, then clear
-    // it to avoid moving historical panels for later assistant text deltas.
-    const settledDetails = lastLiveProcessDetailsRef.current.filter((detail) => detail.isConnected)
-    lastLiveProcessDetailsRef.current = []
-    return settledDetails
-  }, [])
+  ), [])
 
   const scheduleProcessScroll = useCallback((force = false) => {
     if (!isStreamingProcess) return
@@ -1912,24 +1780,6 @@ function AssistantTurnTimeline({
     if (!isStreamingProcess) return
     scheduleProcessScroll()
   }, [isStreamingProcess, scheduleProcessScroll])
-
-  useEffect(() => {
-    const timeline = timelineRef.current
-    if (!timeline || !isStreamingProcess || typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(() => {
-      if (processResizeFrameRef.current !== null) return
-      processResizeFrameRef.current = window.requestAnimationFrame(() => {
-        processResizeFrameRef.current = null
-        scheduleProcessScroll()
-      })
-    })
-    observer.observe(timeline)
-    return () => observer.disconnect()
-  }, [isStreamingProcess, scheduleProcessScroll])
-
-  useEffect(() => () => {
-    if (processResizeFrameRef.current !== null) window.cancelAnimationFrame(processResizeFrameRef.current)
-  }, [])
 
   if (timelineBlocks.length === 0) return null
 
@@ -1981,7 +1831,7 @@ function AssistantTurnTimeline({
           ]}
         />
       )}
-      {finalContent && <div className="assistant-turn-final-content"><MemoMarkdownContent content={finalContent} /></div>}
+      {finalContent && <AiTextResponse><div className="assistant-turn-final-content"><MemoMarkdownContent content={finalContent} /></div></AiTextResponse>}
     </div>
   )
 }
@@ -2095,9 +1945,9 @@ const AssistantTimelineBlock = memo(function AssistantTimelineBlock({
 
   return (
     <div className={`assistant-action-entry assistant-action-content${archived ? ' is-archived' : ''}`}>
-      <div className="assistant-action-content-body">
-        {streaming ? <StreamingMarkdownContent content={block.content} /> : <MemoMarkdownContent content={block.content} />}
-      </div>
+      {streaming
+        ? <AiStreamingText active showCaret={false}><div className="assistant-action-content-body"><StreamingMarkdownContent content={block.content} /></div></AiStreamingText>
+        : <AiTextResponse><div className="assistant-action-content-body"><MemoMarkdownContent content={block.content} /></div></AiTextResponse>}
     </div>
   )
 })
@@ -2127,7 +1977,7 @@ function toolVisualKind(name: string): ToolVisualKind {
   if (['search_html', 'search_layout_reference'].includes(name)) return 'search'
   if (['list_history_versions', 'search_history_versions', 'search_history_version', 'compare_history_version', 'read_history_blocks', 'search_session_history', 'read_session_detail'].includes(name)) return 'history'
   if (name === 'read_tool_output') return 'read'
-  if (['inspect_current_images', 'inspect_history_images', 'generate_article_images', 'apply_generated_image'].includes(name)) return 'image'
+  if (['inspect_current_images', 'inspect_history_images', 'search_article_images', 'view_article_images', 'import_searched_image', 'apply_searched_cover', 'generate_article_images', 'apply_generated_cover', 'edit_article_image', 'apply_edited_image', 'edit_article_cover', 'apply_edited_cover'].includes(name)) return 'image'
   if (['apply_html_patch', 'replace_document'].includes(name)) return 'edit'
   if (name === 'check_compliance' || name === 'validate_gzh_html') return 'check'
   if (name === 'update_task_plan') return 'plan'
@@ -2232,31 +2082,31 @@ function ToolTrace({
     ? tool.preparing ? '正在准备工具参数' : '正在执行操作'
     : toolActionTarget(tool)
 
+  const mappedStatus = tool.status === 'running' || tool.status === 'waiting'
+    ? 'running'
+    : tool.status === 'error'
+      ? 'error'
+      : tool.status === 'interrupted'
+        ? 'cancelled'
+        : 'success'
+  const searchSources = generatedImages
+    .filter((image) => image.kind === 'search')
+    .map((image) => ({ label: image.title || image.label, href: image.sourcePageUrl || undefined }))
+
   return (
-    <Collapse
-      className="assistant-action-row assistant-action-tool-row"
-      size="small"
-      expandIconPlacement="end"
-      activeKey={expanded ? [tool.id] : []}
-      onChange={(keys) => setExpanded((Array.isArray(keys) ? keys : [keys]).includes(tool.id))}
-      items={[{
-        key: tool.id,
-        label: (
-          <span className="tool-trace-label">
-            <span className={`tool-trace-icon is-${toolVisualKind(tool.name)}`} aria-hidden="true"><ToolGlyph name={tool.name} /></span>
-            <span className="tool-trace-copy">
-              <span className={`tool-trace-title${isRunning ? ' is-running' : ''}`}>{toolLabel(tool.name)}</span>
-              <span className="tool-trace-summary-text" title={summary}>{summary}</span>
-              {tool.change_summary && !activity && <ChangeSummaryInline summary={tool.change_summary} />}
-            </span>
-            <span className={`tool-trace-status is-${statusTone}`}>
-              {argumentTokens !== null ? <ToolArgumentTokenCount value={argumentTokens} /> : status.label}
-            </span>
-          </span>
-        ),
-        children: (
-          <div className={`tool-trace-detail${isRunning ? ' is-live' : ''}`} onScroll={onProcessScroll}>
-            {activity?.targets && activity.targets.length > 0 && (
+    <AiToolCall
+      icon={<ToolGlyph name={tool.name} />}
+      iconTone={toolVisualKind(tool.name)}
+      title={toolLabel(tool.name)}
+      summary={summary}
+      status={mappedStatus}
+      expanded={expanded}
+      onToggle={() => setExpanded((value) => !value)}
+      statusDetail={<span className={`aicss-tool-call-status is-${statusTone}`}>{argumentTokens !== null ? <ToolArgumentTokenCount value={argumentTokens} /> : status.label}</span>}
+    >
+      <div className={`tool-trace-detail${isRunning ? ' is-live' : ''}`} onScroll={onProcessScroll}>
+            {toolVisualKind(tool.name) === 'search' && <AiWebSearch query={String(activity?.query || summary)} running={isRunning} sources={searchSources} />}
+            {activity?.targets && activity.targets.length > 0 && !['image_search', 'image_generation', 'image_view'].includes(activity.kind) && (
               <div className="tool-activity-targets">
                 {activity.targets.slice(0, activity.kind === 'plan' ? 12 : 4).map((target, index) => (
                   <span key={`${target.block_id ?? target.path ?? 'target'}-${index}`} title={target.path || target.text || ''}>
@@ -2281,40 +2131,51 @@ function ToolTrace({
             {!activity && Object.keys(tool.arguments).length > 0 && (
               <ToolCodeSection label="调用参数" language="json" code={JSON.stringify(tool.arguments, null, 2)} />
             )}
-            {!activity && tool.change_summary?.diff_preview && (
-              <ToolCodeSection
-                label={tool.change_summary.diff_truncated ? '变更 diff（已截断）' : '变更 diff'}
-                language="diff"
-                code={tool.change_summary.diff_preview}
-              />
-            )}
+            {!activity && tool.change_summary?.diff_preview && <AiFileDiff file={tool.change_summary.diff_truncated ? '变更 diff（已截断）' : '变更 diff'} rows={aiDiffRows(tool.change_summary.diff_preview)} />}
             {detailResult && <div className="tool-trace-result">{detailResult}</div>}
-          </div>
-        ),
-      }]}
-    />
+      </div>
+    </AiToolCall>
   )
 }
 
 interface GeneratedImagePreview {
   id: string
   url: string
+  label: string
+  title: string
+  engine: string
+  width: number | null
+  height: number | null
+  sourcePageUrl: string
+  kind: 'search' | 'generation'
 }
 
 function generatedImagePreviews(tool: ToolExecution): GeneratedImagePreview[] {
-  if (tool.activity?.kind !== 'image_generation') return []
-  const assets = tool.activity.details?.assets
+  const isSearch = tool.activity?.kind === 'image_search'
+  if (!isSearch && tool.activity?.kind !== 'image_generation') return []
+  const details = tool.activity?.details
+  const assets = isSearch ? details?.items : details?.assets
   if (!Array.isArray(assets)) return []
   return assets.flatMap((asset, index) => {
     if (!asset || typeof asset !== 'object' || Array.isArray(asset)) return []
     const value = asset as Record<string, unknown>
-    const url = typeof value.url === 'string' ? value.url.trim() : ''
+    const rawUrl = isSearch ? value.preview_url : value.url
+    const url = typeof rawUrl === 'string' ? rawUrl.trim() : ''
     if (!isSafeImagePreviewUrl(url)) return []
+    const width = typeof value.width === 'number' && value.width > 0 ? value.width : null
+    const height = typeof value.height === 'number' && value.height > 0 ? value.height : null
     return [{
-      id: typeof value.id === 'string' && value.id ? value.id : `generated-image-${index}`,
+      id: typeof value.id === 'string' && value.id ? value.id : `tool-image-${index}`,
       url,
+      label: isSearch ? `搜图候选 ${index + 1}` : `生成候选 ${index + 1}`,
+      title: typeof value.title === 'string' ? value.title : (typeof value.revised_prompt === 'string' ? value.revised_prompt : ''),
+      engine: typeof value.engine === 'string' ? value.engine : '',
+      width,
+      height,
+      sourcePageUrl: typeof value.source_page_url === 'string' ? value.source_page_url : '',
+      kind: isSearch ? 'search' : 'generation',
     }]
-  }).slice(0, 4)
+  })
 }
 
 function isSafeImagePreviewUrl(value: string): boolean {
@@ -2327,19 +2188,44 @@ function isSafeImagePreviewUrl(value: string): boolean {
 }
 
 function GeneratedImagePreviews({ images }: { images: GeneratedImagePreview[] }) {
+  const [expanded, setExpanded] = useState(false)
+  const [failed, setFailed] = useState<Set<string>>(() => new Set())
+  if (!images.length) return null
   return (
-    <div className="tool-generated-image-grid">
-      {images.map((image, index) => (
+    <div className="tool-generated-image-gallery">
+      <div className={`tool-generated-image-grid${expanded ? ' is-expanded' : ''}`}>
+      {images.map((image) => (
         <figure className="tool-generated-image" key={image.id}>
-          <Image
-            alt={`AI 生成候选图 ${index + 1}`}
-            className="tool-generated-image-preview"
-            preview={{ mask: <EyeOutlined /> }}
-            src={image.url}
-          />
-          <figcaption>候选图 {index + 1}</figcaption>
+          <div className="tool-generated-image-frame">
+            {failed.has(image.id) ? (
+              <div className="tool-generated-image-fallback"><PictureOutlined /><span>图片暂不可用</span></div>
+            ) : (
+              <Image
+                alt={image.title || image.label}
+                className="tool-generated-image-preview"
+                preview={{ mask: <EyeOutlined /> }}
+                src={image.url}
+                onError={() => setFailed((current) => new Set(current).add(image.id))}
+              />
+            )}
+          </div>
+          <figcaption>
+            <span className="tool-generated-image-label">{image.title || image.label}</span>
+            <span className="tool-generated-image-meta">
+              {image.engine || (image.kind === 'generation' ? 'AI 生图' : '搜图')}
+              {image.width && image.height ? ` · ${image.width} × ${image.height}` : ' · 尺寸未知'}
+            </span>
+            {image.sourcePageUrl && <AiInlineCitation href={image.sourcePageUrl}>来源</AiInlineCitation>}
+          </figcaption>
         </figure>
       ))}
+      </div>
+      {images.length > 8 && <Button type="link" size="small" className="tool-generated-image-expand tool-generated-image-expand-desktop" onClick={() => setExpanded((value) => !value)}>
+        {expanded ? '收起候选' : `显示更多（${images.length} 张）`}
+      </Button>}
+      {images.length > 4 && <Button type="link" size="small" className="tool-generated-image-expand tool-generated-image-expand-narrow" onClick={() => setExpanded((value) => !value)}>
+        {expanded ? '收起候选' : `显示更多（${images.length} 张）`}
+      </Button>}
     </div>
   )
 }
@@ -2369,6 +2255,9 @@ function toolErrorMetadata(tool: ToolExecution): string {
   if (tool.status !== 'error') return ''
   const details = tool.activity?.details
   if (!details || typeof details !== 'object' || Array.isArray(details)) return ''
+  if (details.reason === 'revision_not_current' || details.current_block) {
+    return '目标内容已更新，Agent 将重新读取当前排版块后重试；本次未写入旧补丁。'
+  }
   const requested = Number(details.requested_block_count)
   const maximum = Number(details.max_read_blocks)
   if (Number.isFinite(requested) && Number.isFinite(maximum)) {
@@ -2394,31 +2283,15 @@ function toolActionTarget(tool: ToolExecution): string {
   return toolLabel(tool.name)
 }
 
-function ChangeSummaryInline({ summary }: { summary: ChangeSummary }) {
-  return (
-    <span className="tool-change-inline">
-      <span className="is-added">+{summary.added_lines}</span>
-      <span className="is-removed">-{summary.removed_lines}</span>
-    </span>
-  )
-}
-
 function ChangeSummaryLine({ summary }: { summary: ChangeSummary }) {
-  return (
-    <div className="tool-change-summary">
-      <span>新增 {summary.added_lines} 行</span>
-      <span>删除 {summary.removed_lines} 行</span>
-    </div>
-  )
+  return <AiComparisonTable rows={[
+    { label: '新增行', value: `+${summary.added_lines}`, tone: 'add' },
+    { label: '删除行', value: `-${summary.removed_lines}`, tone: 'remove' },
+  ]} />
 }
 
 function ToolCodeSection({ label, language, code }: { label: string; language: string; code: string }) {
-  return (
-    <section className="tool-code-section">
-      <div className="tool-code-section-title">{label}</div>
-      <CodeBlock code={code} language={language} showLineNumbers={code.split('\n').length > 1} />
-    </section>
-  )
+  return <section className="tool-code-section"><div className="tool-code-section-title">{label}</div><CodeBlock code={code} language={language} showLineNumbers={code.split('\n').length > 1} /></section>
 }
 
 function ThinkingTrace({
@@ -2433,53 +2306,16 @@ function ThinkingTrace({
   onProcessScroll: (event: UIEvent<HTMLDivElement>) => void
 }) {
   const isThinking = trace.status === 'thinking'
-  const [expanded, setExpanded] = useState(isThinking)
   const liveDurationMs = useLiveThoughtDuration(isThinking, startedAtMs)
-
-  useEffect(() => {
-    setExpanded(isThinking)
-  }, [isThinking])
 
   const label = isThinking ? '正在思考' : '思考过程'
 
-  return (
-    <Collapse
-      className={`assistant-action-row assistant-action-thought-row is-${trace.status}`}
-      size="small"
-      expandIconPlacement="end"
-      activeKey={expanded ? ['thinking'] : []}
-      onChange={(keys) => {
-        if (!isThinking) setExpanded((Array.isArray(keys) ? keys : [keys]).includes('thinking'))
-      }}
-      items={[
-        {
-          key: 'thinking',
-          label: (
-            <span className="thinking-action-label">
-              <span className="thinking-action-icon" aria-hidden="true"><BulbOutlined /></span>
-              <span>{label}</span>
-              <span className={`thinking-action-status is-${trace.status}`}>{isThinking ? '分析中' : '已完成'}</span>
-              {isThinking && liveDurationMs !== null && (
-                <span className="thought-duration" aria-label={`已思考 ${formatThoughtDuration(liveDurationMs)}`}>
-                  {formatThoughtDuration(liveDurationMs)}
-                </span>
-              )}
-              {!isThinking && durationMs !== null && durationMs !== undefined && (
-                <span className="thought-duration">{formatThoughtDuration(durationMs)}</span>
-              )}
-            </span>
-          ),
-          children: (
-            <div className={`thinking-trace-detail${isThinking ? ' is-live' : ''}`} onScroll={onProcessScroll}>
-              {trace.content
-                ? trace.content
-                : <span>{trace.detail || '模型正在生成推理内容…'}</span>}
-            </div>
-          ),
-        },
-      ]}
-    />
-  )
+  const duration = isThinking && liveDurationMs !== null
+    ? formatThoughtDuration(liveDurationMs)
+    : durationMs !== null && durationMs !== undefined
+      ? formatThoughtDuration(durationMs)
+      : null
+  return <AiThinkingReasoning thinking={isThinking} duration={duration} content={trace.content} fallback={trace.detail || label} onScroll={onProcessScroll} />
 }
 
 function useLiveThoughtDuration(isThinking: boolean, startedAtMs?: number): number | null {

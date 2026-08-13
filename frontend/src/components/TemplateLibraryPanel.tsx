@@ -18,11 +18,12 @@ import {
 import { templateLibraryApi, type TemplateWritePayload } from '../api/templateLibrary'
 import { gzhThemesApi } from '../api/gzhThemes'
 import { ApiError } from '../api/client'
-import type { ChatSessionItem, GzhThemeItem, TemplateCategory, TemplateGeneration, TemplateItem, TemplateSourceType } from '../types'
+import ModelSelector from './ModelSelector'
+import type { AIModelItem, ChatSessionItem, GzhThemeItem, TemplateCategory, TemplateGeneration, TemplateItem, TemplateSourceType } from '../types'
 import { frameDocumentWithNewWindowLinks, SANDBOX_ALLOW_NEW_WINDOW, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 import { frameThemeDocument } from '../utils/themePreview'
 
-type ResourceTab = 'templates' | 'themes'
+export type ResourceTab = 'templates' | 'themes' | 'images'
 type CategoryFilter = 'all' | 'uncategorized' | number
 
 interface TemplateDraft {
@@ -36,6 +37,7 @@ interface TemplateDraft {
 
 interface TemplateLibraryPanelProps {
   modelId: number | null
+  models: AIModelItem[]
   disabled?: boolean
   canInsertAtCaret: boolean
   attachedTemplateIds: number[]
@@ -47,6 +49,9 @@ interface TemplateLibraryPanelProps {
   onOpenThemeGallery: (themeKey?: string) => void
   collection: { id: number; html: string } | null
   onCollectionHandled: () => void
+  activeResourceTab: ResourceTab
+  onResourceTabChange: (tab: ResourceTab) => void
+  imagePanel: React.ReactNode
 }
 
 const SOURCE_LABEL: Record<TemplateSourceType, string> = {
@@ -158,6 +163,7 @@ function emptyDraft(): TemplateDraft {
 
 export default function TemplateLibraryPanel({
   modelId,
+  models,
   disabled = false,
   canInsertAtCaret,
   attachedTemplateIds,
@@ -169,8 +175,12 @@ export default function TemplateLibraryPanel({
   onOpenThemeGallery,
   collection,
   onCollectionHandled,
+  activeResourceTab,
+  onResourceTabChange,
+  imagePanel,
 }: TemplateLibraryPanelProps) {
-  const [tab, setTab] = useState<ResourceTab>('templates')
+  const tab = activeResourceTab
+  const setTab = onResourceTabChange
   const [categories, setCategories] = useState<TemplateCategory[]>([])
   const [templates, setTemplates] = useState<TemplateItem[]>([])
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all')
@@ -186,6 +196,7 @@ export default function TemplateLibraryPanel({
   const [categoryManagerOpen, setCategoryManagerOpen] = useState(false)
   const [savingCategory, setSavingCategory] = useState(false)
   const [generation, setGeneration] = useState<TemplateGeneration | null>(null)
+  const [generationModelId, setGenerationModelId] = useState<number | null>(modelId)
   const [generationPrompt, setGenerationPrompt] = useState('')
   const [generationSubmitting, setGenerationSubmitting] = useState(false)
   const [themeItems, setThemeItems] = useState<GzhThemeItem[]>([])
@@ -229,6 +240,13 @@ export default function TemplateLibraryPanel({
     }, 1200)
     return () => window.clearTimeout(timer)
   }, [generation])
+
+  useEffect(() => {
+    setGenerationModelId((current) => {
+      if (current !== null && models.some((model) => model.id === current)) return current
+      return models.find((model) => model.id === modelId)?.id ?? models[0]?.id ?? null
+    })
+  }, [modelId, models])
 
   const loadThemes = useCallback(async () => {
     setThemeLoading(true)
@@ -372,8 +390,8 @@ export default function TemplateLibraryPanel({
   }
 
   const generateTemplate = async () => {
-    if (!modelId) {
-      message.warning('请先在 AI 对话中选择可用模型')
+    if (!generationModelId) {
+      message.warning('请选择 AI 模型')
       return
     }
     if (generationSubmitting || generationPrompt.trim().length < 4) {
@@ -382,7 +400,7 @@ export default function TemplateLibraryPanel({
     }
     setGenerationSubmitting(true)
     try {
-      const next = await templateLibraryApi.createGeneration({ model_id: modelId, prompt: generationPrompt.trim() })
+      const next = await templateLibraryApi.createGeneration({ model_id: generationModelId, prompt: generationPrompt.trim() })
       setGeneration(next)
     } catch (err) {
       message.error(asErrorMessage(err, '创建模板生成任务失败'))
@@ -492,11 +510,12 @@ export default function TemplateLibraryPanel({
           options={[
             { label: '模板库', value: 'templates' },
             { label: '主题库', value: 'themes' },
+            { label: '图片库', value: 'images' },
           ]}
         />
       </div>
 
-      {tab === 'templates' ? (
+      {tab === 'images' ? imagePanel : tab === 'templates' ? (
         <div className="template-library-content" ref={templateContentRef}>
           <div className="template-library-toolbar">
             <Input.Search
@@ -674,9 +693,13 @@ export default function TemplateLibraryPanel({
               )}
               {draft.mode === 'ai' && (
                 <div className="template-ai-generation">
+                  <div className="template-ai-model">
+                    <span>生成模型</span>
+                    <ModelSelector models={models} value={generationModelId} onChange={setGenerationModelId} disabled={generationIsActive} />
+                  </div>
                   <Input.TextArea rows={6} value={generationPrompt} maxLength={6000} placeholder="描述需要的公众号静态组件，例如：科技发布会文章的蓝色数据卡片，包含标题、数字和说明。" disabled={generationIsActive} onChange={(event) => setGenerationPrompt(event.target.value)} />
                   <div className="template-ai-actions">
-                    <Button type="primary" icon={generationIsActive ? <LoadingOutlined spin /> : <SendOutlined />} loading={generationSubmitting} disabled={generationIsActive || !modelId} onClick={() => void generateTemplate()}>生成组件</Button>
+                    <Button type="primary" icon={generationIsActive ? <LoadingOutlined spin /> : <SendOutlined />} loading={generationSubmitting} disabled={generationIsActive || !generationModelId} onClick={() => void generateTemplate()}>生成组件</Button>
                     {generationIsActive && <Button onClick={() => void cancelGeneration()}>取消生成</Button>}
                   </div>
                   {generation && generation.status === 'failed' && <Alert type="error" showIcon message={generation.error_message || '模板生成失败'} />}

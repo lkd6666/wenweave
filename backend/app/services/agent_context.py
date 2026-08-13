@@ -59,6 +59,7 @@ CURRENT_DOCUMENT_TOOL_NAMES = {
     "apply_html_patch",
     "replace_document",
     "inspect_current_images",
+    "apply_searched_image",
     "check_compliance",
 }
 

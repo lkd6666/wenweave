@@ -1,0 +1,16 @@
+services:
+  searxng-verify:
+    image: docker.io/searxng/searxng@sha256:f4c8e59de166ed71f6380c0847c312ca51f0d41996e31d0559163b6b09ecde52
+    ports:
+      - "127.0.0.1:8089:8080"
+    volumes:
+      - ./settings.verify.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:8089/
+      UWSGI_WORKERS: "1"
+      UWSGI_THREADS: "1"
+    mem_limit: 320m
+    mem_reservation: 160m
+    pids_limit: 96
+    security_opt:
+      - no-new-privileges:true

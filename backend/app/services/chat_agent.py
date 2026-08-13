@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import random
@@ -20,11 +22,12 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, AsyncIterator, Callable, Dict, Literal, Sequence, cast
 
-from langchain_anthropic import ChatAnthropic
+from langchain_anthropic import ChatAnthropic, convert_to_anthropic_tool
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages.utils import message_chunk_to_message
 from langchain_core.tools import tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -77,7 +80,7 @@ logger = logging.getLogger(__name__)
 
 ThinkingMode = Literal["auto", "enabled", "disabled"]
 ThinkingEffort = Literal["auto", "minimal", "low", "medium", "high", "xhigh", "max"]
-PROMPT_CACHE_KEY_VERSION = "v1"
+PROMPT_CACHE_KEY_VERSION = "v2"
 PROMPT_CACHE_KEY_SHARDS = 16
 # LangGraph 要求递归限制为正整数。此值仅防御模型异常的无限循环，
 # 不作为 Agent 的工具调用次数上限。
@@ -121,7 +124,7 @@ MODEL_REQUEST_TIMEOUT_SECONDS = max(
 )
 MODEL_MESSAGE_CONVERSION_TIMEOUT_SECONDS = get_settings().CHAT_AGENT_MODEL_MESSAGE_CONVERSION_TIMEOUT_SECONDS
 COMPLIANCE_CHECK_TIMEOUT_SECONDS = get_settings().CHAT_AGENT_COMPLIANCE_CHECK_TIMEOUT_SECONDS
-EARLY_DISPATCH_WRITE_TOOL_NAMES = frozenset({"apply_html_patch", "replace_document", "apply_generated_image"})
+EARLY_DISPATCH_WRITE_TOOL_NAMES = frozenset({"apply_html_patch", "replace_document", "apply_generated_cover", "apply_edited_image", "apply_edited_cover", "apply_searched_cover"})
 # Streamed tokens arrive much faster than an interface can usefully repaint.
 # Keep the context telemetry responsive without turning every token into a
 # separate SSE event and replay-buffer entry.
@@ -233,6 +236,24 @@ class AskUserInput(BaseModel):
     include_style: bool = Field(
         default=False,
         description="是否附带样式预览；为 true 时 options 每项都必须有 style_html",
+    )
+
+
+class ImageViewReferenceInput(BaseModel):
+    """One server-resolved image reference accepted by the vision tool."""
+
+    kind: Literal["article", "generated", "searched"]
+    image_slot: int = Field(default=0, ge=0, le=10_000)
+    revision: str = Field(default="", max_length=64)
+    asset_id: str = Field(default="", max_length=64)
+    candidate_token: str = Field(default="", max_length=16_000, description="旧版完整搜图候选令牌")
+    # Keep this large enough to accept a legacy full JWT when a model places it
+    # in candidate_ref. The server still prefers compact references and applies
+    # the same scoped signature checks to the compatibility path.
+    candidate_ref: str = Field(
+        default="",
+        max_length=16_000,
+        description="搜图结果返回的短 candidate_ref；不要改写或截断。兼容旧令牌误放此字段。",
     )
 
 
@@ -385,6 +406,8 @@ def serialise_resume_messages(messages: Sequence[BaseMessage]) -> list[dict[str,
         if isinstance(message, SystemMessage):
             values.append({"type": "system", "content": message.content})
         elif isinstance(message, HumanMessage):
+            if bool(getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")):
+                continue
             values.append({"type": "human", "content": message.content})
         elif isinstance(message, AIMessage):
             values.append(
@@ -581,7 +604,9 @@ def _usage_from_message(message: BaseMessage) -> Dict[str, int] | None:
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
-        "cached_input_tokens": usage.cache_read_tokens + usage.cache_write_tokens,
+        # Cache creation is a write, not a hit. The context meter and cache
+        # hit rate must only count tokens the provider actually read from cache.
+        "cached_input_tokens": usage.cache_read_tokens,
         "cache_read_tokens": usage.cache_read_tokens,
         "cache_write_tokens": usage.cache_write_tokens,
     }
@@ -678,7 +703,9 @@ def _split_run_cycles(messages: Sequence[BaseMessage]) -> tuple[list[BaseMessage
     """
     boundary = -1
     for index, message in enumerate(messages):
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not bool(
+            getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+        ):
             boundary = index
     head = list(messages[: boundary + 1])
     cycles: list[list[BaseMessage]] = []
@@ -835,7 +862,9 @@ def _runtime_hot_transcript(messages: Sequence[BaseMessage], max_tokens: int) ->
     """Render the persisted hot prefix, excluding the static system prompt."""
     lines: list[str] = []
     for message in messages:
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not bool(
+            getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+        ):
             lines.append(f"用户：{_message_content(message.content)}")
         elif isinstance(message, ToolMessage):
             lines.append(f"工具结果 {message.name or 'unknown'}：{_message_content(message.content)}")
@@ -1071,6 +1100,8 @@ def _selected_elements_prompt(selected_elements: Sequence[Dict[str, Any]] | None
         current_path = str(selected_element.get("workspace_path", ""))
         parent_path = str(selected_element.get("workspace_parent_path", ""))
         sibling_index = selected_element.get("workspace_sibling_index", "")
+        image_slot = selected_element.get("workspace_image_slot", "")
+        image_location = str(selected_element.get("workspace_image_location", ""))
         source = redact_inline_data(str(selected_element.get("html", "")))
         text = str(selected_element.get("text", ""))[:2000]
         target_data = "; ".join(
@@ -1080,6 +1111,8 @@ def _selected_elements_prompt(selected_elements: Sequence[Dict[str, Any]] | None
                 f"path={current_path}" if current_path else f"path={selector}",
                 f"parent={parent_path}" if parent_path else "",
                 f"same_tag_index={sibling_index}" if sibling_index else "",
+                f"image_slot={image_slot}" if image_slot else "",
+                f"image_location={image_location}" if image_location else "",
                 f"reason={reason}" if reason else "",
                 "required_action=reselect_or_confirm" if status in {"ambiguous", "missing"} else "",
             ) if item
@@ -1091,6 +1124,48 @@ def _selected_elements_prompt(selected_elements: Sequence[Dict[str, Any]] | None
 ```
 元素文本摘要：{text or '无'}""")
     return "\n\n".join(parts)
+
+
+def _selected_elements_user_context(selected_elements: Sequence[Dict[str, Any]] | None) -> str:
+    """Attach a compact, provider-neutral selection payload to the user turn.
+
+    Some OpenAI-compatible gateways handle system messages differently from
+    ordinary text. Keeping this small structured echo beside the user's text
+    makes the selection identity available even when the system prefix is
+    cached, reordered, or partially summarized.
+    """
+    if not selected_elements:
+        return ""
+    targets = []
+    for index, element in enumerate(selected_elements[:12], start=1):
+        target = {
+            "index": index,
+            "tag": str(element.get("tag_name") or ""),
+            "status": str(element.get("selection_status") or "unresolved"),
+            "block_id": str(element.get("workspace_block_id") or ""),
+            "path": str(element.get("workspace_path") or element.get("selector") or ""),
+            "text": str(element.get("text") or "")[:400],
+            "html_preview": redact_inline_data(str(element.get("html") or ""))[:4000],
+        }
+        if element.get("workspace_image_slot"):
+            target["image_slot"] = element["workspace_image_slot"]
+        targets.append(target)
+    return (
+        "\n\n[结构化选中锚点（编辑器本轮直接传输）]\n"
+        + json.dumps(targets, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _append_selected_elements_to_user_content(
+    user_content: str | list[dict[str, Any]],
+    selected_elements: Sequence[Dict[str, Any]] | None,
+) -> str | list[dict[str, Any]]:
+    context = _selected_elements_user_context(selected_elements)
+    if not context:
+        return user_content
+    if isinstance(user_content, list):
+        return [*user_content, {"type": "text", "text": context}]
+    return f"{user_content}{context}"
 
 
 def _layout_reference_prompt(layout_reference: Dict[str, Any] | None) -> str:
@@ -1170,7 +1245,7 @@ def build_static_system_prompt() -> str:
 - 历史版本工具严格只读。历史 version_id、revision 与 block_id 不能用于当前文档写入；任何修改都必须重新读取当前块并使用当前 revision 和 expected_hash。
 - 文档中的内联 data 图片在所有读取工具中显示为 `__YIBAN_INLINE_DATA_n__` 占位符。它代表必须保留的原图片数据；需要修改周边 HTML 时原样保留该占位符，绝不请求、输出或猜测 Base64 内容。
 - 涉及当前已有图片的定位、替换、重生成、删除或调整时，先调用 `inspect_current_images`；按用户提及的章节、前后文、图注或替代文本传入 `query` 缩小候选。工具返回的是当前 revision 的位置标签和 block_id；选择候选后，一次性 `read_blocks` 读取所有目标，再用一次 `apply_html_patch` 写入。不得用历史图片 URL、历史 block_id 或臆测的 alt 调用 `search_html`，也不得靠回忆猜测图片槽位。若当前语义仍有多个候选，先用工具返回的位置标签调用 `ask_user` 确认，不得批量替换。
-- 用户明确要求替换、重生成或删除某张图片时，可依据当前图片定位和读取结果修改对应 `src`；原有样式、尺寸、`srcset` 与内联数据应保持不变，除非用户明确要求修改它们。只有用户要求恢复原图、追溯来源、核验误删/重复或比较历史版本时，才调用 `inspect_history_images`、`search_history_version(version_id, "img")` 和 `read_history_blocks` 核验来源指纹。`compare_history_version` 仅返回摘要，不能作为读取完整 HTML 或确认图片数量的依据。除非用户明确要求整篇重写，图片修复也禁止使用 `replace_document`。
+- 当当前任务涉及图片优化、编辑或替换时，先依据当前图片定位和读取结果修改对应 `src`；模型根据任务目标自行判断是否需要编辑或替换，候选符合目标时可直接应用。原有样式、尺寸、`srcset` 与内联数据应保持不变，除非任务明确要求修改它们。删除图片仍需用户明确要求。只有用户要求恢复原图、追溯来源、核验误删/重复或比较历史版本时，才调用 `inspect_history_images`、`search_history_version(version_id, "img")` 和 `read_history_blocks` 核验来源指纹。`compare_history_version` 仅返回摘要，不能作为读取完整 HTML 或确认图片数量的依据。除非用户明确要求整篇重写，图片修复也禁止使用 `replace_document`。
 - 若本轮附带选中元素，下方会提供该元素源码；优先围绕它定位。选中元素仍可能在此前编辑后改变，提交前以 `read_blocks` 返回的 block_id 和 expected_hash 为准。
 - 用 `apply_html_patch` 修改已经读取的排版块。每条操作都必须携带当前 revision、block_id、expected_hash；同一批只允许不重叠的块，任一条失败则不会写入。
 - 一条消息里并行调用多个工具时，只允许并行只读工具（搜索、读取、盘点、历史查询）。写入工具（`apply_html_patch`、`replace_document`）每条消息只能出现一次：多处改动要合并进同一次 `apply_html_patch`（一次最多 64 条操作）。并行提交两次写入时，只有一次会生效，另一次会因 revision 冲突失败。写入若产生结构无效 HTML 会被拒绝，文档不会变更。
@@ -1242,18 +1317,29 @@ Revision：{workspace_map.get('revision', '')}
 
 
 def _image_generation_prompt(context: Dict[str, Any] | None) -> str:
-    if not context:
-        return "当前会话未启用图片生成。只有用户明确要求配图时，才可调用 `generate_article_images`。"
-    enabled = bool(context.get("enabled"))
+    context = context or {}
     model_name = str(context.get("model_name") or "管理员默认图片模型")
-    if enabled:
-        return (
-            f"本次会话已开启自动配图，图片模型：{model_name}。正文初稿完成后，可根据文章语义决定是否需要配图、用途、数量和位置；"
-            "用户指定数量时必须严格服从。先生成候选图，只有用户明确要求直接插入或设为封面时，才调用 apply_generated_image 应用候选图。"
-        )
     return (
-        f"本次会话未开启自动配图（可用模型：{model_name}）。仅当用户明确要求生成、插入或设置封面时，才可调用 `generate_article_images`；"
-        "生成后默认返回候选图，不要自行写入文章；明确要求时用 apply_generated_image。"
+        f"本次会话图片模型：{model_name}。模型可根据文章语义和当前任务决定是否需要配图、用途、数量和位置；"
+        "用户指定数量时必须严格服从。用户明确要求配图、找图或换图时，优先调用 search_article_images 搜索真实图片；"
+        "用户明确要求生成、插画或风格化画面时才调用 generate_article_images。"
+        "当前聊天模型支持多模态时，应调用 view_article_images 按需查看候选或文章现有图片，每次最多 4 张；"
+        "搜图候选返回的 candidate_ref 是短期安全引用，调用 view_article_images 或 import_searched_image 时必须原样传 candidate_ref，"
+        "每项候选已提供 candidate_ref，不得为了取得完整 token 调用 read_tool_output；candidate_token 只用于旧版兼容，"
+        "不要把完整 token 填入 candidate_ref，也不要复制或截断 token、preview_url；"
+        "搜图候选不足且 next_cursor 存在时携带游标继续搜索，同一轮最多搜索 3 批，禁止重复首批。"
+        "generate_article_images、search_article_images 和 view_article_images 都不会提供可直接写入的当前文档定位；"
+        "AI 生成候选的 assets[].url 是可直接写入正文的受控稳定地址。搜图候选须先用 import_searched_image 导入，"
+        "再使用其返回的 url 和 asset_id。是否采用候选、采用哪张、放入哪个容器由你根据任务决定；"
+        "若要写入正文，必须基于当前 revision 重新调用 search_html/read_blocks，再用 apply_html_patch 将该 URL 写入合适的容器。"
+        "可按容器结构使用 replace_inner、insert_before、insert_after 等任意补丁模式，并自行构造 img、figure、figcaption 或保留容器既有 class/style 的 HTML；"
+        "不得把正文图片限制为某个锚点之后，也不得调用专用图片应用工具。成功补丁会自动保留被正文引用的生成资产。"
+        "若决定设为文章封面，封面不属于正文 HTML：AI 生成候选调用 apply_generated_cover；已导入的搜图候选调用 apply_searched_cover。"
+        "不得沿用生成前或更早轮次的 anchor_block_id、expected_hash。若工具返回‘基于旧内容’或 revision 冲突，先读取返回的 current_revision/current_block 或按关键词重新定位，再用最新 hash 重试；"
+        "搜图候选仅在用户明确要求找图、配图或换图时使用；导入候选不会改动文章，正文采用、替换或嵌入均由 apply_html_patch 完成。"
+        "对于文章内已有图片，可先用 inspect_current_images 定位，再调用 edit_article_image 生成候选；"
+        "候选符合任务目标时可调用 apply_edited_image。已有文章封面不属于正文 HTML：需要编辑它时调用 edit_article_cover，"
+        "候选符合任务目标时调用 apply_edited_cover；不得用 apply_html_patch 或正文图片工具修改封面。"
     )
 
 
@@ -1294,10 +1380,188 @@ def _uses_explicit_prompt_cache(chat_model: BaseChatModel) -> bool:
     seen: set[int] = set()
     while candidate is not None and id(candidate) not in seen:
         seen.add(id(candidate))
-        if getattr(candidate, "prompt_cache_options", None) == {"mode": "explicit"}:
+        options = getattr(candidate, "prompt_cache_options", None)
+        if isinstance(options, dict) and options.get("mode") == "explicit":
             return True
         candidate = getattr(candidate, "_primary", None)
     return False
+
+
+def _cache_fingerprint(value: Any) -> str:
+    """Return a short stable hash suitable for cache routing and logs."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+def _anthropic_cache_control(*, include_ttl: bool = True) -> dict[str, str]:
+    control = {"type": "ephemeral"}
+    if include_ttl:
+        control["ttl"] = get_settings().CHAT_AGENT_ANTHROPIC_CACHE_TTL
+    return control
+
+
+def _anthropic_tools_with_cache_breakpoint(
+    tools: Sequence[Any], *, include_ttl: bool = True
+) -> list[dict[str, Any]]:
+    """Convert tools once and cache the stable schema prefix through its end."""
+    formatted = [dict(convert_to_anthropic_tool(item)) for item in tools]
+    if formatted:
+        formatted[-1]["cache_control"] = _anthropic_cache_control(include_ttl=include_ttl)
+    return formatted
+
+
+def _without_anthropic_cache_ttl(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """Copy message cache controls without ttl for legacy Anthropic gateways."""
+    normalized: list[BaseMessage] = []
+    for message in messages:
+        content = message.content
+        if not isinstance(content, list):
+            normalized.append(message)
+            continue
+        changed = False
+        blocks: list[Any] = []
+        for block in content:
+            if not isinstance(block, dict) or not isinstance(block.get("cache_control"), dict):
+                blocks.append(block)
+                continue
+            cache_control = dict(block["cache_control"])
+            if "ttl" not in cache_control:
+                blocks.append(block)
+                continue
+            cache_control.pop("ttl", None)
+            blocks.append({**block, "cache_control": cache_control})
+            changed = True
+        normalized.append(message.model_copy(update={"content": blocks}) if changed else message)
+    return normalized
+
+
+def _is_anthropic_cache_ttl_rejection(exc: BaseException) -> bool:
+    detail = str(exc).lower()
+    if "ttl" not in detail or not any(marker in detail for marker in ("cache", "ephemeral")):
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "extra inputs are not permitted",
+            "invalid",
+            "not allowed",
+            "not permitted",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unexpected",
+        )
+    )
+
+
+class _AnthropicCacheTtlFallbackModel:
+    """Retry one pre-output request without ttl for an older compatible gateway."""
+
+    def __init__(self, primary: Any, fallback: Any) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._ttl_supported: bool | None = None
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        if self._ttl_supported is False:
+            return await self._invoke(
+                self._fallback, _without_anthropic_cache_ttl(input), config, **kwargs
+            )
+        try:
+            return await self._invoke(self._primary, input, config, **kwargs)
+        except Exception as exc:
+            if not _is_anthropic_cache_ttl_rejection(exc):
+                raise
+        self._ttl_supported = False
+        logger.warning("agent_trace anthropic_cache_ttl_unsupported fallback=ephemeral_default")
+        return await self._invoke(
+            self._fallback, _without_anthropic_cache_ttl(input), config, **kwargs
+        )
+
+    @staticmethod
+    async def _invoke(model: Any, input: Any, config: Any, **kwargs: Any) -> Any:
+        if config is None:
+            return await model.ainvoke(input, **kwargs)
+        return await model.ainvoke(input, config=config, **kwargs)
+
+    async def astream(self, input: Any, config: Any = None, **kwargs: Any) -> AsyncIterator[Any]:
+        if self._ttl_supported is False:
+            async for chunk in self._stream(
+                self._fallback, _without_anthropic_cache_ttl(input), config, **kwargs
+            ):
+                yield chunk
+            return
+        emitted = False
+        try:
+            async for chunk in self._stream(self._primary, input, config, **kwargs):
+                emitted = True
+                yield chunk
+            return
+        except Exception as exc:
+            if emitted or not _is_anthropic_cache_ttl_rejection(exc):
+                raise
+        self._ttl_supported = False
+        logger.warning("agent_trace anthropic_cache_ttl_unsupported fallback=ephemeral_default")
+        async for chunk in self._stream(
+            self._fallback, _without_anthropic_cache_ttl(input), config, **kwargs
+        ):
+            yield chunk
+
+    @staticmethod
+    async def _stream(
+        model: Any, input: Any, config: Any, **kwargs: Any
+    ) -> AsyncIterator[Any]:
+        if config is None:
+            async for chunk in model.astream(input, **kwargs):
+                yield chunk
+        else:
+            async for chunk in model.astream(input, config=config, **kwargs):
+                yield chunk
+
+
+def _prompt_cache_key(chat_model: BaseChatModel) -> str:
+    candidate: Any = chat_model
+    seen: set[int] = set()
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        model_kwargs = getattr(candidate, "model_kwargs", None)
+        if isinstance(model_kwargs, dict) and isinstance(model_kwargs.get("prompt_cache_key"), str):
+            return model_kwargs["prompt_cache_key"]
+        candidate = getattr(candidate, "_primary", None)
+    return ""
+
+
+def _tool_schema_fingerprint(chat_model: BaseChatModel, tools: Sequence[Any]) -> str:
+    try:
+        schemas = (
+            [convert_to_anthropic_tool(item) for item in tools]
+            if isinstance(chat_model, ChatAnthropic)
+            else [convert_to_openai_tool(item) for item in tools]
+        )
+    except (TypeError, ValueError):
+        schemas = [{"name": str(getattr(item, "name", type(item).__name__))} for item in tools]
+    return _cache_fingerprint(schemas)
+
+
+def _bind_tools_with_prompt_cache(chat_model: BaseChatModel, tools: Sequence[Any]) -> Any:
+    if isinstance(chat_model, ChatAnthropic):
+        return _AnthropicCacheTtlFallbackModel(
+            chat_model.bind_tools(_anthropic_tools_with_cache_breakpoint(tools)),
+            chat_model.bind_tools(
+                _anthropic_tools_with_cache_breakpoint(tools, include_ttl=False)
+            ),
+        )
+    cache_key = _prompt_cache_key(chat_model)
+    if cache_key:
+        cache_key = f"{cache_key}-t{_tool_schema_fingerprint(chat_model, tools)}"
+        return chat_model.bind_tools(tools, prompt_cache_key=cache_key)
+    return chat_model.bind_tools(tools)
 
 
 def build_system_message(
@@ -1339,7 +1603,11 @@ def build_system_message(
     if isinstance(chat_model, ChatAnthropic):
         return SystemMessage(
             content=[
-                {"type": "text", "text": static_prompt, "cache_control": {"type": "ephemeral"}},
+                {
+                    "type": "text",
+                    "text": static_prompt,
+                    "cache_control": _anthropic_cache_control(),
+                },
                 {"type": "text", "text": volatile_prompt},
             ]
         )
@@ -1375,7 +1643,11 @@ def build_agent_prompt_cache_key(
         return None
     # Partition per-user traffic without revealing the user ID to the provider.
     shard = int(actor_user_id) % PROMPT_CACHE_KEY_SHARDS
-    return f"yb-agent-{PROMPT_CACHE_KEY_VERSION}-p{provider_id}-m{model_id}-s{shard}"
+    prompt_fingerprint = _cache_fingerprint(build_static_system_prompt())
+    return (
+        f"yb-agent-{PROMPT_CACHE_KEY_VERSION}-p{provider_id}-m{model_id}"
+        f"-h{prompt_fingerprint}-s{shard}"
+    )
 
 
 def _openai_request_kwargs(
@@ -2224,6 +2496,35 @@ def _openai_reasoning_kwargs(
     )
 
 
+def _anthropic_thinking_kwargs(request_params: dict[str, Any]) -> dict[str, Any]:
+    """Keep model thinking settings within the Anthropic Messages API contract.
+
+    Model configuration is editable and providers can be changed after a model
+    is created. ``reasoning_effort`` is translated only as a compatibility
+    fallback; it is never forwarded to ``AsyncMessages.create``.
+    """
+    thinking = request_params.get("thinking")
+    kwargs: dict[str, Any] = {}
+    if isinstance(thinking, dict) and thinking.get("type") in {"enabled", "adaptive"}:
+        kwargs["thinking"] = thinking
+
+    effort = request_params.get("effort")
+    if effort in {"low", "medium", "high", "xhigh", "max"}:
+        kwargs["effort"] = effort
+        return kwargs
+
+    # Existing installations could have generated OpenAI mappings even when
+    # the provider was Anthropic. Keep those models operational until startup
+    # migration persists their native replacements.
+    legacy_effort = request_params.get("reasoning_effort")
+    if legacy_effort in {"low", "medium", "high", "xhigh", "max"}:
+        return {
+            "thinking": {"type": "adaptive"},
+            "effort": legacy_effort,
+        }
+    return kwargs
+
+
 def build_chat_model(
     provider: AIProvider,
     model: AIModel,
@@ -2258,9 +2559,12 @@ def build_chat_model(
         }
         if thinking_mode == "enabled":
             configured = _configured_thinking_params(model, thinking_mode, thinking_effort)
-            if configured:
-                kwargs.update(configured)
+            anthropic_kwargs = _anthropic_thinking_kwargs(configured)
+            if anthropic_kwargs:
+                kwargs.update(anthropic_kwargs)
                 detail = "已使用该模型配置的 Anthropic 思考参数"
+                if "reasoning_effort" in configured:
+                    detail = "已将旧 OpenAI 思考参数转换为 Anthropic adaptive thinking"
                 if thinking_effort != "auto":
                     detail += f"（强度：{thinking_effort}）"
             else:
@@ -2269,8 +2573,7 @@ def build_chat_model(
             status = ThinkingStatus("enabled", True, detail)
         elif thinking_mode == "disabled":
             configured = _configured_thinking_params(model, thinking_mode, thinking_effort)
-            if configured:
-                kwargs.update(configured)
+            kwargs.update(_anthropic_thinking_kwargs(configured))
             status = ThinkingStatus("disabled", True, "已关闭 Anthropic extended thinking")
         else:
             status = ThinkingStatus("auto", False, "使用 Anthropic 模型默认推理设置")
@@ -2280,7 +2583,7 @@ def build_chat_model(
     explicit_prompt_cache_kwargs: dict[str, Any] = {}
     if prompt_cache_key and getattr(model, "prompt_cache_enabled", False):
         explicit_prompt_cache_kwargs = {
-            "prompt_cache_options": {"mode": "explicit"},
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
             # ``model_kwargs`` is serialized as a top-level OpenAI request
             # field by langchain-openai, unlike provider-specific extra_body.
             "model_kwargs": {"prompt_cache_key": prompt_cache_key},
@@ -2661,11 +2964,18 @@ def _take_matching_tool_report(
     reports = reports_by_name.get(tool_name, [])
     if len(reports) == 1:
         return reports.pop(0)
-    if tool_name != "generate_article_images" or not reports:
+    if tool_name not in {"generate_article_images", "edit_article_image", "edit_article_cover", "search_article_images"} or not reports:
         return None
     try:
         payload = json.loads(content)
     except (TypeError, json.JSONDecodeError):
+        return None
+    if tool_name == "search_article_images" and isinstance(payload, dict):
+        query = str(payload.get("query") or "")
+        for index, report in enumerate(reports):
+            activity = report.get("activity")
+            if isinstance(activity, dict) and str(activity.get("query") or "") == query:
+                return reports.pop(index)
         return None
     generation_id = str(payload.get("id") or "") if isinstance(payload, dict) else ""
     if not generation_id:
@@ -2695,7 +3005,10 @@ def _build_editor_graph(
     runtime_compaction_state: dict[str, Any] | None = None,
     model_id: int | None = None,
     image_generation_context: Dict[str, Any] | None = None,
+    model_is_multimodal: bool = False,
+    provider_type: str = "openai_compatible",
     system_message_factory: Callable[[], SystemMessage] | None = None,
+    selected_elements_factory: Callable[[], list[Dict[str, Any]]] | None = None,
 ):
     """建立单次编辑图。工具闭包隔离了不同 SSE 请求的 HTML 状态。"""
 
@@ -2704,6 +3017,8 @@ def _build_editor_graph(
     # so every emitted presentation report can be paired with its own call.
     reported_tool_results: list[dict[str, Any]] = []
     reported_tool_results_lock = threading.Lock()
+    visual_tool_images: dict[str, list[dict[str, Any]]] = {}
+    visual_tool_images_lock = threading.Lock()
     active_tool_call_id: ContextVar[str | None] = ContextVar("active_tool_call_id", default=None)
 
     def emit_tool_result(
@@ -2768,13 +3083,469 @@ def _build_editor_graph(
         return SessionHistoryReader(tool_output_store.document_id, tool_output_store.session_id)
 
     @tool
+    async def search_article_images(
+        query: str,
+        purpose: str = "body",
+        orientation: str = "landscape",
+        cursor: str = "",
+        limit: int = 12,
+    ) -> str:
+        """Search SearXNG for real article images without changing the document.
+
+        Use this only when the user explicitly asks to find, illustrate, or
+        replace an article image. Results come from the public web and do not
+        imply permission to reuse them. ``purpose`` is ``cover`` or ``body``;
+        ``orientation`` is ``any``, ``landscape``, ``portrait`` or ``square``.
+        """
+        from app.services.image_search import (
+            IMAGE_SEARCH_NOTICE,
+            ImageSearchError,
+            ImageSearchTokenError,
+            candidate_payload,
+            issue_candidate_reference,
+            issue_candidate_token,
+            search_images_with_cursor,
+        )
+
+        if not tool_output_store or actor_user_id is None:
+            return tool_error("search_article_images", WorkspaceError("当前运行缺少文档上下文"))
+        purpose_aliases = {
+            "cover": "cover", "body": "body", "封面": "cover", "封面图": "cover", "文章封面": "cover",
+            "正文": "body", "正文图": "body", "正文配图": "body", "插图": "body",
+        }
+        normalized_purpose = purpose_aliases.get(str(purpose or "").strip().lower(), "")
+        if not normalized_purpose:
+            return tool_error("search_article_images", WorkspaceError("图片用途必须是 cover 或 body"))
+        if orientation not in {"any", "landscape", "portrait", "square"}:
+            return tool_error("search_article_images", WorkspaceError("图片方向必须是 any、landscape、portrait 或 square"))
+        try:
+            limit_value = int(limit)
+            if limit_value < 1 or limit_value > 12:
+                raise ValueError
+        except (TypeError, ValueError):
+            return tool_error("search_article_images", WorkspaceError("返回数量必须是 1 到 12"))
+        normalized_query = str(query or "").strip()
+        if len(normalized_query) < 2 or len(normalized_query) > 120:
+            return tool_error("search_article_images", WorkspaceError("搜图关键词必须是 2 到 120 个字符"))
+        try:
+            candidates, next_cursor = await search_images_with_cursor(
+                normalized_query,
+                purpose=normalized_purpose,
+                orientation=orientation,
+                cursor=str(cursor or "").strip(),
+                limit=limit_value,
+                user_id=actor_user_id,
+                document_id=tool_output_store.document_id,
+            )
+        except (ImageSearchError, ImageSearchTokenError) as exc:
+            return tool_error("search_article_images", WorkspaceError(str(exc)))
+        items = [
+            candidate_payload(
+                candidate,
+                issue_candidate_token(
+                    candidate,
+                    user_id=actor_user_id,
+                    document_id=tool_output_store.document_id,
+                ),
+            )
+            for candidate in candidates
+        ]
+        payload = {
+            "query": normalized_query,
+            "purpose": normalized_purpose,
+            "orientation": orientation,
+            "next_cursor": next_cursor,
+            "notice": IMAGE_SEARCH_NOTICE,
+            "items": items,
+        }
+        # Candidate JWTs contain the validated source and preview URLs and are
+        # intentionally large. Persist the complete payload once, then give the
+        # model short signed pointers so context truncation cannot corrupt the
+        # capability before view/apply tools use it. The activity report keeps
+        # the full items for the browser timeline.
+        model_payload = payload
+        call_id = active_tool_call_id.get()
+        if call_id:
+            try:
+                stored_binding = tool_output_store.bind(
+                    tool_call_id=call_id,
+                    tool_name="search_article_images",
+                    content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    max_preview_tokens=session.tool_result_max_tokens,
+                    force_store=True,
+                )
+            except Exception:  # noqa: BLE001 - the normal tool result remains usable if storage is unavailable.
+                logger.exception("agent_trace search_candidate_reference_store_failed run=%s", trace_id)
+                stored_binding = None
+            if stored_binding is not None and stored_binding.output_id:
+                compact_items = []
+                for index, item in enumerate(items):
+                    compact_item = {
+                        key: value for key, value in item.items() if key not in {"token", "preview_url"}
+                    }
+                    compact_item["candidate_ref"] = issue_candidate_reference(
+                        stored_binding.output_id,
+                        index,
+                        user_id=actor_user_id,
+                        document_id=tool_output_store.document_id,
+                    )
+                    compact_items.append(compact_item)
+                model_payload = {**payload, "items": compact_items}
+        summary = f"已搜索“{_short(normalized_query, 60)}”，返回 {len(items)} 张候选图"
+        emit_tool_result(
+            "search_article_images",
+            summary,
+            {
+                "kind": "image_search",
+                "summary": summary,
+                "query": normalized_query,
+                "details": payload,
+            },
+        )
+        return bounded_json(
+            model_payload,
+            session.tool_result_max_tokens,
+            next_step=(
+                "多模态模型应先用 view_article_images 查看最多 4 张候选，并原样使用每项的 candidate_ref；"
+                "不要复制或截断 token、preview_url；"
+                "候选不合适且 next_cursor 存在时可继续搜索，同一轮最多搜索 3 批。"
+            ),
+        )
+
+    @tool
+    async def view_article_images(references: list[ImageViewReferenceInput]) -> str:
+        """Read up to four trusted article, generated, or searched images.
+
+        References must come from ``inspect_current_images``, an image
+        generation result, or ``search_article_images``. Arbitrary URLs are
+        never accepted. Use the short ``candidate_ref`` for searched images;
+        the legacy full JWT may be supplied as ``candidate_token`` (or is
+        tolerated in candidate_ref during rollout). Multimodal models receive
+        the resolved image bytes in the next model turn; text-only models
+        receive safe metadata only.
+        """
+        from app.models.storage_config import StorageConfig
+        from app.services import local_uploads
+        from app.services.external_fetch import MAX_IMAGE_BYTES
+        from app.services.image_generation import (
+            ImageGenerationError,
+            image_source_at,
+            image_target_fingerprint,
+            materialize_source_image,
+        )
+        from app.services.image_search import (
+            ImageSearchError,
+            ImageSearchTokenError,
+            decode_candidate_reference_or_token,
+            decode_candidate_token,
+            fetch_candidate_preview,
+        )
+
+        if not tool_output_store or actor_user_id is None:
+            return tool_error("view_article_images", WorkspaceError("当前运行缺少文档上下文"))
+        if not isinstance(references, list) or not references or len(references) > 4:
+            return tool_error("view_article_images", WorkspaceError("每次必须查看 1 到 4 张图片"))
+
+        descriptors: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        db = SessionLocal()
+        try:
+            storage = db.query(StorageConfig).first()
+            inventory = session.workspace().image_inventory()
+            inventory_by_slot = {int(item.get("slot") or 0): item for item in inventory.get("images", [])}
+            for index, reference_model in enumerate(references, start=1):
+                reference = reference_model.model_dump() if isinstance(reference_model, BaseModel) else dict(reference_model)
+                kind = str(reference.get("kind") or "")
+                try:
+                    if kind == "article":
+                        slot = int(reference.get("image_slot") or 0)
+                        revision = str(reference.get("revision") or "")
+                        if slot < 1 or not revision or revision != session.workspace().revision:
+                            raise WorkspaceError("文章图片位置已过期，请重新调用 inspect_current_images")
+                        source = image_source_at(session.html, slot - 1)
+                        fingerprint = image_target_fingerprint(session.html, slot - 1, source)
+                        inventory_item = inventory_by_slot.get(slot)
+                        if not source or not fingerprint or inventory_item is None:
+                            raise WorkspaceError("文章图片槽位不存在")
+                        descriptors.append({
+                            "index": index,
+                            "kind": kind,
+                            "label": f"文章图片 {slot} · {str(inventory_item.get('location_label') or '')[:120]}",
+                            "width": None,
+                            "height": None,
+                            "source": source,
+                            "storage": storage,
+                        })
+                    elif kind == "generated":
+                        asset_id = str(reference.get("asset_id") or "").strip()
+                        asset = db.get(GeneratedImageAsset, asset_id) if asset_id else None
+                        generation = db.get(ImageGeneration, asset.generation_id) if asset is not None else None
+                        if (
+                            asset is None
+                            or generation is None
+                            or generation.document_id != tool_output_store.document_id
+                            or generation.user_id != actor_user_id
+                            or generation.status != ImageGenerationStatus.SUCCEEDED
+                        ):
+                            raise WorkspaceError("AI 图片候选不存在或不可用")
+                        descriptors.append({
+                            "index": index,
+                            "kind": kind,
+                            "label": f"AI 图片候选 {asset.id}",
+                            "width": asset.width or None,
+                            "height": asset.height or None,
+                            "source": asset.url,
+                            "storage": storage,
+                        })
+                    elif kind == "searched":
+                        candidate_ref = str(reference.get("candidate_ref") or "").strip()
+                        candidate = (
+                            decode_candidate_reference_or_token(
+                                candidate_ref,
+                                user_id=actor_user_id,
+                                document_id=tool_output_store.document_id,
+                            )
+                            if candidate_ref
+                            else decode_candidate_token(
+                                str(reference.get("candidate_token") or ""),
+                                user_id=actor_user_id,
+                                document_id=tool_output_store.document_id,
+                            )
+                        )
+                        descriptors.append({
+                            "index": index,
+                            "kind": kind,
+                            "label": candidate.title or f"搜图候选 {candidate.id}",
+                            "width": candidate.width,
+                            "height": candidate.height,
+                            "candidate": candidate,
+                        })
+                    else:
+                        raise WorkspaceError("图片引用类型无效")
+                except (WorkspaceError, ImageSearchTokenError, TypeError, ValueError) as exc:
+                    errors.append({"index": index, "kind": kind or "unknown", "error": str(exc)})
+        finally:
+            db.close()
+
+        if not descriptors:
+            return tool_error("view_article_images", WorkspaceError(errors[0]["error"] if errors else "没有可查看的图片"))
+
+        visual_items: list[dict[str, Any]] = []
+        viewed_items: list[dict[str, Any]] = []
+        if model_is_multimodal:
+            async def materialize(descriptor: dict[str, Any]) -> tuple[bytes, str]:
+                if descriptor["kind"] == "searched":
+                    data, info = await fetch_candidate_preview(descriptor["candidate"])
+                    return data, info.content_type
+                source = str(descriptor.get("source") or "")
+                if source.lower().startswith("data:image/"):
+                    try:
+                        header, encoded = source.split(",", 1)
+                        if ";base64" not in header.lower():
+                            raise ValueError
+                        data = base64.b64decode(encoded, validate=True)
+                        return data, local_uploads.inspect_image(data).content_type
+                    except Exception as exc:  # noqa: BLE001 - normalize all malformed inline data.
+                        raise WorkspaceError("文章内联图片无效") from exc
+                return await materialize_source_image(source, storage=descriptor.get("storage"))
+
+            results = await asyncio.gather(*(materialize(item) for item in descriptors), return_exceptions=True)
+            for descriptor, loaded in zip(descriptors, results):
+                if isinstance(loaded, Exception):
+                    error_text = str(loaded)
+                    if isinstance(loaded, (ImageGenerationError, ImageSearchError, WorkspaceError, ValueError)):
+                        errors.append({"index": descriptor["index"], "kind": descriptor["kind"], "error": error_text})
+                    else:
+                        errors.append({"index": descriptor["index"], "kind": descriptor["kind"], "error": "图片读取失败"})
+                    continue
+                data, content_type = loaded
+                if len(data) > MAX_IMAGE_BYTES:
+                    errors.append({"index": descriptor["index"], "kind": descriptor["kind"], "error": "图片超过 10MB 限制"})
+                    continue
+                visual_items.append({
+                    "index": descriptor["index"],
+                    "label": descriptor["label"],
+                    "data": data,
+                    "content_type": content_type,
+                })
+                viewed_items.append({key: descriptor.get(key) for key in ("index", "kind", "label", "width", "height")})
+            if not visual_items:
+                return tool_error("view_article_images", WorkspaceError(errors[0]["error"] if errors else "图片读取失败"))
+            call_id = active_tool_call_id.get()
+            if call_id:
+                with visual_tool_images_lock:
+                    visual_tool_images[call_id] = visual_items
+        else:
+            viewed_items = [
+                {key: descriptor.get(key) for key in ("index", "kind", "label", "width", "height")}
+                for descriptor in descriptors
+            ]
+
+        payload = {
+            "vision_supported": bool(model_is_multimodal),
+            "requested_count": len(references),
+            "viewed_count": len(visual_items) if model_is_multimodal else 0,
+            "items": viewed_items,
+            "errors": errors,
+        }
+        summary = (
+            f"已向多模态模型提供 {len(visual_items)} 张图片"
+            if model_is_multimodal
+            else "当前聊天模型不支持读取图片，已返回安全元数据"
+        )
+        emit_tool_result(
+            "view_article_images",
+            summary,
+            {"kind": "image_view", "summary": summary, "details": payload},
+        )
+        return bounded_json(
+            payload,
+            session.tool_result_max_tokens,
+            next_step="根据已查看的画面和文章语义选择候选；不要根据未查看图片的标题臆测画面内容。",
+        )
+
+    @tool
+    async def import_searched_image(candidate_ref: str = "", candidate_token: str = "") -> str:
+        """Import one signed searched-image candidate and return its stable asset URL.
+
+        This tool does not modify article HTML or create a document version. For
+        body use, first import the candidate, then read the current container and
+        use ``apply_html_patch`` with the returned URL and any suitable HTML.
+        Use ``apply_searched_cover`` only when the imported candidate should be
+        the article cover. Prefer the short ``candidate_ref`` from search.
+        """
+        from app.models.image_generation import ImageLibrarySource
+        from app.services.document_images import delete_tracked_document_image, store_tracked_document_image
+        from app.services.image_library import create_library_asset
+        from app.services.image_search import (
+            ImageSearchError,
+            ImageSearchTokenError,
+            decode_candidate_reference_or_token,
+            fetch_candidate_image,
+        )
+
+        if not tool_output_store or actor_user_id is None:
+            return tool_error("import_searched_image", WorkspaceError("当前运行缺少文档上下文"))
+        try:
+            candidate = decode_candidate_reference_or_token(
+                candidate_ref or candidate_token,
+                user_id=actor_user_id,
+                document_id=tool_output_store.document_id,
+            )
+            image_data, image = await fetch_candidate_image(candidate)
+        except (ImageSearchError, ImageSearchTokenError, ValueError) as exc:
+            return tool_error("import_searched_image", WorkspaceError(str(exc)))
+
+        db = SessionLocal()
+        stored = None
+        try:
+            stored = store_tracked_document_image(db, image_data, f"image-search-{candidate.id}")
+            asset = create_library_asset(
+                db,
+                owner_id=actor_user_id,
+                document_id=tool_output_store.document_id,
+                name=candidate.title or "搜索图片",
+                source=ImageLibrarySource.SEARCH,
+                stored=stored,
+                content_type=image.content_type,
+                size=len(image_data),
+                width=image.width,
+                height=image.height,
+            )
+            db.commit()
+            result = {
+                "ok": True,
+                "asset_id": asset.id,
+                "url": stored.url,
+                "title": candidate.title,
+                "source_page_url": candidate.source_page_url,
+                "width": image.width,
+                "height": image.height,
+            }
+            emit_tool_result(
+                "import_searched_image",
+                "搜索图片已导入",
+                {"kind": "image_import", "summary": "搜索图片已导入", "details": result},
+            )
+            return bounded_json(
+                result,
+                session.tool_result_max_tokens,
+                next_step="正文采用此 URL 时，先读取当前容器，再用 apply_html_patch 自行决定插入、替换或组合方式；设封面时调用 apply_searched_cover。",
+            )
+        except (WorkspaceError, ValueError) as exc:
+            db.rollback()
+            if stored is not None:
+                delete_tracked_document_image(db, stored)
+            return tool_error("import_searched_image", exc)
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            if stored is not None:
+                delete_tracked_document_image(db, stored)
+            return tool_error("import_searched_image", WorkspaceError(f"搜索图片导入失败：{exc}"))
+        finally:
+            db.close()
+
+    @tool
+    def apply_searched_cover(asset_id: str) -> str:
+        """Set one current user's imported searched image as the article cover.
+
+        Covers are document metadata, so this is intentionally separate from
+        body HTML placement and accepts only a searched asset imported for the
+        current document and user.
+        """
+        if not tool_output_store or actor_user_id is None:
+            return tool_error("apply_searched_cover", WorkspaceError("当前运行缺少文档上下文"))
+        from app.models.image_generation import ImageLibraryAsset, ImageLibrarySource
+
+        db = SessionLocal()
+        try:
+            asset = (
+                db.query(ImageLibraryAsset)
+                .filter(
+                    ImageLibraryAsset.id == asset_id,
+                    ImageLibraryAsset.owner_id == actor_user_id,
+                    ImageLibraryAsset.document_id == tool_output_store.document_id,
+                    ImageLibraryAsset.source == ImageLibrarySource.SEARCH,
+                    ImageLibraryAsset.deleted_at.is_(None),
+                )
+                .first()
+            )
+            if asset is None:
+                raise WorkspaceError("搜索图片素材不存在或不可用")
+            document = (
+                db.query(Document)
+                .filter(Document.id == tool_output_store.document_id)
+                .with_for_update()
+                .first()
+            )
+            if document is None:
+                raise WorkspaceError("文档不存在")
+            document.wechat_cover_url = asset.url
+            document.wechat_pic_crop_235_1 = ""
+            document.wechat_pic_crop_1_1 = ""
+            touch_document(document, actor_user_id)
+            create_document_version(db, document, actor_user_id, DocumentVersionSource.AI, "Agent 搜图设置封面")
+            db.commit()
+            result = {"ok": True, "target": "cover", "asset_id": asset.id, "url": asset.url}
+            emit_tool_result(
+                "apply_searched_cover",
+                "搜索图片已设为封面",
+                {"kind": "image_application", "summary": "搜索图片已设为封面", "details": result},
+            )
+            return bounded_json(result, session.tool_result_max_tokens, next_step="封面已更新；正文采用搜索图片请使用 apply_html_patch。")
+        except (WorkspaceError, ValueError) as exc:
+            db.rollback()
+            return tool_error("apply_searched_cover", exc)
+        finally:
+            db.close()
+
+    @tool
     def generate_article_images(
         purpose: str,
         prompt: str,
         quantity: int = 1,
         aspect_ratio: str = "landscape",
         quality: str = "auto",
-        anchor_block_id: str = "",
     ) -> str:
         """Generate validated article images and return candidate asset URLs.
 
@@ -2783,12 +3554,11 @@ def _build_editor_graph(
         accepted and normalized before validation. ``aspect_ratio`` is one of
         ``square``, ``portrait`` or ``landscape``.
 
-        This tool never edits HTML. The Agent must use the returned asset URL in
-        an explicit HTML patch only when the user requested direct insertion.
+        This tool never edits HTML. Each successful candidate includes a stable
+        asset URL. Decide whether to keep it as a candidate or use that URL in
+        an explicit HTML patch for any suitable current-document container.
         """
         context = image_generation_context or {}
-        if not bool(context.get("enabled")) and not bool(context.get("explicit_requested")):
-            return tool_error("generate_article_images", WorkspaceError("当前会话未开启自动配图，需用户明确提出配图请求"))
         purpose_aliases = {
             "cover": "cover",
             "body": "body",
@@ -2872,7 +3642,6 @@ def _build_editor_graph(
                 quantity=quantity_value,
                 aspect_ratio=aspect_ratio,
                 quality=quality,
-                anchor_block_id=anchor_block_id,
                 direct_insert=False,
             )
             generation_id = generation.id
@@ -2901,28 +3670,344 @@ def _build_editor_graph(
         emit_tool_result(
             "generate_article_images",
             summary,
-            {"kind": "image_generation", "summary": summary, "details": payload, "targets": [{"text": f"候选图片 {item['id']}"} for item in payload.get("assets", [])]},
+            {"kind": "image_generation", "summary": summary, "details": payload},
         )
-        return bounded_json(payload, session.tool_result_max_tokens, next_step="默认只展示候选图片；仅在用户明确要求时，调用 apply_generated_image 应用候选图。")
+        return bounded_json(
+            payload,
+            session.tool_result_max_tokens,
+            next_step="根据当前任务决定是否采用候选。正文使用候选 assets[].url 配合当前 revision 的 apply_html_patch 写入任意合适容器；封面使用 apply_generated_cover。",
+        )
 
     @tool
-    def apply_generated_image(
+    def apply_generated_cover(
         generation_id: str,
         asset_id: str,
-        target: str,
-        revision: str = "",
-        anchor_block_id: str = "",
-        expected_hash: str = "",
-        alt: str = "",
     ) -> str:
-        """在用户明确要求插入正文或设为封面后应用一张候选图。"""
-        context = image_generation_context or {}
-        if not bool(context.get("explicit_requested")):
-            return tool_error("apply_generated_image", WorkspaceError("只有用户明确要求插入正文或设为封面时才能应用图片"))
-        if target not in {"cover", "body"}:
-            return tool_error("apply_generated_image", WorkspaceError("应用目标必须是 cover 或 body"))
+        """将当前用户在当前文档中生成的一张成功候选图设为文章封面。
+
+        正文图片不使用本工具，必须由 Agent 依据容器结构通过
+        ``apply_html_patch`` 写入候选的稳定 URL。
+        """
         if not tool_output_store or actor_user_id is None:
-            return tool_error("apply_generated_image", WorkspaceError("当前运行缺少文档上下文"))
+            return tool_error("apply_generated_cover", WorkspaceError("当前运行缺少文档上下文"))
+        db = SessionLocal()
+        try:
+            generation = db.query(ImageGeneration).filter(
+                ImageGeneration.id == generation_id,
+                ImageGeneration.document_id == tool_output_store.document_id,
+            ).first()
+            asset = db.get(GeneratedImageAsset, asset_id) if generation else None
+            if (
+                generation is None
+                or generation.document_id != tool_output_store.document_id
+                or asset is None
+                or asset.generation_id != generation.id
+            ):
+                raise WorkspaceError("图片候选不存在")
+            from app.models.image_generation import ImageGenerationOperation
+            if (
+                generation.user_id != actor_user_id
+                or generation.status != ImageGenerationStatus.SUCCEEDED
+                or getattr(generation, "operation", ImageGenerationOperation.GENERATE) != ImageGenerationOperation.GENERATE
+            ):
+                raise WorkspaceError("图片候选不可用")
+            document = db.get(Document, generation.document_id)
+            if document is None:
+                raise WorkspaceError("文档不存在")
+            document.wechat_cover_url = asset.url
+            document.wechat_pic_crop_235_1 = ""
+            document.wechat_pic_crop_1_1 = ""
+            asset.is_applied = True
+            asset.applied_at = datetime.now(timezone.utc)
+            touch_document(document, actor_user_id)
+            create_document_version(db, document, actor_user_id, DocumentVersionSource.AI, "AI 生成封面")
+            db.commit()
+            result = {"ok": True, "target": "cover", "asset_id": asset.id, "url": asset.url}
+            emit_tool_result(
+                "apply_generated_cover",
+                "AI 图片已设为封面",
+                {"kind": "image_application", "summary": "AI 图片已设为封面", "details": result},
+            )
+            return bounded_json(
+                result,
+                session.tool_result_max_tokens,
+                next_step="封面已更新；正文配图请使用 apply_html_patch。",
+            )
+        except (WorkspaceError, ValueError) as exc:
+            db.rollback()
+            return tool_error("apply_generated_cover", exc)
+        finally:
+            db.close()
+
+    @tool
+    def edit_article_image(
+        image_slot: int,
+        prompt: str,
+        quantity: int = 1,
+        aspect_ratio: str = "landscape",
+        quality: str = "auto",
+    ) -> str:
+        """根据当前任务，为当前文章的一张图片生成编辑候选图。
+
+        调用前必须先用 inspect_current_images 定位图片槽位。image_slot 是其
+        1 起始槽位；本工具只生成候选，绝不替换正文。候选符合任务目标时，调用
+        apply_edited_image 替换原图。
+        """
+        context = image_generation_context or {}
+        try:
+            slot = int(image_slot)
+            quantity_value = int(quantity)
+        except (TypeError, ValueError):
+            return tool_error("edit_article_image", WorkspaceError("图片槽位和数量必须是有效整数"))
+        if slot < 1:
+            return tool_error("edit_article_image", WorkspaceError("图片槽位从 1 开始，请先使用 inspect_current_images 定位"))
+        if quantity_value < 1 or quantity_value > 4:
+            return tool_error("edit_article_image", WorkspaceError("图片数量必须是 1 到 4"))
+        if aspect_ratio not in {"square", "portrait", "landscape"}:
+            return tool_error("edit_article_image", WorkspaceError("图片比例必须是 square、portrait 或 landscape"))
+        if len(prompt.strip()) < 3:
+            return tool_error("edit_article_image", WorkspaceError("请提供至少 3 个字符的图片编辑要求"))
+        from app.db.session import SessionLocal
+        from app.models.ai_image_model import AIImageModel
+        from app.models.image_generation import ImageGenerationOperation, ImageGenerationPurpose, ImageGenerationSource
+        from app.services.image_generation import create_generation, generation_payload, image_target_fingerprint, run_generation_sync
+        from app.services.model_access import can_access_image_model
+
+        image_tags = list(re.finditer(r"<img\b[^>]*>", session.html or "", flags=re.IGNORECASE))
+        index = slot - 1
+        if index >= len(image_tags):
+            return tool_error("edit_article_image", WorkspaceError("图片槽位不存在，请重新盘点当前图片"))
+        src_match = re.search(r"\bsrc\s*=\s*(['\"])(.*?)\1", image_tags[index].group(0), flags=re.IGNORECASE | re.DOTALL)
+        source_url = src_match.group(2).strip() if src_match else ""
+        source_hash = image_target_fingerprint(session.html, index, source_url)
+        if not source_url or not source_hash:
+            return tool_error("edit_article_image", WorkspaceError("该图片没有可编辑的原图，请重新选择"))
+        if tool_output_store is None or actor_user_id is None:
+            return tool_error("edit_article_image", WorkspaceError("当前运行缺少文档上下文，无法创建图片任务"))
+
+        generation_id = ""
+        db = SessionLocal()
+        try:
+            actor = db.get(User, actor_user_id)
+            image_model = None
+            if actor is not None and context.get("image_model_id"):
+                from sqlalchemy.orm import joinedload as _jl
+                image_model = db.query(AIImageModel).options(_jl(AIImageModel.provider)).filter(AIImageModel.id == int(context["image_model_id"])).first()
+                if image_model is not None and not can_access_image_model(actor, image_model):
+                    image_model = None
+            if actor is not None and image_model is None:
+                from sqlalchemy.orm import joinedload as _jl
+                image_model = next((candidate for candidate in db.query(AIImageModel).options(_jl(AIImageModel.provider)).order_by(AIImageModel.is_default.desc(), AIImageModel.id).all() if can_access_image_model(actor, candidate) and candidate.provider.image_protocol and candidate.provider.image_base_url), None)
+            if actor is None or image_model is None:
+                raise WorkspaceError("当前没有可用的图片模型，请先在管理端配置并选择")
+            if "edit" not in image_model.operations:
+                raise WorkspaceError("当前图片模型不支持 AI 图片编辑，请在管理端选择支持编辑的模型")
+            generation = create_generation(
+                db,
+                document_id=tool_output_store.document_id,
+                session_id=tool_output_store.session_id,
+                model_id=image_model.id,
+                user_id=actor_user_id,
+                source=ImageGenerationSource.AGENT,
+                purpose=ImageGenerationPurpose.BODY,
+                operation=ImageGenerationOperation.EDIT,
+                prompt=prompt.strip(),
+                quantity=quantity_value,
+                aspect_ratio=aspect_ratio,
+                quality=quality,
+                source_image_url=source_url,
+                source_image_hash=source_hash,
+                target_image_index=index,
+            )
+            generation_id = generation.id
+            db.commit()
+        except (WorkspaceError, ValueError) as exc:
+            db.rollback()
+            return tool_error("edit_article_image", exc)
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            return tool_error("edit_article_image", WorkspaceError(f"图片编辑任务创建失败：{exc}"))
+        finally:
+            db.close()
+        run_generation_sync(generation_id)
+        db = SessionLocal()
+        try:
+            from sqlalchemy.orm import joinedload as _jl
+            generation = db.query(ImageGeneration).options(_jl(ImageGeneration.assets)).filter(ImageGeneration.id == generation_id).first()
+            if generation is None:
+                return tool_error("edit_article_image", WorkspaceError("图片编辑任务已丢失"))
+            payload = generation_payload(generation, current_html=session.html)
+        finally:
+            db.close()
+        summary = "图片编辑候选已生成" if payload.get("status") == "succeeded" else f"图片编辑{payload.get('status', '失败')}"
+        emit_tool_result(
+            "edit_article_image",
+            summary,
+            {"kind": "image_generation", "summary": summary, "details": payload},
+        )
+        return bounded_json(payload, session.tool_result_max_tokens, next_step="根据当前任务判断候选是否合适；合适时直接调用 apply_edited_image 替换原图。")
+
+    @tool
+    def apply_edited_image(generation_id: str, asset_id: str, revision: str = "") -> str:
+        """将符合当前任务目标的 AI 图片编辑候选替换回原图片位置。"""
+        if not revision:
+            return tool_error("apply_edited_image", WorkspaceError("替换图片需要 inspect_current_images 返回的 revision"))
+        from app.models.image_generation import ImageGenerationOperation
+        from app.services.image_generation import image_target_fingerprint, replace_image_source
+
+        if not tool_output_store or actor_user_id is None:
+            return tool_error("apply_edited_image", WorkspaceError("当前运行缺少文档上下文"))
+        db = SessionLocal()
+        try:
+            generation = db.query(ImageGeneration).filter(ImageGeneration.id == generation_id, ImageGeneration.document_id == tool_output_store.document_id).first()
+            asset = db.get(GeneratedImageAsset, asset_id) if generation else None
+            if generation is None or asset is None or asset.generation_id != generation.id:
+                raise WorkspaceError("图片编辑候选不存在")
+            if generation.user_id != actor_user_id or generation.status != ImageGenerationStatus.SUCCEEDED or generation.operation != ImageGenerationOperation.EDIT:
+                raise WorkspaceError("图片编辑候选不可用")
+            if session.workspace().revision != revision:
+                raise WorkspaceError("文档已发生变化，请重新定位图片后再替换")
+            current_hash = image_target_fingerprint(session.html, generation.target_image_index, generation.source_image_url)
+            if not current_hash or current_hash != generation.source_image_hash:
+                raise WorkspaceError("目标图片已发生变化，请重新生成编辑候选")
+            session.html = replace_image_source(session.html, generation.target_image_index, generation.source_image_url, asset.url)
+            session.edited = True
+            asset.is_applied = True
+            asset.applied_at = datetime.now(timezone.utc)
+            document = db.get(Document, generation.document_id)
+            if document is None:
+                raise WorkspaceError("文档不存在")
+            document.current_html = session.html
+            touch_document(document, actor_user_id)
+            create_document_version(db, document, actor_user_id, DocumentVersionSource.AI, "AI 编辑图片")
+            db.commit()
+            session.persist_checkpoint()
+            result = {"ok": True, "target": "replace", "asset_id": asset.id, "url": asset.url, "revision": session.workspace().revision}
+            emit_tool_result(
+                "apply_edited_image",
+                "图片已替换",
+                {"kind": "image_application", "summary": "图片已替换", "details": result},
+                html=session.html,
+            )
+            return bounded_json(result, session.tool_result_max_tokens, next_step="图片已替换；如需调整位置或裁剪，请先读取当前文档地图。")
+        except (WorkspaceError, ValueError) as exc:
+            db.rollback()
+            return tool_error("apply_edited_image", exc)
+        finally:
+            db.close()
+
+    @tool
+    def edit_article_cover(
+        prompt: str,
+        quantity: int = 1,
+        aspect_ratio: str = "landscape",
+        quality: str = "auto",
+    ) -> str:
+        """根据当前文章封面生成 AI 编辑候选图。
+
+        封面是文档元数据而非正文图片，不需要图片槽位或 HTML revision。本工具只
+        生成候选；确认候选适合当前任务时调用 ``apply_edited_cover`` 更新封面。
+        """
+        context = image_generation_context or {}
+        try:
+            quantity_value = int(quantity)
+        except (TypeError, ValueError):
+            return tool_error("edit_article_cover", WorkspaceError("图片数量必须是有效整数"))
+        if quantity_value < 1 or quantity_value > 4:
+            return tool_error("edit_article_cover", WorkspaceError("图片数量必须是 1 到 4"))
+        if aspect_ratio not in {"square", "portrait", "landscape"}:
+            return tool_error("edit_article_cover", WorkspaceError("图片比例必须是 square、portrait 或 landscape"))
+        if len(prompt.strip()) < 3:
+            return tool_error("edit_article_cover", WorkspaceError("请提供至少 3 个字符的封面编辑要求"))
+        if tool_output_store is None or actor_user_id is None:
+            return tool_error("edit_article_cover", WorkspaceError("当前运行缺少文档上下文，无法创建图片任务"))
+
+        from app.models.ai_image_model import AIImageModel
+        from app.models.image_generation import ImageGenerationOperation, ImageGenerationPurpose, ImageGenerationSource
+        from app.services.image_generation import cover_source_fingerprint, create_generation, generation_payload, run_generation_sync
+        from app.services.model_access import can_access_image_model
+
+        generation_id = ""
+        db = SessionLocal()
+        try:
+            document = db.get(Document, tool_output_store.document_id)
+            source_url = str(getattr(document, "wechat_cover_url", "") or "").strip() if document else ""
+            source_hash = cover_source_fingerprint(source_url)
+            if document is None:
+                raise WorkspaceError("文档不存在")
+            if not source_url or not source_hash:
+                raise WorkspaceError("当前文章没有可编辑的封面，请先设置封面或生成一张封面候选")
+            actor = db.get(User, actor_user_id)
+            image_model = None
+            if actor is not None and context.get("image_model_id"):
+                from sqlalchemy.orm import joinedload as _jl
+                image_model = db.query(AIImageModel).options(_jl(AIImageModel.provider)).filter(AIImageModel.id == int(context["image_model_id"])).first()
+                if image_model is not None and not can_access_image_model(actor, image_model):
+                    image_model = None
+            if actor is not None and image_model is None:
+                from sqlalchemy.orm import joinedload as _jl
+                image_model = next((candidate for candidate in db.query(AIImageModel).options(_jl(AIImageModel.provider)).order_by(AIImageModel.is_default.desc(), AIImageModel.id).all() if can_access_image_model(actor, candidate) and candidate.provider.image_protocol and candidate.provider.image_base_url), None)
+            if actor is None or image_model is None:
+                raise WorkspaceError("当前没有可用的图片模型，请先在管理端配置并选择")
+            if "edit" not in image_model.operations:
+                raise WorkspaceError("当前图片模型不支持 AI 图片编辑，请在管理端选择支持编辑的模型")
+            generation = create_generation(
+                db,
+                document_id=document.id,
+                session_id=tool_output_store.session_id,
+                model_id=image_model.id,
+                user_id=actor_user_id,
+                source=ImageGenerationSource.AGENT,
+                purpose=ImageGenerationPurpose.COVER,
+                operation=ImageGenerationOperation.EDIT,
+                prompt=prompt.strip(),
+                quantity=quantity_value,
+                aspect_ratio=aspect_ratio,
+                quality=quality,
+                source_image_url=source_url,
+                source_image_hash=source_hash,
+                target_image_index=-1,
+            )
+            generation_id = generation.id
+            db.commit()
+        except (WorkspaceError, ValueError) as exc:
+            db.rollback()
+            return tool_error("edit_article_cover", exc)
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            return tool_error("edit_article_cover", WorkspaceError(f"封面编辑任务创建失败：{exc}"))
+        finally:
+            db.close()
+        run_generation_sync(generation_id)
+        db = SessionLocal()
+        try:
+            from sqlalchemy.orm import joinedload as _jl
+            generation = db.query(ImageGeneration).options(_jl(ImageGeneration.assets)).filter(ImageGeneration.id == generation_id).first()
+            if generation is None:
+                return tool_error("edit_article_cover", WorkspaceError("封面编辑任务已丢失"))
+            payload = generation_payload(generation)
+        finally:
+            db.close()
+        summary = "封面编辑候选已生成" if payload.get("status") == "succeeded" else f"封面编辑{payload.get('status', '失败')}"
+        emit_tool_result(
+            "edit_article_cover",
+            summary,
+            {"kind": "image_generation", "summary": summary, "details": payload},
+        )
+        return bounded_json(payload, session.tool_result_max_tokens, next_step="根据当前任务判断封面编辑候选是否合适；合适时直接调用 apply_edited_cover。")
+
+    @tool
+    def apply_edited_cover(generation_id: str, asset_id: str) -> str:
+        """将符合当前任务目标的 AI 封面编辑候选应用为文章封面。
+
+        仅接受当前用户、当前文档、当前封面生成的成功编辑候选。若封面在生成期间
+        已变化，会拒绝覆盖并要求重新生成候选。
+        """
+        if not tool_output_store or actor_user_id is None:
+            return tool_error("apply_edited_cover", WorkspaceError("当前运行缺少文档上下文"))
+        from app.models.image_generation import ImageGenerationOperation, ImageGenerationPurpose
+        from app.services.image_generation import cover_source_fingerprint
+
         db = SessionLocal()
         try:
             generation = db.query(ImageGeneration).filter(
@@ -2931,58 +4016,43 @@ def _build_editor_graph(
             ).first()
             asset = db.get(GeneratedImageAsset, asset_id) if generation else None
             if generation is None or asset is None or asset.generation_id != generation.id:
-                raise WorkspaceError("图片候选不存在")
-            if generation.user_id != actor_user_id or generation.status != ImageGenerationStatus.SUCCEEDED:
-                raise WorkspaceError("图片候选不可用")
-            # ``purpose`` captures the composition requested at generation
-            # time (for example, a wide cover).  A completed candidate may
-            # still be deliberately reused as an inline banner or as a cover
-            # when the user asks for it, so it must not constrain application.
-            document = db.get(Document, generation.document_id)
+                raise WorkspaceError("封面编辑候选不存在")
+            if (
+                generation.user_id != actor_user_id
+                or generation.status != ImageGenerationStatus.SUCCEEDED
+                or generation.operation != ImageGenerationOperation.EDIT
+                or generation.purpose != ImageGenerationPurpose.COVER
+            ):
+                raise WorkspaceError("封面编辑候选不可用")
+            document = (
+                db.query(Document)
+                .filter(Document.id == generation.document_id)
+                .with_for_update()
+                .first()
+            )
             if document is None:
                 raise WorkspaceError("文档不存在")
-            if target == "cover":
-                document.wechat_cover_url = asset.url
-                document.wechat_pic_crop_235_1 = ""
-                document.wechat_pic_crop_1_1 = ""
-                asset.is_applied = True
-                asset.applied_at = datetime.now(timezone.utc)
-                touch_document(document, actor_user_id)
-                create_document_version(db, document, actor_user_id, DocumentVersionSource.AI, "AI 生成封面")
-                db.commit()
-                result = {"ok": True, "target": "cover", "asset_id": asset.id, "url": asset.url}
-            else:
-                if not revision or not anchor_block_id or not expected_hash:
-                    raise WorkspaceError("正文插图需要 revision、anchor_block_id 和 expected_hash")
-                image_html = (
-                    f'<p><img src="{escape(asset.url, quote=True)}" alt="{escape(alt.strip() or generation.prompt[:120], quote=True)}" '
-                    'style="display:block;width:100%;height:auto;max-width:100%;" /></p>'
-                )
-                summary = session.patch_blocks(
-                    revision,
-                    [{"block_id": anchor_block_id, "expected_hash": expected_hash, "mode": "insert_after", "html": image_html}],
-                )
-                asset.is_applied = True
-                asset.applied_at = datetime.now(timezone.utc)
-                db.commit()
-                result = {"ok": True, "target": "body", "asset_id": asset.id, "url": asset.url, "revision": summary.get("revision", "")}
-                # Match regular HTML patch semantics: once the image has been
-                # applied, a later model failure must not discard the write.
-                session.persist_checkpoint()
+            current_hash = cover_source_fingerprint(document.wechat_cover_url)
+            if not generation.source_image_hash or current_hash != generation.source_image_hash:
+                raise WorkspaceError("文章封面已发生变化，请重新生成编辑候选")
+            document.wechat_cover_url = asset.url
+            document.wechat_pic_crop_235_1 = ""
+            document.wechat_pic_crop_1_1 = ""
+            asset.is_applied = True
+            asset.applied_at = datetime.now(timezone.utc)
+            touch_document(document, actor_user_id)
+            create_document_version(db, document, actor_user_id, DocumentVersionSource.AI, "AI 编辑封面")
+            db.commit()
+            result = {"ok": True, "target": "cover", "asset_id": asset.id, "url": asset.url}
             emit_tool_result(
-                "apply_generated_image",
-                "图片已应用",
-                {"kind": "image_application", "summary": "图片已应用", "details": result},
-                html=session.html if target == "body" else None,
+                "apply_edited_cover",
+                "封面已更新",
+                {"kind": "image_application", "summary": "封面已更新", "details": result},
             )
-            return bounded_json(
-                result,
-                session.tool_result_max_tokens,
-                next_step="图片已按用户要求应用；如仍需调整位置或封面，请先读取当前文档地图。",
-            )
+            return bounded_json(result, session.tool_result_max_tokens, next_step="封面已更新；如需编辑正文图片，请先盘点当前正文图片。")
         except (WorkspaceError, ValueError) as exc:
             db.rollback()
-            return tool_error("apply_generated_image", exc)
+            return tool_error("apply_edited_cover", exc)
         finally:
             db.close()
 
@@ -3361,6 +4431,52 @@ def _build_editor_graph(
         limit = max(256, min(100_000, requested, session.effective_tool_result_max_tokens))
         try:
             with SessionLocal() as db:
+                from app.models.chat_tool_output import ChatToolOutput
+
+                stored = db.get(ChatToolOutput, output_id)
+                expires_at = getattr(stored, "expires_at", None)
+                if expires_at is not None and expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if (
+                    stored is not None
+                    and stored.document_id == tool_output_store.document_id
+                    and stored.session_id == tool_output_store.session_id
+                    and stored.tool_name == "search_article_images"
+                    and (expires_at is None or expires_at > datetime.now(timezone.utc))
+                    and actor_user_id is not None
+                ):
+                    payload = json.loads(stored.content or "{}")
+                    items = payload.get("items") if isinstance(payload, dict) else None
+                    if isinstance(items, list):
+                        from app.services.image_search import issue_candidate_reference
+
+                        compact_items = []
+                        for index, item in enumerate(items):
+                            if not isinstance(item, dict):
+                                continue
+                            compact = {
+                                key: value
+                                for key, value in item.items()
+                                if key not in {"token", "preview_url"}
+                            }
+                            compact["candidate_ref"] = issue_candidate_reference(
+                                output_id,
+                                index,
+                                user_id=actor_user_id,
+                                document_id=tool_output_store.document_id,
+                            )
+                            compact_items.append(compact)
+                        safe_payload = {
+                            key: value for key, value in payload.items() if key != "items"
+                        }
+                        safe_payload["items"] = compact_items
+                        safe_payload["output_id"] = output_id
+                        safe_payload["token_redacted"] = True
+                        return bounded_json(
+                            safe_payload,
+                            limit,
+                            next_step="候选已提供 candidate_ref；直接原样传给 view_article_images 或 import_searched_image，不要读取或转录完整 token。",
+                        )
                 return tool_output_store.read_page(db, output_id=output_id, cursor=cursor, max_tokens=limit)
         except ToolOutputError as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -3714,6 +4830,56 @@ def _build_editor_graph(
             value = session.workspace().image_inventory(query, limit, cursor)
         except WorkspaceError as exc:
             return tool_error("inspect_current_images", exc)
+        active_selected_elements = selected_elements_factory() if selected_elements_factory else []
+        selected_images: list[dict[str, Any]] = []
+        selected_by_path: dict[str, list[int]] = {}
+        non_image_element_indexes: list[int] = []
+        for index, selected_element in enumerate(active_selected_elements, start=1):
+            if str(selected_element.get("tag_name") or "").lower() != "img":
+                non_image_element_indexes.append(index)
+                continue
+            selected_path = str(selected_element.get("workspace_path") or "")
+            status = str(selected_element.get("selection_status") or "missing")
+            image_slot = selected_element.get("workspace_image_slot")
+            item = {
+                "selected_element_index": index,
+                "status": status,
+                "path": selected_path,
+                "block_id": str(selected_element.get("workspace_block_id") or ""),
+                "image_slot": int(image_slot) if isinstance(image_slot, int) and image_slot > 0 else None,
+                "location_label": str(selected_element.get("workspace_image_location") or ""),
+                "reason": str(selected_element.get("selection_reason") or ""),
+            }
+            selected_images.append(item)
+            if status in {"exact", "relocated"} and selected_path and item["image_slot"]:
+                selected_by_path.setdefault(selected_path, []).append(index)
+
+        annotated_images: list[dict[str, Any]] = []
+        for image in value["images"]:
+            selected_indexes = selected_by_path.get(str(image.get("path") or ""), [])
+            annotated_images.append(
+                {
+                    **image,
+                    "selected_anchor": bool(selected_indexes),
+                    "selected_element_indexes": selected_indexes,
+                }
+            )
+        value = {
+            **value,
+            "images": annotated_images,
+            "selection": {
+                "received": bool(active_selected_elements),
+                "selected_element_count": len(active_selected_elements),
+                "selected_image_count": len(selected_images),
+                "selected_images": selected_images,
+                "non_image_element_indexes": non_image_element_indexes,
+                "unresolved_image_element_indexes": [
+                    item["selected_element_index"]
+                    for item in selected_images
+                    if item["status"] not in {"exact", "relocated"} or item["image_slot"] is None
+                ],
+            },
+        }
         query_label = f"图片定位“{_short(query, 80)}”" if query.strip() else "图片盘点"
         suffix = f"，剩余 {value['remaining_image_count']} 张" if value.get("next_cursor") is not None else ""
         emit_tool_result(
@@ -3726,9 +4892,16 @@ def _build_editor_graph(
                     {
                         "block_id": item["block_id"],
                         "path": item["path"],
-                        "text": f"图片槽位 {item['slot']} · {item['location_label']}",
+                        "text": (
+                            f"图片槽位 {item['slot']} · {item['location_label']}"
+                            + (
+                                f" · 用户选中 @元素{','.join(str(index) for index in item['selected_element_indexes'])}"
+                                if item["selected_element_indexes"]
+                                else ""
+                            )
+                        ),
                     }
-                    for item in value["images"]
+                    for item in annotated_images
                 ],
                 "revision": value["revision"],
                 "details": {
@@ -3737,6 +4910,7 @@ def _build_editor_graph(
                     "query": value["query"],
                     "cursor": value["cursor"],
                     "next_cursor": value["next_cursor"],
+                    "selection": value["selection"],
                 },
             },
         )
@@ -3744,7 +4918,8 @@ def _build_editor_graph(
             value,
             session.tool_result_max_tokens,
             next_step=(
-                "若候选唯一，读取对应 block 再修改；若候选不唯一，使用位置标签向用户确认。"
+                "selection.selected_images 中的已解析图片就是用户明确选中的目标，应优先使用；"
+                "只有该列表为空或标为未解析时，才按候选位置向用户确认。"
                 if value.get("next_cursor") is None
                 else "使用相同 query 和 next_cursor 继续查看候选图片。"
             ),
@@ -3961,8 +5136,16 @@ def _build_editor_graph(
         replace_document,
         ask_user,
         update_task_plan,
+        search_article_images,
+        view_article_images,
+        import_searched_image,
+        apply_searched_cover,
         generate_article_images,
-        apply_generated_image,
+        apply_generated_cover,
+        edit_article_image,
+        apply_edited_image,
+        edit_article_cover,
+        apply_edited_cover,
         check_compliance,
     ]
     # The strict gzh validator only applies to an explicitly approved theme
@@ -3977,7 +5160,20 @@ def _build_editor_graph(
             read_layout_reference_blocks,
         ]
     tools_by_name = {item.name: item for item in tools}
-    model_with_tools = chat_model.bind_tools(tools)
+    static_prompt_fingerprint = _cache_fingerprint(build_static_system_prompt())
+    tool_schema_fingerprint = _tool_schema_fingerprint(chat_model, tools)
+    model_with_tools = _bind_tools_with_prompt_cache(chat_model, tools)
+    logger.info(
+        "agent_trace run=%s prompt_cache_config provider=%s static_hash=%s tool_hash=%s tools=%s anthropic_ttl=%s",
+        trace_id,
+        provider_type,
+        static_prompt_fingerprint,
+        tool_schema_fingerprint,
+        len(tools),
+        get_settings().CHAT_AGENT_ANTHROPIC_CACHE_TTL
+        if isinstance(chat_model, ChatAnthropic)
+        else "-",
+    )
     model_turn = 0
 
     async def call_model(state: EditorState) -> Dict[str, list[BaseMessage]]:
@@ -4166,11 +5362,13 @@ def _build_editor_graph(
             )
 
         logger.warning(
-            "agent_trace run=%s turn=%s model_start messages=%s compacted=%s",
+            "agent_trace run=%s turn=%s model_start messages=%s compacted=%s static_hash=%s tool_hash=%s",
             trace_id,
             turn,
             len(outgoing),
             compaction["compacted"],
+            static_prompt_fingerprint,
+            tool_schema_fingerprint,
         )
         if compaction["compacted"]:
             writer(
@@ -4330,6 +5528,17 @@ def _build_editor_graph(
         # returns usage while streaming.
         usage = _usage_from_message(response_chunk)
         if usage:
+            logger.info(
+                "agent_trace run=%s turn=%s prompt_cache_usage input_tokens=%s cache_read_tokens=%s cache_write_tokens=%s hit_rate=%s",
+                trace_id,
+                turn,
+                usage["input_tokens"],
+                usage["cache_read_tokens"],
+                usage["cache_write_tokens"],
+                round(usage["cache_read_tokens"] * 100 / usage["input_tokens"], 1)
+                if usage["input_tokens"]
+                else 0,
+            )
             writer(
                 {
                     "event": "context_stats",
@@ -4720,6 +5929,39 @@ def _build_editor_graph(
                     status=message.status,
                 )
             )
+        visual_batches: list[dict[str, Any]] = []
+        with visual_tool_images_lock:
+            for message in raw_messages:
+                if not isinstance(message, ToolMessage) or str(message.name or "") != "view_article_images":
+                    continue
+                visual_batches.extend(visual_tool_images.pop(str(message.tool_call_id or ""), []))
+        if visual_batches:
+            visual_content: list[dict[str, Any]] = [
+                {"type": "text", "text": "以下图片由 view_article_images 安全读取；请按编号结合工具元数据分析画面。"}
+            ]
+            for item in visual_batches:
+                visual_content.append({"type": "text", "text": f"图片 {item['index']}：{item['label']}"})
+                encoded = base64.b64encode(item["data"]).decode("ascii")
+                if provider_type == ProviderType.ANTHROPIC.value:
+                    visual_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": item["content_type"],
+                            "data": encoded,
+                        },
+                    })
+                else:
+                    visual_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{item['content_type']};base64,{encoded}"},
+                    })
+            bound_messages.append(
+                HumanMessage(
+                    content=visual_content,
+                    additional_kwargs={"ephemeral_tool_images": True},
+                )
+            )
         if tool_output_store is not None:
             try:
                 with SessionLocal() as stats_db:
@@ -4773,6 +6015,8 @@ async def run_agent_loop(
     resume_tool_result: dict[str, Any] | None = None,
     prior_context_events: Sequence[dict[str, Any]] | None = None,
     image_generation_context: Dict[str, Any] | None = None,
+    model_is_multimodal: bool = False,
+    provider_type: str = "openai_compatible",
 ) -> AsyncIterator[Dict[str, Any]]:
     """运行 LangGraph 并标准化为 API 层消费的 SSE 事件。"""
     session = session or HtmlEditSession(current_html)
@@ -4789,6 +6033,12 @@ async def run_agent_loop(
 
     def resolve_active_selected_elements() -> list[Dict[str, Any]]:
         workspace = session.workspace()
+        image_inventory = workspace.image_inventory()
+        images_by_path = {
+            str(image.get("path")): image
+            for image in image_inventory.get("images", [])
+            if isinstance(image, dict) and image.get("path")
+        }
         resolved_items: list[Dict[str, Any]] = []
         for element in selection_anchors:
             resolved = workspace.resolve_selection(
@@ -4815,11 +6065,24 @@ async def run_agent_loop(
                         "workspace_sibling_index": int(sibling_match.group(1)) if sibling_match else 0,
                     }
                 )
+                image = images_by_path.get(resolved.path) if resolved.tag == "img" else None
+                if image is not None:
+                    item.update(
+                        {
+                            "workspace_image_slot": int(image.get("slot", 0) or 0),
+                            "workspace_image_location": str(image.get("location_label", "")),
+                        }
+                    )
+                else:
+                    item.pop("workspace_image_slot", None)
+                    item.pop("workspace_image_location", None)
             else:
                 item.pop("workspace_block_id", None)
                 item.pop("workspace_path", None)
                 item.pop("workspace_parent_path", None)
                 item.pop("workspace_sibling_index", None)
+                item.pop("workspace_image_slot", None)
+                item.pop("workspace_image_location", None)
             resolved_items.append(item)
         return resolved_items
 
@@ -4860,10 +6123,14 @@ async def run_agent_loop(
         # saved on the question record before the pause.
         produced_messages: list[BaseMessage] = [messages[-2], messages[-1]]
     else:
+        initial_user_content = _append_selected_elements_to_user_content(
+            user_content if user_content is not None else user_message,
+            resolve_active_selected_elements(),
+        )
         messages = [
             current_system_message(),
             *recent_history,
-            HumanMessage(content=user_content if user_content is not None else user_message),
+            HumanMessage(content=initial_user_content),
         ]
         produced_messages = []
     if messages and isinstance(messages[0], SystemMessage):
@@ -4904,7 +6171,10 @@ async def run_agent_loop(
         runtime_compaction_state,
         model_id,
         image_generation_context=image_generation_context,
+        model_is_multimodal=model_is_multimodal,
+        provider_type=provider_type,
         system_message_factory=current_system_message,
+        selected_elements_factory=resolve_active_selected_elements,
     )
     final_content = ""
     try:

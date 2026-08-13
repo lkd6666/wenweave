@@ -1,0 +1,39 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - baidu images
+      - sogou images
+      - bing images
+
+engines:
+  - name: baidu images
+    disabled: false
+  - name: sogou images
+    disabled: false
+  - name: bing images
+    disabled: false
+    base_url: https://cn.bing.com
+
+general:
+  instance_name: yibanpaiban-domestic-image-search-verify
+
+search:
+  safe_search: 1
+  default_lang: zh-CN
+  formats:
+    - html
+    - json
+
+outgoing:
+  request_timeout: 3.2
+  max_request_timeout: 3.5
+
+server:
+  secret_key: "replace-with-a-random-64-character-verification-secret"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: true
+
+ui:
+  static_use_hash: true

@@ -3,7 +3,7 @@ import { Alert, Button, Checkbox, Empty, Input, Modal, Segmented, Select, Spin, 
 import { CheckOutlined, EyeOutlined, LoadingOutlined, SettingOutlined } from '@ant-design/icons'
 import { gzhThemesApi } from '../api/gzhThemes'
 import { ApiError } from '../api/client'
-import type { GzhApplyMode, GzhThemeItem, GzhThemeManifest, GzhThemeProposal } from '../types'
+import type { AIModelItem, GzhApplyMode, GzhThemeItem, GzhThemeManifest, GzhThemeProposal } from '../types'
 import { useAuthStore } from '../store/authStore'
 import { frameThemeDocument } from '../utils/themePreview'
 import { SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
@@ -15,6 +15,7 @@ interface ThemeGalleryModalProps {
   documentId: number
   sessionId: number | null
   modelId: number | null
+  models: AIModelItem[]
   disabled?: boolean
   onClose: () => void
   onApproved: (proposal: GzhThemeProposal) => void
@@ -45,6 +46,7 @@ export default function ThemeGalleryModal({
   documentId,
   sessionId,
   modelId,
+  models,
   disabled = false,
   onClose,
   onApproved,
@@ -312,7 +314,7 @@ export default function ThemeGalleryModal({
           ? <iframe className="theme-preview-frame" title={`${selected.name} 完整预览`} sandbox={SANDBOX_ALLOW_NEW_WINDOW} srcDoc={frameThemeDocument(previews[selected.key], 'full')} />
           : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="预览正在加载" />}
       </Modal>
-      {isAdmin && <ThemeManagerModal open={managerOpen} modelId={modelId} onClose={() => setManagerOpen(false)} onThemesChanged={loadThemes} />}
+      {isAdmin && <ThemeManagerModal open={managerOpen} modelId={modelId} models={models} onClose={() => setManagerOpen(false)} onThemesChanged={loadThemes} />}
     </>
   )
 }

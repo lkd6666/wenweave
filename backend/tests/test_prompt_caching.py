@@ -6,10 +6,13 @@ Prompt 缓存只匹配前缀：静态规则必须整段排在任何易变内容�
 """
 from __future__ import annotations
 
+import asyncio
 import unittest
+from unittest import mock
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
 
 from app.services.chat_agent import (
     build_agent_prompt_cache_key,
@@ -17,6 +20,10 @@ from app.services.chat_agent import (
     build_system_message,
     build_system_prompt,
     build_volatile_system_prompt,
+    _anthropic_tools_with_cache_breakpoint,
+    _AnthropicCacheTtlFallbackModel,
+    _bind_tools_with_prompt_cache,
+    _cache_fingerprint,
 )
 from app.services.openai_compatible_chat_model import OpenAICompatibleChatModel
 from app.services.token_budget import estimate_tokens
@@ -71,7 +78,7 @@ class PromptCachingTests(unittest.TestCase):
         blocks = message.content
         self.assertIsInstance(blocks, list)
         self.assertEqual(len(blocks), 2)
-        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral", "ttl": "1h"})
         # 断点必须只落在静态块：加在易变块上等于每轮都写入新缓存条目。
         self.assertNotIn("cache_control", blocks[1])
         self.assertEqual(blocks[0]["text"], build_static_system_prompt())
@@ -102,8 +109,86 @@ class PromptCachingTests(unittest.TestCase):
 
         key = build_agent_prompt_cache_key(provider, model, 41)
 
-        self.assertEqual(key, "yb-agent-v1-p7-m11-s9")
+        expected_hash = _cache_fingerprint(build_static_system_prompt())
+        self.assertEqual(key, f"yb-agent-v2-p7-m11-h{expected_hash}-s9")
         self.assertNotIn("41", key or "")
+
+    def test_agent_cache_key_changes_with_the_static_prompt(self) -> None:
+        from app.models.ai_model import AIModel
+        from app.models.ai_provider import AIProvider, ProviderType
+
+        provider = AIProvider(id=7, name="OpenAI", provider_type=ProviderType.OPENAI_RESPONSES, base_url="https://example.test/v1")
+        model = AIModel(id=11, provider_id=7, model_name="gpt-5.6", display_name="GPT", prompt_cache_enabled=True)
+
+        original = build_agent_prompt_cache_key(provider, model, 41)
+        with mock.patch("app.services.chat_agent.build_static_system_prompt", return_value="changed rules"):
+            changed = build_agent_prompt_cache_key(provider, model, 41)
+
+        self.assertNotEqual(original, changed)
+
+    def test_anthropic_tool_cache_breakpoint_is_only_on_the_last_schema(self) -> None:
+        @tool
+        def first(value: str) -> str:
+            """Return the first value."""
+            return value
+
+        @tool
+        def second(value: str) -> str:
+            """Return the second value."""
+            return value
+
+        schemas = _anthropic_tools_with_cache_breakpoint([first, second])
+
+        self.assertNotIn("cache_control", schemas[0])
+        self.assertEqual(
+            schemas[1]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+
+    def test_openai_bound_tools_extend_the_cache_key_with_a_schema_hash(self) -> None:
+        @tool
+        def ping(value: str) -> str:
+            """Return one value."""
+            return value
+
+        bound = _bind_tools_with_prompt_cache(_explicit_cache_openai(), [ping])
+
+        self.assertRegex(bound.kwargs["prompt_cache_key"], r"^test-cache-key-t[0-9a-f]{12}$")
+
+    def test_anthropic_ttl_rejection_falls_back_before_output(self) -> None:
+        class RejectingModel:
+            def astream(self, _messages: object, **_kwargs: object) -> object:
+                async def generate():
+                    raise RuntimeError(
+                        "cache_control.ttl: Extra inputs are not permitted"
+                    )
+                    yield None
+
+                return generate()
+
+        class RecordingFallback:
+            def __init__(self) -> None:
+                self.messages: list[SystemMessage] = []
+
+            def astream(self, messages: object, **_kwargs: object) -> object:
+                async def generate():
+                    self.messages = list(messages)  # type: ignore[arg-type]
+                    yield "fallback"
+
+                return generate()
+
+        fallback = RecordingFallback()
+        model = _AnthropicCacheTtlFallbackModel(RejectingModel(), fallback)
+        system = build_system_message(_anthropic(), "标题", _HTML)
+
+        async def collect() -> list[object]:
+            return [chunk async for chunk in model.astream([system, HumanMessage(content="hi")])]
+
+        self.assertEqual(asyncio.run(collect()), ["fallback"])
+        self.assertEqual(
+            fallback.messages[0].content[0]["cache_control"],
+            {"type": "ephemeral"},
+        )
 
     def test_agent_cache_key_is_disabled_for_unsupported_or_opted_out_models(self) -> None:
         from app.models.ai_model import AIModel

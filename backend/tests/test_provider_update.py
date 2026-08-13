@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import create_engine
@@ -11,9 +12,12 @@ import app.models  # noqa: F401  确保关系模型已注册
 from fastapi import HTTPException
 
 from app.api.routes.ai_providers import create_model, discover_preset_models, install_preset, update_model, update_provider
+from app.bootstrap import migrate_anthropic_thinking_models
+from app.api.routes.models import list_models
 from app.db.base import Base
 from app.models.ai_provider import AIProvider, ProviderType
-from app.schemas.ai_provider import ModelCreate, ModelUpdate, PresetDiscoveryRequest, PresetInstallRequest, ProviderUpdate
+from app.models.user import UserRole
+from app.schemas.ai_provider import ModelCreate, ModelRead, ModelUpdate, PresetDiscoveryRequest, PresetInstallRequest, ProviderUpdate
 
 
 class ProviderUpdateTests(unittest.TestCase):
@@ -119,6 +123,56 @@ class ProviderUpdateTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 422)
+
+    def test_anthropic_model_normalizes_openai_thinking_mapping(self) -> None:
+        update_provider(self.provider_id, ProviderUpdate(provider_type=ProviderType.ANTHROPIC), self.db)
+
+        model = create_model(
+            self.provider_id,
+            ModelCreate(
+                model_name="claude-opus-5",
+                display_name="Claude Opus 5",
+                thinking_config={
+                    "enabled": {"reasoning_effort": "medium"},
+                    "efforts": {"xhigh": {"reasoning_effort": "xhigh"}},
+                },
+            ),
+            self.db,
+        )
+
+        self.assertEqual(model.thinking_config["enabled"], {"thinking": {"type": "adaptive"}, "effort": "medium"})
+        self.assertEqual(model.thinking_config["efforts"]["xhigh"], {"thinking": {"type": "adaptive"}, "effort": "xhigh"})
+
+    def test_startup_migrates_existing_anthropic_openai_mapping(self) -> None:
+        update_provider(self.provider_id, ProviderUpdate(provider_type=ProviderType.ANTHROPIC), self.db)
+        model = create_model(
+            self.provider_id,
+            ModelCreate(model_name="claude", display_name="Claude"),
+            self.db,
+        )
+        model.thinking_config = {
+            "enabled": {"reasoning_effort": "medium"},
+            "efforts": {"high": {"reasoning_effort": "high"}},
+        }
+        self.db.commit()
+
+        changed = migrate_anthropic_thinking_models(self.db)
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(model.thinking_config["enabled"], {"thinking": {"type": "adaptive"}, "effort": "medium"})
+        self.assertEqual(model.thinking_config["efforts"]["high"], {"thinking": {"type": "adaptive"}, "effort": "high"})
+
+    def test_model_list_includes_provider_name(self) -> None:
+        create_model(
+            self.provider_id,
+            ModelCreate(model_name="gpt-5.6", display_name="GPT-5.6"),
+            self.db,
+        )
+
+        models = list_models(SimpleNamespace(role=UserRole.ADMIN), self.db)
+        payload = ModelRead.model_validate(models[0])
+
+        self.assertEqual(payload.provider_name, "测试 Provider")
 
 
 if __name__ == "__main__":

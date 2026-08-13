@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -16,7 +17,6 @@ from app.models.ai_model import (
     DEFAULT_TOOL_RESULT_MAX_TOKENS,
 )
 from app.models.ai_image_model import AIImageModel
-from app.models.image_generation import ImageGeneration
 from app.models.ai_provider import AIProvider, ProviderType
 from app.models.user import User
 from app.models.user_group import UserGroup
@@ -45,6 +45,7 @@ from app.services.model_presets import (
     AUTH_STYLE_API_KEY,
     AUTH_STYLE_BEARER,
     CATALOG_SOURCE,
+    anthropic_adaptive_thinking_config,
     find_model_preset,
     find_provider_preset,
     get_provider_preset,
@@ -85,6 +86,34 @@ def _effective_thinking_config(base_url: str, thinking_config: dict[str, Any] | 
     return thinking_config or {}
 
 
+def _anthropic_thinking_config(thinking_config: dict[str, Any]) -> dict[str, Any]:
+    """Reject protocol leakage and normalize legacy Claude thinking mappings."""
+    entries: list[Any] = [thinking_config.get("enabled"), thinking_config.get("disabled")]
+    effort_entries = thinking_config.get("efforts")
+    if isinstance(effort_entries, dict):
+        entries.extend(effort_entries.values())
+    has_legacy_openai_field = any(
+        isinstance(entry, dict) and "reasoning_effort" in entry for entry in entries
+    )
+    if not has_legacy_openai_field:
+        return thinking_config
+    selected_efforts = (
+        [str(effort) for effort in effort_entries if str(effort) in {"low", "medium", "high", "xhigh", "max"}]
+        if isinstance(effort_entries, dict)
+        else None
+    )
+    enabled = thinking_config.get("enabled")
+    default_effort = enabled.get("reasoning_effort") if isinstance(enabled, dict) else None
+    return anthropic_adaptive_thinking_config(selected_efforts, str(default_effort or ""))
+
+
+def _thinking_config_for_provider(provider: AIProvider, thinking_config: dict[str, Any] | None) -> dict[str, Any]:
+    config = _effective_thinking_config(provider.base_url, thinking_config)
+    if provider.provider_type == ProviderType.ANTHROPIC:
+        return _anthropic_thinking_config(config)
+    return config
+
+
 def _validate_default_thinking_effort(thinking_config: dict[str, Any], default_effort: str) -> None:
     """Require concrete defaults to have a provider request mapping."""
     if default_effort == "auto":
@@ -119,7 +148,7 @@ def _to_provider_read(provider: AIProvider) -> ProviderRead:
         image_base_url=provider.image_base_url,
         api_key_masked=mask_secret(api_key_plain),
         models=[ModelRead.model_validate(m) for m in provider.models],
-        image_models=[ImageModelRead.model_validate(m) for m in provider.image_models],
+        image_models=[ImageModelRead.model_validate(m) for m in provider.image_models if m.deleted_at is None],
     )
 
 
@@ -652,7 +681,7 @@ def create_model(provider_id: int, payload: ModelCreate, db: Session = Depends(g
         max_output_tokens=payload.max_output_tokens,
         tool_result_max_tokens=payload.tool_result_max_tokens,
     )
-    thinking_config = _effective_thinking_config(provider.base_url, payload.thinking_config)
+    thinking_config = _thinking_config_for_provider(provider, payload.thinking_config)
     _validate_default_thinking_effort(thinking_config, payload.default_thinking_effort)
     _validate_prompt_cache_provider(provider, payload.prompt_cache_enabled)
 
@@ -700,8 +729,8 @@ def update_model(model_id: int, payload: ModelUpdate, db: Session = Depends(get_
             else model.tool_result_max_tokens
         ),
     )
-    thinking_config = _effective_thinking_config(
-        model.provider.base_url,
+    thinking_config = _thinking_config_for_provider(
+        model.provider,
         payload.thinking_config if payload.thinking_config is not None else model.thinking_config,
     )
     default_thinking_effort = (
@@ -836,7 +865,7 @@ def create_models_bulk(
             context_compaction_threshold_tokens=item.context_compaction_threshold_tokens,
             max_output_tokens=item.max_output_tokens,
             tool_result_max_tokens=item.tool_result_max_tokens,
-            thinking_config=_effective_thinking_config(provider.base_url, item.thinking_config),
+            thinking_config=_thinking_config_for_provider(provider, item.thinking_config),
             is_multimodal=item.is_multimodal,
             supports_disabled_thinking=item.supports_disabled_thinking,
             is_default=False,
@@ -867,7 +896,7 @@ def create_image_model(provider_id: int, payload: ImageModelCreate, db: Session 
     if not provider.image_protocol or not provider.image_base_url:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请先配置 Provider 的图片协议和 Base URL")
     if payload.is_default:
-        db.query(AIImageModel).update({AIImageModel.is_default: False})
+        db.query(AIImageModel).filter(AIImageModel.deleted_at.is_(None)).update({AIImageModel.is_default: False})
     model = AIImageModel(
         provider_id=provider_id,
         model_name=payload.model_name,
@@ -877,6 +906,7 @@ def create_image_model(provider_id: int, payload: ImageModelCreate, db: Session 
         supported_qualities=list(payload.supported_qualities) or ["auto", "low", "medium", "high"],
         is_default=payload.is_default,
         access_mode=payload.access_mode,
+        adapter_config=payload.adapter_config,
     )
     users, groups = _validate_access_targets(db, payload.allowed_user_ids, payload.allowed_group_ids)
     if users is not None:
@@ -892,10 +922,10 @@ def create_image_model(provider_id: int, payload: ImageModelCreate, db: Session 
 @router.patch("/image-models/{model_id}", response_model=ImageModelRead)
 def update_image_model(model_id: int, payload: ImageModelUpdate, db: Session = Depends(get_db)) -> AIImageModel:
     model = db.get(AIImageModel, model_id)
-    if not model:
+    if not model or model.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="图片模型不存在")
     if payload.is_default:
-        db.query(AIImageModel).update({AIImageModel.is_default: False})
+        db.query(AIImageModel).filter(AIImageModel.deleted_at.is_(None)).update({AIImageModel.is_default: False})
     if payload.display_name is not None:
         model.display_name = payload.display_name
     if payload.description is not None:
@@ -908,6 +938,8 @@ def update_image_model(model_id: int, payload: ImageModelUpdate, db: Session = D
         model.is_default = payload.is_default
     if payload.access_mode is not None:
         model.access_mode = payload.access_mode
+    if payload.adapter_config is not None:
+        model.adapter_config = payload.adapter_config
     users, groups = _validate_access_targets(db, payload.allowed_user_ids, payload.allowed_group_ids)
     if users is not None:
         model.allowed_users = users
@@ -921,11 +953,10 @@ def update_image_model(model_id: int, payload: ImageModelUpdate, db: Session = D
 @router.delete("/image-models/{model_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_image_model(model_id: int, db: Session = Depends(get_db)) -> None:
     model = db.get(AIImageModel, model_id)
-    if not model:
+    if not model or model.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="图片模型不存在")
-    if db.query(ImageGeneration.id).filter(ImageGeneration.model_id == model.id).first():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该图片模型已有生成记录，不能删除")
-    db.delete(model)
+    model.deleted_at = datetime.now(timezone.utc)
+    model.is_default = False
     db.commit()
 
 

@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup, Comment
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.ai_model import AIModel
 from app.models.storage_config import StorageConfig
@@ -41,6 +42,8 @@ REMOTE_TIMEOUT_SECONDS = 10.0
 REMOTE_MAX_REDIRECTS = 3
 REMOTE_FETCH_CONCURRENCY = 3
 ASSET_URL_PREFIX = "/api/template-library/assets/"
+TEMPLATE_GENERATION_TIMEOUT_SECONDS = max(60.0, float(get_settings().TEMPLATE_GENERATION_TIMEOUT_SECONDS))
+TEMPLATE_GENERATION_CLEANUP_GRACE_SECONDS = 10.0
 _CODE_FENCE = re.compile(r"^\s*```(?:html)?\s*|\s*```\s*$", re.IGNORECASE)
 _DANGEROUS_URL = re.compile(r"^\s*(?:javascript|vbscript|file):", re.IGNORECASE)
 _DANGEROUS_STYLE = re.compile(
@@ -425,14 +428,24 @@ async def _ask_generation_model(generation: TemplateGeneration) -> str:
         model = db.get(AIModel, generation.model_id)
         if model is None:
             raise TemplateLibraryError("所选 AI 模型不存在")
-        chat_model, _ = build_chat_model(model.provider, model, "disabled", max_retries=0, request_timeout_seconds=90, streaming=False)
+        # Keep the provider request and the application-level guard aligned.
+        # The latter gets a short grace period for response parsing and cleanup.
+        request_timeout = TEMPLATE_GENERATION_TIMEOUT_SECONDS
+        chat_model, _ = build_chat_model(
+            model.provider,
+            model,
+            "disabled",
+            max_retries=0,
+            request_timeout_seconds=request_timeout,
+            streaming=False,
+        )
         response = await invoke_with_accounting(
             asyncio.wait_for(
                 chat_model.ainvoke([
                     SystemMessage(content="只生成安全、静态的公众号 HTML 组件。"),
                     HumanMessage(content=_generation_prompt(generation.prompt)),
                 ]),
-                timeout=100,
+                timeout=request_timeout + TEMPLATE_GENERATION_CLEANUP_GRACE_SECONDS,
             ),
             model_id=model.id,
             user_id=generation.user_id,

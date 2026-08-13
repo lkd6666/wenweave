@@ -54,13 +54,16 @@ class HtmlWorkspaceTests(unittest.TestCase):
         workspace = self.make_workspace(source)
         block = workspace.search("第一段")["results"][0]
 
-        with self.assertRaisesRegex(WorkspaceError, "旧内容"):
+        with self.assertRaisesRegex(WorkspaceError, "旧内容") as raised:
             workspace.apply_patch(
                 workspace.revision,
                 [{"block_id": block["block_id"], "expected_hash": "stale", "mode": "replace_inner", "html": "新内容"}],
                 lambda value: value,
             )
 
+        self.assertEqual(raised.exception.details["current_revision"], workspace.revision)
+        self.assertEqual(raised.exception.details["current_hash"], block["expected_hash"])
+        self.assertEqual(raised.exception.details["current_block"]["block_id"], block["block_id"])
         self.assertEqual(workspace.source_html, source)
 
     def test_batch_patch_rejects_nested_blocks_atomically(self) -> None:

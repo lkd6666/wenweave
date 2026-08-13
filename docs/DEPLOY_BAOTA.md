@@ -55,6 +55,27 @@ TRUSTED_PROXY_CIDRS=127.0.0.1/32,172.18.0.0/16,198.51.100.0/24
 
 后端会在受信任的 `X-Forwarded-For` 链中从右向左跳过这些代理，以最左边的非代理 IP 作为操作日志的客户端 IP。用实际雷池回源网段和 CDN 官方 IP 段代替示例值，不要配置 `0.0.0.0/0`。需保证雷池将 CDN 传入的 `X-Forwarded-For` 继续透传到 Nginx；如果该头被丢弃，后端只能拿到 CDN/雷池 IP。
 
+### 启动 SearXNG 搜图服务
+
+在已安装 Docker Compose 的宝塔终端执行：
+
+```bash
+cd /www/wwwroot/yibanpaiban/deploy/searxng
+cp settings.yml.example settings.yml
+SECRET=$(openssl rand -hex 32)
+sed -i "s/replace-with-a-random-64-character-secret/$SECRET/" settings.yml
+chmod 600 settings.yml
+printf 'SEARXNG_HOST_PORT=8088\nSEARXNG_SECRET=%s\n' "$SECRET" > .env
+chmod 600 .env
+docker compose pull
+docker compose up -d
+curl -fsS 'http://127.0.0.1:8088/search?q=test&categories=images&format=json' >/dev/null
+```
+
+保持 `SEARXNG_BASE_URL=http://127.0.0.1:8088`。如需改端口，同时修改 `deploy/searxng/.env` 的 `SEARXNG_HOST_PORT` 与此地址。默认国内来源为百度图片、搜狗图片和 `cn.bing.com` 图片；百度候选仅安全升级其 HTTP 来源页为 HTTPS，原图仍必须通过现有 HTTPS 校验。生产切换前按 `deploy/searxng/README.md` 在 `127.0.0.1:8089` 运行隔离验证，验证通过后执行 `./apply-domestic-profile.sh`；该脚本会保留搜图密钥并创建可回滚备份。应用层搜图总等待预算默认 4 秒，规范化结果缓存 300 秒，可分别用 `SEARXNG_TIMEOUT_SECONDS` 与 `SEARXNG_SEARCH_CACHE_SECONDS` 调整。不要在宝塔安全组、Nginx 或公网防火墙开放该端口。搜图服务停机不会阻止主应用启动。
+
+Compose 默认使用单 worker、单线程和 320 MiB 内存上限（160 MiB 预留、96 PID），可通过 `deploy/searxng/.env` 的 `SEARXNG_MEMORY_LIMIT`、`SEARXNG_UWSGI_WORKERS` 等变量调整。2C2G 仅适合低并发且数据库外置的场景；宝塔、MySQL、主应用和搜图同机部署建议至少 4G 内存。
+
 ## 4. 安装 Python 依赖并启动
 
 在宝塔终端执行：

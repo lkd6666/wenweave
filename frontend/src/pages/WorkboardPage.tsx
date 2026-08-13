@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Button, Card, Empty, Grid, Segmented, Skeleton, Statistic, Table, Tooltip, Typography, message } from 'antd'
+import { Button, Card, Empty, Grid, Progress, Segmented, Skeleton, Statistic, Table, Tooltip, Typography, message } from 'antd'
 import type { TableColumnsType } from 'antd'
 import {
-  DatabaseOutlined,
   FileTextOutlined,
   PieChartOutlined,
   ReloadOutlined,
-  RobotOutlined,
   TeamOutlined,
-  ThunderboltOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
 import { ApiError } from '../api/client'
 import { workboardApi } from '../api/workboard'
@@ -66,13 +64,28 @@ export default function WorkboardPage() {
     setPeriod(next)
   }
 
+  const overview = data?.overview
+  const activity = data?.tweet_activity
+  const maxModelCalls = Math.max(...(data?.model_ranking.map((item) => item.call_count) ?? [0]), 1)
+  const cacheHitRate = overview?.cache_hit_rate ?? 0
+  const totalVersions = (activity?.ai_versions ?? 0) + (activity?.manual_versions ?? 0)
+  const aiVersionShare = totalVersions === 0 ? 0 : (activity!.ai_versions / totalVersions) * 100
+
   const modelColumns: TableColumnsType<WorkboardModelRank> = [
     {
       title: '模型',
       dataIndex: 'display_name',
       key: 'display_name',
-      render: (value: string, _: WorkboardModelRank, index: number) => (
-        <span className="workboard-rank-name"><Text type="secondary">{index + 1}</Text>{value}</span>
+      render: (value: string, record: WorkboardModelRank, index: number) => (
+        <div className="workboard-model-cell">
+          <span className="workboard-rank-name">
+            <span className="workboard-rank-index">{index + 1}</span>
+            <span className="workboard-rank-label">{value}</span>
+          </span>
+          <span className="workboard-rank-bar" aria-hidden="true">
+            <span style={{ width: `${(record.call_count / maxModelCalls) * 100}%` }} />
+          </span>
+        </div>
       ),
     },
     { title: '调用', dataIndex: 'call_count', key: 'call_count', align: 'right', render: (value) => number(value) },
@@ -89,9 +102,9 @@ export default function WorkboardPage() {
       key: 'display_name',
       render: (value: string, record: WorkboardUserRank, index: number) => (
         <span className="workboard-rank-name">
-          <Text type="secondary">{index + 1}</Text>
-          <span>{value}</span>
-          {record.username && record.username !== value && <Text type="secondary">@{record.username}</Text>}
+          <span className={`workboard-rank-index rank-${index + 1}`}>{index + 1}</span>
+          <span className="workboard-rank-label">{value}</span>
+          {record.username && record.username !== value && <Text className="workboard-user-handle" type="secondary">@{record.username}</Text>}
         </span>
       ),
     },
@@ -101,13 +114,10 @@ export default function WorkboardPage() {
     { title: '命中率', dataIndex: 'cache_hit_rate', key: 'cache_hit_rate', align: 'right', render: (value) => percent(value) },
   ]
 
-  const overview = data?.overview
-  const activity = data?.tweet_activity
-
   return (
     <main className="workboard-page">
       <header className="workboard-page-header">
-        <div>
+        <div className="workboard-page-title">
           <Title level={4}>工作看板</Title>
           <Text type="secondary">{PERIOD_OPTIONS.find((item) => item.value === period)?.label}的工作数据</Text>
         </div>
@@ -130,15 +140,52 @@ export default function WorkboardPage() {
         <Empty description="暂无可展示的工作数据" />
       ) : (
         <>
-          <section className="workboard-stat-grid" aria-label="模型调用指标">
-            <Card size="small"><Statistic title="模型调用" value={overview.model_call_count} prefix={<ThunderboltOutlined />} formatter={(value) => number(Number(value))} /></Card>
-            <Card size="small"><Statistic title="活跃用户" value={overview.active_users} prefix={<TeamOutlined />} formatter={(value) => number(Number(value))} /></Card>
-            <Card size="small"><Statistic title="输入 Token" value={overview.input_tokens} prefix={<DatabaseOutlined />} formatter={(value) => number(Number(value))} /></Card>
-            <Card size="small"><Statistic title="输出 Token" value={overview.output_tokens} prefix={<RobotOutlined />} formatter={(value) => number(Number(value))} /></Card>
-            <Card size="small"><Statistic title="缓存读取" value={overview.cache_read_tokens} prefix={<PieChartOutlined />} formatter={(value) => number(Number(value))} /></Card>
-            <Card size="small"><Statistic title="缓存写入" value={overview.cache_write_tokens} prefix={<PieChartOutlined />} formatter={(value) => number(Number(value))} /></Card>
-            <Card size="small"><Statistic title="缓存命中率" value={overview.cache_hit_rate ?? 0} suffix={overview.cache_hit_rate === null ? '' : '%'} formatter={(value) => overview.cache_hit_rate === null ? '--' : Number(value).toFixed(overview.cache_hit_rate % 1 === 0 ? 0 : 2)} /></Card>
-            <Card size="small"><Statistic title="未上报用量" value={overview.usage_unreported_calls} formatter={(value) => number(Number(value))} /></Card>
+          <section className="workboard-spotlight" aria-label="模型调用指标">
+            <div className="workboard-spotlight-summary">
+              <span className="workboard-spotlight-label">模型调用</span>
+              <strong>{number(overview.model_call_count)}</strong>
+              <Text>所选周期内的模型请求总量</Text>
+            </div>
+            <div className="workboard-spotlight-tokens">
+              <div>
+                <span>输入 Token</span>
+                <strong>{number(overview.input_tokens)}</strong>
+              </div>
+              <div>
+                <span>输出 Token</span>
+                <strong>{number(overview.output_tokens)}</strong>
+              </div>
+            </div>
+            <div className="workboard-spotlight-cache">
+              <Progress
+                type="circle"
+                percent={cacheHitRate}
+                size={108}
+                strokeColor="#279b88"
+                trailColor="#d0e6e0"
+                format={() => percent(overview.cache_hit_rate)}
+              />
+              <span>缓存命中率</span>
+            </div>
+          </section>
+
+          <section className="workboard-utility-grid" aria-label="使用补充指标">
+            <div>
+              <span><TeamOutlined />活跃用户</span>
+              <strong>{number(overview.active_users)}</strong>
+            </div>
+            <div>
+              <span><PieChartOutlined />缓存读取</span>
+              <strong>{number(overview.cache_read_tokens)}</strong>
+            </div>
+            <div>
+              <span><PieChartOutlined />缓存写入</span>
+              <strong>{number(overview.cache_write_tokens)}</strong>
+            </div>
+            <div className="is-warning">
+              <span><WarningOutlined />未上报用量</span>
+              <strong>{number(overview.usage_unreported_calls)}</strong>
+            </div>
           </section>
 
           <section className="workboard-data-grid">
@@ -153,30 +200,35 @@ export default function WorkboardPage() {
                 locale={{ emptyText: '当前权限下暂无模型调用' }}
               />
             </Card>
-            <Card title="用户调用排行" className="workboard-data-card">
-              <Table
-                size="small"
-                columns={userColumns}
-                dataSource={data.user_ranking}
-                rowKey={(row) => row.user_id ?? `deleted-${row.display_name}`}
-                pagination={false}
-                scroll={{ x: 'max-content' }}
-                locale={{ emptyText: '当前权限下暂无用户调用' }}
-              />
-            </Card>
-          </section>
-
-          <section className="workboard-tweet-section" aria-label="推文创作活动">
-            <div className="workboard-section-heading">
-              <div><Title level={5}>推文创作活动</Title><Text type="secondary">全站汇总</Text></div>
-              <FileTextOutlined />
-            </div>
-            <div className="workboard-tweet-grid">
-              <Statistic title="推文总数" value={activity.total_documents} formatter={(value) => number(Number(value))} />
-              <Statistic title="本期新建" value={activity.created_documents} formatter={(value) => number(Number(value))} />
-              <Statistic title="活跃创作者" value={activity.active_creators} formatter={(value) => number(Number(value))} />
-              <Statistic title="AI 版本" value={activity.ai_versions} formatter={(value) => number(Number(value))} />
-              <Statistic title="手动与恢复版本" value={activity.manual_versions} formatter={(value) => number(Number(value))} />
+            <div className="workboard-side-stack">
+              <Card title="用户调用排行" className="workboard-data-card">
+                <Table
+                  size="small"
+                  columns={userColumns}
+                  dataSource={data.user_ranking}
+                  rowKey={(row) => row.user_id ?? `deleted-${row.display_name}`}
+                  pagination={false}
+                  scroll={{ x: 'max-content' }}
+                  locale={{ emptyText: '当前权限下暂无用户调用' }}
+                />
+              </Card>
+              <section className="workboard-tweet-section" aria-label="推文创作活动">
+                <div className="workboard-section-heading">
+                  <div><Title level={5}>推文创作活动</Title><Text type="secondary">全站内容与版本汇总</Text></div>
+                  <FileTextOutlined />
+                </div>
+                <div className="workboard-tweet-grid">
+                  <Statistic title="推文总数" value={activity.total_documents} formatter={(value) => number(Number(value))} />
+                  <Statistic title="本期新建" value={activity.created_documents} formatter={(value) => number(Number(value))} />
+                  <Statistic title="活跃创作者" value={activity.active_creators} formatter={(value) => number(Number(value))} />
+                  <Statistic title="AI 版本" value={activity.ai_versions} formatter={(value) => number(Number(value))} />
+                  <Statistic title="手动与恢复版本" value={activity.manual_versions} formatter={(value) => number(Number(value))} />
+                </div>
+                <div className="workboard-version-bar" aria-label={`AI 版本占 ${aiVersionShare.toFixed(0)}%，手动与恢复版本占 ${(100 - aiVersionShare).toFixed(0)}%`}>
+                  <span style={{ width: `${aiVersionShare}%` }} />
+                </div>
+                <div className="workboard-version-legend"><span>AI 版本</span><span>手动与恢复版本</span></div>
+              </section>
             </div>
           </section>
         </>

@@ -136,6 +136,7 @@ export default function AdminModelsPage() {
   const modelModalProvider = providers.find((provider) => provider.id === modelModalProviderId)
   const supportsExplicitPromptCache = modelModalProvider?.provider_type === 'openai_compatible'
     || modelModalProvider?.provider_type === 'openai_responses'
+  const isAnthropicProvider = modelModalProvider?.provider_type === 'anthropic'
   const automaticTokenBudget = deriveModelTokenBudget(inputLimitK, outputLimitK)
 
   const loadProviders = async () => {
@@ -303,7 +304,7 @@ export default function AdminModelsPage() {
         <article className="responsive-data-card" key={model.id}>
           <div className="responsive-data-card-heading"><div><strong>{model.display_name}</strong><div className="responsive-data-card-secondary">{model.model_name}</div></div>{model.is_default && <Tag color="blue">默认</Tag>}</div>
           {model.description && <div className="responsive-data-card-description">{model.description}</div>}
-          <div className="responsive-data-card-tags"><Tag>{model.supported_aspect_ratios.join(' / ')}</Tag><Tag>{model.supported_qualities.join(' / ')}</Tag>{model.access_mode === 'restricted' && <Tag color="orange">受限</Tag>}</div>
+          <div className="responsive-data-card-tags"><Tag>{model.supported_aspect_ratios.join(' / ')}</Tag><Tag>{model.supported_qualities.join(' / ')}</Tag><Tag color={(model.operations ?? []).includes('edit') ? 'green' : 'default'}>{(model.operations ?? []).includes('edit') ? '支持 AI 编辑' : '仅支持生成'}</Tag>{Array.isArray(model.adapter_config?.operations) && <Tag color="blue">能力已覆盖</Tag>}{model.access_mode === 'restricted' && <Tag color="orange">受限</Tag>}</div>
           <Space className="responsive-data-card-actions"><Button size="small" onClick={() => openEditImageModel(model)}>编辑</Button>{!model.is_default && <Button size="small" type="link" onClick={() => void aiProvidersApi.updateImageModel(model.id, { is_default: true }).then(loadProviders)}>设为默认</Button>}<Popconfirm title="确认删除该图片模型？" onConfirm={() => void handleDeleteImageModel(model)}><Button size="small" danger>删除</Button></Popconfirm></Space>
         </article>
         ))
@@ -359,12 +360,20 @@ export default function AdminModelsPage() {
         const existingEfforts = isRecord(thinkingConfig.efforts) ? thinkingConfig.efforts : {}
         const effortConfigs = { ...existingEfforts }
         for (const effort of selectedEfforts) {
-          if (!isRecord(effortConfigs[effort])) effortConfigs[effort] = { reasoning_effort: effort }
+          if (!isRecord(effortConfigs[effort])) {
+            effortConfigs[effort] = isAnthropicProvider
+              ? { thinking: { type: 'adaptive' }, effort }
+              : { reasoning_effort: effort }
+          }
         }
         thinkingConfig = {
           ...thinkingConfig,
-          enabled: thinkingConfig.enabled ?? { reasoning_effort: 'medium' },
-          disabled: thinkingConfig.disabled ?? { reasoning_effort: 'none' },
+          enabled: thinkingConfig.enabled ?? (
+            isAnthropicProvider
+              ? { thinking: { type: 'adaptive' }, effort: 'medium' }
+              : { reasoning_effort: 'medium' }
+          ),
+          disabled: thinkingConfig.disabled ?? (isAnthropicProvider ? {} : { reasoning_effort: 'none' }),
           efforts: effortConfigs,
         }
       }
@@ -852,7 +861,7 @@ export default function AdminModelsPage() {
           <Form.Item name="image_protocol" label="图片协议（可选）">
             <Select allowClear options={[{ value: 'openai_images', label: 'OpenAI Images' }, { value: 'dashscope_images', label: '阿里百炼文生图' }, { value: 'volcengine_ark_images', label: '火山方舟图片' }]} />
           </Form.Item>
-          <Form.Item name="image_base_url" label="图片 Base URL" extra="留空则不启用图片模型；百炼原生填 https://dashscope.aliyuncs.com/api/v1。若 Token Plan 兼容网关返回 url error，请为图片另建使用原生 DashScope API Key 的 Provider">
+          <Form.Item name="image_base_url" label="图片 Base URL" extra="留空则不启用图片模型。OpenAI Images 可填 API 根地址、/v1、/v1/images 或完整 /v1/images/generations，系统会自动补全正确端点；百炼原生填 https://dashscope.aliyuncs.com/api/v1。">
             <Input placeholder="https://api.openai.com/v1" />
           </Form.Item>
         </Form>
@@ -1083,9 +1092,15 @@ export default function AdminModelsPage() {
           <Form.Item
             name="thinking_efforts"
             label="思考强度"
-            extra="选择后会生成 OpenAI reasoning_effort 的极简、低、中、高、超高或最大参数；其他厂商使用下方高级 JSON 覆盖。"
+            extra={isAnthropicProvider
+              ? 'Claude 通过 Anthropic adaptive thinking 与 output_config.effort 传递强度。'
+              : 'OpenAI 兼容协议通过 reasoning_effort 传递极简、低、中、高、超高或最大强度。'}
           >
-            <Checkbox.Group options={THINKING_EFFORT_OPTIONS} />
+            <Checkbox.Group
+              options={isAnthropicProvider
+                ? THINKING_EFFORT_OPTIONS.filter((option) => option.value !== 'minimal')
+                : THINKING_EFFORT_OPTIONS}
+            />
           </Form.Item>
           <Form.Item
             name="default_thinking_effort"
@@ -1112,11 +1127,15 @@ export default function AdminModelsPage() {
           <Form.Item
             name="thinking_config_text"
             label="高级思考参数 JSON（可选）"
-            extra={'预设已自动填写。手工模型示例：{"enabled":{"enable_thinking":true},"disabled":{"enable_thinking":false},"efforts":{"high":{"reasoning_effort":"high"}}}'}
+            extra={isAnthropicProvider
+              ? 'Claude 示例：{"enabled":{"thinking":{"type":"adaptive"},"effort":"medium"},"disabled":{},"efforts":{"xhigh":{"thinking":{"type":"adaptive"},"effort":"xhigh"}}}'
+              : 'OpenAI 示例：{"enabled":{"reasoning_effort":"medium"},"disabled":{"reasoning_effort":"none"},"efforts":{"high":{"reasoning_effort":"high"}}}'}
           >
             <Input.TextArea
               autoSize={{ minRows: 3, maxRows: 8 }}
-              placeholder='例如：{"enabled":{"enable_thinking":true},"disabled":{"enable_thinking":false}}'
+              placeholder={isAnthropicProvider
+                ? '例如：{"enabled":{"thinking":{"type":"adaptive"},"effort":"medium"}}'
+                : '例如：{"enabled":{"reasoning_effort":"medium"},"disabled":{"reasoning_effort":"none"}}'}
             />
           </Form.Item>
         </Form>

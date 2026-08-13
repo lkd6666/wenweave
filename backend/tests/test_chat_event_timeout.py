@@ -16,13 +16,13 @@ import app.models  # noqa: F401 - register referenced tables for the isolated da
 import app.api.routes.chat as chat_module
 import app.bootstrap as bootstrap_module
 from app.db.base import Base
-from app.api.routes.chat import _agent_execution_error_message, _force_stuck_cancellation, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _preserve_retried_tool_previews, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
+from app.api.routes.chat import _agent_execution_error_message, _force_stuck_cancellation, _has_external_document_conflict, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _preserve_retried_tool_previews, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.chat_user_question import ChatUserQuestion, ChatUserQuestionStatus
 from app.models.chat_message import ChatMessage
 from app.models.document import Document
 from app.models.user import User
-from app.schemas.chat import ChatUserQuestionAnswerRequest
+from app.schemas.chat import ChatMessageRead, ChatUserQuestionAnswerRequest
 from app.services.agent_run_manager import AgentRunManager
 from app.services.chat_agent import ModelStreamCleanupError, ModelStreamTimeoutError, _iterate_model_stream_with_idle_limits
 
@@ -200,6 +200,40 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools[-1]["argument_tokens"], 16393)
         self.assertIn("尚未执行", tools[-1]["result"])
         self.assertEqual(blocks[-1]["tool"]["id"], "patch-1:retry-2")
+
+    def test_interrupted_tool_preview_is_readable_from_chat_schema(self) -> None:
+        message = ChatMessageRead.model_validate(
+            {
+                "id": 1,
+                "role": "assistant",
+                "content": "",
+                "created_at": datetime.now(timezone.utc),
+                "tool_calls": [
+                    {
+                        "id": "patch-1:retry-2",
+                        "name": "apply_html_patch",
+                        "status": "interrupted",
+                        "preparing": False,
+                        "result": "本次工具参数生成被模型重试中断，尚未执行任何修改。",
+                    }
+                ],
+                "turn_blocks": [
+                    {
+                        "id": "block-patch-1:retry-2",
+                        "type": "tool",
+                        "state": "done",
+                        "tool": {
+                            "id": "patch-1:retry-2",
+                            "name": "apply_html_patch",
+                            "status": "interrupted",
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(message.tool_calls[0].status, "interrupted")
+        self.assertEqual(message.turn_blocks[0].tool.status, "interrupted")
 
     def test_settling_a_legacy_timeline_backfills_missing_block_content(self) -> None:
         tool_calls = [{"id": "call-1", "name": "ask_user", "status": "success"}]
@@ -598,6 +632,27 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(outcome)
         self.assertIn("未完成", outcome[0])
         self.assertIsNone(_unresolved_edit_failure(recovered_tools))
+
+    def test_direct_image_checkpoint_is_not_an_external_document_conflict(self) -> None:
+        source = "<p>原稿</p>"
+        own_image_replacement = '<p><img src="/api/documents/local-images/edited.png" /></p>'
+
+        self.assertFalse(
+            _has_external_document_conflict(
+                source,
+                own_image_replacement,
+                own_image_replacement,
+                set(),
+            )
+        )
+        self.assertTrue(
+            _has_external_document_conflict(
+                source,
+                own_image_replacement,
+                "<p>其他人修改</p>",
+                {own_image_replacement},
+            )
+        )
 
     def test_restart_failure_events_are_plain_payloads(self) -> None:
         compliance = SimpleNamespace(to_dict=lambda: {"valid": True})

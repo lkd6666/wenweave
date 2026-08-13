@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 ImagePurpose = Literal["cover", "body"]
 ImageSource = Literal["editor", "agent"]
 ImageStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
+ImageOperation = Literal["generate", "edit"]
 ImageAspectRatio = Literal["square", "portrait", "landscape"]
 
 
@@ -21,7 +22,10 @@ class GeneratedImageAssetRead(BaseModel):
     width: int
     height: int
     revised_prompt: str = ""
+    library_asset_id: str = ""
+    library_url: str = ""
     is_applied: bool
+    is_currently_applied: bool = False
     applied_at: datetime | None = None
     created_at: datetime
 
@@ -36,11 +40,17 @@ class ImageGenerationRead(BaseModel):
     model_id: int
     source: ImageSource
     purpose: ImagePurpose
+    operation: ImageOperation = "generate"
     prompt: str
     quantity: int
     aspect_ratio: ImageAspectRatio
     quality: str
+    timeout_seconds: int = 180
     anchor_block_id: str = ""
+    source_image_url: str = ""
+    source_image_hash: str = ""
+    source_asset_url: str = ""
+    target_image_index: int = -1
     direct_insert: bool = False
     status: ImageStatus
     error_message: str = ""
@@ -57,12 +67,16 @@ class ImageGenerationRead(BaseModel):
 class ImageGenerationCreate(BaseModel):
     model_id: int = Field(gt=0)
     session_id: int | None = Field(default=None, gt=0)
-    purpose: ImagePurpose
+    purpose: ImagePurpose = "body"
+    operation: ImageOperation = "generate"
     prompt: str = Field(min_length=3, max_length=8_000)
     quantity: int = Field(ge=1, le=4)
     aspect_ratio: ImageAspectRatio = "landscape"
     quality: str = Field(default="auto", max_length=24)
+    timeout_seconds: int = Field(default=180, ge=30, le=1800)
     anchor_block_id: str = Field(default="", max_length=128)
+    source_image_url: str = Field(default="", max_length=4096)
+    target_image_index: int = Field(default=-1, ge=-1, le=10000)
     direct_insert: bool = False
 
     @field_validator("prompt")
@@ -81,10 +95,17 @@ class ImageGenerationApply(BaseModel):
     revision: str = Field(default="", max_length=64)
     anchor_block_id: str = Field(default="", max_length=128)
     expected_hash: str = Field(default="", max_length=64)
+    source_image_url: str = Field(default="", max_length=4096)
+    source_image_hash: str = Field(default="", max_length=64)
+    target_image_index: int = Field(default=-1, ge=-1, le=10000)
     alt: str = Field(default="", max_length=240)
 
 
-class ChatImageGenerationSettingsUpdate(BaseModel):
-    image_model_id: int | None = Field(default=None, gt=0)
-    auto_image_generation_enabled: bool = False
+class ImageGenerationWorkspaceResolve(BaseModel):
+    """A preview DOM selection that must resolve to a current HTML block."""
 
+    selector: str = Field(min_length=1, max_length=1024)
+    tag_name: str = Field(min_length=1, max_length=64)
+    text: str = Field(default="", max_length=1_000)
+    html: str = Field(default="", max_length=12_000)
+    locator: dict[str, Any] | None = None

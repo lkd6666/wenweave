@@ -5,14 +5,17 @@ import json
 import unittest
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Sequence
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.api.routes.image_generations import apply_document_generated_image
 from app.models.document import Document
-from app.models.image_generation import GeneratedImageAsset, ImageGeneration, ImageGenerationPurpose, ImageGenerationStatus
+from app.models.image_generation import GeneratedImageAsset, ImageGeneration, ImageGenerationOperation, ImageGenerationPurpose, ImageGenerationStatus
 from app.schemas.image_generation import ImageGenerationApply
 from app.services.chat_agent import HtmlEditSession, _take_matching_tool_report, run_agent_loop
 from app.services.html_workspace import HtmlWorkspace
+from app.services.document_images import StoredDocumentImage
+from app.services.image_generation import cover_source_fingerprint, image_target_fingerprint, materialize_source_image, replace_image_source
+from app.services.image_search import ImageSearchCandidate
 from app.services.tool_output_store import ToolOutputStore
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
@@ -23,12 +26,14 @@ from langchain_core.outputs import ChatGenerationChunk
 class _ScriptedToolModel(BaseChatModel):
     script: list[dict[str, Any]] = []
     seen_messages: list[list[BaseMessage]] = []
+    bound_tool_names: list[str] = []
 
     @property
     def _llm_type(self) -> str:
         return "scripted-image-application"
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> "_ScriptedToolModel":
+        self.bound_tool_names = [item.name for item in tools]
         return self
 
     async def _astream(
@@ -79,6 +84,108 @@ class _ScriptedToolModel(BaseChatModel):
 
 
 class ImageGenerationApplicationTests(unittest.TestCase):
+    def test_source_image_reads_configured_storage_without_public_fetch(self) -> None:
+        storage = SimpleNamespace(endpoint="oss-cn-example.aliyuncs.com", bucket="article-images", custom_domain="")
+        source_url = "https://article-images.oss-cn-example.aliyuncs.com/yibanpaiban%2F20260808%2Foriginal.png?Expires=1"
+        image_info = SimpleNamespace(content_type="image/png")
+
+        async def run() -> tuple[bytes, str]:
+            with (
+                patch("app.services.image_generation.oss_client.storage_object_key_for_url", return_value="yibanpaiban/20260808/original.png"),
+                patch("app.services.image_generation.oss_client.get_object_bytes", return_value=b"png-bytes"),
+                patch("app.services.image_generation.local_uploads.inspect_image", return_value=image_info),
+            ):
+                return await materialize_source_image(source_url, storage=storage)
+
+        data, content_type = asyncio.run(run())
+        self.assertEqual(data, b"png-bytes")
+        self.assertEqual(content_type, "image/png")
+
+    def test_signed_image_url_accepts_html_entity_encoding(self) -> None:
+        source_url = "https://cdn.example.test/image.png?Expires=2101&Signature=abc%2F123"
+        source_html = '<p><img src="https://cdn.example.test/image.png?Expires=2101&amp;Signature=abc%2F123" alt="原图"></p>'
+
+        self.assertTrue(image_target_fingerprint(source_html, 0, source_url))
+        replaced = replace_image_source(source_html, 0, source_url, "https://cdn.example.test/replaced.png")
+        self.assertIn('src="https://cdn.example.test/replaced.png"', replaced)
+
+    def test_regular_candidate_can_replace_explicit_image_target(self) -> None:
+        source_url = "/api/documents/local-images/original.png"
+        source_html = f'<section><img src="{source_url}" alt="原图" style="width:66%"></section>'
+        workspace = HtmlWorkspace(source_html)
+        document = SimpleNamespace(id=1, current_html=source_html)
+        asset = SimpleNamespace(id="asset-1", url="https://cdn.example.test/candidate.png", is_applied=False, applied_at=None)
+        generation = SimpleNamespace(
+            purpose=ImageGenerationPurpose.BODY,
+            operation=ImageGenerationOperation.GENERATE,
+            status=ImageGenerationStatus.SUCCEEDED,
+            prompt="候选图片",
+            target_image_index=-1,
+            source_image_url="",
+            source_image_hash="",
+            assets=[asset],
+        )
+        payload = ImageGenerationApply(
+            target="body",
+            revision=workspace.revision,
+            source_image_url=source_url,
+            target_image_index=0,
+        )
+        db = MagicMock()
+
+        with (
+            patch("app.api.routes.image_generations._generation_or_404", return_value=generation),
+            patch("app.api.routes.image_generations._document_or_404", return_value=document),
+            patch("app.api.routes.image_generations._require_idle_document"),
+            patch("app.api.routes.image_generations.touch_document"),
+            patch("app.api.routes.image_generations.create_document_version"),
+            patch("app.api.routes.image_generations.generation_payload", return_value={"id": "generation-1"}),
+        ):
+            apply_document_generated_image(1, "generation-1", asset.id, payload, SimpleNamespace(id=1), db)
+
+        self.assertIn('src="https://cdn.example.test/candidate.png"', document.current_html)
+        self.assertIn('style="width:66%"', document.current_html)
+
+    def test_replace_candidate_preserves_current_image_markup(self) -> None:
+        source_html = '<section><p><img src="/api/documents/local-images/original.png" alt="原图" style="width:66%" data-crop-source="x" /></p></section>'
+        workspace = HtmlWorkspace(source_html)
+        source_url = "/api/documents/local-images/original.png"
+        document = SimpleNamespace(id=1, current_html=source_html)
+        asset = SimpleNamespace(id="asset-1", url="https://cdn.example.test/replaced.png", is_applied=False, applied_at=None)
+        generation = SimpleNamespace(
+            purpose=ImageGenerationPurpose.BODY,
+            operation=ImageGenerationOperation.GENERATE,
+            status=ImageGenerationStatus.SUCCEEDED,
+            prompt="替换图片",
+            target_image_index=0,
+            source_image_url=source_url,
+            source_image_hash=image_target_fingerprint(source_html, 0, source_url),
+            assets=[asset],
+        )
+        payload = ImageGenerationApply(
+            target="body",
+            revision=workspace.revision,
+            source_image_url=source_url,
+            source_image_hash=generation.source_image_hash,
+            target_image_index=0,
+        )
+        db = MagicMock()
+        with (
+            patch("app.api.routes.image_generations._generation_or_404", return_value=generation),
+            patch("app.api.routes.image_generations._document_or_404", return_value=document),
+            patch("app.api.routes.image_generations._require_idle_document"),
+            patch("app.api.routes.image_generations.touch_document"),
+            patch("app.api.routes.image_generations.create_document_version"),
+            patch("app.api.routes.image_generations.generation_payload", return_value={"id": "generation-1"}),
+        ):
+            apply_document_generated_image(1, "generation-1", asset.id, payload, SimpleNamespace(id=1), db)
+
+        self.assertIn('src="https://cdn.example.test/replaced.png"', document.current_html)
+        self.assertIn('style="width:66%"', document.current_html)
+        self.assertIn('data-crop-source="x"', document.current_html)
+        self.assertNotIn(source_url, document.current_html)
+        self.assertTrue(asset.is_applied)
+
     def test_cover_candidate_can_be_explicitly_reused_as_body_banner(self) -> None:
         source_html = "<section><h1>文章标题</h1><p>正文内容</p></section>"
         workspace = HtmlWorkspace(source_html)
@@ -128,28 +235,553 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         self.assertLess(document.current_html.index("</h1>"), document.current_html.index("banner.png"))
         db.commit.assert_called_once()
 
-    def test_agent_can_apply_cover_candidate_as_body_and_checkpoint_html(self) -> None:
-        source_html = "<section><h1>文章标题</h1><p>正文内容</p></section>"
+    def test_agent_uses_html_patch_to_place_generated_candidate_in_nested_container(self) -> None:
+        source_html = (
+            '<section class="article"><h1>文章标题</h1>'
+            '<div class="feature-card"><p>这里保留卡片导语。</p></div>'
+            '<p>正文内容</p></section>'
+        )
         workspace = HtmlWorkspace(source_html)
-        heading = next(block for block in workspace.map_payload()["blocks"] if block["tag"] == "h1")
+        card = next(block for block in workspace.map_payload()["blocks"] if block["attributes"] == 'class="feature-card"')
         checkpointed_html: list[str] = []
         session = HtmlEditSession(source_html, checkpoint_callback=checkpointed_html.append)
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("read_blocks", {"block_ids": [card["block_id"]]})},
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": workspace.revision,
+                            "operations": [
+                                {
+                                    "block_id": card["block_id"],
+                                    "expected_hash": card["expected_hash"],
+                                    "mode": "replace_inner",
+                                    "html": (
+                                        '<figure class="feature-image">'
+                                        '<img src="https://cdn.example.test/banner.png" alt="AI 生成横幅" />'
+                                        '<figcaption>卡片配图</figcaption></figure>'
+                                    ),
+                                }
+                            ],
+                        },
+                    )
+                },
+                {"text": "已将生成候选放入文章特色卡片。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "生成一张横幅并放进特色卡片容器",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-image-patch-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}):
+            events = asyncio.run(run())
+
+        result = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_html_patch"
+        )
+        self.assertEqual(result["activity"]["kind"], "edit")
+        self.assertIn("banner.png", result["html"])
+        self.assertEqual(checkpointed_html, [session.html])
+        self.assertIn("banner.png", session.html)
+        self.assertIn('class="feature-card"><figure', session.html)
+        self.assertNotIn('class="feature-card"><p>', session.html)
+        self.assertNotIn("apply_generated_image", model.bound_tool_names)
+        self.assertIn("apply_generated_cover", model.bound_tool_names)
+
+    def test_agent_imports_searched_candidate_then_patches_nested_container(self) -> None:
+        source_html = (
+            '<section class="article"><h1>文章标题</h1>'
+            '<div class="feature-card"><p>这里保留卡片导语。</p></div>'
+            '<p>正文内容</p></section>'
+        )
+        workspace = HtmlWorkspace(source_html)
+        card = next(block for block in workspace.map_payload()["blocks"] if block["attributes"] == 'class="feature-card"')
+        session = HtmlEditSession(source_html)
+        candidate = ImageSearchCandidate(
+            id="searched-card-1",
+            image_url="https://images.example.test/card.jpg",
+            preview_url="https://images.example.test/card-preview.jpg",
+            source_page_url="https://example.test/card",
+            title="城市公园晨光",
+            engine="search",
+            width=1600,
+            height=900,
+            image_format="jpeg",
+        )
+        stored = StoredDocumentImage(
+            url="/api/documents/local-images/searched-card.jpg",
+            object_key="manual/searched-card.jpg",
+            storage_mode="local",
+        )
+        library_asset = SimpleNamespace(id="library-search-card-1")
+        db = MagicMock()
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("import_searched_image", {"candidate_ref": "searched-candidate-ref"})},
+                {"tool": ("read_blocks", {"block_ids": [card["block_id"]]})},
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": workspace.revision,
+                            "operations": [
+                                {
+                                    "block_id": card["block_id"],
+                                    "expected_hash": card["expected_hash"],
+                                    "mode": "replace_inner",
+                                    "html": (
+                                        '<figure class="feature-image">'
+                                        '<img src="/api/documents/local-images/searched-card.jpg" alt="城市公园晨光" />'
+                                        '<figcaption>城市公园晨光</figcaption></figure>'
+                                    ),
+                                }
+                            ],
+                        },
+                    )
+                },
+                {"text": "已将导入的搜索图片放入文章特色卡片。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "找一张城市公园图片，放进特色卡片",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="searched-image-patch-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.image_search.decode_candidate_reference_or_token", return_value=candidate),
+            patch("app.services.image_search.fetch_candidate_image", new=AsyncMock(return_value=(b"image", SimpleNamespace(content_type="image/jpeg", width=1600, height=900)))),
+            patch("app.services.document_images.store_tracked_document_image", return_value=stored),
+            patch("app.services.image_library.create_library_asset", return_value=library_asset),
+        ):
+            events = asyncio.run(run())
+
+        imported = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "import_searched_image"
+        )
+        patched = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_html_patch"
+        )
+        self.assertEqual(imported["activity"]["kind"], "image_import")
+        self.assertEqual(imported["activity"]["details"]["url"], stored.url)
+        self.assertEqual(patched["activity"]["kind"], "edit")
+        self.assertIn("import_searched_image", model.bound_tool_names)
+        self.assertNotIn("apply_searched_image", model.bound_tool_names)
+        self.assertIn('class="feature-card"><figure', session.html)
+        self.assertIn(stored.url, session.html)
+        self.assertNotIn('class="feature-card"><p>', session.html)
+
+    def test_agent_can_set_imported_searched_asset_as_cover_only(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        workspace = HtmlWorkspace(source_html)
         asset = SimpleNamespace(
-            id="asset-1",
-            generation_id="generation-1",
-            url="https://cdn.example.test/banner.png",
+            id="library-search-cover-1",
+            owner_id=7,
+            document_id=1,
+            url="/api/documents/local-images/search-cover.jpg",
+            source="search",
+            deleted_at=None,
+        )
+        document = SimpleNamespace(
+            id=1,
+            wechat_cover_url="",
+            wechat_pic_crop_235_1="stale-crop",
+            wechat_pic_crop_1_1="stale-square-crop",
+        )
+        db = MagicMock()
+
+        class _Query:
+            def __init__(self, value: Any) -> None:
+                self.value = value
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def with_for_update(self) -> "_Query":
+                return self
+            def first(self) -> Any:
+                return self.value
+
+        db.query.side_effect = lambda model: _Query(asset if model.__name__ == "ImageLibraryAsset" else document)
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("apply_searched_cover", {"asset_id": asset.id})},
+                {"text": "已将搜索图片设为文章封面。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "将搜索图片设为封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="searched-cover-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.chat_agent.touch_document") as touch,
+            patch("app.services.chat_agent.create_document_version") as create_version,
+        ):
+            events = asyncio.run(run())
+
+        result = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_searched_cover"
+        )
+        self.assertEqual(result["activity"]["details"]["target"], "cover")
+        self.assertEqual(document.wechat_cover_url, asset.url)
+        self.assertEqual(document.wechat_pic_crop_235_1, "")
+        self.assertEqual(document.wechat_pic_crop_1_1, "")
+        self.assertEqual(model.bound_tool_names.count("apply_searched_cover"), 1)
+        touch.assert_called_once_with(document, 7)
+        create_version.assert_called_once()
+        db.commit.assert_called_once()
+
+    def test_agent_rejects_unavailable_searched_cover_asset(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        db = MagicMock()
+
+        class _Query:
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def first(self) -> None:
+                return None
+
+        db.query.return_value = _Query()
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("apply_searched_cover", {"asset_id": "foreign-or-generated-asset"})},
+                {"text": "该素材不可用。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "设为封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="searched-cover-unavailable-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+        ):
+            events = asyncio.run(run())
+
+        error = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_searched_cover"
+        )
+        self.assertIn("搜索图片素材不存在或不可用", error["result"])
+        db.commit.assert_not_called()
+
+    def test_agent_can_retry_generated_candidate_patch_after_stale_hash(self) -> None:
+        source_html = '<section><div class="feature-card"><p>正文内容</p></div></section>'
+        workspace = HtmlWorkspace(source_html)
+        card = next(block for block in workspace.map_payload()["blocks"] if block["attributes"] == 'class="feature-card"')
+        session = HtmlEditSession(source_html)
+        model = _ScriptedToolModel(
+            script=[
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": workspace.revision,
+                            "operations": [{
+                                "block_id": card["block_id"],
+                                "expected_hash": "stale-hash",
+                                "mode": "replace_inner",
+                                "html": '<img src="https://cdn.example.test/retry.png" alt="重试候选" />',
+                            }],
+                        },
+                    )
+                },
+                {"tool": ("read_blocks", {"block_ids": [card["block_id"]]})},
+                {
+                    "tool": (
+                        "apply_html_patch",
+                        {
+                            "revision": workspace.revision,
+                            "operations": [{
+                                "block_id": card["block_id"],
+                                "expected_hash": card["expected_hash"],
+                                "mode": "replace_inner",
+                                "html": '<img src="https://cdn.example.test/retry.png" alt="重试候选" />',
+                            }],
+                        },
+                    )
+                },
+                {"text": "已重新读取卡片容器并应用生成候选。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "将候选图放入特色卡片",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-image-patch-retry-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}):
+            events = asyncio.run(run())
+
+        applications = [
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_html_patch"
+        ]
+        self.assertEqual(len(applications), 2)
+        self.assertIn("基于旧内容", applications[0]["result"])
+        self.assertEqual(applications[0]["activity"]["details"]["current_revision"], workspace.revision)
+        self.assertEqual(applications[0]["activity"]["details"]["current_block"]["block_id"], card["block_id"])
+        self.assertEqual(applications[1]["activity"]["kind"], "edit")
+        self.assertIn("retry.png", session.html)
+
+    def test_agent_can_set_its_successful_candidate_as_cover_only(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        session = HtmlEditSession(source_html)
+        asset = SimpleNamespace(
+            id="asset-cover-1",
+            generation_id="generation-cover-1",
+            url="https://cdn.example.test/cover.png",
             is_applied=False,
             applied_at=None,
         )
         generation = SimpleNamespace(
-            id="generation-1",
+            id="generation-cover-1",
             document_id=1,
             user_id=7,
-            purpose=ImageGenerationPurpose.COVER,
             status=ImageGenerationStatus.SUCCEEDED,
-            prompt="横幅配图",
         )
-        document = SimpleNamespace(id=1)
+        document = SimpleNamespace(
+            id=1,
+            wechat_cover_url="",
+            wechat_pic_crop_235_1="stale-crop",
+            wechat_pic_crop_1_1="stale-square-crop",
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = generation
+
+        def get_item(model: Any, item_id: Any) -> Any:
+            if model is GeneratedImageAsset and item_id == asset.id:
+                return asset
+            if model is Document and item_id == document.id:
+                return document
+            return None
+
+        db.get.side_effect = get_item
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("apply_generated_cover", {"generation_id": generation.id, "asset_id": asset.id})},
+                {"text": "已将生成候选设为文章封面。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "将生成图设为封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-cover-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.chat_agent.touch_document") as touch,
+            patch("app.services.chat_agent.create_document_version") as create_version,
+        ):
+            events = asyncio.run(run())
+
+        result = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_generated_cover"
+        )
+        self.assertEqual(result["activity"]["details"]["target"], "cover")
+        self.assertEqual(document.wechat_cover_url, asset.url)
+        self.assertEqual(document.wechat_pic_crop_235_1, "")
+        self.assertEqual(document.wechat_pic_crop_1_1, "")
+        self.assertTrue(asset.is_applied)
+        self.assertIsNotNone(asset.applied_at)
+        self.assertEqual(session.html, source_html)
+        touch.assert_called_once_with(document, 7)
+        create_version.assert_called_once()
+        db.commit.assert_called_once()
+
+    def test_agent_rejects_generated_cover_from_another_user(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        asset = SimpleNamespace(id="asset-cover-foreign", generation_id="generation-cover-foreign", url="https://cdn.example.test/foreign.png")
+        generation = SimpleNamespace(
+            id="generation-cover-foreign",
+            document_id=1,
+            user_id=99,
+            status=ImageGenerationStatus.SUCCEEDED,
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = generation
+        db.get.return_value = asset
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("apply_generated_cover", {"generation_id": generation.id, "asset_id": asset.id})},
+                {"text": "候选不可用。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "将生成图设为封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-cover-foreign-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+        ):
+            events = asyncio.run(run())
+
+        error = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_generated_cover"
+        )
+        self.assertIn("图片候选不可用", error["result"])
+        db.commit.assert_not_called()
+
+    def test_agent_can_apply_edited_image_without_explicit_confirmation(self) -> None:
+        source_url = "/api/documents/local-images/original.png"
+        source_html = f'<section><img src="{source_url}" alt="原图"></section>'
+        workspace = HtmlWorkspace(source_html)
+        checkpointed_html: list[str] = []
+        session = HtmlEditSession(source_html, checkpoint_callback=checkpointed_html.append)
+        asset = SimpleNamespace(
+            id="asset-edit-1",
+            generation_id="generation-edit-1",
+            url="https://cdn.example.test/edited.png",
+            is_applied=False,
+            applied_at=None,
+        )
+        generation = SimpleNamespace(
+            id="generation-edit-1",
+            document_id=1,
+            user_id=7,
+            status=ImageGenerationStatus.SUCCEEDED,
+            operation=ImageGenerationOperation.EDIT,
+            target_image_index=0,
+            source_image_url=source_url,
+            source_image_hash=image_target_fingerprint(source_html, 0, source_url),
+        )
+        document = SimpleNamespace(id=1, current_html=source_html)
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = generation
 
@@ -165,18 +797,15 @@ class ImageGenerationApplicationTests(unittest.TestCase):
             script=[
                 {
                     "tool": (
-                        "apply_generated_image",
+                        "apply_edited_image",
                         {
                             "generation_id": generation.id,
                             "asset_id": asset.id,
-                            "target": "body",
                             "revision": workspace.revision,
-                            "anchor_block_id": heading["block_id"],
-                            "expected_hash": heading["expected_hash"],
                         },
                     )
                 },
-                {"text": "横幅已插入标题之后。"},
+                {"text": "已按任务目标替换图片。"},
             ],
             seen_messages=[],
         )
@@ -188,14 +817,263 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     model,
                     "测试文章",
                     source_html,
-                    "将图片插入标题之后",
+                    "自动优化文章图片",
                     workspace.map_payload(),
                     None,
                     [],
                     session=session,
-                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="image-application-test"),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-image-test"),
                     actor_user_id=7,
-                    image_generation_context={"explicit_requested": True},
+                    image_generation_context={"explicit_requested": False},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.chat_agent.touch_document"),
+            patch("app.services.chat_agent.create_document_version"),
+        ):
+            events = asyncio.run(run())
+
+        result = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "apply_edited_image"
+        )
+        self.assertEqual(result["activity"]["kind"], "image_application")
+        self.assertIn("edited.png", session.html)
+        self.assertEqual(checkpointed_html, [session.html])
+        self.assertTrue(asset.is_applied)
+
+    def test_agent_can_apply_edited_cover_and_clears_crop(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        source_url = "https://cdn.example.test/original-cover.png"
+        asset = SimpleNamespace(
+            id="asset-cover-edit-1",
+            generation_id="generation-cover-edit-1",
+            url="https://cdn.example.test/edited-cover.png",
+            is_applied=False,
+            applied_at=None,
+        )
+        generation = SimpleNamespace(
+            id="generation-cover-edit-1",
+            document_id=1,
+            user_id=7,
+            status=ImageGenerationStatus.SUCCEEDED,
+            operation=ImageGenerationOperation.EDIT,
+            purpose=ImageGenerationPurpose.COVER,
+            source_image_url=source_url,
+            source_image_hash=cover_source_fingerprint(source_url),
+        )
+        document = SimpleNamespace(
+            id=1,
+            wechat_cover_url=source_url,
+            wechat_pic_crop_235_1="crop",
+            wechat_pic_crop_1_1="square-crop",
+        )
+        db = MagicMock()
+
+        class _Query:
+            def __init__(self, value: Any) -> None:
+                self.value = value
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def with_for_update(self) -> "_Query":
+                return self
+            def first(self) -> Any:
+                return self.value
+
+        db.query.side_effect = lambda model: _Query(generation if model is ImageGeneration else document)
+        db.get.side_effect = lambda model, item_id: asset if model is GeneratedImageAsset else None
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("apply_edited_cover", {"generation_id": generation.id, "asset_id": asset.id})},
+                {"text": "已更新文章封面。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "编辑文章封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-cover-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.chat_agent.touch_document") as touch,
+            patch("app.services.chat_agent.create_document_version") as create_version,
+        ):
+            events = asyncio.run(run())
+
+        result = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "apply_edited_cover")
+        self.assertEqual(result["activity"]["kind"], "image_application")
+        self.assertEqual(document.wechat_cover_url, asset.url)
+        self.assertEqual(document.wechat_pic_crop_235_1, "")
+        self.assertEqual(document.wechat_pic_crop_1_1, "")
+        self.assertTrue(asset.is_applied)
+        self.assertIsNotNone(asset.applied_at)
+        touch.assert_called_once_with(document, 7)
+        create_version.assert_called_once()
+        db.commit.assert_called_once()
+
+    def test_agent_rejects_edited_cover_when_source_changed(self) -> None:
+        source_html = "<section><p>正文</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        original_url = "https://cdn.example.test/original-cover.png"
+        document = SimpleNamespace(id=1, wechat_cover_url="https://cdn.example.test/new-cover.png", wechat_pic_crop_235_1="", wechat_pic_crop_1_1="")
+        asset = SimpleNamespace(id="asset-stale-cover", generation_id="generation-stale-cover", url="https://cdn.example.test/stale.png", is_applied=False, applied_at=None)
+        generation = SimpleNamespace(id="generation-stale-cover", document_id=1, user_id=7, status=ImageGenerationStatus.SUCCEEDED, operation=ImageGenerationOperation.EDIT, purpose=ImageGenerationPurpose.COVER, source_image_url=original_url, source_image_hash=cover_source_fingerprint(original_url))
+        db = MagicMock()
+
+        class _Query:
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def with_for_update(self) -> "_Query":
+                return self
+            def first(self) -> Any:
+                return generation if not getattr(self, "document_query", False) else document
+
+        generation_query = _Query(); document_query = _Query(); document_query.document_query = True
+        db.query.side_effect = lambda model: generation_query if model is ImageGeneration else document_query
+        db.get.side_effect = lambda model, item_id: asset if model is GeneratedImageAsset else None
+        model = _ScriptedToolModel(script=[{"tool": ("apply_edited_cover", {"generation_id": generation.id, "asset_id": asset.id})}, {"text": "封面已变化。"}], seen_messages=[], bound_tool_names=[])
+
+        async def run() -> list[dict[str, Any]]:
+            return [event async for event in run_agent_loop(model, "测试文章", source_html, "应用封面编辑", workspace.map_payload(), None, [], session=HtmlEditSession(source_html), tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="stale-cover-test"), actor_user_id=7, image_generation_context={})]
+
+        with (patch("app.services.chat_agent.SessionLocal", return_value=db), patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0})):
+            events = asyncio.run(run())
+        error = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "apply_edited_cover")
+        self.assertIn("文章封面已发生变化", error["result"])
+        self.assertEqual(document.wechat_cover_url, "https://cdn.example.test/new-cover.png")
+        self.assertFalse(asset.is_applied)
+        db.commit.assert_not_called()
+
+    def test_agent_creates_cover_edit_candidates_from_current_cover(self) -> None:
+        source_html = "<section><p>正文</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        source_url = "https://cdn.example.test/current-cover.png"
+        document = SimpleNamespace(id=1, wechat_cover_url=source_url)
+        actor = SimpleNamespace(id=7)
+        image_model = SimpleNamespace(
+            id=5,
+            operations=["generate", "edit"],
+            provider=SimpleNamespace(image_protocol="openai_images", image_base_url="https://images.example.test/v1"),
+        )
+        created = SimpleNamespace(id="generation-cover-create")
+        completed = SimpleNamespace(id=created.id)
+        db = MagicMock()
+
+        class _Query:
+            def __init__(self, value: Any) -> None:
+                self.value = value
+            def options(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def first(self) -> Any:
+                return self.value
+
+        db.get.side_effect = lambda model, item_id: document if model is Document else actor
+        db.query.side_effect = lambda model: _Query(image_model if model.__name__ == "AIImageModel" else completed)
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("edit_article_cover", {"prompt": "改成暖色的秋日插画封面", "quantity": 2})},
+                {"text": "已生成两张封面编辑候选。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "编辑现有封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-cover-create-test"),
+                    actor_user_id=7,
+                    image_generation_context={"image_model_id": 5},
+                )
+            ]
+
+        payload = {"id": created.id, "status": "succeeded", "assets": []}
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.image_generation.create_generation", return_value=created) as create_generation,
+            patch("app.services.image_generation.run_generation_sync") as run_generation_sync,
+            patch("app.services.image_generation.generation_payload", return_value=payload),
+            patch("app.services.model_access.can_access_image_model", return_value=True),
+        ):
+            events = asyncio.run(run())
+
+        result = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "edit_article_cover")
+        self.assertEqual(result["activity"]["kind"], "image_generation")
+        self.assertIn("edit_article_cover", model.bound_tool_names)
+        self.assertIn("apply_edited_cover", model.bound_tool_names)
+        kwargs = create_generation.call_args.kwargs
+        self.assertEqual(kwargs["purpose"], ImageGenerationPurpose.COVER)
+        self.assertEqual(kwargs["operation"], ImageGenerationOperation.EDIT)
+        self.assertEqual(kwargs["source_image_url"], source_url)
+        self.assertEqual(kwargs["source_image_hash"], cover_source_fingerprint(source_url))
+        self.assertEqual(kwargs["target_image_index"], -1)
+        self.assertEqual(kwargs["quantity"], 2)
+        run_generation_sync.assert_called_once_with(created.id)
+
+    def test_agent_rejects_cover_edit_without_current_cover(self) -> None:
+        source_html = "<section><p>正文</p></section>"
+        workspace = HtmlWorkspace(source_html)
+        document = SimpleNamespace(id=1, wechat_cover_url="")
+        db = MagicMock()
+        db.get.return_value = document
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("edit_article_cover", {"prompt": "修改封面配色"})},
+                {"text": "请先设置封面。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "编辑现有封面",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-cover-missing-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
                 )
             ]
 
@@ -205,17 +1083,10 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         ):
             events = asyncio.run(run())
 
-        result = next(
-            event["data"]
-            for event in events
-            if event["event"] == "tool_result" and event["data"]["name"] == "apply_generated_image"
-        )
-        self.assertEqual(result["activity"]["kind"], "image_application")
-        self.assertIn("banner.png", result["html"])
-        self.assertTrue(asset.is_applied)
-        self.assertEqual(checkpointed_html, [session.html])
-        self.assertIn("banner.png", session.html)
-        db.commit.assert_called_once()
+        error = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "edit_article_cover")
+        self.assertIn("没有可编辑的封面", error["result"])
+        db.query.assert_not_called()
+        db.commit.assert_not_called()
 
     def test_parallel_image_generation_reports_match_their_task_ids(self) -> None:
         reports = {

@@ -898,7 +898,6 @@ def _session_read(db: Session, session: ChatSession) -> dict:
             else None
         ),
         "image_model_id": session.image_model_id,
-        "auto_image_generation_enabled": session.auto_image_generation_enabled,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -1448,6 +1447,18 @@ def _checkpoint_save_state(
     return "preserved", checkpoint, True
 
 
+def _has_external_document_conflict(
+    source_html: str,
+    candidate_html: str,
+    stored_html: str,
+    agent_checkpoint_htmls: set[str],
+) -> bool:
+    """Keep own direct image writes distinct from an external document edit."""
+    if stored_html == source_html or stored_html == candidate_html:
+        return False
+    return not (candidate_html != source_html and stored_html in agent_checkpoint_htmls)
+
+
 def _persist_run_checkpoint(run_id: str, html: str) -> None:
     """Make completed edit-tool work recoverable before asking the model again."""
     if not html:
@@ -1663,7 +1674,6 @@ def update_chat_session_image_settings(
         if not model.provider.image_protocol or not model.provider.image_base_url:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该 Provider 尚未配置图片生成端点")
         session.image_model_id = model.id
-    session.auto_image_generation_enabled = payload.auto_image_generation_enabled
     db.commit()
     db.refresh(session)
     return _session_read(db, session)
@@ -2427,6 +2437,7 @@ async def start_chat_run(
             user_id=current_user.id,
             chat_model=chat_model,
             thinking_status=thinking_status,
+            thinking_effort=payload.thinking_effort,
             document_title=document.title,
             current_html=document.current_html,
             user_message=effective_message,
@@ -2748,11 +2759,14 @@ async def answer_chat_user_question(
     thinking_mode = str(execution_context.get("thinking_mode") or "auto")
     if thinking_mode not in {"auto", "enabled", "disabled"}:
         thinking_mode = "auto"
+    thinking_effort = str(execution_context.get("thinking_effort") or "auto")
+    if thinking_effort not in {"auto", "minimal", "low", "medium", "high", "xhigh", "max"}:
+        thinking_effort = "auto"
     chat_model, thinking_status = build_chat_model(
         model.provider,
         model,
         thinking_mode,
-        "auto",
+        thinking_effort,
         prompt_cache_key=build_agent_prompt_cache_key(model.provider, model, current_user.id),
     )
     compaction_model = build_compaction_model(model.provider, model)
@@ -2802,6 +2816,7 @@ async def answer_chat_user_question(
             user_id=current_user.id,
             chat_model=chat_model,
             thinking_status=thinking_status,
+            thinking_effort=thinking_effort,
             document_title=str(execution_context.get("document_title") or document.title),
             current_html=source_html,
             user_message=user_message.content,
@@ -3064,6 +3079,7 @@ async def _execute_agent_run(
     user_id: int,
     chat_model,
     thinking_status,
+    thinking_effort: str = "auto",
     document_title: str,
     current_html: str,
     user_message: str,
@@ -3098,6 +3114,11 @@ async def _execute_agent_run(
     reasoning_status = str(persisted_reasoning.get("status", "idle"))
     reasoning_detail = str(persisted_reasoning.get("detail", ""))
     latest_html = current_html
+    # Some image application tools commit their replacement immediately so
+    # the stored object and document stay in sync while the Agent continues.
+    # Keep the checkpoint snapshots produced by this run so terminal save does
+    # not mistake that own write for an external document edit.
+    agent_checkpoint_htmls: set[str] = set()
     terminal_context_events: list[dict] | None = None
     terminal_compliance: dict | None = None
     model_turn_checkpoint: dict[str, object] | None = None
@@ -3288,8 +3309,14 @@ async def _execute_agent_run(
                     .with_for_update()
                     .first()
                 )
-                document_conflict = bool(document and document.current_html != current_html)
+                document_conflict = bool(document) and _has_external_document_conflict(
+                    current_html,
+                    latest_html,
+                    document.current_html,
+                    agent_checkpoint_htmls,
+                )
                 candidate_exists = latest_html != current_html
+                document_already_at_candidate = bool(document and document.current_html == latest_html)
                 if document_conflict:
                     terminal_status = AgentRunStatus.FAILED
                     error_message = error_message or "运行期间文档已被手动或外部修改，Agent 结果未覆盖该修改"
@@ -3304,13 +3331,14 @@ async def _execute_agent_run(
                         content = f"{content.rstrip()}\n\n{failure_summary}"
 
                 html_changed = latest_html != current_html and not document_conflict
-                if document and html_changed:
+                if document and html_changed and not document_already_at_candidate:
                     document.current_html = latest_html
                     touch_document(document, user_id)
-                    if document.group:
+                if document and html_changed:
+                    if document.group and not document_already_at_candidate:
                         touch_group(document.group, user_id)
-                    # Agent direct-insert flows use the normal HTML workspace
-                    # patch after receiving candidate URLs. Mark matching
+                    # Agent HTML patches can reference generated candidate
+                    # URLs directly. Mark matching
                     # assets as applied so the seven-day candidate sweep does
                     # not remove an image that is now referenced by正文.
                     referenced_assets = terminal_db.query(GeneratedImageAsset).filter(
@@ -3361,7 +3389,7 @@ async def _execute_agent_run(
                         model_id=model_id,
                         input_budget_tokens=max(0, int(stream_model.context_compaction_threshold_tokens) - AGENT_TOOL_SCHEMA_RESERVE_TOKENS),
                     )
-                if document and html_changed:
+                if document and html_changed and not document_already_at_candidate:
                     label = (
                         f"主题排版：{theme_application['theme_name']}"
                         if theme_application and terminal_status == AgentRunStatus.COMPLETED
@@ -3490,6 +3518,7 @@ async def _execute_agent_run(
             "theme_reference": theme_reference,
             "attached_templates": attached_templates or [],
             "thinking_mode": thinking_status.requested,
+            "thinking_effort": thinking_effort,
         }
         now = datetime.now(timezone.utc)
         timeout_at = now + timedelta(
@@ -3588,10 +3617,15 @@ async def _execute_agent_run(
             history_rows = [
                 row for row in history_rows if row.id > stream_session.context_start_message_id
             ]
+        def persist_agent_checkpoint(html: str) -> None:
+            if html:
+                agent_checkpoint_htmls.add(html)
+            _persist_run_checkpoint(run_id, html)
+
         edit_session = HtmlEditSession(
             current_html,
             stream_model.tool_result_max_tokens,
-            checkpoint_callback=lambda html: _persist_run_checkpoint(run_id, html),
+            checkpoint_callback=persist_agent_checkpoint,
             cancel_requested=lambda: agent_run_manager.is_cancel_requested(run_id),
         )
         # History reads happen after potentially long model calls. Give them
@@ -3776,13 +3810,7 @@ async def _execute_agent_run(
             user_id,
             stream_session.image_model_id,
         )
-        explicit_image_requested = any(
-            marker in user_message.lower()
-            for marker in ("配图", "生成图片", "生成图", "插图", "封面图", "设为封面", "设置封面", "作为封面", "直接插入")
-        )
         image_generation_context = {
-            "enabled": bool(stream_session.auto_image_generation_enabled),
-            "explicit_requested": explicit_image_requested,
             "image_model_id": selected_image_model.id if selected_image_model else None,
             "model_name": selected_image_model.display_name if selected_image_model else "管理员默认图片模型",
         }
@@ -3822,6 +3850,8 @@ async def _execute_agent_run(
                     resume_tool_result=resume_tool_result,
                     prior_context_events=prior_context_events,
                     image_generation_context=image_generation_context,
+                    model_is_multimodal=stream_model.is_multimodal,
+                    provider_type=stream_model.provider.provider_type.value,
                 )
             ):
                 event = evt["event"]

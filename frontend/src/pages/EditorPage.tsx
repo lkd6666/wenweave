@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react'
-import { Button, Drawer, Grid, Input, Modal, Popconfirm, Popover, Segmented, Slider, Space, Spin, Tooltip, message } from 'antd'
-import { AppstoreOutlined, ArrowLeftOutlined, BulbOutlined, CloudDownloadOutlined, CopyOutlined, EditOutlined, FileSearchOutlined, HistoryOutlined, LinkOutlined, MoreOutlined, PictureOutlined, RedoOutlined, ReloadOutlined, SafetyCertificateOutlined, SaveOutlined, SelectOutlined, SendOutlined, UndoOutlined } from '@ant-design/icons'
+import { Button, Drawer, Grid, Input, Modal, Popconfirm, Popover, Progress, Segmented, Slider, Space, Tooltip, message } from 'antd'
+import { AppstoreOutlined, ArrowLeftOutlined, BulbOutlined, CloudDownloadOutlined, CopyOutlined, EditOutlined, FileSearchOutlined, HistoryOutlined, LinkOutlined, MoreOutlined, RedoOutlined, ReloadOutlined, SafetyCertificateOutlined, SaveOutlined, SelectOutlined, SendOutlined, UndoOutlined } from '@ant-design/icons'
 import { useNavigate, useParams } from 'react-router'
 import ChatPanel, { type ChatRunNotice, type QueuedChatMessage, type ReaskConflictNotice } from '../components/ChatPanel'
 import type { UserQuestionAnswer } from '../components/UserQuestionPanel'
@@ -9,9 +9,10 @@ import PreviewFrame from '../components/PreviewFrame'
 import type { PreviewFrameHandle, PreviewMode } from '../components/PreviewFrame'
 import CompliancePanel from '../components/CompliancePanel'
 import VersionHistoryDrawer from '../components/VersionHistoryDrawer'
-import TemplateLibraryPanel from '../components/TemplateLibraryPanel'
-import AIImageGenerationModal from '../components/AIImageGenerationModal'
+import TemplateLibraryPanel, { type ResourceTab } from '../components/TemplateLibraryPanel'
+import ImageLibraryPanel from '../components/ImageLibraryPanel'
 import { documentsApi } from '../api/documents'
+import { imageLibraryApi } from '../api/imageLibrary'
 import { modelsApi } from '../api/models'
 import { aiProvidersApi } from '../api/aiProviders'
 import { complianceApi } from '../api/compliance'
@@ -19,11 +20,12 @@ import { wechatAccountsApi } from '../api/wechatAccounts'
 import { cancelChatRun, chatApi, reaskDocumentConflictFromError, startChatRun, streamChatRunEvents } from '../api/chat'
 import type { ReaskConflictResolution, ThinkingEffort, ThinkingMode } from '../api/chat'
 import { ApiError } from '../api/client'
-import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, ReasoningTrace, SelectedElementContext, TemplateItem, ToolExecution, VisibilitySettings, WeChatArticleMetadata, WeChatAvailableAccount } from '../types'
+import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, PreviewImageTarget, ReasoningTrace, SelectedElementContext, TemplateItem, ToolExecution, VisibilitySettings, WeChatArticleMetadata, WeChatAvailableAccount } from '../types'
 import { sanitizeSelectedElement, sanitizeSelectedElements } from '../utils/selectedElements'
-import { formatWeChatImageSize, prepareWeChatBodyImage } from '../utils/wechatBodyImage'
+import { prepareWeChatBodyImage } from '../utils/wechatBodyImage'
 import { clearChatComposerDraft, clearChatComposerDraftForRequest, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
 import { moveQueuedChatItem, updateQueuedChatContent } from '../utils/chatQueue'
+import { resolveThinkingPreference, saveThinkingPreference } from '../utils/thinkingPreference'
 import { useAuthStore } from '../store/authStore'
 
 const CodeViewer = lazy(() => import('../components/CodeViewer'))
@@ -35,6 +37,12 @@ const DocumentShareModal = lazy(() => import('../components/DocumentShareModal')
 
 type CenterView = 'preview' | 'code'
 type MobileWorkspace = 'chat' | CenterView
+type WorkspaceLoadStep = 'document' | 'sessions' | 'models' | 'resources' | 'messages' | 'draft' | 'editor'
+type WorkspaceLoadStepStatus = 'pending' | 'loading' | 'completed'
+interface WorkspaceResourceProgress {
+  loaded: number
+  total: number
+}
 const STREAM_RENDER_INTERVAL_MS = 48
 const MAX_STREAM_RECONNECT_ATTEMPTS = 12
 const MIN_CHAT_PANE_WIDTH = 300
@@ -45,6 +53,71 @@ const COLUMN_RESIZER_WIDTH = 8
 const AUTO_SAVE_DELAY_MS = 5000
 const USER_QUESTION_ACTIVITY_THROTTLE_MS = 10_000
 const LAST_SELECTED_MODEL_STORAGE_KEY_PREFIX = 'yibanpaiban-last-selected-model'
+const PREVIEW_RESOURCE_TIMEOUT_MS = 12_000
+
+const WORKSPACE_LOAD_STEPS: Array<{ key: WorkspaceLoadStep; label: string }> = [
+  { key: 'document', label: '文章内容' },
+  { key: 'sessions', label: '对话列表' },
+  { key: 'models', label: '可用模型' },
+  { key: 'resources', label: '预览前端资源' },
+  { key: 'messages', label: '当前对话记录' },
+  { key: 'draft', label: '未发送内容' },
+  { key: 'editor', label: '编辑器初始化' },
+]
+
+function initialWorkspaceLoadSteps(): Record<WorkspaceLoadStep, WorkspaceLoadStepStatus> {
+  return {
+    document: 'loading',
+    sessions: 'loading',
+    models: 'loading',
+    resources: 'pending',
+    messages: 'pending',
+    draft: 'pending',
+    editor: 'pending',
+  }
+}
+
+function extractPreviewResourceUrls(html: string): string[] {
+  const document = new DOMParser().parseFromString(html, 'text/html')
+  return [...new Set(
+    Array.from(document.querySelectorAll<HTMLImageElement>('img[src]'))
+      .map((image) => image.getAttribute('src')?.trim() ?? '')
+      .filter((source) => source && !source.startsWith('data:')),
+  )]
+}
+
+function preloadPreviewResources(
+  html: string,
+  onProgress: (progress: WorkspaceResourceProgress) => void,
+): Promise<void> {
+  const resources = extractPreviewResourceUrls(html)
+  const total = resources.length
+  onProgress({ loaded: 0, total })
+  if (total === 0) return Promise.resolve()
+
+  let loaded = 0
+  const settleResource = () => {
+    loaded += 1
+    onProgress({ loaded, total })
+  }
+  return Promise.all(resources.map((source) => new Promise<void>((resolve) => {
+    let settled = false
+    const settle = () => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeout)
+      settleResource()
+      resolve()
+    }
+    const image = new Image()
+    const timeout = window.setTimeout(settle, PREVIEW_RESOURCE_TIMEOUT_MS)
+    image.referrerPolicy = 'no-referrer'
+    image.onload = settle
+    image.onerror = settle
+    image.src = source
+    if (image.complete) queueMicrotask(settle)
+  }))).then(() => undefined)
+}
 
 type ComplianceButtonStatus = 'unknown' | 'checking' | 'success' | 'warning' | 'error'
 
@@ -331,6 +404,8 @@ export default function EditorPage() {
   const [draftHtml, setDraftHtml] = useState('')
   const [previewRevision, setPreviewRevision] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [workspaceLoadSteps, setWorkspaceLoadSteps] = useState<Record<WorkspaceLoadStep, WorkspaceLoadStepStatus>>(initialWorkspaceLoadSteps)
+  const [workspaceResourceProgress, setWorkspaceResourceProgress] = useState<WorkspaceResourceProgress>({ loaded: 0, total: 0 })
   const [hasSourceFile, setHasSourceFile] = useState(false)
   const [documentGroupId, setDocumentGroupId] = useState<number | null>(null)
   const [documentVisibility, setDocumentVisibility] = useState<VisibilitySettings>({
@@ -358,7 +433,10 @@ export default function EditorPage() {
   const [resourceCollapsed, setResourceCollapsed] = useState(false)
   const [resourceDrawerOpen, setResourceDrawerOpen] = useState(false)
   const [mobileActionsDrawerOpen, setMobileActionsDrawerOpen] = useState(false)
-  const [aiImageModalOpen, setAiImageModalOpen] = useState(false)
+  const [activeResourceTab, setActiveResourceTab] = useState<ResourceTab>('templates')
+  const [imageLibraryCommand, setImageLibraryCommand] = useState<{ id: number; tab: 'library' | 'search' | 'generate'; editCurrentImage?: boolean } | null>(null)
+  const [imageApplicationTarget, setImageApplicationTarget] = useState<'image' | 'block' | 'caret' | null>(null)
+  const [activeCanvasImage, setActiveCanvasImage] = useState<PreviewImageTarget | null>(null)
 
   const [models, setModels] = useState<AIModelItem[]>([])
   const [modelId, setModelId] = useState<number | null>(null)
@@ -398,6 +476,7 @@ export default function EditorPage() {
   const [previewBrightness, setPreviewBrightness] = useState(100)
   const [editHistoryState, setEditHistoryState] = useState({ canUndo: false, canRedo: false })
   const [selectedElements, setSelectedElements] = useState<SelectedElementContext[]>([])
+  const [, setActiveCaretTarget] = useState<SelectedElementContext | null>(null)
   const [attachedTemplates, setAttachedTemplates] = useState<TemplateItem[]>([])
   const [templateCollection, setTemplateCollection] = useState<{ id: number; html: string } | null>(null)
   const [hasPreviewCaret, setHasPreviewCaret] = useState(false)
@@ -639,15 +718,52 @@ export default function EditorPage() {
   const loadDocument = useCallback(async () => {
     if (!docId || Number.isNaN(docId)) return
     setLoading(true)
+    setWorkspaceLoadSteps(initialWorkspaceLoadSteps())
+    setWorkspaceResourceProgress({ loaded: 0, total: 0 })
     try {
+      const markLoadStepCompleted = (step: WorkspaceLoadStep) => {
+        setWorkspaceLoadSteps((current) => ({ ...current, [step]: 'completed' }))
+      }
       const [doc, sessions, modelList] = await Promise.all([
-        documentsApi.get(docId),
-        chatApi.listSessions(docId),
-        modelsApi.list(),
+        documentsApi.get(docId).then((document) => {
+          markLoadStepCompleted('document')
+          return document
+        }),
+        chatApi.listSessions(docId).then((items) => {
+          markLoadStepCompleted('sessions')
+          return items
+        }),
+        modelsApi.list().then((items) => {
+          markLoadStepCompleted('models')
+          return items
+        }),
       ])
       const activeSession = sessions.find((item) => !item.is_archived) ?? sessions[0]
-      const msgs = activeSession ? await chatApi.listMessages(docId, activeSession.id) : []
-      const restoredComposerDraft = activeSession ? await resolveStoredComposerDraft(docId, activeSession.id) : null
+      if (activeSession) {
+        setWorkspaceLoadSteps((current) => ({
+          ...current,
+          messages: 'loading',
+          draft: 'loading',
+        }))
+      } else {
+        markLoadStepCompleted('messages')
+        markLoadStepCompleted('draft')
+      }
+      const [msgs, restoredComposerDraft] = activeSession
+        ? await Promise.all([
+          chatApi.listMessages(docId, activeSession.id).then((items) => {
+            markLoadStepCompleted('messages')
+            return items
+          }),
+          resolveStoredComposerDraft(docId, activeSession.id).then((draft) => {
+            markLoadStepCompleted('draft')
+            return draft
+          }),
+        ])
+        : [[], null]
+      setWorkspaceLoadSteps((current) => ({ ...current, resources: 'loading', editor: 'loading' }))
+      await preloadPreviewResources(doc.current_html, setWorkspaceResourceProgress)
+      markLoadStepCompleted('resources')
       setTitle(doc.title)
       setHasSourceFile(doc.has_source_file)
       setDocumentGroupId(doc.group_id)
@@ -659,6 +775,7 @@ export default function EditorPage() {
       setWechatMetadata(doc.wechat_metadata)
       applyExternalHtml(doc.current_html)
       setPreviewRevision((value) => value + 1)
+      setActiveCaretTarget(null)
       // A refresh rehydrates the same article, not the user's selection
       // intent. Keep its anchor so the next turn resolves it against this
       // latest HTML; only discard anchors when navigating to another article.
@@ -681,13 +798,16 @@ export default function EditorPage() {
       const lastSelectedModelId = getLastSelectedModelId(currentUser?.id)
       const lastSelectedModel = modelList.find((model) => model.id === lastSelectedModelId)
       const defaultModel = modelList.find((m) => m.is_default) ?? modelList[0]
-      if (lastSelectedModel) {
-        setModelId(lastSelectedModel.id)
-      } else {
-        if (lastSelectedModelId !== null) clearLastSelectedModelId(currentUser?.id)
-        setModelId(defaultModel?.id ?? null)
+      const selectedModel = lastSelectedModel ?? defaultModel
+      if (!lastSelectedModel && lastSelectedModelId !== null) {
+        clearLastSelectedModelId(currentUser?.id)
       }
+      setModelId(selectedModel?.id ?? null)
+      const restoredThinkingPreference = resolveThinkingPreference(currentUser?.id, selectedModel)
+      setThinkingMode(restoredThinkingPreference.mode)
+      setThinkingEffort(restoredThinkingPreference.effort)
       scheduleComplianceCheck(doc.current_html)
+      markLoadStepCompleted('editor')
     } catch (err) {
       message.error(err instanceof ApiError ? String(err.detail) : '加载文档失败')
       navigate('/')
@@ -695,6 +815,16 @@ export default function EditorPage() {
       setLoading(false)
     }
   }, [applyExternalHtml, currentUser?.id, docId, navigate, resolveStoredComposerDraft, scheduleComplianceCheck])
+
+  const openImageLibrary = useCallback((tab: 'library' | 'search' | 'generate' = 'library', editCurrentImage = false) => {
+    setCenterView('preview')
+    setMobileWorkspace('preview')
+    setPreviewMode('edit')
+    setResourceCollapsed(false)
+    if (isCompact) setResourceDrawerOpen(true)
+    setActiveResourceTab('images')
+    setImageLibraryCommand({ id: Date.now(), tab, editCurrentImage })
+  }, [isCompact])
 
   const handleThinkingCapabilityFallback = useCallback((fallback: {
     model_id: number
@@ -784,11 +914,9 @@ export default function EditorPage() {
     if (!docId) throw new Error('文档不存在')
     try {
       const prepared = await prepareWeChatBodyImage(file)
-      const result = await documentsApi.uploadImage(docId, prepared.file)
-      if (prepared.wasCompressed) {
-        message.info(`图片已在本地压缩：${formatWeChatImageSize(prepared.originalSize)} -> ${formatWeChatImageSize(prepared.file.size)}`)
-      }
-      return result.url
+      const [asset] = await imageLibraryApi.upload(docId, [prepared.file])
+      if (!asset) throw new Error('图片未保存到图库')
+      return asset.url
     } catch (err) {
       message.error(err instanceof ApiError ? String(err.detail) : '图片上传失败')
       throw err
@@ -908,21 +1036,47 @@ export default function EditorPage() {
   const handleLocalizeArticleImages = useCallback(async () => {
     if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
     setLocalizingArticleImages(true)
+    const progressMessageKey = 'editor-localize-external-images'
+    const externalImageCount = (draftHtmlRef.current.match(/<img\b[^>]*https?:\/\//gi) ?? []).length
+    message.loading({ key: progressMessageKey, content: '正在保存文章并转存外链图片…', duration: 0 })
     try {
       previewFrameRef.current?.flushPendingChange()
-      if (await persistDraftHtml(false) === null) return
+      if (await persistDraftHtml(false) === null) {
+        message.destroy(progressMessageKey)
+        return
+      }
+      message.loading({
+        key: progressMessageKey,
+        content: externalImageCount > 0
+          ? `正在转存外链图片（${externalImageCount} 张），请稍候…`
+          : '正在转存外链图片，请稍候…',
+        duration: 0,
+      })
       const result = await documentsApi.localizeExternalImages(docId)
       applyExternalHtml(result.html)
       setPreviewRevision((value) => value + 1)
       setVersionRefreshToken((value) => value + 1)
       scheduleComplianceCheck(result.html)
-      message.success(result.localized_count ? `已转存 ${result.localized_count} 张外链图片` : '未发现需要转存的外链图片')
+      message.success({
+        key: progressMessageKey,
+        content: result.localized_count ? `已转存 ${result.localized_count} 张外链图片` : '未发现需要转存的外链图片',
+        duration: 3,
+      })
     } catch (err) {
-      message.error(err instanceof ApiError ? String(err.detail) : '文章图片转存失败，正文未修改')
+      message.error({
+        key: progressMessageKey,
+        content: err instanceof ApiError ? String(err.detail) : '文章图片转存失败，正文未修改',
+        duration: 4,
+      })
     } finally {
       setLocalizingArticleImages(false)
     }
   }, [applyExternalHtml, docId, localizingArticleImages, materializingTemplateImages, persistDraftHtml, saving, scheduleComplianceCheck, streaming])
+
+  const handleExternalImagesPasted = useCallback(() => {
+    // Wait for the iframe's native paste/input event to update draftHtmlRef.
+    window.setTimeout(() => { void handleLocalizeArticleImages() }, 0)
+  }, [handleLocalizeArticleImages])
 
   const handleCopyPreviewArticle = useCallback(async () => {
     const result = await previewFrameRef.current?.copyArticle()
@@ -1211,6 +1365,10 @@ export default function EditorPage() {
     }
     if (!existingRunId) previewFrameRef.current?.flushPendingChange()
     const sanitizedAttachedElements = sanitizeSelectedElements(attachedElements)
+    const restoreSubmittedElements = () => {
+      if (!sanitizedAttachedElements.length) return
+      setSelectedElements((current) => current.length ? current : sanitizedAttachedElements)
+    }
     const attachedTemplateRefs = attachedTemplates.map((template) => ({ id: template.id, name: template.name }))
     const sentDraftImages = existingRunId ? [] : attachedImages
     const sentImageIds = new Set(sentDraftImages.map((item) => item.id))
@@ -1253,6 +1411,8 @@ export default function EditorPage() {
       persistedHtml = await persistDraftHtml()
     }
     if (persistedHtml === null) {
+      setContextDraft((current) => current || text)
+      restoreSubmittedElements()
       restoreSentDraftImages()
       finishStarting()
       return
@@ -1361,6 +1521,7 @@ export default function EditorPage() {
       if (hasNewerDraft) return
       setContextDraft(submittedDraft.message)
       setPendingReaskMessageId(submittedDraft.reaskFromMessageId)
+      restoreSubmittedElements()
       writeChatComposerDraft(
         docId,
         sessionId,
@@ -2545,10 +2706,58 @@ export default function EditorPage() {
       } as CSSProperties)
 
   if (loading) {
+    const completedLoadProgress = WORKSPACE_LOAD_STEPS.reduce((total, step) => {
+      const status = workspaceLoadSteps[step.key]
+      if (status === 'completed') return total + 1
+      if (step.key === 'resources' && status === 'loading' && workspaceResourceProgress.total > 0) {
+        return total + workspaceResourceProgress.loaded / workspaceResourceProgress.total
+      }
+      return total
+    }, 0)
+    const progress = Math.round((completedLoadProgress / WORKSPACE_LOAD_STEPS.length) * 100)
+    const waitingSteps = WORKSPACE_LOAD_STEPS
+      .filter((step) => workspaceLoadSteps[step.key] === 'loading')
+      .map((step) => step.label)
+    const pendingSteps = WORKSPACE_LOAD_STEPS
+      .filter((step) => workspaceLoadSteps[step.key] === 'pending')
+      .map((step) => step.label)
+    const loadingDetail = waitingSteps.length > 0
+      ? `正在等待${waitingSteps.join('、')}…`
+      : pendingSteps.length > 0
+        ? `即将准备${pendingSteps.join('、')}…`
+        : '正在打开编辑器…'
+    const loadStepLabel = (step: typeof WORKSPACE_LOAD_STEPS[number], status: WorkspaceLoadStepStatus) => {
+      if (step.key === 'resources' && status === 'loading' && workspaceResourceProgress.total > 0) {
+        return `加载中 ${workspaceResourceProgress.loaded}/${workspaceResourceProgress.total}`
+      }
+      return status === 'completed' ? '已完成' : status === 'loading' ? '加载中' : '等待中'
+    }
     return (
-      <div style={{ textAlign: 'center', padding: 80 }}>
-        <Spin size="large" description="加载排版工作台…" />
-      </div>
+      <main className="editor-workbench-loading" aria-live="polite" aria-busy="true">
+        <section className="editor-workbench-loading-panel" aria-label="排版工作台加载进度">
+          <div className="editor-workbench-loading-heading">
+            <div>
+              <span>排版工作台</span>
+              <strong>正在加载</strong>
+            </div>
+            <b>{progress}%</b>
+          </div>
+          <Progress percent={progress} status="active" showInfo={false} strokeColor="#1677ff" trailColor="#dfe8f7" />
+          <p className="editor-workbench-loading-detail">{loadingDetail}</p>
+          <div className="editor-workbench-loading-steps">
+            {WORKSPACE_LOAD_STEPS.map((step) => {
+              const status = workspaceLoadSteps[step.key]
+              return (
+                <div key={step.key} className={`editor-workbench-loading-step is-${status}`}>
+                  <span aria-hidden="true" />
+                  <span>{step.label}</span>
+                  <small>{loadStepLabel(step, status)}</small>
+                </div>
+              )
+            })}
+          </div>
+        </section>
+      </main>
     )
   }
 
@@ -2569,9 +2778,28 @@ export default function EditorPage() {
     }
     selectCenterView(workspace)
   }
+  const handleSetLibraryCover = async (assetId: string) => {
+    const saved = await persistDraftHtml(false, true)
+    if (saved === null) throw new Error('正文保存失败')
+    try {
+      const updated = await imageLibraryApi.setCover(assetId, docId)
+      setWechatMetadata((metadata) => ({
+        ...metadata,
+        cover_url: updated.url,
+        pic_crop_235_1: '',
+        pic_crop_1_1: '',
+      }))
+      setVersionRefreshToken((value) => value + 1)
+      message.success('已设为文章封面')
+    } catch (error) {
+      message.error(error instanceof ApiError ? String(error.detail) : '设置封面失败')
+      throw error
+    }
+  }
   const resourceLibrary = (
     <TemplateLibraryPanel
       modelId={modelId}
+      models={models}
       disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
       canInsertAtCaret={centerView === 'preview' && previewMode === 'edit' && hasPreviewCaret}
       attachedTemplateIds={attachedTemplates.map((item) => item.id)}
@@ -2582,6 +2810,19 @@ export default function EditorPage() {
       onClearThemeContext={() => { void clearSessionThemeContext() }}
       collection={templateCollection}
       onCollectionHandled={handleTemplateCollection}
+      activeResourceTab={activeResourceTab}
+      onResourceTabChange={setActiveResourceTab}
+      imagePanel={<ImageLibraryPanel
+        documentId={docId}
+        sessionId={activeChatSessionId}
+        initialModelId={activeChatSession?.image_model_id}
+        disabled={streaming || saving || localizingArticleImages}
+        applicationTarget={imageApplicationTarget}
+        selectedImage={activeCanvasImage}
+        command={imageLibraryCommand}
+        onApply={(url, alt) => Boolean(previewFrameRef.current?.applyLibraryImage(url, alt))}
+        onSetCover={handleSetLibraryCover}
+      />}
       onOpenThemeGallery={(themeKey) => {
         setResourceDrawerOpen(false)
         setThemeGalleryInitialKey(themeKey ?? null)
@@ -2696,19 +2937,8 @@ export default function EditorPage() {
                     onClick={() => previewFrameRef.current?.redo()}
                   />
                 </Tooltip>
-                <Tooltip title="插入图片">
-                  <Button
-                    aria-label="插入图片"
-                    icon={<PictureOutlined />}
-                    disabled={streaming || saving}
-                    onClick={() => previewFrameRef.current?.openImagePickerForInsert()}
-                  />
-                </Tooltip>
               </>
             )}
-            <Tooltip title="AI 配图">
-              <Button aria-label="AI 配图" icon={<PictureOutlined />} disabled={streaming || saving} onClick={() => setAiImageModalOpen(true)}>AI 配图</Button>
-            </Tooltip>
             {centerView === 'preview' && (
               <>
                 <Popover
@@ -2868,18 +3098,26 @@ export default function EditorPage() {
               }
               setModelId(nextModelId)
               saveLastSelectedModelId(currentUser?.id, nextModelId)
-              if (
-                nextModel?.supports_disabled_thinking === false
-                || temporarilyUnsupportedThinkingModelIds.has(nextModelId)
-              ) {
-                setThinkingMode('auto')
-              }
-              setThinkingEffort('auto')
+              const restoredThinkingPreference = resolveThinkingPreference(
+                currentUser?.id,
+                nextModel,
+                temporarilyUnsupportedThinkingModelIds.has(nextModelId),
+              )
+              setThinkingMode(restoredThinkingPreference.mode)
+              setThinkingEffort(restoredThinkingPreference.effort)
             }}
             thinkingMode={thinkingMode}
-            onThinkingModeChange={setThinkingMode}
+            onThinkingModeChange={(nextMode) => {
+              setThinkingMode(nextMode)
+              if (modelId) saveThinkingPreference(currentUser?.id, modelId, { mode: nextMode, effort: thinkingEffort })
+            }}
             thinkingEffort={thinkingEffort}
-            onThinkingEffortChange={setThinkingEffort}
+            onThinkingEffortChange={(nextEffort) => {
+              const nextMode = thinkingMode === 'disabled' ? 'enabled' : thinkingMode
+              setThinkingMode(nextMode)
+              setThinkingEffort(nextEffort)
+              if (modelId) saveThinkingPreference(currentUser?.id, modelId, { mode: nextMode, effort: nextEffort })
+            }}
             temporarilyUnsupportedThinkingModelIds={temporarilyUnsupportedThinkingModelIds}
             thinkingStatus={thinkingStatus}
             contextStats={contextStats}
@@ -2887,7 +3125,7 @@ export default function EditorPage() {
             activeChatSession={activeChatSession}
             hiddenHistory={hiddenHistory}
             messages={messages}
-            queuedMessages={queuedChatRequests.map(({ id, content }) => ({ id, content }))}
+            queuedMessages={queuedChatRequests.map(({ id, content, images }) => ({ id, content, images }))}
             streaming={streaming}
             stopping={stopping}
             streamText={streamText}
@@ -2932,6 +3170,10 @@ export default function EditorPage() {
             onMoveQueuedMessage={moveQueuedChatRequest}
             onEditRequest={handleEditRequest}
             onSend={(text, references, images) => {
+              // Clear the submitted draft immediately. The request handler
+              // still owns recovery if persisting or starting the run fails.
+              setContextDraft('')
+              setSelectedElements([])
               if (streaming || chatSubmitting) {
                 enqueueChatRequest(text, references, images)
                 return
@@ -2983,6 +3225,13 @@ export default function EditorPage() {
               selectedElements={selectedElements}
               onHtmlChange={handleHtmlChange}
               onUploadImage={handleImageUpload}
+              onAiImageAction={(mode, target) => {
+                setActiveCanvasImage(target)
+                openImageLibrary('generate', mode === 'edit')
+              }}
+              onImageApplicationTargetChange={setImageApplicationTarget}
+              onActiveImageChange={setActiveCanvasImage}
+              onExternalImagesPasted={handleExternalImagesPasted}
               onToggleSelection={(element, selected) => {
                 setSelectedElements((items) => {
                   if (selected) return items.length < 12 ? [...items, sanitizeSelectedElement(element)] : items
@@ -3007,6 +3256,7 @@ export default function EditorPage() {
               onCollectTemplateHtml={collectTemplateHtml}
               onHistoryStateChange={setEditHistoryState}
               onCaretAvailabilityChange={setHasPreviewCaret}
+              onCaretTargetChange={setActiveCaretTarget}
             />
           </div>
           <div className={`editor-center-panel${centerView === 'code' ? '' : ' is-hidden'}`}>
@@ -3096,16 +3346,6 @@ export default function EditorPage() {
         <section className="editor-mobile-actions-section" aria-label="文章操作">
           <span className="editor-mobile-actions-heading">文章</span>
           <div className="editor-mobile-actions-grid">
-            <Button
-              icon={<PictureOutlined />}
-              disabled={streaming || saving}
-              onClick={() => {
-                setMobileActionsDrawerOpen(false)
-                setAiImageModalOpen(true)
-              }}
-            >
-              AI 配图
-            </Button>
             <Button
               icon={<CopyOutlined />}
               disabled={!draftHtml.trim()}
@@ -3216,16 +3456,6 @@ export default function EditorPage() {
       >
         <CompliancePanel report={compliance} loading={complianceLoading} />
       </Drawer>
-      <AIImageGenerationModal
-        open={aiImageModalOpen}
-        documentId={docId}
-        sessionId={activeChatSessionId}
-        initialModelId={activeChatSession?.image_model_id}
-        initialAutoEnabled={activeChatSession?.auto_image_generation_enabled}
-        selectedBlock={selectedElements[0] ?? null}
-        onClose={() => setAiImageModalOpen(false)}
-        onApplied={() => { void loadDocument() }}
-      />
       <VersionHistoryDrawer
         documentId={docId}
         open={versionDrawerOpen}
@@ -3258,6 +3488,7 @@ export default function EditorPage() {
             documentId={docId}
             sessionId={activeChatSessionId}
             modelId={modelId}
+            models={models}
             disabled={streaming || saving || !modelId}
             onClose={() => {
               setThemeGalleryOpen(false)

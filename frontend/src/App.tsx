@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react'
+import { Progress } from 'antd'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import ProtectedRoute from './components/ProtectedRoute'
 
@@ -14,10 +15,19 @@ const AdminUserGroupsPage = lazy(() => import('./pages/admin/AdminUserGroupsPage
 const AdminWeChatAccountsPage = lazy(() => import('./pages/admin/AdminWeChatAccountsPage'))
 const AdminOperationLogsPage = lazy(() => import('./pages/admin/AdminOperationLogsPage'))
 const AdminBrandingPage = lazy(() => import('./pages/admin/AdminBrandingPage'))
+const AdminImageLibraryPage = lazy(() => import('./pages/admin/AdminImageLibraryPage'))
 const PublicSharePage = lazy(() => import('./pages/PublicSharePage'))
 
 function RouteLoadingFallback() {
-  return <main className="route-loading" aria-busy="true" aria-label="页面加载中" />
+  return (
+    <main className="route-loading" aria-busy="true" aria-label="正在下载页面资源">
+      <section className="route-loading-panel">
+        <strong>正在加载页面</strong>
+        <Progress percent={100} status="active" showInfo={false} strokeColor="#1677ff" trailColor="#dfe8f7" />
+        <span>正在下载前端资源…</span>
+      </section>
+    </main>
+  )
 }
 
 export default function App() {
@@ -83,6 +93,14 @@ export default function App() {
               element={
                 <ProtectedRoute adminOnly>
                   <AdminBrandingPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="admin/image-library"
+              element={
+                <ProtectedRoute adminOnly>
+                  <AdminImageLibraryPage />
                 </ProtectedRoute>
               }
             />

@@ -21,7 +21,10 @@ class ToolExecutionRead(BaseModel):
     id: str
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
-    status: Literal["running", "waiting", "success", "error"]
+    # A retry can preserve an unexecuted tool preview as a terminal timeline
+    # entry so the user can see what was abandoned without treating it as a
+    # failed execution.
+    status: Literal["running", "waiting", "success", "error", "interrupted"]
     preparing: bool = False
     result: str | None = None
     html_changed: bool = False
@@ -241,7 +244,6 @@ class ChatSessionRead(BaseModel):
     attached_templates: list[ChatSessionTemplateAttachmentRead] = Field(default_factory=list)
     theme_context: ChatSessionThemeContextRead | None = None
     image_model_id: int | None = None
-    auto_image_generation_enabled: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -256,7 +258,6 @@ class ChatSessionUpdate(BaseModel):
 
 class ChatSessionImageSettingsUpdate(BaseModel):
     image_model_id: int | None = Field(default=None, gt=0)
-    auto_image_generation_enabled: bool = False
 
 
 class ChatSessionTemplateAttachmentsUpdate(BaseModel):

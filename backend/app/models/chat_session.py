@@ -32,7 +32,6 @@ class ChatSession(Base):
     image_model_id: Mapped[int | None] = mapped_column(
         ID_TYPE, ForeignKey("ai_image_models.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    auto_image_generation_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
     image_model = relationship("AIImageModel")
 

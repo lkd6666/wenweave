@@ -1,0 +1,21 @@
+services:
+  searxng:
+    image: docker.io/searxng/searxng@sha256:f4c8e59de166ed71f6380c0847c312ca51f0d41996e31d0559163b6b09ecde52
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SEARXNG_HOST_PORT:-8088}:8080"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    env_file:
+      - ./.env
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:${SEARXNG_HOST_PORT:-8088}/
+      # Image search fans out to upstream engines, so one async SearXNG
+      # worker is sufficient for this private, application-only service.
+      UWSGI_WORKERS: "${SEARXNG_UWSGI_WORKERS:-1}"
+      UWSGI_THREADS: "${SEARXNG_UWSGI_THREADS:-1}"
+    mem_limit: ${SEARXNG_MEMORY_LIMIT:-320m}
+    mem_reservation: ${SEARXNG_MEMORY_RESERVATION:-160m}
+    pids_limit: ${SEARXNG_PIDS_LIMIT:-96}
+    security_opt:
+      - no-new-privileges:true

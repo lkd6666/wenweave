@@ -143,6 +143,26 @@ CREATE TABLE wechat_accounts (
 CREATE UNIQUE INDEX ix_wechat_accounts_app_id ON wechat_accounts (app_id);
 
 
+CREATE TABLE ai_image_models (
+	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+	provider_id BIGINT UNSIGNED NOT NULL,
+	model_name VARCHAR(256) NOT NULL,
+	display_name VARCHAR(256) NOT NULL,
+	description VARCHAR(1024) NOT NULL,
+	supported_aspect_ratios JSON NOT NULL,
+	supported_qualities JSON NOT NULL,
+	is_default BOOL NOT NULL DEFAULT '0',
+	access_mode VARCHAR(16) NOT NULL DEFAULT 'all',
+	adapter_config JSON NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	deleted_at DATETIME,
+	PRIMARY KEY (id),
+	FOREIGN KEY(provider_id) REFERENCES ai_providers (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_ai_image_models_deleted_at ON ai_image_models (deleted_at);
+CREATE INDEX ix_ai_image_models_provider_id ON ai_image_models (provider_id);
+
+
 CREATE TABLE ai_models (
 	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 	provider_id BIGINT UNSIGNED NOT NULL,
@@ -160,23 +180,6 @@ CREATE TABLE ai_models (
 	prompt_cache_enabled BOOL NOT NULL DEFAULT '0',
 	access_mode VARCHAR(16) NOT NULL DEFAULT 'all',
 	thinking_config JSON NOT NULL,
-	created_at DATETIME NOT NULL DEFAULT now(),
-	PRIMARY KEY (id),
-	FOREIGN KEY(provider_id) REFERENCES ai_providers (id) ON DELETE CASCADE
-)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
-
-
-CREATE TABLE ai_image_models (
-	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-	provider_id BIGINT UNSIGNED NOT NULL,
-	model_name VARCHAR(256) NOT NULL,
-	display_name VARCHAR(256) NOT NULL,
-	description VARCHAR(1024) NOT NULL,
-	supported_aspect_ratios JSON NOT NULL,
-	supported_qualities JSON NOT NULL,
-	is_default BOOL NOT NULL DEFAULT 0,
-	access_mode VARCHAR(16) NOT NULL DEFAULT 'all',
-	adapter_config JSON NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id),
 	FOREIGN KEY(provider_id) REFERENCES ai_providers (id) ON DELETE CASCADE
@@ -273,6 +276,16 @@ CREATE INDEX ix_gzh_themes_active_version_id ON gzh_themes (active_version_id);
 CREATE UNIQUE INDEX ix_gzh_themes_slug ON gzh_themes (slug);
 
 
+CREATE TABLE image_library_settings (
+	id BIGINT UNSIGNED NOT NULL,
+	mode ENUM('personal','shared') NOT NULL DEFAULT 'personal',
+	updated_by_id BIGINT UNSIGNED,
+	updated_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id),
+	FOREIGN KEY(updated_by_id) REFERENCES users (id) ON DELETE SET NULL
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+
+
 CREATE TABLE operation_logs (
 	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 	actor_user_id BIGINT UNSIGNED,
@@ -330,7 +343,7 @@ CREATE TABLE user_group_members (
 	PRIMARY KEY (group_id, user_id),
 	FOREIGN KEY(group_id) REFERENCES user_groups (id) ON DELETE CASCADE,
 	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
-);
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 
 
 CREATE TABLE wechat_account_group_access (
@@ -473,31 +486,13 @@ CREATE TABLE gzh_theme_versions (
 CREATE INDEX ix_gzh_theme_versions_theme_id ON gzh_theme_versions (theme_id);
 
 
-CREATE TABLE model_group_access (
-	model_id BIGINT UNSIGNED NOT NULL,
-	group_id BIGINT UNSIGNED NOT NULL,
-	PRIMARY KEY (model_id, group_id),
-	FOREIGN KEY(model_id) REFERENCES ai_models (id) ON DELETE CASCADE,
-	FOREIGN KEY(group_id) REFERENCES user_groups (id) ON DELETE CASCADE
-);
-
-
-CREATE TABLE model_user_access (
-	model_id BIGINT UNSIGNED NOT NULL,
-	user_id BIGINT UNSIGNED NOT NULL,
-	PRIMARY KEY (model_id, user_id),
-	FOREIGN KEY(model_id) REFERENCES ai_models (id) ON DELETE CASCADE,
-	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
-);
-
-
 CREATE TABLE image_model_group_access (
 	model_id BIGINT UNSIGNED NOT NULL,
 	group_id BIGINT UNSIGNED NOT NULL,
 	PRIMARY KEY (model_id, group_id),
 	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE CASCADE,
 	FOREIGN KEY(group_id) REFERENCES user_groups (id) ON DELETE CASCADE
-);
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 
 
 CREATE TABLE image_model_user_access (
@@ -506,7 +501,25 @@ CREATE TABLE image_model_user_access (
 	PRIMARY KEY (model_id, user_id),
 	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE CASCADE,
 	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
-);
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+
+
+CREATE TABLE model_group_access (
+	model_id BIGINT UNSIGNED NOT NULL,
+	group_id BIGINT UNSIGNED NOT NULL,
+	PRIMARY KEY (model_id, group_id),
+	FOREIGN KEY(model_id) REFERENCES ai_models (id) ON DELETE CASCADE,
+	FOREIGN KEY(group_id) REFERENCES user_groups (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+
+
+CREATE TABLE model_user_access (
+	model_id BIGINT UNSIGNED NOT NULL,
+	user_id BIGINT UNSIGNED NOT NULL,
+	PRIMARY KEY (model_id, user_id),
+	FOREIGN KEY(model_id) REFERENCES ai_models (id) ON DELETE CASCADE,
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 
 
 CREATE TABLE template_generations (
@@ -556,68 +569,16 @@ CREATE TABLE chat_sessions (
 	is_archived BOOL NOT NULL,
 	context_start_message_id INTEGER NOT NULL,
 	context_generation INTEGER NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	updated_at DATETIME NOT NULL DEFAULT now(),
 	image_model_id BIGINT UNSIGNED,
-	auto_image_generation_enabled BOOL NOT NULL DEFAULT 0,
-	created_at DATETIME NOT NULL DEFAULT now(),
-	updated_at DATETIME NOT NULL DEFAULT now(),
-	PRIMARY KEY (id),
-	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE
-)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
-CREATE INDEX ix_chat_sessions_document_id ON chat_sessions (document_id);
-CREATE INDEX ix_chat_sessions_is_archived ON chat_sessions (is_archived);
-
-
-CREATE TABLE image_generations (
-	id VARCHAR(36) NOT NULL,
-	document_id BIGINT UNSIGNED NOT NULL,
-	session_id BIGINT UNSIGNED,
-	model_id BIGINT UNSIGNED NOT NULL,
-	user_id BIGINT UNSIGNED NOT NULL,
-	source ENUM('editor','agent') NOT NULL,
-	purpose ENUM('cover','body') NOT NULL,
-	prompt LONGTEXT NOT NULL,
-	quantity INTEGER NOT NULL DEFAULT 1,
-	aspect_ratio VARCHAR(24) NOT NULL DEFAULT 'landscape',
-	quality VARCHAR(24) NOT NULL DEFAULT 'auto',
-	anchor_block_id VARCHAR(128) NOT NULL,
-	direct_insert BOOL NOT NULL DEFAULT 0,
-	provider_task_id VARCHAR(256) NOT NULL,
-	status ENUM('pending','running','succeeded','failed','cancelled') NOT NULL,
-	cancel_requested BOOL NOT NULL DEFAULT 0,
-	usage_json LONGTEXT NOT NULL,
-	error_message VARCHAR(2048) NOT NULL,
-	created_at DATETIME NOT NULL DEFAULT now(),
-	updated_at DATETIME NOT NULL DEFAULT now(),
-	finished_at DATETIME,
 	PRIMARY KEY (id),
 	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE,
-	FOREIGN KEY(session_id) REFERENCES chat_sessions (id) ON DELETE SET NULL,
-	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE RESTRICT,
-	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+	FOREIGN KEY(image_model_id) REFERENCES ai_image_models (id) ON DELETE SET NULL
 )CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
-CREATE INDEX ix_image_generations_document_id ON image_generations (document_id);
-CREATE INDEX ix_image_generations_status ON image_generations (status);
-
-
-CREATE TABLE generated_image_assets (
-	id VARCHAR(36) NOT NULL,
-	generation_id VARCHAR(36) NOT NULL,
-	object_key VARCHAR(512) NOT NULL,
-	storage_mode VARCHAR(12) NOT NULL,
-	url VARCHAR(4096) NOT NULL,
-	content_type VARCHAR(64) NOT NULL,
-	size INTEGER NOT NULL,
-	width INTEGER NOT NULL DEFAULT 0,
-	height INTEGER NOT NULL DEFAULT 0,
-	revised_prompt LONGTEXT NOT NULL,
-	is_applied BOOL NOT NULL DEFAULT 0,
-	applied_at DATETIME,
-	created_at DATETIME NOT NULL DEFAULT now(),
-	PRIMARY KEY (id),
-	UNIQUE KEY uq_generated_image_assets_object_key (object_key(255)),
-	FOREIGN KEY(generation_id) REFERENCES image_generations (id) ON DELETE CASCADE
-)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
-CREATE INDEX ix_generated_image_assets_generation_id ON generated_image_assets (generation_id);
+CREATE INDEX ix_chat_sessions_document_id ON chat_sessions (document_id);
+CREATE INDEX ix_chat_sessions_image_model_id ON chat_sessions (image_model_id);
+CREATE INDEX ix_chat_sessions_is_archived ON chat_sessions (is_archived);
 
 
 CREATE TABLE document_agent_memories (
@@ -721,6 +682,39 @@ CREATE TABLE document_visible_users (
 	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE,
 	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
 );
+
+
+CREATE TABLE image_library_assets (
+	id VARCHAR(36) NOT NULL,
+	owner_id BIGINT UNSIGNED NOT NULL,
+	document_id BIGINT UNSIGNED,
+	generation_id VARCHAR(36) NOT NULL,
+	generated_asset_id VARCHAR(36) NOT NULL,
+	name VARCHAR(256) NOT NULL,
+	source ENUM('upload','ai','search') NOT NULL,
+	object_key VARCHAR(512) NOT NULL,
+	storage_mode VARCHAR(12) NOT NULL,
+	url VARCHAR(4096) NOT NULL,
+	content_type VARCHAR(64) NOT NULL,
+	size INTEGER NOT NULL,
+	width INTEGER NOT NULL,
+	height INTEGER NOT NULL,
+	is_shared BOOL NOT NULL,
+	deleted_at DATETIME,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	PRIMARY KEY (id),
+	FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE CASCADE,
+	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE SET NULL,
+	UNIQUE (object_key)
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_image_library_assets_created_at ON image_library_assets (created_at);
+CREATE INDEX ix_image_library_assets_deleted_at ON image_library_assets (deleted_at);
+CREATE INDEX ix_image_library_assets_document_id ON image_library_assets (document_id);
+CREATE INDEX ix_image_library_assets_generated_asset_id ON image_library_assets (generated_asset_id);
+CREATE INDEX ix_image_library_assets_generation_id ON image_library_assets (generation_id);
+CREATE INDEX ix_image_library_assets_is_shared ON image_library_assets (is_shared);
+CREATE INDEX ix_image_library_assets_owner_id ON image_library_assets (owner_id);
 
 
 CREATE TABLE template_image_assets (
@@ -938,6 +932,50 @@ CREATE INDEX ix_gzh_theme_proposals_document_id ON gzh_theme_proposals (document
 CREATE INDEX ix_gzh_theme_proposals_user_id ON gzh_theme_proposals (user_id);
 
 
+CREATE TABLE image_generations (
+	id VARCHAR(36) NOT NULL,
+	document_id BIGINT UNSIGNED NOT NULL,
+	session_id BIGINT UNSIGNED,
+	model_id BIGINT UNSIGNED NOT NULL,
+	user_id BIGINT UNSIGNED NOT NULL,
+	source ENUM('editor','agent') NOT NULL,
+	purpose ENUM('cover','body') NOT NULL,
+	operation ENUM('generate','edit') NOT NULL DEFAULT 'generate',
+	prompt LONGTEXT NOT NULL,
+	quantity INTEGER NOT NULL,
+	aspect_ratio VARCHAR(24) NOT NULL,
+	quality VARCHAR(24) NOT NULL,
+	timeout_seconds INTEGER NOT NULL DEFAULT 180,
+	anchor_block_id VARCHAR(128) NOT NULL,
+	source_image_url VARCHAR(4096) NOT NULL,
+	source_image_hash VARCHAR(64) NOT NULL,
+	source_asset_url VARCHAR(4096) NOT NULL,
+	source_object_key VARCHAR(512) NOT NULL,
+	source_storage_mode VARCHAR(12) NOT NULL,
+	target_image_index INTEGER NOT NULL DEFAULT '-1',
+	direct_insert BOOL NOT NULL,
+	provider_task_id VARCHAR(256) NOT NULL,
+	status ENUM('pending','running','succeeded','failed','cancelled') NOT NULL,
+	cancel_requested BOOL NOT NULL,
+	usage_json LONGTEXT NOT NULL,
+	error_message VARCHAR(2048) NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	updated_at DATETIME NOT NULL DEFAULT now(),
+	finished_at DATETIME,
+	PRIMARY KEY (id),
+	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE,
+	FOREIGN KEY(session_id) REFERENCES chat_sessions (id) ON DELETE SET NULL,
+	FOREIGN KEY(model_id) REFERENCES ai_image_models (id) ON DELETE RESTRICT,
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_image_generations_created_at ON image_generations (created_at);
+CREATE INDEX ix_image_generations_document_id ON image_generations (document_id);
+CREATE INDEX ix_image_generations_model_id ON image_generations (model_id);
+CREATE INDEX ix_image_generations_session_id ON image_generations (session_id);
+CREATE INDEX ix_image_generations_status ON image_generations (status);
+CREATE INDEX ix_image_generations_user_id ON image_generations (user_id);
+
+
 CREATE TABLE web_article_import_assets (
 	id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 	import_id VARCHAR(36) NOT NULL,
@@ -998,6 +1036,29 @@ CREATE TABLE chat_session_theme_contexts (
 );
 CREATE INDEX ix_chat_session_theme_contexts_gzh_theme_proposal_id ON chat_session_theme_contexts (gzh_theme_proposal_id);
 CREATE INDEX ix_chat_session_theme_contexts_session_id ON chat_session_theme_contexts (session_id);
+
+
+CREATE TABLE generated_image_assets (
+	id VARCHAR(36) NOT NULL,
+	generation_id VARCHAR(36) NOT NULL,
+	object_key VARCHAR(512) NOT NULL,
+	storage_mode VARCHAR(12) NOT NULL,
+	url VARCHAR(4096) NOT NULL,
+	content_type VARCHAR(64) NOT NULL,
+	size INTEGER NOT NULL,
+	width INTEGER NOT NULL,
+	height INTEGER NOT NULL,
+	revised_prompt LONGTEXT NOT NULL,
+	is_applied BOOL NOT NULL,
+	applied_at DATETIME,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id),
+	FOREIGN KEY(generation_id) REFERENCES image_generations (id) ON DELETE CASCADE,
+	UNIQUE (object_key)
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_generated_image_assets_created_at ON generated_image_assets (created_at);
+CREATE INDEX ix_generated_image_assets_generation_id ON generated_image_assets (generation_id);
+CREATE INDEX ix_generated_image_assets_is_applied ON generated_image_assets (is_applied);
 
 
 CREATE TABLE agent_runs (

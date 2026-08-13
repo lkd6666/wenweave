@@ -1096,7 +1096,22 @@ class HtmlWorkspace:
             if expected_hash != block.expected_hash:
                 raise WorkspaceError(
                     f"第 {index} 条补丁基于旧内容，未写入任何修改",
-                    {"block_id": block_id, "current_hash": block.expected_hash, "suggestion": "重新读取该排版块后再提交"},
+                    {
+                        "block_id": block_id,
+                        "current_revision": self.revision,
+                        "current_hash": block.expected_hash,
+                        # Keep the conflict actionable without returning the
+                        # full HTML block. The model can use this locator to
+                        # issue a focused read and retry with fresh identity.
+                        "current_block": {
+                            "block_id": block.block_id,
+                            "tag": block.tag,
+                            "path": block.path,
+                            "text": block.text,
+                            "expected_hash": block.expected_hash,
+                        },
+                        "suggestion": "使用当前 revision 调用 read_blocks 重新读取该排版块后再提交",
+                    },
                 )
             if mode not in {"replace_outer", "replace_inner", "insert_before", "insert_after", "delete"}:
                 raise WorkspaceError(f"第 {index} 条补丁的 mode 无效")

@@ -22,10 +22,20 @@ CREATE TABLE IF NOT EXISTS `ai_image_models` (
   `access_mode` VARCHAR(16) NOT NULL DEFAULT 'all',
   `adapter_config` JSON NOT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `deleted_at` DATETIME NULL,
   PRIMARY KEY (`id`),
   KEY `ix_ai_image_models_provider_id` (`provider_id`),
+  KEY `ix_ai_image_models_deleted_at` (`deleted_at`),
   CONSTRAINT `fk_ai_image_models_provider` FOREIGN KEY (`provider_id`) REFERENCES `ai_providers` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+SET @sql = IF(
+  EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @schema_name AND TABLE_NAME = 'ai_image_models')
+    AND NOT EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @schema_name AND TABLE_NAME = 'ai_image_models' AND COLUMN_NAME = 'deleted_at'),
+  'ALTER TABLE `ai_image_models` ADD COLUMN `deleted_at` DATETIME NULL, ADD KEY `ix_ai_image_models_deleted_at` (`deleted_at`)',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 CREATE TABLE IF NOT EXISTS `image_model_user_access` (
   `model_id` BIGINT UNSIGNED NOT NULL,

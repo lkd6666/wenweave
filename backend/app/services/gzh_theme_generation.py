@@ -13,6 +13,7 @@ from uuid import uuid4
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.ai_model import AIModel
 from app.models.gzh_theme import (
@@ -39,6 +40,8 @@ MAX_THEME_REFERENCE_IMAGES = 5
 MAX_THEME_REFERENCE_BYTES = 10 * 1024 * 1024
 THEME_REFERENCE_TTL = timedelta(hours=24)
 SUPPORTED_THEME_REFERENCE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+THEME_GENERATION_TIMEOUT_SECONDS = max(60.0, float(get_settings().TEMPLATE_GENERATION_TIMEOUT_SECONDS))
+THEME_GENERATION_CLEANUP_GRACE_SECONDS = 10.0
 _FORBIDDEN_PREVIEW = re.compile(
     r"<\s*/?\s*(?:script|style|iframe|object|embed|form|input|button|textarea|select|video|audio|canvas|svg)\b|@font-face|expression\s*\(",
     re.IGNORECASE,
@@ -293,7 +296,7 @@ async def _ask_model(db: Session, generation: GzhThemeGeneration, assets: list[G
         model,
         "disabled",
         max_retries=0,
-        request_timeout_seconds=120,
+        request_timeout_seconds=THEME_GENERATION_TIMEOUT_SECONDS,
         streaming=False,
     )
     prompt = _prompt_for_generation(generation, repair_errors=repair_errors)
@@ -305,7 +308,7 @@ async def _ask_model(db: Session, generation: GzhThemeGeneration, assets: list[G
                     HumanMessage(content=_message_content(db, generation, assets, model.provider.provider_type.value, prompt)),
                 ]
             ),
-            timeout=130,
+            timeout=THEME_GENERATION_TIMEOUT_SECONDS + THEME_GENERATION_CLEANUP_GRACE_SECONDS,
         ),
         model_id=model.id,
         user_id=generation.user_id,

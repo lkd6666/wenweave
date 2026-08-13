@@ -3,6 +3,7 @@ import { Button, Card, Dropdown, Empty, Grid, Input, List, Modal, Pagination, Se
 import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
+  DownOutlined,
   EditOutlined,
   FileAddOutlined,
   FilePdfOutlined,
@@ -13,6 +14,7 @@ import {
   LockOutlined,
   LinkOutlined,
   MoreOutlined,
+  RightOutlined,
   SafetyCertificateOutlined,
   SendOutlined,
   UploadOutlined,
@@ -107,6 +109,7 @@ export default function DashboardPage() {
   const [allPagination, setAllPagination] = useState<DocumentPaginationState>({ page: 1, pageSize: 20 })
   const [searchPagination, setSearchPagination] = useState<DocumentPaginationState>({ page: 1, pageSize: 20 })
   const [documentPagination, setDocumentPagination] = useState<Record<string, DocumentPaginationState>>({})
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({})
   const [visibilityTarget, setVisibilityTarget] = useState<VisibilityTarget | null>(null)
   const [wechatAccounts, setWechatAccounts] = useState<WeChatAvailableAccount[]>([])
   const [wechatDraftTarget, setWechatDraftTarget] = useState<WeChatDraftTarget | null>(null)
@@ -121,6 +124,7 @@ export default function DashboardPage() {
     || allDocuments?.items.some((document) => document.is_ai_editing)
     || searchResults?.items.some((document) => document.is_ai_editing),
   )
+  const showInitialLoading = loading && !groupedWorkspace && !allDocuments && !searchResults
 
   const loadGroupOptions = async () => {
     setGroupOptions(await documentGroupsApi.list())
@@ -311,9 +315,9 @@ export default function DashboardPage() {
     })
   }
 
-  const handleCreateBlank = () => {
+  const handleCreateBlank = (defaultGroupId: number | null = null) => {
     let title = '未命名推文'
-    let groupId: number | null = null
+    let groupId = defaultGroupId
     Modal.confirm({
       title: '新建空白推文',
       content: (
@@ -322,6 +326,7 @@ export default function DashboardPage() {
           <Select
             allowClear
             placeholder="选择分组（可选）"
+            defaultValue={groupId ?? undefined}
             options={groupOptions.map((group) => ({ value: group.id, label: group.name }))}
             onChange={(value) => (groupId = value ?? null)}
           />
@@ -655,43 +660,18 @@ export default function DashboardPage() {
             { type: 'divider' as const },
             { key: 'delete', label: '删除推文', danger: true },
           ]
-          const actions = [
-            <Tooltip key="open" title="打开推文">
-              <Button
-                aria-label={`打开推文 ${doc.title}`}
-                className="dashboard-document-action"
-                type="text"
-                icon={<EditOutlined />}
-                onClick={() => navigate(`/editor/${doc.id}`)}
-              />
-            </Tooltip>,
-            ...(canOpenWeChatDraft ? [wechatAction] : []),
-            <Dropdown
-              key="group"
-              menu={{
-                items: groupMenu,
-                onClick: ({ key }) => handleMoveToGroup(doc, key === 'ungrouped' ? null : Number(key)),
-              }}
-            >
-              <Tooltip title="移动到分组">
-                <Button aria-label={`移动推文 ${doc.title} 到分组`} className="dashboard-document-action" type="text" icon={<FolderOpenOutlined />} />
-              </Tooltip>
-            </Dropdown>,
-            <Tooltip key="delete" title="删除推文">
-              <Button aria-label={`删除推文 ${doc.title}`} className="dashboard-document-action" type="text" danger icon={<DeleteOutlined />} onClick={() => handleDelete(doc)} />
-            </Tooltip>,
-            ...(canConfigureDocumentVisibility ? [
-              <Tooltip key="visibility" title="可见权限">
-                <Button
-                  aria-label={`设置推文 ${doc.title} 的可见权限`}
-                  className="dashboard-document-action"
-                  type="text"
-                  icon={<SafetyCertificateOutlined />}
-                  onClick={() => setVisibilityTarget({ type: 'document', resource: doc })}
-                />
-              </Tooltip>,
-            ] : []),
+          const desktopMenu: MenuProps['items'] = [
+            { key: 'move', label: '移动到分组', icon: <FolderOpenOutlined />, children: groupMenu },
+            ...(canConfigureDocumentVisibility ? [{ key: 'visibility', label: '可见权限', icon: <SafetyCertificateOutlined /> }] : []),
+            { type: 'divider' as const },
+            { key: 'delete', label: '删除推文', icon: <DeleteOutlined />, danger: true },
           ]
+          const handleDesktopMenuAction: MenuProps['onClick'] = ({ key }) => {
+            const action = String(key)
+            if (action === 'visibility') setVisibilityTarget({ type: 'document', resource: doc })
+            else if (action === 'delete') handleDelete(doc)
+            else handleMoveToGroup(doc, action === 'ungrouped' ? null : Number(action))
+          }
           const handleCompactAction: MenuProps['onClick'] = ({ key }) => {
             const action = String(key)
             if (action === 'open') navigate(`/editor/${doc.id}`)
@@ -737,14 +717,11 @@ export default function DashboardPage() {
           }
 
           return (
-            <List.Item
-              className="dashboard-document-item"
-              actions={actions}
-            >
+            <List.Item className="dashboard-document-item">
               <List.Item.Meta
                 avatar={documentAvatar}
                 title={
-                  <Space>
+                  <Space className="dashboard-document-title" size={[8, 4]} wrap>
                     <Button type="link" style={{ padding: 0 }} onClick={() => navigate(`/editor/${doc.id}`)}>
                       {doc.title}
                     </Button>
@@ -767,6 +744,39 @@ export default function DashboardPage() {
                   </Space>
                 }
               />
+              <div className="dashboard-document-item-actions">
+                <Tooltip title="打开推文">
+                  <Button
+                    aria-label={`打开推文 ${doc.title}`}
+                    type="link"
+                    icon={<EditOutlined />}
+                    onClick={() => navigate(`/editor/${doc.id}`)}
+                  >
+                    编辑
+                  </Button>
+                </Tooltip>
+                {canOpenWeChatDraft && (
+                  <Tooltip title={wechatActionTooltip}>
+                    <span>
+                      <Button
+                        aria-label={`同步推文 ${doc.title} 到公众号草稿`}
+                        type="text"
+                        icon={<SendOutlined />}
+                        loading={loadingWeChatDocumentId === doc.id}
+                        disabled={doc.is_ai_editing || wechatAccounts.length === 0}
+                        onClick={() => void handleOpenWeChatDraft(doc)}
+                      >
+                        同步
+                      </Button>
+                    </span>
+                  </Tooltip>
+                )}
+                <Dropdown menu={{ items: desktopMenu, onClick: handleDesktopMenuAction }} trigger={['click']}>
+                  <Tooltip title="更多操作">
+                    <Button aria-label={`更多推文 ${doc.title} 操作`} type="text" icon={<MoreOutlined />} />
+                  </Tooltip>
+                </Dropdown>
+              </div>
             </List.Item>
           )
     }
@@ -813,8 +823,20 @@ export default function DashboardPage() {
     )
   }
 
-  const renderGroup = (item: WorkbenchGroupedPage['groups']['items'][number], isFirst: boolean) => {
+  const toggleGroup = (groupKey: string) => {
+    setCollapsedGroups((groups) => ({ ...groups, [groupKey]: !groups[groupKey] }))
+  }
+
+  const handleGroupHeadingKeyDown = (event: React.KeyboardEvent<HTMLElement>, groupKey: string) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    toggleGroup(groupKey)
+  }
+
+  const renderGroup = (item: WorkbenchGroupedPage['groups']['items'][number]) => {
     const { group } = item
+    const groupKey = `group:${group.id}`
+    const collapsed = Boolean(collapsedGroups[groupKey])
     const canConfigureGroupVisibility = isAdmin || group.created_by?.id === currentUserId
     const groupMenu: MenuProps['items'] = [
       { key: 'rename', label: '修改名称', icon: <EditOutlined /> },
@@ -823,41 +845,78 @@ export default function DashboardPage() {
     if (canConfigureGroupVisibility) groupMenu.unshift({ key: 'visibility', label: '可见权限', icon: <SafetyCertificateOutlined /> })
 
     return (
-      <section className="dashboard-group" key={group.id} style={{ paddingTop: isFirst ? 0 : 20, marginTop: isFirst ? 0 : 20, borderTop: isFirst ? undefined : '1px solid var(--app-border)' }}>
-        <div className="dashboard-group-heading">
-          <Space size={10} wrap>
-            <FolderOpenOutlined style={{ color: '#1677ff' }} />
-            <Text strong>{group.name}</Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>共 {item.document_total} 篇</Text>
-            {group.visibility_mode === 'restricted' && (
-              <Tooltip title="仅指定用户或用户组可见">
-                <Tag color="gold" icon={<LockOutlined />}>受限可见</Tag>
-              </Tooltip>
+      <section className={`dashboard-group${collapsed ? ' is-collapsed' : ''}`} key={group.id}>
+        <div
+          className="dashboard-group-heading"
+          role="button"
+          tabIndex={0}
+          aria-label={`${collapsed ? '展开' : '收起'}分组 ${group.name}`}
+          aria-expanded={!collapsed}
+          onClick={() => toggleGroup(groupKey)}
+          onKeyDown={(event) => handleGroupHeadingKeyDown(event, groupKey)}
+        >
+          <div className="dashboard-group-title">
+            <Tooltip title={collapsed ? '展开分组' : '收起分组'}>
+              <Button
+                aria-label={`${collapsed ? '展开' : '收起'}分组 ${group.name}`}
+                aria-expanded={!collapsed}
+                className="dashboard-group-toggle"
+                type="text"
+                icon={collapsed ? <RightOutlined /> : <DownOutlined />}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  toggleGroup(groupKey)
+                }}
+                onKeyDown={(event) => event.stopPropagation()}
+              />
+            </Tooltip>
+            <span className="dashboard-group-icon"><FolderOpenOutlined /></span>
+            <div>
+              <div className="dashboard-group-name">
+                <Text strong>{group.name}</Text>
+                <Tag bordered={false} className="dashboard-group-count">{item.document_total} 篇</Tag>
+                {group.visibility_mode === 'restricted' && (
+                  <Tooltip title="仅指定用户或用户组可见">
+                    <Tag color="gold" icon={<LockOutlined />}>受限可见</Tag>
+                  </Tooltip>
+                )}
+              </div>
+              <div className="dashboard-group-meta">
+                <span>最后修改：{formatUser(group.last_modified_by)} · {formatDate(group.updated_at)}</span>
+              </div>
+            </div>
+          </div>
+          <Space className="dashboard-group-actions" size={2} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+            <Tooltip title={`在「${group.name}」中新建推文`}>
+              <Button aria-label={`在分组 ${group.name} 中新建推文`} type="text" icon={<FileAddOutlined />} onClick={() => handleCreateBlank(group.id)}>
+                <span className="dashboard-group-create-label">新建推文</span>
+              </Button>
+            </Tooltip>
+            {groupMenu.length > 0 && (
+              <Dropdown
+                menu={{
+                  items: groupMenu,
+                  onClick: ({ key }) => {
+                    if (key === 'visibility') setVisibilityTarget({ type: 'group', resource: group })
+                    else if (key === 'rename') handleRenameGroup(group)
+                    else handleDeleteGroup(group)
+                  },
+                }}
+              >
+                <Tooltip title="分组操作">
+                  <Button aria-label={`操作分组 ${group.name}`} type="text" icon={<MoreOutlined />} />
+                </Tooltip>
+              </Dropdown>
             )}
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              最后修改：{formatUser(group.last_modified_by)} · {formatDate(group.updated_at)}
-            </Text>
           </Space>
-          {groupMenu.length > 0 && (
-            <Dropdown
-              menu={{
-                items: groupMenu,
-                onClick: ({ key }) => {
-                  if (key === 'visibility') setVisibilityTarget({ type: 'group', resource: group })
-                  else if (key === 'rename') handleRenameGroup(group)
-                  else handleDeleteGroup(group)
-                },
-              }}
-            >
-              <Tooltip title="分组操作">
-                <Button aria-label={`操作分组 ${group.name}`} type="text" icon={<MoreOutlined />} />
-              </Tooltip>
-            </Dropdown>
-          )}
         </div>
-        {renderDocuments(item.documents, (page, pageSize) => {
-          void loadGroupedDocumentPage(group.id, pageSize === item.documents.page_size ? page : 1, pageSize)
-        }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+        {!collapsed && (
+          <div className="dashboard-group-content">
+            {renderDocuments(item.documents, (page, pageSize) => {
+              void loadGroupedDocumentPage(group.id, pageSize === item.documents.page_size ? page : 1, pageSize)
+            }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+          </div>
+        )}
       </section>
     )
   }
@@ -904,7 +963,7 @@ export default function DashboardPage() {
           <Button icon={<FolderAddOutlined />} onClick={handleCreateGroup}>
             新建分组
           </Button>
-          <Button icon={<FileAddOutlined />} loading={creating} onClick={handleCreateBlank}>
+          <Button icon={<FileAddOutlined />} loading={creating} onClick={() => handleCreateBlank()}>
             新建空白推文
           </Button>
           <Button type="primary" icon={<UploadOutlined />} loading={importing} onClick={handleImportClick}>
@@ -923,7 +982,7 @@ export default function DashboardPage() {
         </Space>
       </div>
 
-      <Card loading={loading}>
+      <Card className="dashboard-workspace-card" loading={showInitialLoading}>
         {searchQuery ? (
           <section className="dashboard-flat-results" aria-label="搜索结果">
             <Text strong>搜索结果</Text>
@@ -945,20 +1004,54 @@ export default function DashboardPage() {
                 <Empty description="还没有任何推文，点击右上角新建、导入或创建分组" />
               ) : (
                 <>
-                  {groupedWorkspace.groups.items.map((item, index) => renderGroup(item, index === 0))}
+                  {groupedWorkspace.groups.items.map(renderGroup)}
                   {groupedWorkspace.ungrouped.total > 0 && (
-                    <section
-                      className="dashboard-group dashboard-ungrouped"
-                      style={{
-                        paddingTop: groupedWorkspace.groups.items.length > 0 ? 20 : 0,
-                        marginTop: groupedWorkspace.groups.items.length > 0 ? 20 : 0,
-                        borderTop: groupedWorkspace.groups.items.length > 0 ? '1px solid var(--app-border)' : undefined,
-                      }}
-                    >
-                      <Text strong>未分组</Text>
-                      {renderDocuments(groupedWorkspace.ungrouped, (page, pageSize) => {
-                        void loadUngroupedDocumentPage(pageSize === groupedWorkspace.ungrouped.page_size ? page : 1, pageSize)
-                      }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+                    <section className={`dashboard-group dashboard-ungrouped${collapsedGroups.ungrouped ? ' is-collapsed' : ''}`}>
+                      <div
+                        className="dashboard-group-heading"
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`${collapsedGroups.ungrouped ? '展开' : '收起'}未分组推文`}
+                        aria-expanded={!collapsedGroups.ungrouped}
+                        onClick={() => toggleGroup('ungrouped')}
+                        onKeyDown={(event) => handleGroupHeadingKeyDown(event, 'ungrouped')}
+                      >
+                        <div className="dashboard-group-title">
+                          <Tooltip title={collapsedGroups.ungrouped ? '展开未分组推文' : '收起未分组推文'}>
+                            <Button
+                              aria-label={`${collapsedGroups.ungrouped ? '展开' : '收起'}未分组推文`}
+                              aria-expanded={!collapsedGroups.ungrouped}
+                              className="dashboard-group-toggle"
+                              type="text"
+                              icon={collapsedGroups.ungrouped ? <RightOutlined /> : <DownOutlined />}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                toggleGroup('ungrouped')
+                              }}
+                              onKeyDown={(event) => event.stopPropagation()}
+                            />
+                          </Tooltip>
+                          <span className="dashboard-group-icon"><FolderOpenOutlined /></span>
+                          <div>
+                            <div className="dashboard-group-name"><Text strong>未分组</Text><Tag bordered={false} className="dashboard-group-count">{groupedWorkspace.ungrouped.total} 篇</Tag></div>
+                            <div className="dashboard-group-meta"><span>尚未归类的推文</span></div>
+                          </div>
+                        </div>
+                        <Space className="dashboard-group-actions" size={2} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+                          <Tooltip title="新建未分组推文">
+                            <Button aria-label="新建未分组推文" type="text" icon={<FileAddOutlined />} onClick={() => handleCreateBlank()}>
+                              <span className="dashboard-group-create-label">新建推文</span>
+                            </Button>
+                          </Tooltip>
+                        </Space>
+                      </div>
+                      {!collapsedGroups.ungrouped && (
+                        <div className="dashboard-group-content">
+                          {renderDocuments(groupedWorkspace.ungrouped, (page, pageSize) => {
+                            void loadUngroupedDocumentPage(pageSize === groupedWorkspace.ungrouped.page_size ? page : 1, pageSize)
+                          }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+                        </div>
+                      )}
                     </section>
                   )}
                   {groupedWorkspace.groups.total > groupedWorkspace.groups.page_size && (

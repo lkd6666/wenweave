@@ -7,16 +7,18 @@ run 内压缩不会破坏工具配对导致整轮失败。
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 import unittest
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Sequence
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -31,6 +33,7 @@ from app.services.chat_agent import (
     run_agent_loop,
 )
 from app.services.html_workspace import HtmlWorkspace
+from app.services.image_search import ImageSearchCandidate, decode_candidate_reference
 from app.services.tool_output_store import ToolOutputStore
 
 SOURCE_HTML = "<section><h1>旧标题</h1><p>正文内容</p></section>"
@@ -252,6 +255,11 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         _run(ordinary_model, HtmlEditSession(SOURCE_HTML))
 
         self.assertIn("check_compliance", ordinary_model.bound_tool_names)
+        self.assertIn("search_article_images", ordinary_model.bound_tool_names)
+        self.assertIn("view_article_images", ordinary_model.bound_tool_names)
+        self.assertIn("import_searched_image", ordinary_model.bound_tool_names)
+        self.assertIn("apply_searched_cover", ordinary_model.bound_tool_names)
+        self.assertNotIn("apply_searched_image", ordinary_model.bound_tool_names)
         self.assertNotIn("validate_gzh_html", ordinary_model.bound_tool_names)
 
         theme_model = ScriptedChatModel(
@@ -284,6 +292,156 @@ class AgentLoopEndToEndTests(unittest.TestCase):
 
         self.assertIn("check_compliance", theme_model.bound_tool_names)
         self.assertIn("validate_gzh_html", theme_model.bound_tool_names)
+
+    def test_multimodal_view_tool_injects_ephemeral_image_message(self) -> None:
+        image_bytes = b"not-a-real-image-but-validated-by-the-test"
+        source = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        session = HtmlEditSession(f'<section><img src="{source}" alt="活动图片"></section>')
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "view_article_images",
+                        {"references": [{"kind": "article", "image_slot": 1, "revision": session.workspace().revision}]},
+                    )
+                },
+                {"text": "已查看文章图片。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="vision-view-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "多模态测试稿",
+                    session.html,
+                    "请查看文章内图片",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=store,
+                    actor_user_id=7,
+                    model_is_multimodal=True,
+                    provider_type="openai_compatible",
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+            patch("app.services.local_uploads.inspect_image", return_value=SimpleNamespace(content_type="image/png")),
+        ):
+            events = asyncio.run(go())
+        try:
+            self.assertEqual(events[-1]["event"], "final")
+            self.assertTrue(any(isinstance(message, HumanMessage) for message in model.seen_messages[1]))
+            visual_message = next(
+                message
+                for message in model.seen_messages[1]
+                if isinstance(message, HumanMessage) and getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+            )
+            self.assertTrue(any(block.get("type") == "image_url" for block in visual_message.content))
+            result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
+            )
+            self.assertEqual(result["activity"]["kind"], "image_view")
+            persisted_context = [
+                event["data"].get("context_events", [])
+                for event in events
+                if isinstance(event.get("data"), dict) and event["event"] in {"final", "error"}
+            ]
+            self.assertNotIn(base64.b64encode(image_bytes).decode("ascii"), json.dumps(persisted_context, ensure_ascii=False))
+        finally:
+            engine.dispose()
+
+    def test_image_search_exposes_compact_candidate_references_to_model(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        candidate = ImageSearchCandidate(
+            id="park-candidate",
+            image_url="https://images.example.test/park.jpg",
+            preview_url="https://images.example.test/park-small.jpg",
+            source_page_url="https://example.test/park",
+            title="城市公园",
+            engine="bing images",
+            width=1600,
+            height=900,
+            image_format="jpeg",
+        )
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_article_images", {"query": "城市公园", "limit": 1})},
+                {"text": "已获得候选。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="compact-search-reference-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "搜图短引用测试稿",
+                    session.html,
+                    "为文章找一张城市公园配图",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=store,
+                    actor_user_id=7,
+                )
+            ]
+
+        try:
+            with (
+                patch("app.services.chat_agent.SessionLocal", factory),
+                patch("app.services.tool_output_store.SessionLocal", factory),
+                patch("app.db.session.SessionLocal", factory),
+                patch(
+                    "app.services.image_search.search_images_with_cursor",
+                    new=AsyncMock(return_value=([candidate], None)),
+                ),
+            ):
+                events = asyncio.run(go())
+                model_result = next(
+                    message
+                    for message in model.seen_messages[1]
+                    if isinstance(message, ToolMessage) and message.name == "search_article_images"
+                )
+                payload = json.loads(str(model_result.content))
+                compact_item = payload["items"][0]
+                decoded = decode_candidate_reference(
+                    compact_item["candidate_ref"], user_id=7, document_id=1
+                )
+
+            self.assertEqual(events[-1]["event"], "final")
+            self.assertNotIn("token", compact_item)
+            self.assertNotIn("preview_url", compact_item)
+            self.assertLess(len(compact_item["candidate_ref"]), 128)
+            self.assertEqual(decoded.id, candidate.id)
+            activity = next(
+                event["data"]["activity"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "search_article_images"
+            )
+            self.assertTrue(activity["details"]["items"][0]["token"])
+        finally:
+            engine.dispose()
 
     def _patch_script(self, session: HtmlEditSession) -> list[dict[str, Any]]:
         blocks = session.search("旧标题")["results"]
@@ -467,14 +625,82 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertGreaterEqual(len(model.seen_messages), 2)
         first_system = model.seen_messages[0][0]
         second_system = model.seen_messages[1][0]
+        first_user = model.seen_messages[0][-1]
         self.assertIsInstance(first_system, SystemMessage)
         self.assertIsInstance(second_system, SystemMessage)
+        self.assertIn("结构化选中锚点", str(first_user.content))
+        self.assertIn('"status":"exact"', str(first_user.content))
+        self.assertIn("section:nth-of-type(1) > p:nth-of-type(1) > img:nth-of-type(1)", str(first_user.content))
         self.assertIn("status=exact", str(first_system.content))
+        self.assertIn("image_slot=1", str(first_system.content))
         self.assertIn("status=relocated", str(second_system.content))
+        self.assertIn("image_slot=1", str(second_system.content))
         self.assertIn(
             "path=section:nth-of-type(1) > p:nth-of-type(2) > img:nth-of-type(1)",
             str(second_system.content),
         )
+
+    def test_image_inventory_explicitly_marks_the_selected_image_anchor(self) -> None:
+        source = (
+            "<article><p>活动开场</p><p><img src='https://cdn.example/opening.png' alt='开场图'></p>"
+            "<p>活动主题</p><p><img src='https://cdn.example/theme.png' alt='主题图'></p></article>"
+        )
+        session = HtmlEditSession(source)
+        selected_path = "article:nth-of-type(1) > p:nth-of-type(2) > img:nth-of-type(1)"
+        model = ScriptedChatModel(
+            script=[{"tool": ("inspect_current_images", {})}, {"text": "已确认用户选中的图片。"}],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        anchor = {
+            "selector": selected_path,
+            "tag_name": "img",
+            "html": "<img src='https://cdn.example/opening.png' alt='开场图'>",
+            "text": "",
+            "locator": {
+                "path": selected_path,
+                "parent_path": "article:nth-of-type(1) > p:nth-of-type(2)",
+                "sibling_index": 1,
+                "fingerprint": {
+                    "tag_name": "img",
+                    "stable_attributes": {"src": "https://cdn.example/opening.png"},
+                    "text": "",
+                },
+            },
+        }
+
+        events = _run(model, session, selected_elements=[anchor])
+
+        self.assertEqual(events[-1]["event"], "final")
+        inventory_result = next(
+            message for message in model.seen_messages[1] if getattr(message, "name", "") == "inspect_current_images"
+        )
+        payload = json.loads(str(inventory_result.content))
+        self.assertEqual(payload["selection"], {
+            "received": True,
+            "selected_element_count": 1,
+            "selected_image_count": 1,
+            "selected_images": [{
+                "selected_element_index": 1,
+                "status": "exact",
+                "path": selected_path,
+                "block_id": payload["images"][0]["block_id"],
+                "image_slot": 1,
+                "location_label": payload["images"][0]["location_label"],
+                "reason": "",
+            }],
+            "non_image_element_indexes": [],
+            "unresolved_image_element_indexes": [],
+        })
+        self.assertTrue(payload["images"][0]["selected_anchor"])
+        self.assertEqual(payload["images"][0]["selected_element_indexes"], [1])
+        self.assertFalse(payload["images"][1]["selected_anchor"])
+        activity = next(
+            event["data"]["activity"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "inspect_current_images"
+        )
+        self.assertIn("用户选中 @元素1", activity["targets"][0]["text"])
 
     def test_bound_layout_template_is_readable_by_tools_without_entering_system_prompt(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)

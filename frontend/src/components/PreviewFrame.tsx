@@ -24,7 +24,7 @@ import {
   UndoOutlined,
   UnderlineOutlined,
 } from '@ant-design/icons'
-import type { SelectedElementContext } from '../types'
+import type { PreviewImageTarget, SelectedElementContext } from '../types'
 import {
   BLOCK_EDITING_TRANSIENT_CLASS,
   BLOCK_HOVER_TRANSIENT_CLASS,
@@ -39,10 +39,12 @@ import {
 } from '../utils/blockEditing'
 import { sanitizeSelectedElement } from '../utils/selectedElements'
 import { frameDocumentWithNewWindowLinks, markLinksToOpenInNewWindow, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { ARTICLE_RENDER_CSS, ARTICLE_RENDER_ROOT_CLASS, ARTICLE_RENDER_VIEWPORT } from '../utils/articleFrame'
 import { documentsApi } from '../api/documents'
 import ImageCropModal from './ImageCropModal'
 import type { CropRect } from '../utils/imageCrop'
 import { ImageCropError, cropImageBlob, isFullCropRect, parseCropRect, serializeCropRect } from '../utils/imageCrop'
+import { applyLibraryImageToDom, resolveImageApplicationTarget, stepEditHistory } from '../utils/editorImageApplication'
 
 export type PreviewMode = 'browse' | 'select' | 'edit'
 type MobileEditTarget = 'text' | 'block'
@@ -53,6 +55,10 @@ export interface PreviewFrameHandle {
   copyArticle: () => Promise<'copied' | 'empty' | 'failed'>
   openImagePickerForInsert: () => void
   insertTemplateHtml: (html: string, placement: 'append' | 'caret') => boolean
+  insertImageAfter: (anchorPath: string, nextUrl: string, alt: string) => string | null
+  replaceImageSource: (target: PreviewImageTarget, nextUrl: string) => string | null
+  getImageApplicationTarget: () => 'image' | 'block' | 'caret' | null
+  applyLibraryImage: (url: string, alt: string) => 'replace' | 'insert' | null
   undo: () => boolean
   redo: () => boolean
 }
@@ -72,6 +78,11 @@ interface PreviewFrameProps {
   onCollectTemplateHtml: (html: string) => void
   onHistoryStateChange: (state: { canUndo: boolean; canRedo: boolean }) => void
   onCaretAvailabilityChange: (available: boolean) => void
+  onCaretTargetChange: (target: SelectedElementContext | null) => void
+  onImageApplicationTargetChange: (target: 'image' | 'block' | 'caret' | null) => void
+  onActiveImageChange: (target: PreviewImageTarget | null) => void
+  onAiImageAction: (mode: 'generate' | 'edit', target: PreviewImageTarget) => void
+  onExternalImagesPasted: () => void
 }
 
 const EMPTY_PREVIEW_HTML = '<p style="color:#999;text-align:center;margin-top:40px;">暂无内容，可通过对话让 AI 生成排版</p>'
@@ -81,6 +92,10 @@ const BLOCK_SELECTOR = TEXT_BLOCK_SELECTOR
 const SYSTEM_FONT_FAMILY = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif"
 const MIXED_VALUE = '__mixed__'
 const TEXT_TOOLBAR_GAP = 10
+// Give the pointer enough time to travel from the content to the drag handle.
+// The handle sits just outside the iframe content, so a short timeout makes it
+// disappear before the user can reach it.
+const BLOCK_HANDLE_HIDE_DELAY_MS = 600
 const FONT_OPTIONS = [
   { value: SYSTEM_FONT_FAMILY, label: '系统默认' },
   { value: 'Microsoft YaHei', label: '微软雅黑' },
@@ -233,6 +248,11 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   onCollectTemplateHtml,
   onHistoryStateChange,
   onCaretAvailabilityChange,
+  onCaretTargetChange,
+  onImageApplicationTargetChange,
+  onActiveImageChange,
+  onAiImageAction,
+  onExternalImagesPasted,
 }, ref) {
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const shellRef = useRef<HTMLDivElement>(null)
@@ -242,6 +262,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const selectedNodesRef = useRef<HTMLElement[]>([])
   const selectedBlocksRef = useRef<HTMLElement[]>([])
   const activeBlockRef = useRef<HTMLElement | null>(null)
+  const activeCaretBlockRef = useRef<HTMLElement | null>(null)
   const hoveredBlockRef = useRef<HTMLElement | null>(null)
   const blockHandleRef = useRef<HTMLButtonElement | null>(null)
   const blockDropIndicatorRef = useRef<HTMLDivElement | null>(null)
@@ -283,6 +304,12 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const onCollectTemplateHtmlRef = useRef(onCollectTemplateHtml)
   const onHistoryStateChangeRef = useRef(onHistoryStateChange)
   const onCaretAvailabilityChangeRef = useRef(onCaretAvailabilityChange)
+  const onCaretTargetChangeRef = useRef(onCaretTargetChange)
+  const onImageApplicationTargetChangeRef = useRef(onImageApplicationTargetChange)
+  const onActiveImageChangeRef = useRef(onActiveImageChange)
+  const onAiImageActionRef = useRef(onAiImageAction)
+  const onExternalImagesPastedRef = useRef(onExternalImagesPasted)
+  const pendingExternalImagePasteRef = useRef(false)
   const inputTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [contentHeight, setContentHeight] = useState(240)
   const [textToolbarPosition, setTextToolbarPosition] = useState<{ top: number; left: number } | null>(null)
@@ -320,6 +347,11 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   onCollectTemplateHtmlRef.current = onCollectTemplateHtml
   onHistoryStateChangeRef.current = onHistoryStateChange
   onCaretAvailabilityChangeRef.current = onCaretAvailabilityChange
+  onCaretTargetChangeRef.current = onCaretTargetChange
+  onImageApplicationTargetChangeRef.current = onImageApplicationTargetChange
+  onActiveImageChangeRef.current = onActiveImageChange
+  onAiImageActionRef.current = onAiImageAction
+  onExternalImagesPastedRef.current = onExternalImagesPasted
 
   useEffect(
     () => () => {
@@ -350,8 +382,11 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     const top = spaceBelow >= toolbarHeight + TEXT_TOOLBAR_GAP || spaceBelow >= spaceAbove
       ? anchor.bottom + TEXT_TOOLBAR_GAP
       : anchor.top - toolbarHeight - TEXT_TOOLBAR_GAP
-    if (Math.abs(textToolbarPosition.top - top) < 1 && Math.abs(textToolbarPosition.left - anchor.left) < 1) return
     const nextPosition = { top: Math.max(8, top), left: anchor.left }
+    if (
+      Math.abs(textToolbarPosition.top - nextPosition.top) < 1
+      && Math.abs(textToolbarPosition.left - nextPosition.left) < 1
+    ) return
     textToolbarBasePositionRef.current = nextPosition
     setTextToolbarPosition(nextPosition)
   }, [textToolbarPosition])
@@ -390,7 +425,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   useEffect(() => {
     updateEditingState()
     if (mode !== 'edit') {
+      pendingExternalImagePasteRef.current = false
       onCaretAvailabilityChangeRef.current(false)
+      onCaretTargetChangeRef.current(null)
       removeImageAction()
       removeBlockHandle()
       clearBlockSelection()
@@ -418,7 +455,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 <html>
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="viewport" content="${ARTICLE_RENDER_VIEWPORT}"/>
   <meta name="referrer" content="no-referrer" />
   <style>
     html, body {
@@ -426,18 +463,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       box-sizing: border-box;
       overflow: hidden;
     }
-    body {
-      margin: 0;
-      padding: 16px 12px 32px;
-      background: #fff;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-      font-size: 15px;
-      line-height: 2;
-      color: #000;
-      word-wrap: break-word;
-    }
-    /* Content images keep their own layout rules so replacement only changes src. */
-    table { max-width: 100%; }
+    ${ARTICLE_RENDER_CSS}
     .ai-preview-selecting * { cursor: pointer !important; }
     .ai-preview-selecting *:hover { outline: 1px dashed #91caff; outline-offset: 2px; }
     .ai-preview-editing { cursor: text; caret-color: #1677ff; }
@@ -477,6 +503,13 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       font: 700 13px/1 monospace;
       cursor: grab;
     }
+    /* Keep a transparent bridge over the small gap between the content and
+       the handle so moving the pointer onto it does not trigger a hide. */
+    .ai-preview-block-handle::before {
+      position: absolute;
+      inset: -6px;
+      content: '';
+    }
     .ai-preview-block-handle:active { cursor: grabbing; }
     .ai-preview-block-drop-indicator {
       position: fixed;
@@ -490,27 +523,49 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     .ai-preview-image-actions {
       position: fixed;
       z-index: 2147483647;
-      height: 30px;
       display: flex;
-      overflow: hidden;
-      border-radius: 4px;
-      box-shadow: 0 2px 8px rgba(22, 119, 255, 0.3);
+      flex-wrap: wrap;
+      gap: 2px;
+      width: max-content;
+      max-width: calc(100vw - 16px);
+      height: auto;
+      box-sizing: border-box;
+      padding: 3px;
+      overflow: visible;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 7px;
+      background: rgba(15, 23, 42, 0.94);
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.28);
     }
     .ai-preview-image-action {
-      min-width: 76px;
-      height: 30px;
-      padding: 0 10px;
-      border: 0;
-      background: #1677ff;
-      color: #fff;
-      font: 600 13px/30px -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      box-sizing: border-box !important;
+      flex: 0 0 46px !important;
+      width: 46px !important;
+      min-width: 0 !important;
+      height: 28px !important;
+      margin: 0 !important;
+      padding: 0 5px !important;
+      border: 1px solid transparent !important;
+      border-radius: 4px !important;
+      background: transparent !important;
+      color: #fff !important;
+      font: 600 12px/26px -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif !important;
+      text-align: center !important;
+      white-space: nowrap !important;
       cursor: pointer;
     }
-    .ai-preview-image-action:hover { background: #4096ff; }
+    .ai-preview-image-action--ai {
+      flex-basis: 72px !important;
+      width: 72px !important;
+      background: #1677ff !important;
+    }
+    .ai-preview-image-action:hover { background: rgba(255, 255, 255, 0.16) !important; }
+    .ai-preview-image-action--ai:hover { background: #4096ff !important; }
+    .ai-preview-image-action--danger:hover { background: #ff4d4f !important; }
     .ai-preview-image-action:disabled { cursor: wait; opacity: 0.75; }
   </style>
 </head>
-<body>${html || EMPTY_PREVIEW_HTML}</body>
+<body class="${ARTICLE_RENDER_ROOT_CLASS}">${html || EMPTY_PREVIEW_HTML}</body>
 </html>`)
   }
 
@@ -559,6 +614,10 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     textSelectionRangeRef.current = null
     pendingTextFormatRangeRef.current = null
     setTextToolbarPosition(null)
+    onCaretTargetChangeRef.current(null)
+    onImageApplicationTargetChangeRef.current(null)
+    onActiveImageChangeRef.current(null)
+    activeCaretBlockRef.current = null
     resetMobileEditingUi()
     body.innerHTML = nextHtml || EMPTY_PREVIEW_HTML
     markLinksToOpenInNewWindow(body)
@@ -679,12 +738,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const restoreEditHistory = (direction: 'undo' | 'redo') => {
     const body = iframeRef.current?.contentDocument?.body
     if (!body) return false
-    const sourceStack = direction === 'undo' ? editUndoStackRef.current : editRedoStackRef.current
-    const targetHtml = sourceStack.pop()
-    if (targetHtml === undefined) return false
     const currentHtml = serialiseBody(body)
-    const destinationStack = direction === 'undo' ? editRedoStackRef.current : editUndoStackRef.current
-    destinationStack.push(currentHtml)
+    const targetHtml = stepEditHistory(direction, currentHtml, editUndoStackRef.current, editRedoStackRef.current)
+    if (targetHtml === null) return false
     pendingInputHistoryRef.current = null
     onHistoryStateChangeRef.current({
       canUndo: editUndoStackRef.current.length > 0,
@@ -865,6 +921,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     selectedBlocksRef.current = ordered
     activeBlockRef.current = activeBlock && ordered.includes(activeBlock) ? activeBlock : ordered.at(-1) ?? null
     setBlockSelectionCount(ordered.length)
+    onImageApplicationTargetChangeRef.current(ordered.length ? 'block' : activeCaretBlockRef.current?.isConnected ? 'caret' : null)
     if (ordered.length === 0) {
       setBlockToolbarPosition(null)
       setBlockStyle(EMPTY_BLOCK_STYLE)
@@ -881,6 +938,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     setBlockSelectionCount(0)
     setBlockToolbarPosition(null)
     setBlockStyle(EMPTY_BLOCK_STYLE)
+    onImageApplicationTargetChangeRef.current(activeCaretBlockRef.current?.isConnected ? 'caret' : null)
   }
 
   const changeMobileEditTarget = (target: MobileEditTarget) => {
@@ -891,6 +949,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     textSelectionRangeRef.current = null
     setTextToolbarPosition(null)
     onCaretAvailabilityChangeRef.current(false)
+    onCaretTargetChangeRef.current(null)
     mobileEditTargetRef.current = target
     mobileBlockMultiSelectRef.current = false
     mobileEditorPanelRef.current = null
@@ -927,7 +986,19 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
   const scheduleBlockHandleHide = () => {
     if (blockHandleTimerRef.current) clearTimeout(blockHandleTimerRef.current)
-    blockHandleTimerRef.current = setTimeout(() => removeBlockHandle(), 180)
+    blockHandleTimerRef.current = setTimeout(() => {
+      blockHandleTimerRef.current = null
+      // Some browsers report the short move from the iframe content to the
+      // fixed handle as relatedTarget=null. Re-check the actual hover state so
+      // that event does not remove a handle the pointer is already over.
+      const handle = blockHandleRef.current
+      const block = hoveredBlockRef.current
+      if (handle?.matches(':hover') || block?.matches(':hover')) {
+        scheduleBlockHandleHide()
+        return
+      }
+      removeBlockHandle()
+    }, BLOCK_HANDLE_HIDE_DELAY_MS)
   }
 
   const clearBlockDropIndicator = () => {
@@ -1187,6 +1258,14 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     document.addEventListener('pointercancel', finish)
   }
 
+  const notifyExternalImagesPasted = () => {
+    if (!pendingExternalImagePasteRef.current) return
+    pendingExternalImagePasteRef.current = false
+    // onHtmlChange updates the parent's draft ref synchronously. Start
+    // localization only after that snapshot is available to persistence.
+    window.setTimeout(() => onExternalImagesPastedRef.current(), 0)
+  }
+
   const emitCurrentHtmlChange = () => {
     const body = iframeRef.current?.contentDocument?.body
     if (!body) return
@@ -1195,6 +1274,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     // 父组件以草稿作为输入时，标记 iframe 已渲染到同一版本，避免输入后被回写重置。
     renderedHtmlRef.current = nextHtml
     onHtmlChangeRef.current(nextHtml)
+    notifyExternalImagesPasted()
   }
 
   const emitHtmlChange = () => {
@@ -1486,6 +1566,10 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     imageActionRef.current?.remove()
     imageActionRef.current = null
     activeImageRef.current = null
+    onActiveImageChangeRef.current(null)
+    onImageApplicationTargetChangeRef.current(
+      activeBlockRef.current?.isConnected ? 'block' : activeCaretBlockRef.current?.isConnected ? 'caret' : null,
+    )
     if (mobileEditorPanelRef.current === 'image-actions') {
       mobileEditorPanelRef.current = null
       setMobileEditorPanel(null)
@@ -1508,6 +1592,23 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return true
   }
 
+  const openAiImageAction = (mode: 'generate' | 'edit', image: HTMLImageElement) => {
+    const body = image.ownerDocument.body
+    if (!body || !body.contains(image)) return
+    const sourceUrl = image.getAttribute('src')?.trim() || ''
+    const imageIndex = Array.from(body.querySelectorAll('img')).indexOf(image)
+    if (!sourceUrl || imageIndex < 0) {
+      message.error('找不到当前图片，无法发起 AI 操作')
+      return
+    }
+    removeImageAction()
+    onAiImageActionRef.current(mode, {
+      sourceUrl,
+      imageIndex,
+      alt: image.getAttribute('alt')?.trim() || '',
+    })
+  }
+
   const openImageAction = (image: HTMLImageElement) => {
     const document = image.ownerDocument
     if (!document.body) return
@@ -1515,11 +1616,14 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     if (compactRef.current) {
       image.classList.add('ai-preview-image-selected')
       activeImageRef.current = image
+      const sourceUrl = image.getAttribute('src')?.trim() || ''
+      const imageIndex = Array.from(document.body.querySelectorAll('img')).indexOf(image)
+      if (sourceUrl && imageIndex >= 0) onActiveImageChangeRef.current({ sourceUrl, imageIndex, alt: image.getAttribute('alt')?.trim() || '' })
+      onImageApplicationTargetChangeRef.current('image')
       openMobileEditorPanel('image-actions')
       return
     }
     const imageBounds = image.getBoundingClientRect()
-    const actionWidth = 318
     const actions = document.createElement('div')
     actions.className = 'ai-preview-image-actions'
     actions.dataset.previewImageAction = 'true'
@@ -1527,17 +1631,29 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     Object.assign(actions.style, {
       position: 'fixed',
       zIndex: '2147483647',
-      height: '30px',
+      height: 'auto',
     })
-    const createActionButton = (label: string, title: string) => {
+    const createActionButton = (label: string, title: string, variant: 'ai' | 'default' | 'danger' = 'default') => {
       const button = document.createElement('button')
       button.type = 'button'
-      button.className = 'ai-preview-image-action'
+      button.className = `ai-preview-image-action${variant === 'ai' ? ' ai-preview-image-action--ai' : ''}${variant === 'danger' ? ' ai-preview-image-action--danger' : ''}`
       button.textContent = label
       button.title = title
       button.setAttribute('aria-label', title)
       return button
     }
+    const aiReplaceButton = createActionButton('AI 换图', '使用 AI 重新生成当前图片', 'ai')
+    aiReplaceButton.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      openAiImageAction('generate', image)
+    })
+    const aiEditButton = createActionButton('AI 编辑', '使用 AI 编辑当前图片', 'ai')
+    aiEditButton.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      openAiImageAction('edit', image)
+    })
     const replaceButton = createActionButton('替换', '替换图片')
     replaceButton.dataset.previewImageReplace = 'true'
     replaceButton.addEventListener('click', (event) => {
@@ -1552,7 +1668,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       event.stopPropagation()
       openImageCrop(image)
     })
-    const deleteButton = createActionButton('删除', '删除图片')
+    const deleteButton = createActionButton('删除', '删除图片', 'danger')
     deleteButton.addEventListener('click', (event) => {
       event.preventDefault()
       event.stopPropagation()
@@ -1564,13 +1680,24 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       event.stopPropagation()
       collectImage(image)
     })
-    actions.append(replaceButton, cropButton, deleteButton, collectButton)
-    actions.style.left = `${Math.max(8, Math.min(document.documentElement.clientWidth - actionWidth - 8, imageBounds.right - actionWidth - 6))}px`
-    actions.style.top = `${Math.max(8, imageBounds.top + 8)}px`
+    actions.append(aiReplaceButton, aiEditButton, replaceButton, cropButton, deleteButton, collectButton)
     document.body.append(actions)
+    const actionBounds = actions.getBoundingClientRect()
+    const viewportWidth = document.documentElement.clientWidth || document.body.clientWidth
+    const viewportHeight = document.documentElement.clientHeight || document.body.clientHeight
+    const maxLeft = Math.max(8, viewportWidth - actionBounds.width - 8)
+    const maxTop = Math.max(8, viewportHeight - actionBounds.height - 8)
+    const preferredLeft = imageBounds.right - actionBounds.width - 6
+    const preferredTop = imageBounds.top + 8
+    actions.style.left = `${Math.max(8, Math.min(maxLeft, preferredLeft))}px`
+    actions.style.top = `${Math.max(8, Math.min(maxTop, preferredTop))}px`
     image.classList.add('ai-preview-image-selected')
     activeImageRef.current = image
     imageActionRef.current = actions
+    const sourceUrl = image.getAttribute('src')?.trim() || ''
+    const imageIndex = Array.from(document.body.querySelectorAll('img')).indexOf(image)
+    if (sourceUrl && imageIndex >= 0) onActiveImageChangeRef.current({ sourceUrl, imageIndex, alt: image.getAttribute('alt')?.trim() || '' })
+    onImageApplicationTargetChangeRef.current('image')
   }
 
   const openImagePickerForReplacement = () => {
@@ -1678,7 +1805,26 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   }
 
   const reportCaretAvailability = () => {
-    onCaretAvailabilityChangeRef.current(Boolean(captureCollapsedCaretRange()))
+    const range = captureCollapsedCaretRange()
+    onCaretAvailabilityChangeRef.current(Boolean(range))
+    // Losing iframe focus (for example when the AI image modal opens) can
+    // temporarily remove the native selection. Keep the last resolved block
+    // until a new caret target, document revision, or mode change replaces it.
+    if (!range) return
+    const body = iframeRef.current?.contentDocument?.body
+    if (!body) return
+    const source = range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? range.startContainer as HTMLElement
+      : range.startContainer.parentElement
+    const block = source?.closest<HTMLElement>(BLOCK_SELECTOR)
+      ?? Array.from(body.querySelectorAll<HTMLElement>(BLOCK_SELECTOR)).find((candidate) => range.intersectsNode(candidate))
+    if (block) {
+      activeCaretBlockRef.current = block
+      onCaretTargetChangeRef.current(selectionContext(block, body))
+      if (!activeImageRef.current?.isConnected && !activeBlockRef.current?.isConnected) {
+        onImageApplicationTargetChangeRef.current('caret')
+      }
+    }
   }
 
   const insertTemplateHtml = (templateHtml: string, placement: 'append' | 'caret'): boolean => {
@@ -1846,9 +1992,139 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     copyArticle,
     openImagePickerForInsert,
     insertTemplateHtml,
+    insertImageAfter: (anchorPath, nextUrl, alt) => {
+      ensureRenderedHtml()
+      if (!anchorPath.trim() || !nextUrl.trim()) return null
+      const body = iframeRef.current?.contentDocument?.body
+      if (!body) return null
+      const pathParts = anchorPath.split(' > ').map((part) => part.trim()).filter(Boolean)
+      const bodyIndex = pathParts.findIndex((part) => /^body:nth-of-type\(\d+\)$/i.test(part))
+      const previewAnchorPath = (bodyIndex >= 0 ? pathParts.slice(bodyIndex + 1) : pathParts).join(' > ')
+      if (!previewAnchorPath) return null
+      let anchor: HTMLElement | null = null
+      try {
+        anchor = body.querySelector<HTMLElement>(previewAnchorPath)
+      } catch {
+        return null
+      }
+      if (!anchor?.parentElement) return null
+      const clone = body.cloneNode(true) as HTMLElement
+      let cloneAnchor: HTMLElement | null = null
+      try {
+        cloneAnchor = clone.querySelector<HTMLElement>(previewAnchorPath)
+      } catch {
+        return null
+      }
+      if (!cloneAnchor?.parentElement) return null
+      const paragraph = clone.ownerDocument.createElement('p')
+      const image = clone.ownerDocument.createElement('img')
+      image.setAttribute('src', nextUrl)
+      image.setAttribute('alt', alt.trim())
+      image.style.display = 'block'
+      image.style.width = '100%'
+      image.style.maxWidth = '100%'
+      image.style.height = 'auto'
+      paragraph.append(image)
+      cloneAnchor.parentElement.insertBefore(paragraph, cloneAnchor.nextSibling)
+      return serialiseBody(clone)
+    },
+    replaceImageSource: (target, nextUrl) => {
+      const body = iframeRef.current?.contentDocument?.body
+      if (!body || target.imageIndex < 0) return null
+      const image = body.querySelectorAll<HTMLImageElement>('img')[target.imageIndex]
+      if (!image || image.getAttribute('src')?.trim() !== target.sourceUrl.trim()) return null
+      // Return the next document state without mutating the live iframe. The
+      // parent then updates `html`, which refreshes only this preview canvas
+      // through the normal external-update path.
+      const clone = body.cloneNode(true) as HTMLElement
+      const nextImage = clone.querySelectorAll<HTMLImageElement>('img')[target.imageIndex]
+      if (!nextImage) return null
+      nextImage.setAttribute('src', nextUrl)
+      return serialiseBody(clone)
+    },
+    getImageApplicationTarget: () => {
+      ensureRenderedHtml()
+      const body = iframeRef.current?.contentDocument?.body
+      if (!body || modeRef.current !== 'edit') return null
+      return resolveImageApplicationTarget(
+        body,
+        activeImageRef.current,
+        activeBlockRef.current,
+        activeCaretBlockRef.current,
+      )?.kind ?? null
+    },
+    applyLibraryImage: (url, alt) => {
+      ensureRenderedHtml()
+      const document = iframeRef.current?.contentDocument
+      const body = document?.body
+      if (!document || !body || modeRef.current !== 'edit' || !url.trim()) return null
+      const previousHtml = serialiseBody(body)
+      const target = resolveImageApplicationTarget(
+        body,
+        activeImageRef.current,
+        activeBlockRef.current,
+        activeCaretBlockRef.current,
+      )
+      const result = applyLibraryImageToDom(document, body, target, url, alt)
+      if (!result) return null
+      result.image.addEventListener('load', syncHeight, { once: true })
+      if (result.paragraph) {
+        clearBlockSelection()
+        activeCaretBlockRef.current = result.paragraph
+      }
+      recordEditChange(previousHtml)
+      const nextHtml = serialiseBody(body)
+      renderedHtmlRef.current = nextHtml
+      onHtmlChangeRef.current(nextHtml)
+      syncHeight()
+      openImageAction(result.image)
+      if (result.paragraph) onCaretTargetChangeRef.current(selectionContext(result.paragraph, body))
+      return result.mode
+    },
     undo: () => restoreEditHistory('undo'),
     redo: () => restoreEditHistory('redo'),
   }))
+
+  const insertPastedHtml = (clipboardHtml: string): boolean => {
+    if (modeRef.current !== 'edit' || !clipboardHtml.trim()) return false
+    const document = iframeRef.current?.contentDocument
+    const body = document?.body
+    if (!document || !body) return false
+    const fragment = document.createRange().createContextualFragment(clipboardHtml)
+    fragment.querySelectorAll('script, iframe, object, embed, link, meta').forEach((node) => node.remove())
+    fragment.querySelectorAll<HTMLElement>('*').forEach((element) => {
+      element.getAttributeNames().forEach((name) => {
+        if (name.toLowerCase().startsWith('on')) element.removeAttribute(name)
+      })
+    })
+    const lastNode = fragment.lastChild
+    if (!lastNode) return false
+
+    const previousHtml = serialiseBody(body)
+    const range = captureCaretRange()
+    if (body.innerHTML.trim() === EMPTY_PREVIEW_HTML) body.innerHTML = ''
+    if (range && body.contains(range.commonAncestorContainer)) {
+      range.deleteContents()
+      range.insertNode(fragment)
+      const selection = document.defaultView?.getSelection()
+      const after = document.createRange()
+      after.setStartAfter(lastNode)
+      after.collapse(true)
+      selection?.removeAllRanges()
+      selection?.addRange(after)
+    } else {
+      body.append(fragment)
+    }
+
+    markLinksToOpenInNewWindow(body)
+    recordEditChange(previousHtml)
+    const nextHtml = serialiseBody(body)
+    renderedHtmlRef.current = nextHtml
+    onHtmlChangeRef.current(nextHtml)
+    notifyExternalImagesPasted()
+    syncHeight()
+    return true
+  }
 
   const handleLoad = () => {
     resizeObserverRef.current?.disconnect()
@@ -2043,6 +2319,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
         removeImageAction()
         // Do not prevent the native click. The browser will set the caret and
         // the iframe's selectionchange listener will enable caret insertion.
+        window.setTimeout(() => {
+          if (modeRef.current === 'edit') reportCaretAvailability()
+        }, 0)
         return
       }
       if (modeRef.current !== 'select') {
@@ -2064,6 +2343,10 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     const handlePointerOut = (event: PointerEvent) => {
       if (modeRef.current !== 'edit' || compactRef.current) return
       const related = event.relatedTarget && (event.relatedTarget as Node).nodeType === 1 ? event.relatedTarget as HTMLElement : null
+      // An iframe reports relatedTarget=null when the pointer crosses its
+      // document boundary. Do not hide here; the outer preview container
+      // handles a genuine leave of the preview area.
+      if (!related) return
       if (related?.closest('[data-preview-block-handle]')) return
       const nextBlock = related ? findEditableBlock(related, body) : null
       if (nextBlock) {
@@ -2092,21 +2375,28 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       }
       if (modeRef.current !== 'edit') return
 
+      const clipboardHtml = event.clipboardData?.getData('text/html') ?? ''
+      const clipboardText = event.clipboardData?.getData('text/plain') ?? ''
+      if (clipboardHtml.trim()) {
+        event.preventDefault()
+        event.stopPropagation()
+        pendingExternalImagePasteRef.current = /<img\b[^>]*(?:https?:\/\/|data:image\/)/i.test(clipboardHtml)
+        if (!insertPastedHtml(clipboardHtml)) pendingExternalImagePasteRef.current = false
+        return
+      }
       const imageItem = Array.from(event.clipboardData?.items ?? []).find((item) => (
         item.kind === 'file' && ACCEPTED_IMAGE_TYPES.has(item.type.toLowerCase())
       ))
       const imageFile = imageItem?.getAsFile()
-      if (imageFile) {
+      // When a source provides both rich HTML and an image item (Word and
+      // browser editors commonly do this), let the browser paste the complete
+      // fragment so text and formatting are not discarded. Handle the image
+      // item only for an image-only clipboard.
+      if (imageFile && !clipboardHtml.trim() && !clipboardText.trim()) {
         event.preventDefault()
         event.stopPropagation()
         void insertUploadedImage(imageFile, captureCaretRange())
         return
-      }
-
-      // Do not let rich clipboard HTML silently add a data: or remote image to
-      // the draft. Image clipboard items use the OSS upload path above.
-      if (/<img\b|data:image\//i.test(event.clipboardData?.getData('text/html') ?? '')) {
-        event.preventDefault()
       }
     }
     const handleHistoryShortcut = (event: KeyboardEvent) => {
@@ -2126,6 +2416,29 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       clearBlockSelection()
       event.preventDefault()
       event.stopPropagation()
+    }
+    const handleSelectAllShortcut = (event: KeyboardEvent) => {
+      if (
+        modeRef.current !== 'edit'
+        || (!event.ctrlKey && !event.metaKey)
+        || event.altKey
+        || event.shiftKey
+        || event.key.toLowerCase() !== 'a'
+      ) return
+      const selection = document.defaultView?.getSelection()
+      if (!selection || !body.isContentEditable) return
+
+      // Chromium does not create a native Select All range for this editable
+      // srcdoc iframe. Select the article DOM here; Delete/Backspace remains
+      // handled by the browser's normal editable-input path.
+      clearBlockSelection()
+      removeImageAction()
+      removeBlockHandle()
+      const range = document.createRange()
+      range.selectNodeContents(body)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      event.preventDefault()
     }
     const handleDeleteShortcut = (event: KeyboardEvent) => {
       if (
@@ -2169,6 +2482,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     body.addEventListener('drop', preventSelectionModeEdit, true)
     body.addEventListener('keydown', handleHistoryShortcut, true)
     body.addEventListener('keydown', handleBlockShortcut, true)
+    body.addEventListener('keydown', handleSelectAllShortcut, true)
     body.addEventListener('keydown', handleDeleteShortcut, true)
     body.addEventListener('keydown', preventSelectionModeEdit, true)
     body.addEventListener('input', handleInput)
@@ -2329,7 +2643,12 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
   return (
     <div className={`preview-shell preview-mode-${mode}${compact ? ' preview-shell-compact' : ''}`} ref={shellRef}>
-      <div className="preview-device">
+      <div
+        className="preview-device"
+        onPointerLeave={() => {
+          if (modeRef.current === 'edit' && !compactRef.current) removeBlockHandle()
+        }}
+      >
         {mode === 'select' && selectedElements.length > 0 && <div className="preview-selection-count">已选 {selectedElements.length}</div>}
         <iframe
           ref={iframeRef}
@@ -2452,6 +2771,14 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
           )}
           {mobileEditorPanel === 'image-actions' && (
             <div className="preview-mobile-action-sheet">
+              <Button icon={<RobotOutlined />} type="primary" onClick={() => {
+                const image = activeImageRef.current
+                if (image) openAiImageAction('generate', image)
+              }}>AI 换图</Button>
+              <Button icon={<RobotOutlined />} onClick={() => {
+                const image = activeImageRef.current
+                if (image) openAiImageAction('edit', image)
+              }}>AI 图片编辑</Button>
               <Button icon={<PictureOutlined />} onClick={openImagePickerForReplacement}>替换图片</Button>
               <Button icon={<BgColorsOutlined />} onClick={() => {
                 const image = activeImageRef.current

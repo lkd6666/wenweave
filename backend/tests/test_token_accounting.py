@@ -31,7 +31,7 @@ class TokenAccountingTests(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 420)
         self.assertEqual(usage["total_tokens"], 9420)
 
-    def test_cache_hits_are_summed_from_input_token_details(self) -> None:
+    def test_cache_hits_exclude_cache_creation_tokens(self) -> None:
         usage = _usage_from_message(
             _message(
                 {
@@ -44,7 +44,7 @@ class TokenAccountingTests(unittest.TestCase):
         )
 
         assert usage is not None
-        self.assertEqual(usage["cached_input_tokens"], 8100)
+        self.assertEqual(usage["cached_input_tokens"], 8000)
         self.assertEqual(usage["cache_read_tokens"], 8000)
         self.assertEqual(usage["cache_write_tokens"], 100)
 

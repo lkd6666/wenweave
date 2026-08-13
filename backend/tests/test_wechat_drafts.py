@@ -431,7 +431,7 @@ class WeChatHttpClientTests(unittest.TestCase):
             f"<p>{'正文' * 10_001}</p>",
         )
 
-    def test_replaces_small_body_images_with_temporary_urls_and_retries_once_for_invalid_token(self) -> None:
+    def test_replaces_small_body_images_with_article_image_urls_and_retries_once_for_invalid_token(self) -> None:
         seen_paths: list[str] = []
         progress_events: list[tuple[str, int, str]] = []
         draft_attempts = 0
@@ -496,15 +496,17 @@ class WeChatHttpClientTests(unittest.TestCase):
 
     def test_preserves_gif_body_by_using_a_permanent_material_url(self) -> None:
         seen_paths: list[str] = []
+        gif_bytes = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen_paths.append(request.url.path)
             if request.url.path == "/cgi-bin/stable_token":
                 return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
             if request.url.host == "images.example.com":
-                return httpx.Response(200, headers={"content-type": "image/gif"}, content=b"gif")
+                return httpx.Response(200, headers={"content-type": "image/gif"}, content=gif_bytes)
             if request.url.path == "/cgi-bin/material/add_material":
                 if b"body.gif" in request.content:
+                    self.assertIn(gif_bytes, request.content)
                     return httpx.Response(
                         200,
                         json={"media_id": "body-gif-media", "url": "https://mmbiz.qpic.cn/body.gif"},
@@ -531,13 +533,13 @@ class WeChatHttpClientTests(unittest.TestCase):
                     cover=CoverImage(b"cover", "image/png", "cover.png"),
                     cached_cover_media_id=None,
                 )
-            )
+        )
 
         self.assertEqual(result.media_id, "draft-media")
         self.assertEqual(seen_paths.count("/cgi-bin/media/uploadimg"), 0)
         self.assertEqual(seen_paths.count("/cgi-bin/material/add_material"), 2)
 
-    def test_reuses_cached_body_image_without_downloading_or_uploading(self) -> None:
+    def test_reuploads_legacy_cached_body_image_url(self) -> None:
         source = "https://images.example.com/cached.png"
         source_hash = WeChatOfficialAccountClient.body_image_source_sha256(source)
         cached_entry = BodyImageCacheEntry(
@@ -553,9 +555,13 @@ class WeChatHttpClientTests(unittest.TestCase):
             seen_paths.append(request.url.path)
             if request.url.path == "/cgi-bin/stable_token":
                 return httpx.Response(200, json={"access_token": "token", "expires_in": 7200})
+            if request.url.host == "images.example.com":
+                return httpx.Response(200, headers={"content-type": "image/png"}, content=b"png")
+            if request.url.path == "/cgi-bin/media/uploadimg":
+                return httpx.Response(200, json={"url": "https://mmbiz.qpic.cn/reuploaded.png"})
             if request.url.path == "/cgi-bin/draft/add":
                 body = json.loads(request.content)
-                self.assertIn(cached_entry.wechat_url, body["articles"][0]["content"])
+                self.assertIn("https://mmbiz.qpic.cn/reuploaded.png", body["articles"][0]["content"])
                 return httpx.Response(200, json={"media_id": "draft-media"})
             raise AssertionError(f"unexpected request {request.url}")
 
@@ -575,11 +581,11 @@ class WeChatHttpClientTests(unittest.TestCase):
                     cached_cover_media_id="cover-media",
                     cached_body_images={source_hash: cached_entry},
                 )
-            )
+        )
 
         self.assertEqual(result.media_id, "draft-media")
-        self.assertEqual(seen_paths, ["/cgi-bin/stable_token", "/cgi-bin/draft/add"])
-        self.assertEqual(result.body_image_cache_entries, ())
+        self.assertIn("/cgi-bin/media/uploadimg", seen_paths)
+        self.assertEqual(result.body_image_cache_entries[0].upload_mode, "uploadimg")
 
     def test_reuses_matching_content_hash_for_a_new_body_image_url(self) -> None:
         previous_source = "https://images.example.com/old.png"
@@ -590,7 +596,7 @@ class WeChatHttpClientTests(unittest.TestCase):
             content_sha256=hashlib.sha256(content).hexdigest(),
             content_type="image/png",
             wechat_url="https://mmbiz.qpic.cn/reused.png",
-            upload_mode="temporary",
+            upload_mode="uploadimg",
         )
         seen_paths: list[str] = []
 
@@ -627,10 +633,38 @@ class WeChatHttpClientTests(unittest.TestCase):
         self.assertEqual(seen_paths.count("/cgi-bin/media/uploadimg"), 0)
         self.assertEqual(result.body_image_cache_entries[0].source_url_sha256, WeChatOfficialAccountClient.body_image_source_sha256(source))
 
+    def test_replaces_hidden_background_image_and_img_with_the_same_wechat_url(self) -> None:
+        source = "https://images.example.com/avatar.png"
+        client = WeChatOfficialAccountClient()
+        client._upload_article_image = AsyncMock(return_value="https://mmbiz.qpic.cn/avatar.png")  # type: ignore[method-assign]
+        html = (
+            f'<section style="width: 7em; height: 7em; border-radius: 100%; background-image: url(\'{source}\'); overflow: hidden;">'
+            f'<img src="{source}" style="width: 100%; height: 100%; opacity: 0;">'
+            "</section>"
+        )
+
+        result = asyncio.run(
+            client._replace_body_images(
+                MagicMock(),
+                "token",
+                html,
+                local_image_loader=lambda _: (b"avatar", "image/png", "avatar.png"),
+            )
+        )
+
+        image = BeautifulSoup(result.html, "html.parser").find("img")
+        container = BeautifulSoup(result.html, "html.parser").find("section")
+        assert image is not None
+        assert container is not None
+        self.assertEqual(image.get("src"), "https://mmbiz.qpic.cn/avatar.png")
+        self.assertEqual(image.get("style"), "width: 100%; height: 100%; opacity: 0;")
+        self.assertIn("background-image: url('https://mmbiz.qpic.cn/avatar.png')", container.get("style") or "")
+        client._upload_article_image.assert_awaited_once()
+
     def test_reuploads_cached_body_image_once_when_wechat_rejects_its_url(self) -> None:
         source = "https://images.example.com/cached.png"
         source_hash = WeChatOfficialAccountClient.body_image_source_sha256(source)
-        cached_entry = BodyImageCacheEntry(source_hash, "a" * 64, "image/png", "https://mmbiz.qpic.cn/stale.png", "temporary")
+        cached_entry = BodyImageCacheEntry(source_hash, "a" * 64, "image/png", "https://mmbiz.qpic.cn/stale.png", "uploadimg")
         seen_paths: list[str] = []
         draft_attempts = 0
 
@@ -690,7 +724,7 @@ class WeChatHttpClientTests(unittest.TestCase):
                 )
         async_client.assert_not_called()
 
-    def test_downgrades_mini_program_text_links_before_submitting_draft(self) -> None:
+    def test_preserves_wechat_native_link_markup_before_submitting_draft(self) -> None:
         submitted_content = ""
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -729,11 +763,11 @@ class WeChatHttpClientTests(unittest.TestCase):
         link = BeautifulSoup(submitted_content, "html.parser").find("a")
         assert link is not None
         self.assertEqual(link.get("href"), "https://idocx.cc/")
-        self.assertNotIn("weapp_text_link", link.get("class") or [])
-        self.assertFalse(any(name.startswith("data-miniprogram-") for name in link.attrs))
+        self.assertIn("weapp_text_link", link.get("class") or [])
+        self.assertEqual(link.get("data-miniprogram-appid"), "wxc8dc2d3cafab889e")
+        self.assertEqual(link.get("data-miniprogram-path"), "/pages/koc/kl?fid=734952377437786112")
+        self.assertEqual(link.get("data-miniprogram-nickname"), "文助手")
         self.assertIn("font-size:15px", link.get("style") or "")
-        self.assertIn("color:#576b95", link.get("style") or "")
-        self.assertIn("text-decoration:none", link.get("style") or "")
 
     def test_lists_targets_and_updates_existing_draft(self) -> None:
         seen_update_payload: dict[str, object] | None = None

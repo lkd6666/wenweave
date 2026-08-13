@@ -30,6 +30,7 @@ class AIImageModel(Base):
     access_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="all", server_default="all")
     adapter_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     provider = relationship("AIProvider", back_populates="image_models")
     allowed_users = relationship("User", secondary=image_model_user_access, back_populates="allowed_image_models")
@@ -42,3 +43,22 @@ class AIImageModel(Base):
     @property
     def allowed_group_ids(self) -> list[int]:
         return [group.id for group in self.allowed_groups]
+
+    @property
+    def operations(self) -> list[str]:
+        """Infer supported operations while allowing provider-specific overrides."""
+        configured = self.adapter_config.get("operations") if isinstance(self.adapter_config, dict) else None
+        if isinstance(configured, list):
+            values = [str(item) for item in configured if str(item) in {"generate", "edit"}]
+            if values:
+                return list(dict.fromkeys(values))
+        protocol = str(getattr(self.provider, "image_protocol", "") or "")
+        name = self.model_name.lower()
+        operations = ["generate"] if protocol else []
+        if protocol == "openai_images" and ("gpt-image" in name or "image" in name):
+            operations.append("edit")
+        elif protocol == "dashscope_images" and ("image-edit" in name or "imageedit" in name or "wan2.7-image" in name or "wanx2.1-imageedit" in name):
+            operations.append("edit")
+        elif protocol == "volcengine_ark_images" and ("seedream" in name or "image" in name or "edit" in name):
+            operations.append("edit")
+        return list(dict.fromkeys(operations))

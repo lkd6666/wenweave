@@ -3,16 +3,21 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
 DATA_DIR = BASE_DIR / "data"
+SEARXNG_ENV_FILE = BASE_DIR.parent / "deploy" / "searxng" / ".env"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(str(BASE_DIR / ".env"), str(SEARXNG_ENV_FILE)),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     APP_NAME: str = "微信公众号 AI 排版系统"
     APP_ENV: str = "development"
@@ -37,6 +42,18 @@ class Settings(BaseSettings):
     # Only these direct peers may supply a client address through X-Forwarded-For.
     TRUSTED_PROXY_CIDRS: str = ""
     DOCUMENT_SHARE_IMAGE_URL_EXPIRE_SECONDS: int = 3600
+
+    # SearXNG is an optional, separately deployed image-search service. HTTP
+    # is accepted only for loopback addresses by the image-search adapter.
+    SEARXNG_HOST_PORT: int = 8088
+    SEARXNG_BASE_URL: str = ""
+    SEARXNG_TIMEOUT_SECONDS: float = 4.0
+    SEARXNG_SEARCH_CACHE_SECONDS: float = 300.0
+    SEARXNG_SECRET: str = ""
+
+    # AI 模板/主题生成是非流式的，复杂组件可能需要数分钟才能完成；
+    # 应用层超时必须略高于此值，以便模型请求有机会正常收尾。
+    TEMPLATE_GENERATION_TIMEOUT_SECONDS: float = 600.0
 
     # 没有任何模型/工具流事件时的保护，以及一轮 Agent 的总运行上限。
     # 不设工具调用步数上限：复杂排版、历史版本翻页等任务本就需要几十步，
@@ -70,6 +87,10 @@ class Settings(BaseSettings):
     # 少数自建网关会拒绝该参数，遇到时可置 false 退回估算。
     # Anthropic 侧由 SDK 默认开启，不受此开关影响。
     CHAT_AGENT_REQUEST_STREAM_USAGE: bool = True
+    # Anthropic prompt cache defaults to five minutes when ttl is omitted.
+    # One hour avoids a cold cache in longer editing runs. Gateways that do
+    # not yet accept the ttl field are retried once with the legacy form.
+    CHAT_AGENT_ANTHROPIC_CACHE_TTL: Literal["5m", "1h"] = "1h"
     # Oversized tool results are kept outside the provider transcript. The
     # preview remains in the audit log indefinitely; the full payload expires.
     CHAT_TOOL_OUTPUT_RETENTION_DAYS: int = 7

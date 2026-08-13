@@ -24,7 +24,9 @@ import {
 } from '@ant-design/icons'
 import { gzhThemesApi } from '../api/gzhThemes'
 import { ApiError } from '../api/client'
+import ModelSelector from './ModelSelector'
 import type {
+  AIModelItem,
   GzhThemeCreatePayload,
   GzhThemeGeneration,
   GzhThemeManagerItem,
@@ -33,10 +35,12 @@ import type {
 } from '../types'
 import { frameThemeDocument } from '../utils/themePreview'
 import { SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { AiImageGeneration } from './AiOutput'
 
 interface ThemeManagerModalProps {
   open: boolean
   modelId: number | null
+  models: AIModelItem[]
   onClose: () => void
   onThemesChanged: () => void | Promise<void>
 }
@@ -73,7 +77,7 @@ function versionLabel(version: GzhThemeVersion) {
   return `v${version.version}`
 }
 
-export default function ThemeManagerModal({ open, modelId, onClose, onThemesChanged }: ThemeManagerModalProps) {
+export default function ThemeManagerModal({ open, modelId, models, onClose, onThemesChanged }: ThemeManagerModalProps) {
   const [themes, setThemes] = useState<GzhThemeManagerItem[]>([])
   const [previews, setPreviews] = useState<Record<number, string>>({})
   const [loading, setLoading] = useState(false)
@@ -83,6 +87,7 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
   const [assets, setAssets] = useState<GzhThemeReferenceAsset[]>([])
   const [uploading, setUploading] = useState(false)
   const [generation, setGeneration] = useState<GzhThemeGeneration | null>(null)
+  const [generationModelId, setGenerationModelId] = useState<number | null>(modelId)
   const [generationBusy, setGenerationBusy] = useState(false)
   const [adjustment, setAdjustment] = useState('')
   const [saving, setSaving] = useState(false)
@@ -128,6 +133,13 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
     }, 1000)
     return () => window.clearTimeout(timer)
   }, [generation])
+
+  useEffect(() => {
+    setGenerationModelId((current) => {
+      if (current !== null && models.some((model) => model.id === current)) return current
+      return models.find((model) => model.id === modelId)?.id ?? models[0]?.id ?? null
+    })
+  }, [modelId, models])
 
   const closeWizard = () => {
     setWizardOpen(false)
@@ -175,8 +187,8 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
   }
 
   const createGeneration = async (extraInstruction = '') => {
-    if (!modelId) {
-      message.warning('请先在编辑器中选择 AI 模型')
+    if (!generationModelId) {
+      message.warning('请选择 AI 模型')
       return
     }
     const brief = `${wizard.brief.trim()}${extraInstruction ? `\n\n补充调整：${extraInstruction.trim()}` : ''}`.trim()
@@ -188,7 +200,7 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
     setError(null)
     try {
       const created = await gzhThemesApi.createGeneration({
-        model_id: modelId,
+        model_id: generationModelId,
         brief,
         name_hint: wizard.name.trim(),
         slug_hint: wizard.theme ? '' : wizard.slug.trim(),
@@ -307,9 +319,9 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
       >
         <div className="theme-manager-toolbar">
           <div><strong>自定义模板</strong><span>用风格描述和参考图生成，发布前先预览整套组件。</span></div>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => openWizard()} disabled={!modelId}>新建模板</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => openWizard()} disabled={!models.length}>新建模板</Button>
         </div>
-        {!modelId && <Alert type="info" showIcon message="选择编辑器中的 AI 模型后即可生成自定义模板" style={{ marginBottom: 12 }} />}
+        {!models.length && <Alert type="info" showIcon message="暂无可用 AI 模型，请联系管理员配置" style={{ marginBottom: 12 }} />}
         {error && <Alert type="error" showIcon message={error} style={{ marginBottom: 12 }} />}
         {loading ? <div className="theme-manager-loading"><Spin /></div> : themes.length ? (
           <div className="theme-manager-grid">
@@ -386,6 +398,9 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
       >
         <div className="theme-wizard-layout">
           <section className="theme-wizard-form">
+            <label>生成模型
+              <ModelSelector models={models} value={generationModelId} onChange={setGenerationModelId} disabled={Boolean(generation && ['pending', 'running'].includes(generation.status))} />
+            </label>
             <label>想要的模板风格 <b>*</b></label>
             <Input.TextArea value={wizard.brief} onChange={(event) => setWizard((current) => ({ ...current, brief: event.target.value }))} maxLength={4000} autoSize={{ minRows: 7, maxRows: 12 }} placeholder="例如：深色但不压抑的技术复盘，标题像实验记录，正文留白充足，重点使用细线和数据标签。" />
             <div className="theme-manager-form-grid">
@@ -399,15 +414,16 @@ export default function ThemeManagerModal({ open, modelId, onClose, onThemesChan
             <div className="theme-wizard-reference-head"><span>参考图（可选，最多 5 张）</span><Button size="small" icon={<FileImageOutlined />} loading={uploading} onClick={() => uploadInputRef.current?.click()}>上传参考图</Button></div>
             <input ref={uploadInputRef} className="theme-wizard-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple onChange={(event) => void uploadReferences(event.target.files)} />
             {assets.length > 0 && <div className="theme-wizard-assets">{assets.map((asset) => <Tag closable key={asset.id} onClose={() => setAssets((items) => items.filter((item) => item.id !== asset.id))}>{asset.filename}</Tag>)}</div>}
-            <Button type="primary" size="large" block icon={generation ? <ReloadOutlined /> : <PlusOutlined />} loading={generationBusy} disabled={!modelId || ['pending', 'running'].includes(generation?.status ?? '')} onClick={() => void createGeneration()}>{generation ? '按当前要求重新生成' : '生成整套模板预览'}</Button>
+            <Button type="primary" size="large" block icon={generation ? <ReloadOutlined /> : <PlusOutlined />} loading={generationBusy} disabled={!generationModelId || ['pending', 'running'].includes(generation?.status ?? '')} onClick={() => void createGeneration()}>{generation ? '按当前要求重新生成' : '生成整套模板预览'}</Button>
             {generation && ['pending', 'running'].includes(generation.status) && <Button block icon={<StopOutlined />} onClick={() => void cancelGeneration()}>停止生成</Button>}
           </section>
           <section className="theme-wizard-result">
-            {generation && ['pending', 'running'].includes(generation.status) && <div className="theme-wizard-running"><Spin /><strong>正在生成主题组件与文章配方</strong><span>生成完成前不会创建或改动模板。</span></div>}
-            {generation?.status === 'failed' && <Alert type="error" showIcon message="主题生成未通过检查" description={generation.error_message || '请调整风格描述后再次生成。'} />}
-            {generation?.status === 'cancelled' && <Alert type="info" showIcon message="主题生成已停止" />}
+            {generation && ['pending', 'running'].includes(generation.status) && <AiImageGeneration status="running" title="正在生成主题组件与文章配方" detail="生成完成前不会创建或改动模板。" />}
+            {generation?.status === 'failed' && <AiImageGeneration status="error" title="主题生成未通过检查" detail={generation.error_message || '请调整风格描述后再次生成。'} />}
+            {generation?.status === 'cancelled' && <AiImageGeneration status="cancelled" title="主题生成已停止" detail="可调整要求后重新生成。" />}
             {generation?.status === 'succeeded' && (
               <>
+                <AiImageGeneration status="success" title="整套组件预览已生成" detail={`${generation.component_count} 个组件 · ${generation.recipe_count} 组文章配方 · 严格检查通过`} />
                 <div className="theme-wizard-result-head"><div><strong>整套组件预览</strong><span>{generation.component_count} 个组件 · {generation.recipe_count} 组文章配方</span></div><Tag color="green">严格检查通过</Tag></div>
                 <iframe className="theme-wizard-preview-frame" title="候选主题预览" sandbox={SANDBOX_ALLOW_NEW_WINDOW} srcDoc={frameThemeDocument(generation.preview_html, 'full')} />
                 <Input.TextArea value={adjustment} onChange={(event) => setAdjustment(event.target.value)} autoSize={{ minRows: 2, maxRows: 4 }} maxLength={2000} placeholder="继续调整，例如：引用块更轻一些，不要使用目录卡片" />

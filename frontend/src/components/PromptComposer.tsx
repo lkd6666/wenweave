@@ -34,6 +34,25 @@ function isSameReference(left: SelectedElementContext, right: SelectedElementCon
   return left.selector === right.selector && left.tag_name === right.tag_name && left.html === right.html
 }
 
+/**
+ * The editor DOM is only a presentation of the selected anchors. A click can
+ * submit before React has inserted the corresponding token, so never allow a
+ * temporarily stale DOM to erase references owned by the parent state.
+ */
+export function resolveOutgoingReferences(
+  tokenReferences: SelectedElementContext[],
+  selectedReferences: SelectedElementContext[],
+): SelectedElementContext[] {
+  if (tokenReferences.length !== selectedReferences.length) return selectedReferences
+  const unmatchedSelected = [...selectedReferences]
+  for (const reference of tokenReferences) {
+    const matchIndex = unmatchedSelected.findIndex((selected) => isSameReference(reference, selected))
+    if (matchIndex < 0) return selectedReferences
+    unmatchedSelected.splice(matchIndex, 1)
+  }
+  return tokenReferences
+}
+
 /** 文本、元素和组件模板共用同一行流；令牌本身不可编辑，但可拖拽和移除。 */
 const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(function PromptComposer(
   { value, references, templates, disabled, onChange, onSubmit, onRemoveReference, onDuplicateReference, onMoveReference, onRemoveTemplate, acceptImages = false, onPasteImages },

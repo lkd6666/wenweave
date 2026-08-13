@@ -87,6 +87,27 @@ TRUSTED_PROXY_CIDRS=127.0.0.1/32,172.18.0.0/16,198.51.100.0/24
 
 代码会从右向左跳过 Nginx、雷池和 CDN，记录第一个非可信地址（即访客 IP）。实际部署中必须以雷池容器/回源网段和 CDN 官方 IP 段替换示例值，不要使用 `0.0.0.0/0`。同时需确认雷池未丢弃 `X-Forwarded-For`；若 CDN 未传入访客地址，后端无法从 CDN IP 反推出真实访客。
 
+### 启动 SearXNG 搜图服务
+
+搜图是独立可降级功能。服务器已安装 Docker Compose 时，按发布包中的固定镜像摘要启动：
+
+```bash
+cd /opt/yibanpaiban/deploy/searxng
+cp settings.yml.example settings.yml
+SECRET=$(openssl rand -hex 32)
+sed -i "s/replace-with-a-random-64-character-secret/$SECRET/" settings.yml
+chmod 600 settings.yml
+printf 'SEARXNG_HOST_PORT=8088\nSEARXNG_SECRET=%s\n' "$SECRET" > .env
+chmod 600 .env
+docker compose pull
+docker compose up -d
+curl -fsS 'http://127.0.0.1:8088/search?q=test&categories=images&format=json' >/dev/null
+```
+
+保持 `backend/.env` 中的 `SEARXNG_BASE_URL=http://127.0.0.1:8088`。如需改端口，同时修改 `deploy/searxng/.env` 的 `SEARXNG_HOST_PORT` 与此地址。默认国内来源为百度图片、搜狗图片和 `cn.bing.com` 图片；百度候选仅安全升级其 HTTP 来源页为 HTTPS，原图仍必须通过现有 HTTPS 校验。生产切换前按 `deploy/searxng/README.md` 在 `127.0.0.1:8089` 运行隔离验证，验证通过后执行 `./apply-domestic-profile.sh`；该脚本会保留搜图密钥并创建可回滚备份。应用层搜图总等待预算默认 4 秒，规范化结果缓存 300 秒，可分别用 `SEARXNG_TIMEOUT_SECONDS` 与 `SEARXNG_SEARCH_CACHE_SECONDS` 调整。该容器端口只绑定回环地址，不要通过防火墙或 Nginx 暴露。未启动或暂时故障时仅搜图返回错误，编辑、AI 生图和其他功能继续可用。
+
+默认以低配机模式运行：单 worker、单线程、320 MiB 内存上限、160 MiB 预留和 96 个 PID。可在 `deploy/searxng/.env` 覆盖 `SEARXNG_MEMORY_LIMIT`、`SEARXNG_UWSGI_WORKERS` 等参数。2C2G 仅适合低并发且数据库外置的场景；MySQL、主应用与搜图都在同机时建议至少 4G 内存。
+
 ## 5. 安装 Python 依赖并配置 systemd
 
 ```bash

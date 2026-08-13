@@ -18,7 +18,16 @@ FETCH_TIMEOUT_SECONDS = 10.0
 MAX_REDIRECTS = 3
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-_WECHAT_PROXY_HOSTS = {"mp.weixin.qq.com", "mmbiz.qpic.cn", "res.wx.qq.com", "wx.qlogo.cn"}
+_WECHAT_PROXY_HOSTS = {
+    "mp.weixin.qq.com",
+    "mmbiz.qpic.cn",
+    "res.wx.qq.com",
+    "wx.qlogo.cn",
+    # Xiumi embeds resolve to the same reserved proxy range in some
+    # development/network environments while remaining public asset hosts.
+    "img.xiumi.us",
+    "statics.xiumi.us",
+}
 _WECHAT_PROXY_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 _DATA_IMAGE_URL_RE = re.compile(
     r"^data:image/(?:png|jpeg|jpg|gif|webp|avif|bmp);base64,([a-z0-9+/=\s]+)$", re.IGNORECASE

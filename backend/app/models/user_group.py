@@ -9,11 +9,19 @@ from app.db.base import Base
 from app.db.types import ID_TYPE
 
 
+_MYSQL_ASSOCIATION_TABLE_OPTIONS = {
+    "mysql_engine": "InnoDB",
+    "mysql_charset": "utf8mb4",
+    "mysql_collate": "utf8mb4_unicode_ci",
+}
+
+
 user_group_members = Table(
     "user_group_members",
     Base.metadata,
     Column("group_id", ID_TYPE, ForeignKey("user_groups.id", ondelete="CASCADE"), primary_key=True),
     Column("user_id", ID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    **_MYSQL_ASSOCIATION_TABLE_OPTIONS,
 )
 
 model_user_access = Table(
@@ -21,6 +29,7 @@ model_user_access = Table(
     Base.metadata,
     Column("model_id", ID_TYPE, ForeignKey("ai_models.id", ondelete="CASCADE"), primary_key=True),
     Column("user_id", ID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    **_MYSQL_ASSOCIATION_TABLE_OPTIONS,
 )
 
 model_group_access = Table(
@@ -28,6 +37,7 @@ model_group_access = Table(
     Base.metadata,
     Column("model_id", ID_TYPE, ForeignKey("ai_models.id", ondelete="CASCADE"), primary_key=True),
     Column("group_id", ID_TYPE, ForeignKey("user_groups.id", ondelete="CASCADE"), primary_key=True),
+    **_MYSQL_ASSOCIATION_TABLE_OPTIONS,
 )
 
 image_model_user_access = Table(
@@ -35,6 +45,7 @@ image_model_user_access = Table(
     Base.metadata,
     Column("model_id", ID_TYPE, ForeignKey("ai_image_models.id", ondelete="CASCADE"), primary_key=True),
     Column("user_id", ID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    **_MYSQL_ASSOCIATION_TABLE_OPTIONS,
 )
 
 image_model_group_access = Table(
@@ -42,6 +53,7 @@ image_model_group_access = Table(
     Base.metadata,
     Column("model_id", ID_TYPE, ForeignKey("ai_image_models.id", ondelete="CASCADE"), primary_key=True),
     Column("group_id", ID_TYPE, ForeignKey("user_groups.id", ondelete="CASCADE"), primary_key=True),
+    **_MYSQL_ASSOCIATION_TABLE_OPTIONS,
 )
 
 

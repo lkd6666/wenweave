@@ -24,6 +24,8 @@ from app.bootstrap import (
     SCHEMA_REVISION,
     backfill_official_deepseek_thinking_models,
     migrate_schema,
+    migrate_anthropic_thinking_models,
+    prepare_mysql_image_model_access_tables,
     recover_expired_agent_runs,
     recover_interrupted_agent_runs,
     schema_migration_lock,
@@ -247,6 +249,11 @@ def _check_database() -> None:
             raise RuntimeError("schema revision is not ready")
 
 
+def _schema_tables_before_image_model_access():
+    access_table_names = {"image_model_user_access", "image_model_group_access"}
+    return [table for table in Base.metadata.sorted_tables if table.name not in access_table_names]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _install_asyncio_exception_reporting()
@@ -270,6 +277,12 @@ async def lifespan(app: FastAPI):
     # Schema mutations and startup recovery must be performed by one worker.
     # Other workers wait on the advisory/file lock before accepting requests.
     with schema_migration_lock():
+        if engine.url.drivername.startswith("mysql"):
+            # Legacy image-model IDs can differ from the current BIGINT UNSIGNED
+            # contract. Create every parent first, then create the two access
+            # tables with the actual parent ID types before static DDL sees them.
+            Base.metadata.create_all(bind=engine, tables=_schema_tables_before_image_model_access())
+            prepare_mysql_image_model_access_tables()
         Base.metadata.create_all(bind=engine)
         migrate_schema()
         db = SessionLocal()
@@ -277,6 +290,10 @@ async def lifespan(app: FastAPI):
             recover_interrupted_agent_runs(db)
             pending_image_generation_ids = recover_pending_generations()
             backfill_official_deepseek_thinking_models(db)
+            migrate_anthropic_thinking_models(db)
+            from app.services.image_library import backfill_generated_assets
+
+            backfill_generated_assets(db)
             seed_default_admin(db)
         finally:
             db.close()

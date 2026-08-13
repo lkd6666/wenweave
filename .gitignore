@@ -2,6 +2,11 @@
 .env
 .env.*
 !.env.example
+deploy/searxng/settings.yml
+deploy/searxng/settings.verify.yml
+deploy/searxng/settings.yml.bak.*
+deploy/searxng/settings.yml.next
+deploy/searxng/.env
 
 # Node / Vite
 node_modules/

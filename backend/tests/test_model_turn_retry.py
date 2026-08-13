@@ -159,6 +159,82 @@ class RetryClassifierTests(unittest.TestCase):
         self.assertEqual(kwargs, {"extra_body": {"enable_thinking": True}})
         self.assertTrue(status.applied)
 
+    def test_anthropic_translates_legacy_openai_reasoning_effort_config(self) -> None:
+        provider = SimpleNamespace(
+            provider_type=ProviderType.ANTHROPIC,
+            api_key_encrypted="encrypted",
+            base_url="https://api.anthropic.com",
+        )
+        model = AIModel(
+            provider_id=1,
+            model_name="claude-opus-5",
+            display_name="Claude Opus 5",
+            max_output_tokens=2048,
+            thinking_config={"efforts": {"xhigh": {"reasoning_effort": "xhigh"}}},
+        )
+        sentinel = object()
+        with mock.patch.object(chat_agent, "decrypt_secret", return_value="test-key"):
+            with mock.patch.object(chat_agent, "ChatAnthropic", return_value=sentinel) as construct:
+                built, status = build_chat_model(provider, model, "enabled", "xhigh")
+
+        self.assertIs(built, sentinel)
+        self.assertEqual(
+            construct.call_args.kwargs["thinking"], {"type": "adaptive"}
+        )
+        self.assertNotIn("reasoning_effort", construct.call_args.kwargs)
+        self.assertEqual(construct.call_args.kwargs["effort"], "xhigh")
+        self.assertIn("转换为 Anthropic adaptive thinking", status.detail)
+
+    def test_anthropic_preserves_native_thinking_config(self) -> None:
+        provider = SimpleNamespace(
+            provider_type=ProviderType.ANTHROPIC,
+            api_key_encrypted="encrypted",
+            base_url="https://api.anthropic.com",
+        )
+        model = AIModel(
+            provider_id=1,
+            model_name="claude-opus-5",
+            display_name="Claude Opus 5",
+            max_output_tokens=2048,
+            thinking_config={"enabled": {"thinking": {"type": "enabled", "budget_tokens": 4096}}},
+        )
+        sentinel = object()
+        with mock.patch.object(chat_agent, "decrypt_secret", return_value="test-key"):
+            with mock.patch.object(chat_agent, "ChatAnthropic", return_value=sentinel) as construct:
+                built, _ = build_chat_model(provider, model, "enabled")
+
+        self.assertIs(built, sentinel)
+        self.assertEqual(
+            construct.call_args.kwargs["thinking"], {"type": "enabled", "budget_tokens": 4096}
+        )
+
+    def test_anthropic_native_effort_is_forwarded_without_openai_parameters(self) -> None:
+        provider = SimpleNamespace(
+            provider_type=ProviderType.ANTHROPIC,
+            api_key_encrypted="encrypted",
+            base_url="https://api.anthropic.com",
+        )
+        model = AIModel(
+            provider_id=1,
+            model_name="claude-opus-5",
+            display_name="Claude Opus 5",
+            max_output_tokens=2048,
+            thinking_config={
+                "efforts": {
+                    "xhigh": {"thinking": {"type": "adaptive"}, "effort": "xhigh"},
+                },
+            },
+        )
+        sentinel = object()
+        with mock.patch.object(chat_agent, "decrypt_secret", return_value="test-key"):
+            with mock.patch.object(chat_agent, "ChatAnthropic", return_value=sentinel) as construct:
+                built, _ = build_chat_model(provider, model, "enabled", "xhigh")
+
+        self.assertIs(built, sentinel)
+        self.assertEqual(construct.call_args.kwargs["thinking"], {"type": "adaptive"})
+        self.assertEqual(construct.call_args.kwargs["effort"], "xhigh")
+        self.assertNotIn("reasoning_effort", construct.call_args.kwargs)
+
     def test_disabled_reasoning_effort_retries_with_provider_default_before_output(self) -> None:
         provider = SimpleNamespace(
             provider_type=ProviderType.OPENAI_COMPATIBLE,

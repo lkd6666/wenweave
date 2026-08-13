@@ -65,6 +65,7 @@ export type ProviderType = 'openai_compatible' | 'openai_responses' | 'anthropic
 export interface AIModelItem {
   id: number
   provider_id: number
+  provider_name: string
   model_name: string
   display_name: string
   description: string
@@ -154,6 +155,8 @@ export interface AIImageModelItem {
   access_mode: 'all' | 'restricted'
   allowed_user_ids: number[]
   allowed_group_ids: number[]
+  operations: Array<'generate' | 'edit'>
+  adapter_config?: Record<string, unknown>
 }
 
 export interface ModelPresetItem {
@@ -626,13 +629,19 @@ export interface ChatSessionItem {
     status: string
   } | null
   image_model_id: number | null
-  auto_image_generation_enabled: boolean
   created_at: string
   updated_at: string
 }
 
 export type ImageGenerationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 export type ImageGenerationPurpose = 'cover' | 'body'
+export type ImageGenerationOperation = 'generate' | 'edit'
+
+export interface PreviewImageTarget {
+  sourceUrl: string
+  imageIndex: number
+  alt: string
+}
 
 export interface GeneratedImageAsset {
   id: string
@@ -643,7 +652,10 @@ export interface GeneratedImageAsset {
   width: number
   height: number
   revised_prompt: string
+  library_asset_id: string
+  library_url: string
   is_applied: boolean
+  is_currently_applied: boolean
   applied_at: string | null
   created_at: string
 }
@@ -655,11 +667,16 @@ export interface ImageGenerationItem {
   model_id: number
   source: 'editor' | 'agent'
   purpose: ImageGenerationPurpose
+  operation: ImageGenerationOperation
   prompt: string
   quantity: number
   aspect_ratio: 'square' | 'portrait' | 'landscape'
   quality: string
+  timeout_seconds: number
   anchor_block_id: string
+  source_image_url: string
+  source_image_hash: string
+  target_image_index: number
   direct_insert: boolean
   status: ImageGenerationStatus
   error_message: string
@@ -668,6 +685,59 @@ export interface ImageGenerationItem {
   updated_at: string
   finished_at: string | null
   assets: GeneratedImageAsset[]
+}
+
+export type ImageSearchOrientation = 'any' | 'landscape' | 'portrait' | 'square'
+
+export interface ImageSearchCandidate {
+  id: string
+  token: string
+  preview_url: string
+  title: string
+  source_page_url: string
+  engine: string
+  width: number | null
+  height: number | null
+  format: string
+}
+
+export interface ImageSearchResult {
+  query: string
+  page: number
+  next_page: number | null
+  notice: string
+  items: ImageSearchCandidate[]
+}
+
+export type ImageLibraryMode = 'personal' | 'shared'
+export type ImageLibrarySource = 'upload' | 'ai' | 'search'
+
+export interface ImageLibraryAsset {
+  id: string
+  owner_id: number
+  owner_name: string
+  document_id: number | null
+  generation_id: string
+  generated_asset_id: string
+  name: string
+  source: ImageLibrarySource
+  url: string
+  content_type: string
+  size: number
+  width: number
+  height: number
+  is_shared: boolean
+  can_manage: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface ImageLibraryListResult {
+  items: ImageLibraryAsset[]
+  total: number
+  page: number
+  page_size: number
+  mode: ImageLibraryMode
 }
 
 export interface SelectedElementFingerprint {

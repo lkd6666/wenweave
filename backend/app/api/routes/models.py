@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 
 
@@ -26,7 +26,12 @@ router = APIRouter(prefix="/api/models", tags=["models"])
 @router.get("", response_model=list[ModelRead])
 
 def list_models(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[AIModel]:
-    return accessible_models_query(db.query(AIModel), current_user).order_by(AIModel.is_default.desc(), AIModel.id).all()
+    return (
+        accessible_models_query(db.query(AIModel), current_user)
+        .options(selectinload(AIModel.provider))
+        .order_by(AIModel.is_default.desc(), AIModel.id)
+        .all()
+    )
 
 
 @router.get("/image", response_model=list[ImageModelRead])

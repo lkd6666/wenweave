@@ -24,6 +24,7 @@ def _validate_token_budget(
 class ModelRead(BaseModel):
     id: int
     provider_id: int
+    provider_name: str
     model_name: str
     display_name: str
     description: str
@@ -101,6 +102,8 @@ class ImageModelRead(BaseModel):
     access_mode: Literal["all", "restricted"] = "all"
     allowed_user_ids: list[int] = Field(default_factory=list)
     allowed_group_ids: list[int] = Field(default_factory=list)
+    operations: list[Literal["generate", "edit"]] = Field(default_factory=lambda: ["generate"])
+    adapter_config: dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         from_attributes = True
@@ -116,6 +119,7 @@ class ImageModelCreate(BaseModel):
     access_mode: Literal["all", "restricted"] = "all"
     allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
     allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
+    adapter_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ImageModelUpdate(BaseModel):
@@ -127,6 +131,7 @@ class ImageModelUpdate(BaseModel):
     access_mode: Literal["all", "restricted"] | None = None
     allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
     allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
+    adapter_config: dict[str, Any] | None = None
 
 
 class ProviderRead(BaseModel):

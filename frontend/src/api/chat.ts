@@ -333,7 +333,7 @@ export async function recordChatUserQuestionActivity(
 export const chatApi = {
   listSessions: (documentId: number, includeArchived = true) => apiGet<ChatSessionItem[]>(`/documents/${documentId}/chat-sessions?include_archived=${includeArchived}`),
   createSession: (documentId: number, title = '新对话') => apiPost<ChatSessionItem>(`/documents/${documentId}/chat-sessions`, { title }),
-  updateImageSettings: (documentId: number, sessionId: number, payload: { image_model_id: number | null; auto_image_generation_enabled: boolean }) => apiPatch<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/image-settings`, payload),
+  updateImageSettings: (documentId: number, sessionId: number, payload: { image_model_id: number | null }) => apiPatch<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/image-settings`, payload),
   renameSession: (documentId: number, sessionId: number, title: string) => apiPatch<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}`, { title }),
   archiveSession: (documentId: number, sessionId: number) => apiPost<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/archive`, {}),
   restoreSession: (documentId: number, sessionId: number) => apiPost<ChatSessionItem>(`/documents/${documentId}/chat-sessions/${sessionId}/restore`, {}),

@@ -75,11 +75,11 @@ class OpenAIResponsesClientTests(unittest.TestCase):
             64,
             False,
             prompt_cache_key="yb-agent-v1-p4-m8-s0",
-            prompt_cache_options={"mode": "explicit"},
+            prompt_cache_options={"mode": "explicit", "ttl": "30m"},
         )
 
         self.assertEqual(payload["prompt_cache_key"], "yb-agent-v1-p4-m8-s0")
-        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit"})
+        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
         self.assertEqual(
             payload["input"][0]["content"][0]["prompt_cache_breakpoint"],
             {"mode": "explicit"},
@@ -214,7 +214,7 @@ class OpenAIResponsesAgentTests(unittest.TestCase):
 
         payload = chat_model._get_request_payload([HumanMessage(content="hello")])
         self.assertEqual(payload["prompt_cache_key"], "yb-agent-v1-p4-m8-s0")
-        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit"})
+        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
 
         system = chat_agent.build_system_message(chat_model, "标题", "<p>正文</p>")
         system_payload = chat_model._get_request_payload([system])
@@ -247,7 +247,7 @@ class OpenAIResponsesAgentTests(unittest.TestCase):
 
         payload = chat_model._get_request_payload([HumanMessage(content="hello")])
         self.assertEqual(payload["prompt_cache_key"], "yb-agent-v1-p4-m8-s0")
-        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit"})
+        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
         self.assertIn("messages", payload)
 
         system = chat_agent.build_system_message(chat_model, "标题", "<p>正文</p>")

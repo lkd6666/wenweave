@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AIModelItem, ChatContextStats } from '../types'
-import { contextUsageValues, formatMessageTime, isRuntimeContextCompacting, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, supportsDisabledThinkingOption } from './ChatPanel'
+import { contextUsageValues, formatMessageTime, isRuntimeContextCompacting, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, supportsDisabledThinkingOption, visibleTemplateReferenceIndexes } from './ChatPanel'
 import { questionDeadlineMs } from './UserQuestionPanel'
 
 describe('contextUsageValues', () => {
@@ -114,5 +114,15 @@ describe('supportsDisabledThinkingOption', () => {
     expect(supportsDisabledThinkingOption(officialDeepSeek, new Set())).toBe(true)
     expect(supportsDisabledThinkingOption(officialDeepSeek, new Set([officialDeepSeek.id]))).toBe(false)
     expect(supportsDisabledThinkingOption({ ...officialDeepSeek, supports_disabled_thinking: false }, new Set())).toBe(false)
+  })
+})
+
+describe('visibleTemplateReferenceIndexes', () => {
+  it('does not turn session resources into attachments when the message has no explicit component reference', () => {
+    expect([...visibleTemplateReferenceIndexes('请继续调整正文间距。', 2)]).toEqual([])
+  })
+
+  it('keeps only valid component references written in the message', () => {
+    expect([...visibleTemplateReferenceIndexes('使用 @组件2，再参考 @组件1 和 @组件3。', 2)]).toEqual([1, 0])
   })
 })

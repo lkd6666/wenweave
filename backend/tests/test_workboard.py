@@ -142,6 +142,19 @@ class WorkboardRouteTests(unittest.TestCase):
         self.assertEqual(payload.tweet_activity.ai_versions, 1)
         self.assertEqual(payload.tweet_activity.manual_versions, 1)
 
+    def test_disabling_model_or_provider_keeps_historical_statistics_visible(self) -> None:
+        provider = self.db.get(AIProvider, self.public_model.provider_id)
+        assert provider is not None
+        self.public_model.is_enabled = False
+        provider.is_enabled = False
+        self.db.commit()
+
+        payload = get_workboard("30d", self.alice, self.db)
+
+        self.assertEqual(payload.overview.model_call_count, 2)
+        self.assertEqual(payload.overview.input_tokens, 100)
+        self.assertEqual([row.display_name for row in payload.model_ranking], ["公共模型"])
+
     def test_today_uses_shanghai_midnight(self) -> None:
         start, end = _period_range("today", datetime(2026, 7, 29, 1, 0, tzinfo=timezone.utc))
 

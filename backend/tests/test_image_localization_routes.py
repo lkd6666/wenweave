@@ -1,6 +1,10 @@
 import asyncio
+import base64
+import shutil
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
@@ -12,15 +16,26 @@ from app.api.routes import documents, template_library
 from app.db.base import Base
 from app.models.document import Document
 from app.models.document_version import DocumentVersion, DocumentVersionSource
-from app.models.template_library import TemplateLibraryItem, TemplateSourceType
+from app.models.template_library import TemplateImageAsset, TemplateLibraryItem, TemplateSourceType
 from app.models.user import User, UserRole
+from app.services import local_uploads
 from app.services.image_localization import ImageLocalizationError, ImageLocalizationResult
 from app.services.local_uploads import ImageInfo
+from app.services.document_versions import content_checksum, materialize_document_version
 from app.services.template_library import TemplateImageLocalization, TemplateLibraryError
+
+
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+TEST_TMP_PARENT = Path(__file__).resolve().parents[1] / "data" / "test-temp"
 
 
 class ImageLocalizationRouteTests(unittest.TestCase):
     def setUp(self) -> None:
+        TEST_TMP_PARENT.mkdir(parents=True, exist_ok=True)
+        self.directory = TEST_TMP_PARENT / f"tmp-{uuid4().hex}"
+        self.directory.mkdir(parents=True)
+        self.local_root = patch.object(local_uploads, "LOCAL_UPLOAD_ROOT", self.directory)
+        self.local_root.start()
         self.engine = create_engine("sqlite://")
         Base.metadata.create_all(self.engine)
         self.db = Session(self.engine)
@@ -41,6 +56,26 @@ class ImageLocalizationRouteTests(unittest.TestCase):
         self.db.close()
         Base.metadata.drop_all(self.engine)
         self.engine.dispose()
+        self.local_root.stop()
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def _template_with_asset(self, html: str, asset_id: str = "11111111-1111-1111-1111-111111111111") -> TemplateLibraryItem:
+        template = TemplateLibraryItem(name="组件", html=html, source_type=TemplateSourceType.SOURCE)
+        self.db.add(template)
+        self.db.flush()
+        object_key = f"local/template-library/{asset_id}.png"
+        local_uploads.save_bytes(object_key, PNG, lambda _path: None)
+        self.db.add(TemplateImageAsset(
+            id=asset_id,
+            template_id=template.id,
+            original_url="https://source.example.test/template.png",
+            object_key=object_key,
+            storage_mode="local",
+            content_type="image/png",
+            size=len(PNG),
+        ))
+        self.db.commit()
+        return template
 
     def test_materialize_returns_copy_without_changing_article(self) -> None:
         template = TemplateLibraryItem(name="组件", html='<img src="/api/template-library/assets/11111111-1111-1111-1111-111111111111">', source_type=TemplateSourceType.SOURCE)
@@ -55,6 +90,94 @@ class ImageLocalizationRouteTests(unittest.TestCase):
         self.assertEqual(response.localized_count, 1)
         self.db.refresh(self.document)
         self.assertIn("images.example.test", self.document.current_html)
+
+    def test_materialize_template_asset_src_srcset_and_css_urls_into_article_images(self) -> None:
+        template = self._template_with_asset(
+            '<section style="background-image:url(\'/api/template-library/assets/11111111-1111-1111-1111-111111111111\');'
+            'background:#fff url(/api/template-library/assets/11111111-1111-1111-1111-111111111111) no-repeat">'
+            '<img src="/api/template-library/assets/11111111-1111-1111-1111-111111111111" '
+            'srcset="/api/template-library/assets/11111111-1111-1111-1111-111111111111 1x, '
+            '/api/template-library/assets/11111111-1111-1111-1111-111111111111 2x"></section>'
+        )
+
+        response = asyncio.run(documents.materialize_template_images(self.document.id, template.id, self.user, self.db))
+
+        self.assertEqual(response.localized_count, 1)
+        self.assertNotIn("/api/template-library/assets/", response.html)
+        self.assertEqual(response.html.count("/api/documents/local-images/"), 5)
+        self.db.refresh(self.document)
+        self.assertNotIn("/api/documents/local-images/", self.document.current_html)
+
+    def test_patch_save_localizes_template_asset_and_persists_saved_html(self) -> None:
+        asset_id = "22222222-2222-2222-2222-222222222222"
+        self._template_with_asset('<p>unused</p>', asset_id)
+        next_html = (
+            f'<section style="background-image:url(/api/template-library/assets/{asset_id})">'
+            f'<img src="/api/template-library/assets/{asset_id}" srcset="/api/template-library/assets/{asset_id} 1x"></section>'
+        )
+
+        response = documents.patch_document_content(
+            self.document.id,
+            documents.DocumentHtmlPatch(
+                base_checksum=content_checksum(self.document.current_html),
+                prefix_length=0,
+                suffix_length=0,
+                replacement=next_html,
+            ),
+            self.user,
+            self.db,
+        )
+
+        self.assertEqual(response.localized_count, 1)
+        self.assertNotIn("/api/template-library/assets/", response.html)
+        self.assertIn("/api/documents/local-images/", response.html)
+        self.db.refresh(self.document)
+        self.assertEqual(self.document.current_html, response.html)
+        version = self.db.query(DocumentVersion).filter(DocumentVersion.document_id == self.document.id).one()
+        self.assertEqual(materialize_document_version(self.db, version), response.html)
+
+    def test_patch_save_rejects_blob_file_and_unknown_relative_images(self) -> None:
+        self.document.current_html = "<p>正文</p>"
+        self.db.commit()
+        for source in ["blob:https://app.example/id", "file:///C:/secret.png", "../images/hero.png"]:
+            with self.subTest(source=source):
+                self.db.refresh(self.document)
+                with self.assertRaises(HTTPException) as caught:
+                    documents.patch_document_content(
+                        self.document.id,
+                        documents.DocumentHtmlPatch(
+                            base_checksum=content_checksum(self.document.current_html),
+                            prefix_length=len(self.document.current_html),
+                            suffix_length=0,
+                            replacement=f'<img src="{source}">',
+                        ),
+                        self.user,
+                        self.db,
+                    )
+                self.assertEqual(caught.exception.status_code, 422)
+                self.assertIn("正文图片不可发布", str(caught.exception.detail))
+                self.db.rollback()
+
+    def test_patch_save_rejects_private_url_without_masking_it_as_public(self) -> None:
+        self.document.current_html = "<p>正文</p>"
+        self.db.commit()
+        with self.assertRaises(HTTPException) as caught:
+            documents.patch_document_content(
+                self.document.id,
+                documents.DocumentHtmlPatch(
+                    base_checksum=content_checksum(self.document.current_html),
+                    prefix_length=len(self.document.current_html),
+                    suffix_length=0,
+                    replacement='<img src="http://127.0.0.1/private.png">',
+                ),
+                self.user,
+                self.db,
+            )
+
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("内网", str(caught.exception.detail))
+        self.db.refresh(self.document)
+        self.assertNotIn("127.0.0.1", self.document.current_html)
 
     def test_article_batch_updates_html_and_creates_manual_version(self) -> None:
         result = ImageLocalizationResult(html='<img src="/api/documents/local-images/copied.png">', localized_count=1, replacements={})

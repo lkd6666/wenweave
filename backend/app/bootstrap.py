@@ -30,6 +30,7 @@ from app.models.chat_history_archive import ChatHistoryArchive
 from app.models.chat_tool_output import ChatToolOutput
 from app.models.user import User, UserRole
 from app.models.app_runtime_lock import AppRuntimeLock
+from app.models.article_typography_settings import ArticleTypographySettings
 from app.models.operation_log import OperationLogStatus
 from app.models.schema_migration import SchemaMigration
 from app.models.gzh_theme import GzhTheme, GzhThemeVersion
@@ -45,7 +46,7 @@ from app.services.model_presets import (
 from app.services.wechat_compliance import run_compliance_check
 
 
-SCHEMA_REVISION = "20260812_image_library_v1"
+SCHEMA_REVISION = "20260815_layout_capture_sessions_v2"
 
 
 _MYSQL_IMAGE_MODEL_ACCESS_SPECS = (
@@ -389,6 +390,9 @@ def migrate_schema() -> None:
     当前项目未引入 Alembic；新部署由 ``Base.metadata.create_all`` 创建完整结构，
     此处覆盖已有 SQLite/MySQL 库的向前兼容升级路径。
     """
+    # Fresh application startup creates every table before this function. Keep
+    # this explicit for standalone compatibility migrations and repair tools.
+    ArticleTypographySettings.__table__.create(bind=engine, checkfirst=True)
     inspector = inspect(engine)
     is_sqlite = engine.url.drivername.startswith("sqlite")
     with engine.begin() as connection:
@@ -499,10 +503,30 @@ def migrate_schema() -> None:
             connection.execute(
                 text(f"{settings_insert} INTO image_library_settings (id, mode) VALUES (1, 'personal')")
             )
+        settings_insert = "INSERT OR IGNORE" if is_sqlite else "INSERT IGNORE"
+        connection.execute(
+            text(
+                f"{settings_insert} INTO article_typography_settings "
+                "(id, horizontal_padding_px, paragraph_spacing_px, font_size_px, "
+                "line_height_em, letter_spacing_px, text_indent_em, text_color) "
+                "VALUES (1, 4, 20, 15, 2, 1, 2, '#000000')"
+            )
+        )
         if inspector.has_table("ai_image_models"):
             image_model_columns = {column["name"] for column in inspector.get_columns("ai_image_models")}
             if "deleted_at" not in image_model_columns:
                 connection.execute(text("ALTER TABLE ai_image_models ADD COLUMN deleted_at DATETIME NULL"))
+            if "is_enabled" not in image_model_columns:
+                connection.execute(text("ALTER TABLE ai_image_models ADD COLUMN is_enabled BOOLEAN NOT NULL DEFAULT 1"))
+            if "availability_time_ranges" not in image_model_columns:
+                if is_sqlite:
+                    connection.execute(
+                        text("ALTER TABLE ai_image_models ADD COLUMN availability_time_ranges JSON NOT NULL DEFAULT '[]'")
+                    )
+                else:
+                    connection.execute(text("ALTER TABLE ai_image_models ADD COLUMN availability_time_ranges JSON NULL"))
+                    connection.execute(text("UPDATE ai_image_models SET availability_time_ranges = JSON_ARRAY() WHERE availability_time_ranges IS NULL"))
+                    connection.execute(text("ALTER TABLE ai_image_models MODIFY COLUMN availability_time_ranges JSON NOT NULL"))
             image_model_indexes = {index["name"] for index in inspector.get_indexes("ai_image_models")}
             if "ix_ai_image_models_deleted_at" not in image_model_indexes:
                 connection.execute(text("CREATE INDEX ix_ai_image_models_deleted_at ON ai_image_models (deleted_at)"))
@@ -528,9 +552,19 @@ def migrate_schema() -> None:
             for column_name, definition in {
                 "image_protocol": "VARCHAR(48) NOT NULL DEFAULT ''",
                 "image_base_url": "VARCHAR(512) NOT NULL DEFAULT ''",
+                "is_enabled": "BOOLEAN NOT NULL DEFAULT 1",
             }.items():
                 if column_name not in provider_columns:
                     connection.execute(text(f"ALTER TABLE ai_providers ADD COLUMN {column_name} {definition}"))
+            if "availability_time_ranges" not in provider_columns:
+                if is_sqlite:
+                    connection.execute(
+                        text("ALTER TABLE ai_providers ADD COLUMN availability_time_ranges JSON NOT NULL DEFAULT '[]'")
+                    )
+                else:
+                    connection.execute(text("ALTER TABLE ai_providers ADD COLUMN availability_time_ranges JSON NULL"))
+                    connection.execute(text("UPDATE ai_providers SET availability_time_ranges = JSON_ARRAY() WHERE availability_time_ranges IS NULL"))
+                    connection.execute(text("ALTER TABLE ai_providers MODIFY COLUMN availability_time_ranges JSON NOT NULL"))
             if not is_sqlite:
                 provider_type_column = provider_columns.get("provider_type")
                 provider_enum_values = ("OPENAI_COMPATIBLE", "OPENAI_RESPONSES", "ANTHROPIC")
@@ -563,6 +597,17 @@ def migrate_schema() -> None:
                             f"ENUM({enum_definition}) NOT NULL"
                         )
                     )
+        if inspector.has_table("layout_capture_sessions"):
+            capture_session_columns = {
+                column["name"] for column in inspector.get_columns("layout_capture_sessions")
+            }
+            if "purpose" not in capture_session_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE layout_capture_sessions ADD COLUMN "
+                        "purpose VARCHAR(32) NOT NULL DEFAULT 'layout_reference'"
+                    )
+                )
         if inspector.has_table("web_article_imports"):
             web_import_columns = {column["name"] for column in inspector.get_columns("web_article_imports")}
             web_import_definitions = {
@@ -631,6 +676,19 @@ def migrate_schema() -> None:
             connection.execute(
                 text("ALTER TABLE ai_models ADD COLUMN prompt_cache_enabled BOOLEAN NOT NULL DEFAULT 0")
             )
+        if "is_enabled" not in model_columns:
+            connection.execute(
+                text("ALTER TABLE ai_models ADD COLUMN is_enabled BOOLEAN NOT NULL DEFAULT 1")
+            )
+        if "availability_time_ranges" not in model_columns:
+            if is_sqlite:
+                connection.execute(
+                    text("ALTER TABLE ai_models ADD COLUMN availability_time_ranges JSON NOT NULL DEFAULT '[]'")
+                )
+            else:
+                connection.execute(text("ALTER TABLE ai_models ADD COLUMN availability_time_ranges JSON NULL"))
+                connection.execute(text("UPDATE ai_models SET availability_time_ranges = JSON_ARRAY() WHERE availability_time_ranges IS NULL"))
+                connection.execute(text("ALTER TABLE ai_models MODIFY COLUMN availability_time_ranges JSON NOT NULL"))
 
         # Custom themes originally stored their complete library directly on
         # ``gzh_themes``.  Keep those columns as a compatibility mirror and
@@ -659,6 +717,24 @@ def migrate_schema() -> None:
                         "WHERE active_version_id IS NULL"
                     )
                 )
+
+        # Theme generation is a multi-stage job. Persist its current phase so
+        # a polling browser can show meaningful progress after any worker swap.
+        if inspector.has_table("gzh_theme_generations"):
+            generation_columns = {
+                column["name"] for column in inspector.get_columns("gzh_theme_generations")
+            }
+            generation_definitions = {
+                "progress_stage": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
+                "progress_current": "INTEGER NOT NULL DEFAULT 0",
+                "progress_total": "INTEGER NOT NULL DEFAULT 0",
+                "progress_message": "VARCHAR(256) NOT NULL DEFAULT ''",
+            }
+            for column_name, definition in generation_definitions.items():
+                if column_name not in generation_columns:
+                    connection.execute(
+                        text(f"ALTER TABLE gzh_theme_generations ADD COLUMN {column_name} {definition}")
+                    )
 
         # Layout-reference bindings predate the selectable imitation level.
         # Keep existing sessions on the former structural behavior.

@@ -118,7 +118,7 @@ uvicorn app.main:app --no-proxy-headers --host 0.0.0.0 --port 8001
 | `DOCUMENT_SHARE_IMAGE_URL_EXPIRE_SECONDS` | 只读分享页中对象存储图片签名 URL 的最长有效期（秒） | `3600` |
 | `SEARXNG_HOST_PORT` | 本机 SearXNG 容器监听端口，可按部署环境修改 | `8088` |
 | `SEARXNG_BASE_URL` | 独立 SearXNG 搜图服务地址；远程实例必须使用 HTTPS | `http://127.0.0.1:8088` |
-| `SEARXNG_TIMEOUT_SECONDS` | 单次搜图请求总超时（秒）；图片代理下载使用独立超时 | `4` |
+| `SEARXNG_TIMEOUT_SECONDS` | 单次搜图、候选图片下载与预览请求的超时（秒） | `4` |
 | `SEARXNG_SEARCH_CACHE_SECONDS` | 规范化 SearXNG 上游页的短期缓存时间（秒） | `300` |
 | `SEARXNG_SECRET` | 与 SearXNG `server.secret_key` 相同的随机值；默认从 `deploy/searxng/.env` 读取 | 必须配置搜图时设置 |
 

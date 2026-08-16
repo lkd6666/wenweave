@@ -57,7 +57,18 @@ def _is_document_local_source(db: Session, source: str) -> bool:
     return bool(storage and oss_client.storage_object_key_for_url(storage, source))
 
 
-async def localize_document_html(db: Session, document: Document, html: str) -> ImageLocalizationResult:
+def _is_public_remote_source(source: str) -> bool:
+    parsed = urlsplit(source.strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
+
+
+async def localize_document_html(
+    db: Session,
+    document: Document,
+    html: str,
+    *,
+    include_public_remote: bool = True,
+) -> ImageLocalizationResult:
     """Copy each non-document image into article storage without mutating the document."""
     async def load_image(source: str, client: httpx.AsyncClient):
         asset_id = _template_asset_id(source)
@@ -70,8 +81,20 @@ async def localize_document_html(db: Session, document: Document, html: str) -> 
                 return data, local_uploads.inspect_image(data)
             except (TemplateLibraryError, local_uploads.LocalUploadError) as exc:
                 raise ImageLocalizationError(str(exc) or "组件图片不存在") from exc
+        normalized_source = source.strip().lower()
+        if normalized_source.startswith("blob:"):
+            raise ImageLocalizationError("检测到浏览器临时图片（blob:），请在编辑器中重新上传该图片")
+        if normalized_source.startswith("file:"):
+            raise ImageLocalizationError("检测到本机文件图片，请在编辑器中重新上传该图片")
+        if not normalized_source.startswith(("data:", "http://", "https://")):
+            if source.strip().startswith("//"):
+                try:
+                    return await fetch_public_image(client, f"https:{source.strip()}", allow_http=True)
+                except PublicFetchError as exc:
+                    raise ImageLocalizationError(str(exc)) from exc
+            raise ImageLocalizationError("图片地址不是可转存的公开 HTTP/HTTPS 链接，请重新上传该图片")
         try:
-            return await fetch_public_image(client, source)
+            return await fetch_public_image(client, source, allow_http=True)
         except PublicFetchError as exc:
             raise ImageLocalizationError(str(exc)) from exc
 
@@ -92,7 +115,8 @@ async def localize_document_html(db: Session, document: Document, html: str) -> 
         load_image=load_image,
         store_image=store_image,
         cleanup_image=cleanup_image,
-        is_local_source=lambda source: _is_document_local_source(db, source),
+        is_local_source=lambda source: _is_document_local_source(db, source)
+        or (not include_public_remote and _template_asset_id(source) is None and _is_public_remote_source(source)),
         max_images=MAX_DOCUMENT_LOCALIZATION_IMAGES,
         max_total_bytes=MAX_DOCUMENT_LOCALIZATION_BYTES,
     )

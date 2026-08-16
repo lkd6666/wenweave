@@ -1,13 +1,15 @@
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import app.models  # noqa: F401 - register the full metadata graph for SQLite.
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.api.routes.gzh_themes import list_gzh_themes
+from app.api.routes.gzh_themes import _generation_read, list_gzh_themes
 from app.db.base import Base
 from app.models.gzh_theme import GzhTheme, GzhThemeGeneration, GzhThemeGenerationStatus, GzhThemeStatus
 from app.models.gzh_theme_proposal import GzhThemeProposalStatus
@@ -29,9 +31,15 @@ from app.services.gzh_theme import (
 )
 from app.services.gzh_theme_generation import (
     GzhThemeGenerationError,
+    THEME_COMPONENT_IDS,
+    _parse_json_object,
+    build_standard_theme_package,
     publish_theme_version,
+    run_generation,
     save_generation_as_draft,
+    validate_component_batch,
     validate_generated_package,
+    validate_theme_blueprint,
 )
 
 
@@ -86,6 +94,60 @@ GENERATED_PREVIEW = """<section style="padding:16px"><p><span leaf="">封面标�
 <section style="padding:12px"><h2><span leaf="">章节标题</span></h2></section>
 <p style="line-height:1.8"><span leaf="">正文内容</span></p>
 <section style="padding:12px;border-left:3px solid #1677ff"><p><span leaf="">引用内容</span></p></section>"""
+
+
+def standard_blueprint() -> dict:
+    component_ids = list(THEME_COMPONENT_IDS)
+    return {
+        "name": "标准测试主题",
+        "slug": "standard-test-theme",
+        "description": "用于验证完整组件覆盖的标准主题。",
+        "scenarios": ["教程", "复盘", "品牌故事"],
+        "accent_color": "#1677ff",
+        "design_tokens": [
+            {"name": "主色", "value": "#1677ff"},
+            {"name": "辅助色", "value": "#e6f4ff"},
+            {"name": "正文色", "value": "#1f2937"},
+            {"name": "弱文本", "value": "#667085"},
+            {"name": "背景色", "value": "#ffffff"},
+            {"name": "边框色", "value": "#d0d5dd"},
+        ],
+        "components": [{"id": component_id, "name": f"测试组件 {component_id}"} for component_id in component_ids],
+        "recipes": [
+            {
+                "article_type": article_type,
+                "core_component_ids": ["1", "3", "5", "24"],
+                "decorative_component_ids": decorative,
+            }
+            for article_type, decorative in (
+                ("教程", ["12", "14", "16"]),
+                ("复盘", ["7", "15", "18"]),
+                ("品牌故事", ["2", "19", "23"]),
+            )
+        ],
+        "markdown_mappings": [
+            {"markdown": "# 一级标题", "component_id": "3"},
+            {"markdown": "## 二级标题", "component_id": "4"},
+            {"markdown": "正文", "component_id": "5"},
+            {"markdown": "> 引用", "component_id": "7"},
+            {"markdown": "```代码```", "component_id": "16"},
+        ],
+    }
+
+
+def standard_component_payload(component_ids: tuple[str, ...] | list[str]) -> dict:
+    return {
+        "components": [
+            {
+                "id": component_id,
+                "html": (
+                    f'<section style="margin:12px 0;padding:12px;border:1px solid #d0d5dd">'
+                    f'<p style="margin:0"><span leaf="">组件 {component_id} 展示文案</span></p></section>'
+                ),
+            }
+            for component_id in component_ids
+        ]
+    }
 
 
 class GzhThemeServiceTests(unittest.TestCase):
@@ -441,6 +503,126 @@ class GzhThemeServiceTests(unittest.TestCase):
         self.assertGreaterEqual(len(validated["manifest"]["components"]), 4)
         with self.assertRaisesRegex(GzhThemeGenerationError, "预览"):
             validate_generated_package({"source_markdown": GENERATED_SOURCE, "preview_html": "<script>alert(1)</script>"})
+
+    def test_strict_json_parser_rejects_explanatory_text(self) -> None:
+        self.assertEqual(_parse_json_object('```json\n{"ok":true}\n```', "测试结果"), {"ok": True})
+        with self.assertRaisesRegex(GzhThemeGenerationError, "不是有效 JSON"):
+            _parse_json_object('下面是结果：{"ok":true}', "测试结果")
+
+    def test_generation_api_exposes_durable_progress(self) -> None:
+        generation = GzhThemeGeneration(
+            id="generation-progress",
+            model_id=1,
+            user_id=7,
+            brief="蓝色教程主题",
+            status=GzhThemeGenerationStatus.RUNNING,
+            progress_stage="generating_components",
+            progress_current=4,
+            progress_total=10,
+            progress_message="正在生成组件第 4/8 批",
+        )
+        self.db.add(generation)
+        self.db.flush()
+
+        payload = _generation_read(generation)
+
+        self.assertEqual(payload.progress.stage, "generating_components")
+        self.assertEqual(payload.progress.current, 4)
+        self.assertEqual(payload.progress.total, 10)
+        self.assertEqual(payload.progress.message, "正在生成组件第 4/8 批")
+
+    def test_standard_theme_package_requires_all_24_component_slots(self) -> None:
+        blueprint = validate_theme_blueprint(standard_blueprint())
+        components = {}
+        for start in range(0, len(THEME_COMPONENT_IDS), 3):
+            component_ids = THEME_COMPONENT_IDS[start:start + 3]
+            components.update(validate_component_batch(standard_component_payload(component_ids), component_ids))
+
+        package = build_standard_theme_package(blueprint, components)
+        validated = validate_generated_package(package, require_standard=True)
+
+        theme_components = [item for item in validated["manifest"]["components"] if item["source"] == "theme"]
+        self.assertEqual([item["id"] for item in theme_components], list(THEME_COMPONENT_IDS))
+        self.assertEqual(len(validated["manifest"]["recipes"]), 3)
+
+        del components["24"]
+        with self.assertRaisesRegex(GzhThemeGenerationError, "组件不完整"):
+            build_standard_theme_package(blueprint, components)
+
+    def test_component_batch_rejects_unwrapped_text(self) -> None:
+        component_ids = THEME_COMPONENT_IDS[:3]
+        payload = standard_component_payload(component_ids)
+        payload["components"][1]["html"] = '<section style="padding:12px"><p>未包装文本</p></section>'
+
+        with self.assertRaisesRegex(GzhThemeGenerationError, "严格检查"):
+            validate_component_batch(payload, component_ids)
+
+    def test_generation_repairs_only_the_failed_component_batch(self) -> None:
+        run_db = Session(self.engine)
+        generation = GzhThemeGeneration(
+            id="generation-repair-batch",
+            model_id=1,
+            user_id=7,
+            brief="蓝色教程主题",
+            status=GzhThemeGenerationStatus.PENDING,
+        )
+        run_db.add(generation)
+        run_db.commit()
+        generation_id = generation.id
+
+        blueprint = standard_blueprint()
+        first_batch_invalid = {"components": [{"id": "1", "html": "<p>太短</p>"}]}
+        responses = [blueprint, first_batch_invalid]
+        for start in range(0, len(THEME_COMPONENT_IDS), 3):
+            responses.append(standard_component_payload(THEME_COMPONENT_IDS[start:start + 3]))
+        ask_model = AsyncMock(side_effect=responses)
+
+        with patch("app.services.gzh_theme_generation.SessionLocal", return_value=run_db), patch(
+            "app.services.gzh_theme_generation._ask_json_prompt", ask_model
+        ):
+            asyncio.run(run_generation(generation_id))
+
+        check_db = Session(self.engine)
+        completed = check_db.get(GzhThemeGeneration, generation_id)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.status, GzhThemeGenerationStatus.SUCCEEDED)
+        self.assertEqual(completed.progress_stage, "succeeded")
+        self.assertEqual(completed.progress_current, completed.progress_total)
+        self.assertEqual(ask_model.await_count, 1 + 1 + 1 + (len(THEME_COMPONENT_IDS) // 3 - 1))
+        check_db.close()
+
+    def test_generation_stops_after_cancellation_between_stages(self) -> None:
+        run_db = Session(self.engine)
+        generation = GzhThemeGeneration(
+            id="generation-cancel-stage",
+            model_id=1,
+            user_id=7,
+            brief="蓝色教程主题",
+            status=GzhThemeGenerationStatus.PENDING,
+        )
+        run_db.add(generation)
+        run_db.commit()
+        generation_id = generation.id
+
+        async def cancel_after_blueprint(*_args, **_kwargs):
+            other_session = Session(self.engine)
+            row = other_session.get(GzhThemeGeneration, generation_id)
+            row.cancel_requested = True
+            other_session.commit()
+            other_session.close()
+            return standard_blueprint()
+
+        with patch("app.services.gzh_theme_generation.SessionLocal", return_value=run_db), patch(
+            "app.services.gzh_theme_generation._ask_json_prompt", AsyncMock(side_effect=cancel_after_blueprint)
+        ):
+            asyncio.run(run_generation(generation_id))
+
+        check_db = Session(self.engine)
+        cancelled = check_db.get(GzhThemeGeneration, generation_id)
+        self.assertIsNotNone(cancelled)
+        self.assertEqual(cancelled.status, GzhThemeGenerationStatus.CANCELLED)
+        self.assertEqual(cancelled.progress_stage, "cancelled")
+        check_db.close()
 
     def test_generation_saves_draft_then_publishes_new_version_without_changing_old_snapshot(self) -> None:
         generation = GzhThemeGeneration(

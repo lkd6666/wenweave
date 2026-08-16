@@ -27,6 +27,10 @@ class AIImageModel(Base):
     supported_aspect_ratios: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     supported_qualities: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    availability_time_ranges: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     access_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="all", server_default="all")
     adapter_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

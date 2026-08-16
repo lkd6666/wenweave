@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>排版采集助手</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main class="popup-shell">
+    <header class="popup-header">
+      <span class="app-mark" aria-hidden="true">排</span>
+      <div class="brand-copy">
+        <h1>排版采集助手</h1>
+        <p>微信公众号文章与排版采集</p>
+      </div>
+      <span class="connection-badge"><i aria-hidden="true"></i>已安装</span>
+    </header>
+
+    <section class="task-panel" id="task" data-state="loading">
+      <div class="task-state">
+        <span class="state-indicator" aria-hidden="true"></span>
+        <span id="state-label">正在检查</span>
+      </div>
+      <h2 id="task-title">读取采集任务</h2>
+      <p class="status" id="status" aria-live="polite">正在连接排版页面…</p>
+      <div class="target" id="target" hidden>
+        <span>关联文章</span>
+        <code id="target-value"></code>
+      </div>
+    </section>
+
+    <div class="actions" id="actions" hidden>
+      <button class="secondary" id="cancel" type="button" hidden>取消</button>
+      <button class="primary" id="start" type="button" disabled>开始采集</button>
+    </div>
+
+    <footer><span aria-hidden="true">✓</span>仅在你主动开始后读取文章，不读取微信 Cookie</footer>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

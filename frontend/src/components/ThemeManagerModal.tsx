@@ -8,6 +8,7 @@ import {
   Input,
   Modal,
   Popconfirm,
+  Progress,
   Spin,
   Tag,
   message,
@@ -96,6 +97,12 @@ export default function ThemeManagerModal({ open, modelId, models, onClose, onTh
   const [publishingId, setPublishingId] = useState<number | null>(null)
   const [advancedForm] = Form.useForm<GzhThemeCreatePayload>()
   const uploadInputRef = useRef<HTMLInputElement>(null)
+  const generationProgress = generation?.progress
+  const generationProgressTotal = Math.max(0, generationProgress?.total ?? 0)
+  const generationProgressCurrent = Math.min(generationProgressTotal, Math.max(0, generationProgress?.current ?? 0))
+  const generationProgressPercent = generationProgressTotal
+    ? Math.round((generationProgressCurrent / generationProgressTotal) * 100)
+    : 0
 
   const loadThemes = useCallback(async () => {
     setLoading(true)
@@ -418,7 +425,20 @@ export default function ThemeManagerModal({ open, modelId, models, onClose, onTh
             {generation && ['pending', 'running'].includes(generation.status) && <Button block icon={<StopOutlined />} onClick={() => void cancelGeneration()}>停止生成</Button>}
           </section>
           <section className="theme-wizard-result">
-            {generation && ['pending', 'running'].includes(generation.status) && <AiImageGeneration status="running" title="正在生成主题组件与文章配方" detail="生成完成前不会创建或改动模板。" />}
+            {generation && ['pending', 'running'].includes(generation.status) && (
+              <div className="theme-wizard-progress">
+                <AiImageGeneration
+                  status="running"
+                  title={generationProgress?.stage === 'repairing' ? '正在修复当前主题批次' : '正在生成主题组件与文章配方'}
+                  detail={generationProgress?.message || '正在准备生成任务。'}
+                />
+                <Progress
+                  percent={generationProgressPercent}
+                  size="small"
+                  format={() => generationProgressTotal ? `${generationProgressCurrent}/${generationProgressTotal}` : '准备中'}
+                />
+              </div>
+            )}
             {generation?.status === 'failed' && <AiImageGeneration status="error" title="主题生成未通过检查" detail={generation.error_message || '请调整风格描述后再次生成。'} />}
             {generation?.status === 'cancelled' && <AiImageGeneration status="cancelled" title="主题生成已停止" detail="可调整要求后重新生成。" />}
             {generation?.status === 'succeeded' && (

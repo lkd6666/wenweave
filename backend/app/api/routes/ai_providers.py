@@ -133,7 +133,7 @@ def _validate_prompt_cache_provider(provider: AIProvider, enabled: bool) -> None
     }:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="显式提示缓存仅适用于 OpenAI Responses 或 OpenAI-compatible Provider",
+            detail="提示缓存仅适用于 OpenAI Responses 或 OpenAI-compatible Provider",
         )
 
 
@@ -146,6 +146,8 @@ def _to_provider_read(provider: AIProvider) -> ProviderRead:
         base_url=provider.base_url,
         image_protocol=provider.image_protocol,
         image_base_url=provider.image_base_url,
+        is_enabled=provider.is_enabled,
+        availability_time_ranges=provider.availability_time_ranges,
         api_key_masked=mask_secret(api_key_plain),
         models=[ModelRead.model_validate(m) for m in provider.models],
         image_models=[ImageModelRead.model_validate(m) for m in provider.image_models if m.deleted_at is None],
@@ -625,6 +627,8 @@ def create_provider(payload: ProviderCreate, db: Session = Depends(get_db)) -> P
         base_url=payload.base_url.rstrip("/"),
         image_protocol=payload.image_protocol,
         image_base_url=payload.image_base_url.rstrip("/") if payload.image_base_url else "",
+        is_enabled=payload.is_enabled,
+        availability_time_ranges=[item.model_dump() for item in payload.availability_time_ranges],
         api_key_encrypted=encrypt_secret(payload.api_key),
     )
     db.add(provider)
@@ -649,6 +653,10 @@ def update_provider(provider_id: int, payload: ProviderUpdate, db: Session = Dep
         provider.image_protocol = payload.image_protocol
     if payload.image_base_url is not None:
         provider.image_base_url = payload.image_base_url.rstrip("/")
+    if payload.is_enabled is not None:
+        provider.is_enabled = payload.is_enabled
+    if payload.availability_time_ranges is not None:
+        provider.availability_time_ranges = [item.model_dump() for item in payload.availability_time_ranges]
     if payload.api_key:
         provider.api_key_encrypted = encrypt_secret(payload.api_key)
 
@@ -695,6 +703,8 @@ def create_model(provider_id: int, payload: ModelCreate, db: Session = Depends(g
         max_output_tokens=payload.max_output_tokens,
         tool_result_max_tokens=payload.tool_result_max_tokens,
         is_default=payload.is_default,
+        is_enabled=payload.is_enabled,
+        availability_time_ranges=[item.model_dump() for item in payload.availability_time_ranges],
         is_multimodal=payload.is_multimodal,
         supports_disabled_thinking=payload.supports_disabled_thinking,
         default_thinking_effort=payload.default_thinking_effort,
@@ -759,6 +769,10 @@ def update_model(model_id: int, payload: ModelUpdate, db: Session = Depends(get_
         model.tool_result_max_tokens = payload.tool_result_max_tokens
     if payload.is_default is not None:
         model.is_default = payload.is_default
+    if payload.is_enabled is not None:
+        model.is_enabled = payload.is_enabled
+    if payload.availability_time_ranges is not None:
+        model.availability_time_ranges = [item.model_dump() for item in payload.availability_time_ranges]
     if payload.is_multimodal is not None:
         model.is_multimodal = payload.is_multimodal
     if payload.supports_disabled_thinking is not None:
@@ -866,6 +880,8 @@ def create_models_bulk(
             max_output_tokens=item.max_output_tokens,
             tool_result_max_tokens=item.tool_result_max_tokens,
             thinking_config=_thinking_config_for_provider(provider, item.thinking_config),
+            is_enabled=item.is_enabled,
+            availability_time_ranges=[time_range.model_dump() for time_range in item.availability_time_ranges],
             is_multimodal=item.is_multimodal,
             supports_disabled_thinking=item.supports_disabled_thinking,
             is_default=False,
@@ -905,6 +921,8 @@ def create_image_model(provider_id: int, payload: ImageModelCreate, db: Session 
         supported_aspect_ratios=list(payload.supported_aspect_ratios) or ["square", "portrait", "landscape"],
         supported_qualities=list(payload.supported_qualities) or ["auto", "low", "medium", "high"],
         is_default=payload.is_default,
+        is_enabled=payload.is_enabled,
+        availability_time_ranges=[item.model_dump() for item in payload.availability_time_ranges],
         access_mode=payload.access_mode,
         adapter_config=payload.adapter_config,
     )
@@ -936,6 +954,10 @@ def update_image_model(model_id: int, payload: ImageModelUpdate, db: Session = D
         model.supported_qualities = list(payload.supported_qualities)
     if payload.is_default is not None:
         model.is_default = payload.is_default
+    if payload.is_enabled is not None:
+        model.is_enabled = payload.is_enabled
+    if payload.availability_time_ranges is not None:
+        model.availability_time_ranges = [item.model_dump() for item in payload.availability_time_ranges]
     if payload.access_mode is not None:
         model.access_mode = payload.access_mode
     if payload.adapter_config is not None:

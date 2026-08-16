@@ -55,7 +55,7 @@ class OpenAIResponsesClientTests(unittest.TestCase):
         self.assertEqual(payload["input"][2]["type"], "function_call")
         self.assertEqual(payload["input"][3], {"type": "function_call_output", "call_id": "call_1", "output": "result"})
 
-    def test_payload_preserves_prompt_cache_breakpoint_on_text_block(self) -> None:
+    def test_payload_drops_unsupported_prompt_cache_breakpoint(self) -> None:
         payload = OpenAIResponsesClient._build_payload(
             "gpt-5.6",
             [
@@ -75,16 +75,11 @@ class OpenAIResponsesClientTests(unittest.TestCase):
             64,
             False,
             prompt_cache_key="yb-agent-v1-p4-m8-s0",
-            prompt_cache_options={"mode": "explicit", "ttl": "30m"},
         )
 
         self.assertEqual(payload["prompt_cache_key"], "yb-agent-v1-p4-m8-s0")
-        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
-        self.assertEqual(
-            payload["input"][0]["content"][0]["prompt_cache_breakpoint"],
-            {"mode": "explicit"},
-        )
-        self.assertNotIn("prompt_cache_breakpoint", payload["input"][0]["content"][1])
+        self.assertNotIn("prompt_cache_options", payload)
+        self.assertNotIn("prompt_cache_breakpoint", payload["input"][0]["content"][0])
 
     def test_chat_and_stream_parse_responses_events(self) -> None:
         requests: list[httpx.Request] = []
@@ -189,7 +184,7 @@ class OpenAIResponsesAgentTests(unittest.TestCase):
         self.assertNotIn("stream_options", payload)
         self.assertEqual(payload["reasoning"], {"effort": "medium"})
 
-    def test_explicit_prompt_cache_fields_reach_responses_payload(self) -> None:
+    def test_prompt_cache_key_reaches_responses_payload_without_breakpoints(self) -> None:
         provider = AIProvider(
             id=4,
             provider_type=ProviderType.OPENAI_RESPONSES,
@@ -214,15 +209,14 @@ class OpenAIResponsesAgentTests(unittest.TestCase):
 
         payload = chat_model._get_request_payload([HumanMessage(content="hello")])
         self.assertEqual(payload["prompt_cache_key"], "yb-agent-v1-p4-m8-s0")
-        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
+        self.assertNotIn("prompt_cache_options", payload)
 
         system = chat_agent.build_system_message(chat_model, "标题", "<p>正文</p>")
         system_payload = chat_model._get_request_payload([system])
-        static_block = system_payload["input"][0]["content"][0]
-        self.assertEqual(static_block["type"], "input_text")
-        self.assertEqual(static_block["prompt_cache_breakpoint"], {"mode": "explicit"})
+        self.assertIsInstance(system_payload["input"][0]["content"], str)
+        self.assertNotIn("prompt_cache_breakpoint", str(system_payload))
 
-    def test_explicit_prompt_cache_fields_reach_chat_completions_payload(self) -> None:
+    def test_prompt_cache_key_reaches_chat_completions_without_breakpoints(self) -> None:
         provider = AIProvider(
             id=4,
             provider_type=ProviderType.OPENAI_COMPATIBLE,
@@ -247,14 +241,13 @@ class OpenAIResponsesAgentTests(unittest.TestCase):
 
         payload = chat_model._get_request_payload([HumanMessage(content="hello")])
         self.assertEqual(payload["prompt_cache_key"], "yb-agent-v1-p4-m8-s0")
-        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
+        self.assertNotIn("prompt_cache_options", payload)
         self.assertIn("messages", payload)
 
         system = chat_agent.build_system_message(chat_model, "标题", "<p>正文</p>")
         system_payload = chat_model._get_request_payload([system])
-        static_block = system_payload["messages"][0]["content"][0]
-        self.assertEqual(static_block["type"], "text")
-        self.assertEqual(static_block["prompt_cache_breakpoint"], {"mode": "explicit"})
+        self.assertIsInstance(system_payload["messages"][0]["content"], str)
+        self.assertNotIn("prompt_cache_breakpoint", str(system_payload))
 
     def test_opted_out_model_keeps_the_existing_request_shape(self) -> None:
         provider = AIProvider(
@@ -293,6 +286,19 @@ class OpenAIResponsesAgentTests(unittest.TestCase):
             ]
         )
         self.assertEqual(chat_agent._reasoning_content(chunk), "thinking")
+
+    def test_nested_compatible_reasoning_content_is_forwarded(self) -> None:
+        chunk = AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning_content": [
+                    {"type": "reasoning", "text": "先读取文档。"},
+                    {"type": "reasoning", "content": "再调整标题层级。"},
+                ]
+            }
+        )
+
+        self.assertEqual(chat_agent._reasoning_content(chunk), "先读取文档。再调整标题层级。")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -7,6 +8,67 @@ from app.models.ai_provider import ProviderType
 
 ThinkingEffort = Literal["auto", "minimal", "low", "medium", "high", "xhigh", "max"]
 ImageProtocol = Literal["", "openai_images", "dashscope_images", "volcengine_ark_images"]
+_TIME_OF_DAY_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class AvailabilityTimeRange(BaseModel):
+    """One daily, minute-precision availability interval in China Standard Time."""
+
+    start: str
+    end: str
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if not _TIME_OF_DAY_PATTERN.fullmatch(self.start) or not _TIME_OF_DAY_PATTERN.fullmatch(self.end):
+            raise ValueError("可用时段必须使用 HH:mm 格式")
+        if self.start == self.end:
+            raise ValueError("可用时段的开始和结束时间不能相同")
+        return self
+
+
+def _time_of_day_minutes(value: str) -> int:
+    hour, minute = value.split(":", 1)
+    return int(hour) * 60 + int(minute)
+
+
+def _validate_availability_time_ranges(ranges: list[AvailabilityTimeRange]) -> None:
+    """Reject overlapping daily ranges while allowing adjoining intervals."""
+    segments: list[tuple[int, int]] = []
+    for item in ranges:
+        start = _time_of_day_minutes(item.start)
+        end = _time_of_day_minutes(item.end)
+        if start < end:
+            segments.append((start, end))
+        else:
+            segments.append((start, 24 * 60))
+            if end:
+                segments.append((0, end))
+    previous_end = -1
+    for start, end in sorted(segments):
+        if start < previous_end:
+            raise ValueError("可用时段不能重叠或重复")
+        previous_end = max(previous_end, end)
+
+
+class AvailabilityTimeRanges(BaseModel):
+    """Shared validator so every managed object accepts the same schedule shape."""
+
+    availability_time_ranges: list[AvailabilityTimeRange] = Field(default_factory=list, max_length=48)
+
+    @model_validator(mode="after")
+    def validate_ranges(self):
+        _validate_availability_time_ranges(self.availability_time_ranges)
+        return self
+
+
+class AvailabilityTimeRangesUpdate(BaseModel):
+    availability_time_ranges: list[AvailabilityTimeRange] | None = Field(default=None, max_length=48)
+
+    @model_validator(mode="after")
+    def validate_ranges(self):
+        if self.availability_time_ranges is not None:
+            _validate_availability_time_ranges(self.availability_time_ranges)
+        return self
 
 
 def _validate_token_budget(
@@ -21,7 +83,7 @@ def _validate_token_budget(
         raise ValueError("单次工具返回 token 上限不能超过压缩阈值")
 
 
-class ModelRead(BaseModel):
+class ModelRead(AvailabilityTimeRanges):
     id: int
     provider_id: int
     provider_name: str
@@ -33,6 +95,7 @@ class ModelRead(BaseModel):
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     is_default: bool
+    is_enabled: bool = True
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True
     default_thinking_effort: ThinkingEffort = "auto"
@@ -46,7 +109,7 @@ class ModelRead(BaseModel):
         from_attributes = True
 
 
-class ModelCreate(BaseModel):
+class ModelCreate(AvailabilityTimeRanges):
     model_name: str = Field(min_length=1, max_length=256)
     display_name: str = Field(min_length=1, max_length=256)
     description: str = Field(default="", max_length=1024)
@@ -55,6 +118,7 @@ class ModelCreate(BaseModel):
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     is_default: bool = False
+    is_enabled: bool = True
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True
     default_thinking_effort: ThinkingEffort = "auto"
@@ -72,7 +136,7 @@ class ModelCreate(BaseModel):
         return self
 
 
-class ModelUpdate(BaseModel):
+class ModelUpdate(AvailabilityTimeRangesUpdate):
     display_name: str | None = Field(default=None, min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=1024)
     context_window_tokens: int | None = Field(default=None, ge=8192, le=2_000_000)
@@ -80,6 +144,7 @@ class ModelUpdate(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=128, le=1_000_000)
     tool_result_max_tokens: int | None = Field(default=None, ge=128, le=1_000_000)
     is_default: bool | None = None
+    is_enabled: bool | None = None
     is_multimodal: bool | None = None
     supports_disabled_thinking: bool | None = None
     default_thinking_effort: ThinkingEffort | None = None
@@ -90,7 +155,7 @@ class ModelUpdate(BaseModel):
     allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
 
 
-class ImageModelRead(BaseModel):
+class ImageModelRead(AvailabilityTimeRanges):
     id: int
     provider_id: int
     model_name: str
@@ -99,6 +164,7 @@ class ImageModelRead(BaseModel):
     supported_aspect_ratios: list[str] = Field(default_factory=list)
     supported_qualities: list[str] = Field(default_factory=list)
     is_default: bool
+    is_enabled: bool = True
     access_mode: Literal["all", "restricted"] = "all"
     allowed_user_ids: list[int] = Field(default_factory=list)
     allowed_group_ids: list[int] = Field(default_factory=list)
@@ -109,58 +175,63 @@ class ImageModelRead(BaseModel):
         from_attributes = True
 
 
-class ImageModelCreate(BaseModel):
+class ImageModelCreate(AvailabilityTimeRanges):
     model_name: str = Field(min_length=1, max_length=256)
     display_name: str = Field(min_length=1, max_length=256)
     description: str = Field(default="", max_length=1024)
     supported_aspect_ratios: list[Literal["square", "portrait", "landscape"]] = Field(default_factory=list)
     supported_qualities: list[str] = Field(default_factory=list, max_length=12)
     is_default: bool = False
+    is_enabled: bool = True
     access_mode: Literal["all", "restricted"] = "all"
     allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
     allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
     adapter_config: dict[str, Any] = Field(default_factory=dict)
 
 
-class ImageModelUpdate(BaseModel):
+class ImageModelUpdate(AvailabilityTimeRangesUpdate):
     display_name: str | None = Field(default=None, min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=1024)
     supported_aspect_ratios: list[Literal["square", "portrait", "landscape"]] | None = None
     supported_qualities: list[str] | None = Field(default=None, max_length=12)
     is_default: bool | None = None
+    is_enabled: bool | None = None
     access_mode: Literal["all", "restricted"] | None = None
     allowed_user_ids: list[int] | None = Field(default=None, max_length=500)
     allowed_group_ids: list[int] | None = Field(default=None, max_length=500)
     adapter_config: dict[str, Any] | None = None
 
 
-class ProviderRead(BaseModel):
+class ProviderRead(AvailabilityTimeRanges):
     id: int
     name: str
     provider_type: ProviderType
     base_url: str
     image_protocol: ImageProtocol = ""
     image_base_url: str = ""
+    is_enabled: bool = True
     api_key_masked: str
     models: list[ModelRead] = []
     image_models: list[ImageModelRead] = []
 
 
-class ProviderCreate(BaseModel):
+class ProviderCreate(AvailabilityTimeRanges):
     name: str = Field(min_length=1, max_length=128)
     provider_type: ProviderType
     base_url: str = Field(min_length=1, max_length=512)
     image_protocol: ImageProtocol = ""
     image_base_url: str = Field(default="", max_length=512)
+    is_enabled: bool = True
     api_key: str = Field(min_length=1)
 
 
-class ProviderUpdate(BaseModel):
+class ProviderUpdate(AvailabilityTimeRangesUpdate):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     provider_type: ProviderType | None = None
     base_url: str | None = Field(default=None, min_length=1, max_length=512)
     image_protocol: ImageProtocol | None = None
     image_base_url: str | None = Field(default=None, max_length=512)
+    is_enabled: bool | None = None
     api_key: str | None = None  # 留空表示不修改现有密钥
 
 
@@ -203,7 +274,7 @@ class PresetDiscoveryRequest(BaseModel):
     provider_type: ProviderType | None = None
 
 
-class ModelBulkCreateItem(BaseModel):
+class ModelBulkCreateItem(AvailabilityTimeRanges):
     model_name: str = Field(min_length=1, max_length=256)
     display_name: str = Field(min_length=1, max_length=256)
     description: str = Field(default="", max_length=1024)
@@ -211,6 +282,7 @@ class ModelBulkCreateItem(BaseModel):
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
+    is_enabled: bool = True
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True
     thinking_config: dict[str, Any] = Field(default_factory=dict)

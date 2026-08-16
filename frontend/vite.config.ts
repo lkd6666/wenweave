@@ -1,9 +1,33 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { readFileSync } from 'node:fs'
+
+interface LayoutCaptureDownloadMetadata {
+  file_name?: unknown
+}
+
+function layoutCaptureExtensionDownloadUrl() {
+  try {
+    const metadata = JSON.parse(readFileSync(
+      new URL('./public/downloads/layout-capture-extension.json', import.meta.url),
+      'utf8',
+    )) as LayoutCaptureDownloadMetadata
+    if (typeof metadata.file_name === 'string'
+      && /^layout-capture-extension-[0-9]+(?:\.[0-9]+){0,3}\.zip$/.test(metadata.file_name)) {
+      return `/downloads/${metadata.file_name}`
+    }
+  } catch {
+    // The extension build runs before production Vite builds; development can use the stable fallback.
+  }
+  return '/downloads/layout-capture-extension.zip'
+}
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  define: {
+    __LAYOUT_CAPTURE_EXTENSION_DOWNLOAD_URL__: JSON.stringify(layoutCaptureExtensionDownloadUrl()),
+  },
   server: {
     port: 5173,
     proxy: {

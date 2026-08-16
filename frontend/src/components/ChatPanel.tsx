@@ -73,6 +73,9 @@ export interface ChatRunNotice {
   detail: string
   attempt?: number
   maxAttempts?: number
+  /** The retry wait window, anchored to the event's server-side timestamp. */
+  retryDelaySeconds?: number
+  retryStartedAtMs?: number
 }
 
 export interface ReaskConflictNotice {
@@ -508,17 +511,47 @@ export default function ChatPanel({
   const [hiddenHistoryOpen, setHiddenHistoryOpen] = useState(false)
   const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false)
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null)
-  const [editingQueuedContent, setEditingQueuedContent] = useState('')
   const [draggedQueuedMessageId, setDraggedQueuedMessageId] = useState<string | null>(null)
   const [queuedDropTargetId, setQueuedDropTargetId] = useState<string | null>(null)
   const composerRef = useRef<PromptComposerHandle>(null)
+  const queuedEditPreviousDraftRef = useRef<string | null>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
+  const messageListContentElementRef = useRef<HTMLDivElement | null>(null)
+  const autoFollowSuspensionsRef = useRef(new Set<number>())
+  const autoFollowSuspensionIdRef = useRef(0)
   const {
     scrollRef: messageListRef,
     contentRef: messageListContentRef,
     scrollToBottom,
+    stopScroll,
     isAtBottom,
+    state: stickToBottomState,
   } = useStickToBottom({ initial: 'instant', resize: 'instant' })
+  const setMessageListContentElement = useCallback((element: HTMLDivElement | null) => {
+    messageListContentElementRef.current = element
+    messageListContentRef(element)
+  }, [messageListContentRef])
+  const suspendChatAutoFollow = useCallback(() => {
+    const suspensionId = ++autoFollowSuspensionIdRef.current
+    autoFollowSuspensionsRef.current.add(suspensionId)
+    stopScroll()
+    stickToBottomState.resizeObserver?.disconnect()
+    return suspensionId
+  }, [stickToBottomState, stopScroll])
+  const resumeChatAutoFollow = useCallback((suspensionId: number | null) => {
+    if (suspensionId === null) return
+    const removed = autoFollowSuspensionsRef.current.delete(suspensionId)
+    if (removed && autoFollowSuspensionsRef.current.size === 0 && messageListContentElementRef.current) {
+      messageListContentRef(messageListContentElementRef.current)
+    }
+  }, [messageListContentRef])
+  const resumeAllChatAutoFollow = useCallback(() => {
+    const hadSuspensions = autoFollowSuspensionsRef.current.size > 0
+    autoFollowSuspensionsRef.current.clear()
+    if (hadSuspensions && messageListContentElementRef.current) {
+      messageListContentRef(messageListContentElementRef.current)
+    }
+  }, [messageListContentRef])
 
   const handleSend = () => {
     const composerPayload = composerRef.current?.getPayload() ?? {
@@ -529,6 +562,10 @@ export default function ChatPanel({
     const payload = {
       ...composerPayload,
       references: resolveOutgoingReferences(composerPayload.references, selectedElements),
+    }
+    if (editingQueuedMessageId) {
+      saveQueuedMessageEdit()
+      return
     }
     const text = payload.message || (payload.references.length > 0
       ? '请处理所附元素。'
@@ -547,6 +584,7 @@ export default function ChatPanel({
       return
     }
     onSend(text, payload.references, imageAttachments)
+    resumeAllChatAutoFollow()
     void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
   }
 
@@ -560,24 +598,32 @@ export default function ChatPanel({
   }, [onContextDraftChange, onEditRequest])
 
   const beginQueuedMessageEdit = (queuedMessage: QueuedChatMessage) => {
+    queuedEditPreviousDraftRef.current = composerDraft
     setEditingQueuedMessageId(queuedMessage.id)
-    setEditingQueuedContent(queuedMessage.content)
+    onContextDraftChange(queuedMessage.content)
+    window.requestAnimationFrame(() => composerRef.current?.focus())
+  }
+
+  const finishQueuedMessageEdit = (restorePreviousDraft: boolean) => {
+    const previousDraft = queuedEditPreviousDraftRef.current
+    queuedEditPreviousDraftRef.current = null
+    setEditingQueuedMessageId(null)
+    if (restorePreviousDraft && previousDraft !== null) onContextDraftChange(previousDraft)
   }
 
   const cancelQueuedMessageEdit = () => {
-    setEditingQueuedMessageId(null)
-    setEditingQueuedContent('')
+    finishQueuedMessageEdit(true)
   }
 
   const saveQueuedMessageEdit = () => {
     if (!editingQueuedMessageId) return
-    const content = editingQueuedContent.trim()
+    const content = composerDraft.trim()
     if (!content) {
       message.warning('待处理内容不能为空')
       return
     }
     onUpdateQueuedMessage(editingQueuedMessageId, content)
-    cancelQueuedMessageEdit()
+    finishQueuedMessageEdit(true)
   }
 
   const moveQueuedMessage = (fromIndex: number, toIndex: number) => {
@@ -602,13 +648,15 @@ export default function ChatPanel({
   const conversationControlsDisabled = streaming || stopping || submitting || Boolean(pendingUserQuestion)
   const composerDisabled = stopping || submitting || Boolean(pendingUserQuestion)
   const canSend = Boolean(
-    modelId
-    && activeChatSession
+    activeChatSession
     && !activeChatSession.is_archived
-    && (!contextCannotFit || streaming)
     && !imageUploading
     && !submitting
-    && (composerDraft.trim() || selectedElements.length > 0 || imageAttachments.length > 0 || composerTemplates.length > 0),
+    && (editingQueuedMessageId
+      ? composerDraft.trim()
+      : modelId
+        && (!contextCannotFit || streaming)
+        && (composerDraft.trim() || selectedElements.length > 0 || imageAttachments.length > 0 || composerTemplates.length > 0)),
   )
   const effortConfig = selectedModel?.thinking_config?.efforts
   const effortOptions = effortConfig && typeof effortConfig === 'object' && !Array.isArray(effortConfig)
@@ -767,8 +815,15 @@ export default function ChatPanel({
       ]
 
   useLayoutEffect(() => {
+    resumeAllChatAutoFollow()
     void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
-  }, [activeChatSession?.id, scrollToBottom])
+  }, [activeChatSession?.id, resumeAllChatAutoFollow, scrollToBottom])
+
+  useLayoutEffect(() => {
+    if (!streaming) return
+    resumeAllChatAutoFollow()
+    void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
+  }, [resumeAllChatAutoFollow, scrollToBottom, streaming])
 
   return (
     <>
@@ -958,7 +1013,7 @@ export default function ChatPanel({
 
       <div className="chat-messages-shell">
         <div className="chat-messages" ref={messageListRef}>
-          <div className="chat-messages-content" ref={messageListContentRef}>
+          <div className="chat-messages-content" ref={setMessageListContentElement}>
         {messages.length === 0 && !streaming && (
           <div className="chat-empty">
             <Text strong>开始排版对话</Text>
@@ -980,6 +1035,8 @@ export default function ChatPanel({
             currentUserId={currentUserId}
             editingDisabled={streaming}
             onEditRequest={handleEditRequest}
+            suspendChatAutoFollow={suspendChatAutoFollow}
+            resumeChatAutoFollow={resumeChatAutoFollow}
           />
         ))}
 
@@ -1009,6 +1066,9 @@ export default function ChatPanel({
                   fallbackTrace={reasoningTrace}
                   fallbackTools={toolActivities}
                   streaming
+                  suspendChatAutoFollow={suspendChatAutoFollow}
+                  resumeChatAutoFollow={resumeChatAutoFollow}
+                  archiveScrollAnchorEnabled={false}
                 />
                 {streaming && runtimeContextCompacting ? (
                   <div className="chat-context-compacting" role="status" aria-live="polite">
@@ -1044,7 +1104,7 @@ export default function ChatPanel({
                 const isDropTarget = queuedDropTargetId === queuedMessage.id && !isDragging
                 return (
                   <article
-                    className={`chat-queue-item${isDragging ? ' is-dragging' : ''}${isDropTarget ? ' is-drop-target' : ''}`}
+                    className={`chat-queue-item${isDragging ? ' is-dragging' : ''}${isDropTarget ? ' is-drop-target' : ''}${isEditing ? ' is-editing' : ''}`}
                     key={queuedMessage.id}
                     role="listitem"
                     onDragOver={(event) => {
@@ -1095,40 +1155,14 @@ export default function ChatPanel({
                             </Image.PreviewGroup>
                           </div>
                         )}
-                        {isEditing ? (
-                          <Input.TextArea
-                            aria-label={`编辑待处理任务 ${index + 1}`}
-                            autoFocus
-                            autoSize={{ minRows: 2, maxRows: 6 }}
-                            className="chat-queue-editor"
-                            value={editingQueuedContent}
-                            onChange={(event) => setEditingQueuedContent(event.target.value)}
-                            onKeyDown={(event) => {
-                              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                                event.preventDefault()
-                                saveQueuedMessageEdit()
-                              }
-                              if (event.key === 'Escape') {
-                                event.preventDefault()
-                                cancelQueuedMessageEdit()
-                              }
-                            }}
-                          />
-                        ) : (
-                          <div className="chat-queue-message">{queuedMessage.content}</div>
-                        )}
+                        <div className="chat-queue-message">{queuedMessage.content}</div>
                       </div>
                     </div>
                     <div className="chat-queue-actions">
                       {isEditing ? (
-                        <>
-                          <Tooltip title="保存待处理内容">
-                            <Button aria-label="保存待处理内容" type="text" size="small" icon={<CheckOutlined />} onClick={saveQueuedMessageEdit} />
-                          </Tooltip>
-                          <Tooltip title="取消编辑">
-                            <Button aria-label="取消编辑" type="text" size="small" icon={<CloseOutlined />} onClick={cancelQueuedMessageEdit} />
-                          </Tooltip>
-                        </>
+                        <Tooltip title="取消编辑">
+                          <Button aria-label="取消编辑" type="text" size="small" icon={<CloseOutlined />} onClick={cancelQueuedMessageEdit} />
+                        </Tooltip>
                       ) : (
                         <>
                           {queuedMessages.length > 1 && (
@@ -1142,7 +1176,7 @@ export default function ChatPanel({
                             </Tooltip>
                           )}
                           <Tooltip title="编辑待处理内容">
-                            <Button aria-label="编辑待处理内容" type="text" size="small" icon={<EditOutlined />} disabled={stopping} onClick={() => beginQueuedMessageEdit(queuedMessage)} />
+                            <Button aria-label="编辑待处理内容" type="text" size="small" icon={<EditOutlined />} disabled={stopping || Boolean(editingQueuedMessageId)} onClick={() => beginQueuedMessageEdit(queuedMessage)} />
                           </Tooltip>
                           <Tooltip title="取消待处理要求">
                             <Button aria-label="取消待处理要求" type="text" size="small" icon={<CloseOutlined />} disabled={stopping} onClick={() => onRemoveQueuedMessage(queuedMessage.id)} />
@@ -1166,6 +1200,7 @@ export default function ChatPanel({
               shape="circle"
               icon={<ArrowDownOutlined />}
               onClick={() => {
+                resumeAllChatAutoFollow()
                 void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
               }}
             />
@@ -1173,7 +1208,7 @@ export default function ChatPanel({
         )}
       </div>
 
-      <div className="chat-input-area">
+      <div className={`chat-input-area${pendingUserQuestion ? ' has-user-question' : ''}`}>
         <div className="chat-composer-shell">
           {pendingUserQuestion ? (
             <UserQuestionPanel
@@ -1219,6 +1254,14 @@ export default function ChatPanel({
               <span>正在上传图片</span>
             </div>
           )}
+          {editingQueuedMessageId && (
+            <div className="chat-queue-composer-status">
+              <span>正在编辑待处理任务</span>
+              <Tooltip title="取消编辑">
+                <Button aria-label="取消编辑" type="text" size="small" icon={<CloseOutlined />} onClick={cancelQueuedMessageEdit} />
+              </Tooltip>
+            </div>
+          )}
           <PromptComposer
             ref={composerRef}
             value={composerDraft}
@@ -1254,7 +1297,7 @@ export default function ChatPanel({
                   />
                 </Tooltip>
               )}
-              <Text type="secondary">Enter 发送，Shift+Enter 换行</Text>
+              <Text type="secondary">{editingQueuedMessageId ? 'Enter 保存，Shift+Enter 换行' : 'Enter 发送，Shift+Enter 换行'}</Text>
             </div>
             <div className="chat-input-actions-submit">
               {chatSettingsTrigger}
@@ -1264,8 +1307,14 @@ export default function ChatPanel({
                   <Button aria-label="停止生成" danger icon={<StopOutlined />} loading={stopping} disabled={stopping} onClick={onStop} />
                 </Tooltip>
               )}
-              <Tooltip title={streaming ? '加入待处理队列' : '发送'}>
-                <Button aria-label={streaming ? '加入待处理队列' : '发送'} type="primary" icon={<SendOutlined />} disabled={!canSend} onClick={handleSend} />
+              <Tooltip title={editingQueuedMessageId ? '保存队列修改' : streaming ? '加入待处理队列' : '发送'}>
+                <Button
+                  aria-label={editingQueuedMessageId ? '保存队列修改' : streaming ? '加入待处理队列' : '发送'}
+                  type="primary"
+                  icon={editingQueuedMessageId ? <CheckOutlined /> : <SendOutlined />}
+                  disabled={!canSend}
+                  onClick={handleSend}
+                />
               </Tooltip>
             </div>
           </div>
@@ -1363,11 +1412,15 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
   currentUserId,
   editingDisabled,
   onEditRequest,
+  suspendChatAutoFollow,
+  resumeChatAutoFollow,
 }: {
   messageItem: ChatMessageItem
   currentUserId: number | undefined
   editingDisabled: boolean
   onEditRequest: (message: ChatMessageItem) => void
+  suspendChatAutoFollow: () => number
+  resumeChatAutoFollow: (suspensionId: number | null) => void
 }) {
   return (
     <article className={`chat-turn chat-turn-${messageItem.role}`}>
@@ -1380,6 +1433,9 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
               fallbackTrace={messageItem.reasoning_trace}
               fallbackTools={messageItem.tool_calls}
               streaming={false}
+              suspendChatAutoFollow={suspendChatAutoFollow}
+              resumeChatAutoFollow={resumeChatAutoFollow}
+              archiveScrollAnchorEnabled={!editingDisabled}
             />
           ) : (
             <div className="chat-turn-content">
@@ -1542,14 +1598,39 @@ function isTaskPlanTool(tool: ToolExecution | null | undefined): tool is ToolExe
 
 function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
   const [detailExpanded, setDetailExpanded] = useState(false)
+  const [retryRemainingSeconds, setRetryRemainingSeconds] = useState<number | null>(null)
   const retryLabel = notice.kind === 'retrying' && notice.attempt && notice.maxAttempts
     ? `第 ${notice.attempt}/${notice.maxAttempts} 次`
     : ''
   const detail = notice.detail.trim()
-  const collapsible = detail.length > 220
+
+  useEffect(() => {
+    if (
+      notice.kind !== 'retrying'
+      || typeof notice.retryDelaySeconds !== 'number'
+      || typeof notice.retryStartedAtMs !== 'number'
+    ) {
+      setRetryRemainingSeconds(null)
+      return undefined
+    }
+    const deadline = notice.retryStartedAtMs + Math.max(0, notice.retryDelaySeconds) * 1000
+    const update = () => {
+      const remaining = Math.max(0, deadline - Date.now()) / 1000
+      setRetryRemainingSeconds(Math.ceil(remaining * 100) / 100)
+    }
+    update()
+    const timer = window.setInterval(update, 100)
+    return () => window.clearInterval(timer)
+  }, [notice.kind, notice.retryDelaySeconds, notice.retryStartedAtMs])
+
+  const formattedRetryRemaining = retryRemainingSeconds === null
+    ? ''
+    : `${retryRemainingSeconds.toFixed(2).replace(/\.?(0+)$/, '')} 秒后重试${notice.attempt && notice.maxAttempts ? `（剩余 ${Math.max(0, notice.maxAttempts - notice.attempt)} 次）` : ''}`
+  const fullDetail = formattedRetryRemaining ? `${detail}；${formattedRetryRemaining}。` : detail
+  const collapsible = fullDetail.length > 220
   const displayedDetail = collapsible && !detailExpanded
-    ? `${detail.slice(0, 220).trimEnd()}…`
-    : detail
+    ? `${fullDetail.slice(0, 220).trimEnd()}…`
+    : fullDetail
 
   useEffect(() => {
     setDetailExpanded(false)
@@ -1684,12 +1765,18 @@ function AssistantTurnTimeline({
   fallbackTrace,
   fallbackTools,
   streaming,
+  suspendChatAutoFollow,
+  resumeChatAutoFollow,
+  archiveScrollAnchorEnabled,
 }: {
   blocks: AssistantTurnBlock[]
   fallbackContent: string
   fallbackTrace: ReasoningTrace
   fallbackTools: ToolExecution[]
   streaming: boolean
+  suspendChatAutoFollow: () => number
+  resumeChatAutoFollow: (suspensionId: number | null) => void
+  archiveScrollAnchorEnabled: boolean
 }) {
   const normalisedBlocks = normaliseAssistantTurnBlocks(blocks)
   const hasStructuredContent = normalisedBlocks.some((block) => block.type === 'content' && block.content.trim())
@@ -1701,19 +1788,20 @@ function AssistantTurnTimeline({
   // The model may attempt a second ask_user call immediately after a timeout.
   // It receives a recoverable ToolMessage, but that rejected retry is not a
   // new user interaction and should not pollute the visible timeline.
-  const timelineBlocks = rawTimelineBlocks.filter((block) => (
-    block.type !== 'tool'
-    || (
-      block.tool?.activity?.details?.reason !== 'user_question_timed_out'
-      && !isTaskPlanTool(block.tool)
-    )
-  ))
+  const timelineBlocks = visibleAssistantTurnBlocks(mergeFallbackThoughtBlocks(rawTimelineBlocks, fallbackTrace))
   const displayBlocks = streaming ? timelineBlocks : settleHistoricalTimeline(timelineBlocks)
   const recoveredAfterRestart = !streaming && fallbackContent.includes('服务已重启，未完成的 Agent 已停止')
   const [archiveExpanded, setArchiveExpanded] = useState(recoveredAfterRestart)
   const timelineRef = useRef<HTMLDivElement>(null)
+  const archiveAnchorRef = useRef<{ scrollTop: number } | null>(null)
+  const archiveAutoFollowSuspensionRef = useRef<number | null>(null)
   const processFollowRef = useRef(new WeakMap<HTMLElement, boolean>())
   const processLastScrollTopRef = useRef(new WeakMap<HTMLElement, number>())
+
+  useEffect(() => () => {
+    resumeChatAutoFollow(archiveAutoFollowSuspensionRef.current)
+    archiveAutoFollowSuspensionRef.current = null
+  }, [resumeChatAutoFollow])
 
   // History is always terminal. Older records may have been persisted before
   // their last tool-result event reached the server, but must never render as
@@ -1781,6 +1869,82 @@ function AssistantTurnTimeline({
     scheduleProcessScroll()
   }, [isStreamingProcess, scheduleProcessScroll])
 
+  const handleArchiveChange = useCallback((keys: string | string[]) => {
+    const nextExpanded = (Array.isArray(keys) ? keys : [keys]).includes('process')
+    const timeline = timelineRef.current
+    const scrollContainer = timeline?.closest<HTMLElement>('.chat-messages')
+    archiveAnchorRef.current = null
+    if (archiveAutoFollowSuspensionRef.current !== null) {
+      resumeChatAutoFollow(archiveAutoFollowSuspensionRef.current)
+      archiveAutoFollowSuspensionRef.current = null
+    }
+    if (nextExpanded && archiveScrollAnchorEnabled && timeline && scrollContainer) {
+      const distanceFromBottom = scrollContainer.scrollHeight
+        - scrollContainer.scrollTop
+        - scrollContainer.clientHeight
+      // Historical disclosure layout changes must not be interpreted as live
+      // output. Suspend the main content observer until this motion settles.
+      archiveAutoFollowSuspensionRef.current = suspendChatAutoFollow()
+      if (distanceFromBottom <= 4) {
+        archiveAnchorRef.current = { scrollTop: scrollContainer.scrollTop }
+      }
+    }
+    setArchiveExpanded(nextExpanded)
+  }, [archiveScrollAnchorEnabled, resumeChatAutoFollow, suspendChatAutoFollow])
+
+  useLayoutEffect(() => {
+    if (!archiveExpanded || !archiveScrollAnchorEnabled) return
+    const anchor = archiveAnchorRef.current
+    const timeline = timelineRef.current
+    const scrollContainer = timeline?.closest<HTMLElement>('.chat-messages')
+    if (archiveAutoFollowSuspensionRef.current === null || !timeline || !scrollContainer) return
+
+    let frame = 0
+    let settleTimer = 0
+    let active = true
+    let observer: ResizeObserver | null = null
+    const restore = () => {
+      if (!active || !anchor) return
+      const timeline = timelineRef.current
+      const scrollContainer = timeline?.closest<HTMLElement>('.chat-messages')
+      if (!timeline || !scrollContainer) return
+      // Keep the viewport at the exact position it had before the historical
+      // card opened. The stick-to-bottom observer otherwise follows the new
+      // content height and makes the card appear to expand upward.
+      const computedBehavior = window.getComputedStyle(scrollContainer).scrollBehavior
+      if (computedBehavior !== 'auto') scrollContainer.style.scrollBehavior = 'auto'
+      scrollContainer.scrollTop = anchor.scrollTop
+      if (computedBehavior !== 'auto') scrollContainer.style.scrollBehavior = computedBehavior
+    }
+    const release = () => {
+      if (!active) return
+      active = false
+      observer?.disconnect()
+    }
+    const keepAnchor = () => {
+      restore()
+      window.clearTimeout(settleTimer)
+      // Ant Design animates the panel height. Wait until those layout changes
+      // have settled before restoring normal automatic chat following.
+      settleTimer = window.setTimeout(release, 420)
+    }
+
+    observer = new ResizeObserver(keepAnchor)
+    observer.observe(timeline)
+    scrollContainer.addEventListener('touchstart', release, { passive: true })
+    scrollContainer.addEventListener('wheel', release, { passive: true })
+    scrollContainer.addEventListener('pointerdown', release, { passive: true })
+    frame = window.requestAnimationFrame(keepAnchor)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.clearTimeout(settleTimer)
+      scrollContainer.removeEventListener('touchstart', release)
+      scrollContainer.removeEventListener('wheel', release)
+      scrollContainer.removeEventListener('pointerdown', release)
+      release()
+    }
+  }, [archiveExpanded, archiveScrollAnchorEnabled])
+
   if (timelineBlocks.length === 0) return null
 
   if (isStreamingProcess) {
@@ -1793,6 +1957,9 @@ function AssistantTurnTimeline({
             streaming
             connectsToNext={hasFollowingProcessBlock(displayBlocks, index)}
             onProcessScroll={handleProcessScroll}
+            suspendChatAutoFollow={suspendChatAutoFollow}
+            resumeChatAutoFollow={resumeChatAutoFollow}
+            autoFollowSuspensionEnabled={false}
           />
         ))}
       </div>
@@ -1807,7 +1974,7 @@ function AssistantTurnTimeline({
           size="small"
           expandIconPlacement="end"
           activeKey={archiveExpanded ? ['process'] : []}
-          onChange={(keys) => setArchiveExpanded((Array.isArray(keys) ? keys : [keys]).includes('process'))}
+          onChange={handleArchiveChange}
           items={[
             {
               key: 'process',
@@ -1822,6 +1989,9 @@ function AssistantTurnTimeline({
                         archived
                         connectsToNext={hasFollowingProcessBlock(archiveBlocks, index)}
                         onProcessScroll={handleProcessScroll}
+                        suspendChatAutoFollow={suspendChatAutoFollow}
+                        resumeChatAutoFollow={resumeChatAutoFollow}
+                        autoFollowSuspensionEnabled={archiveScrollAnchorEnabled}
                       />
                     ))}
                   </div>
@@ -1848,6 +2018,43 @@ export function normaliseAssistantTurnBlocks(blocks: AssistantTurnBlock[]): Assi
         : String(block.content)
     return content === block.content ? block : { ...block, content }
   })
+}
+
+export function visibleAssistantTurnBlocks(blocks: AssistantTurnBlock[]): AssistantTurnBlock[] {
+  // A timed-out duplicate ask_user attempt is an internal retry detail. Task
+  // plan updates are deliberate model actions and must stay visible alongside
+  // the current plan panel above the conversation.
+  return blocks.filter((block) => (
+    block.type !== 'tool' || block.tool?.activity?.details?.reason !== 'user_question_timed_out'
+  ))
+}
+
+export function mergeFallbackThoughtBlocks(
+  blocks: AssistantTurnBlock[],
+  fallbackTrace: ReasoningTrace,
+): AssistantTurnBlock[] {
+  const fallbackContent = fallbackTrace.content.trim()
+  if (!fallbackContent || blocks.some((block) => block.type === 'thought' && block.content.trim())) return blocks
+
+  const emptyThoughtIndex = blocks.findIndex((block) => block.type === 'thought' && !block.content.trim())
+  if (emptyThoughtIndex >= 0) {
+    return blocks.map((block, index) => index === emptyThoughtIndex
+      ? { ...block, content: fallbackContent, state: fallbackTrace.status === 'thinking' ? 'active' : 'done' }
+      : block,
+    )
+  }
+
+  return [
+    {
+      id: 'legacy-reasoning-trace',
+      type: 'thought',
+      state: fallbackTrace.status === 'thinking' ? 'active' : 'done',
+      content: fallbackContent,
+      duration_ms: null,
+      tool: null,
+    },
+    ...blocks,
+  ]
 }
 
 function findLastTimelineContentIndex(blocks: AssistantTurnBlock[]): number {
@@ -1904,12 +2111,18 @@ const AssistantTimelineBlock = memo(function AssistantTimelineBlock({
   streaming = false,
   connectsToNext = false,
   onProcessScroll,
+  suspendChatAutoFollow,
+  resumeChatAutoFollow,
+  autoFollowSuspensionEnabled,
 }: {
   block: AssistantTurnBlock
   archived?: boolean
   streaming?: boolean
   connectsToNext?: boolean
   onProcessScroll: (event: UIEvent<HTMLDivElement>) => void
+  suspendChatAutoFollow: () => number
+  resumeChatAutoFollow: (suspensionId: number | null) => void
+  autoFollowSuspensionEnabled: boolean
 }) {
   if (block.type === 'thought') {
     const trace: ReasoningTrace = {
@@ -1937,7 +2150,13 @@ const AssistantTimelineBlock = memo(function AssistantTimelineBlock({
       <div className={`assistant-process-entry assistant-action-entry assistant-process-tool is-${block.tool.status}${connectsToNext ? ' has-next-process' : ''}${archived ? ' is-archived' : ''}`}>
         <div className="assistant-process-rail" aria-hidden="true"><i className="assistant-process-dot" /></div>
         <div className="assistant-process-main">
-          <ToolTrace tool={block.tool} onProcessScroll={onProcessScroll} />
+          <ToolTrace
+            tool={block.tool}
+            onProcessScroll={onProcessScroll}
+            suspendChatAutoFollow={suspendChatAutoFollow}
+            resumeChatAutoFollow={resumeChatAutoFollow}
+            autoFollowSuspensionEnabled={autoFollowSuspensionEnabled}
+          />
         </div>
       </div>
     )
@@ -2038,12 +2257,28 @@ function ToolArgumentTokenCount({ value }: { value: number }) {
 function ToolTrace({
   tool,
   onProcessScroll,
+  suspendChatAutoFollow,
+  resumeChatAutoFollow,
+  autoFollowSuspensionEnabled,
 }: {
   tool: ToolExecution
   onProcessScroll: (event: UIEvent<HTMLDivElement>) => void
+  suspendChatAutoFollow: () => number
+  resumeChatAutoFollow: (suspensionId: number | null) => void
+  autoFollowSuspensionEnabled: boolean
 }) {
   const [expanded, setExpanded] = useState(tool.status === 'running')
   const previousStatus = useRef(tool.status)
+  const expansionSuspensionRef = useRef<number | null>(null)
+  const expansionSuspensionTimerRef = useRef(0)
+
+  const releaseExpansionSuspension = useCallback(() => {
+    window.clearTimeout(expansionSuspensionTimerRef.current)
+    resumeChatAutoFollow(expansionSuspensionRef.current)
+    expansionSuspensionRef.current = null
+  }, [resumeChatAutoFollow])
+
+  useEffect(() => releaseExpansionSuspension, [releaseExpansionSuspension])
 
   useEffect(() => {
     if (tool.status === 'running') {
@@ -2072,6 +2307,7 @@ function ToolTrace({
   const status = toolStatusSummary(tool)
   const isRunning = tool.status === 'running'
   const activity = tool.activity
+  const htmlValidation = toolHtmlValidation(tool)
   const detailResult = toolDetailResult(tool)
   const generatedImages = generatedImagePreviews(tool)
   const statusTone = status.tone
@@ -2092,6 +2328,15 @@ function ToolTrace({
   const searchSources = generatedImages
     .filter((image) => image.kind === 'search')
     .map((image) => ({ label: image.title || image.label, href: image.sourcePageUrl || undefined }))
+  const handleToggle = () => {
+    const nextExpanded = !expanded
+    releaseExpansionSuspension()
+    if (nextExpanded && autoFollowSuspensionEnabled) {
+      expansionSuspensionRef.current = suspendChatAutoFollow()
+      expansionSuspensionTimerRef.current = window.setTimeout(releaseExpansionSuspension, 420)
+    }
+    setExpanded(nextExpanded)
+  }
 
   return (
     <AiToolCall
@@ -2101,7 +2346,7 @@ function ToolTrace({
       summary={summary}
       status={mappedStatus}
       expanded={expanded}
-      onToggle={() => setExpanded((value) => !value)}
+      onToggle={handleToggle}
       statusDetail={<span className={`aicss-tool-call-status is-${statusTone}`}>{argumentTokens !== null ? <ToolArgumentTokenCount value={argumentTokens} /> : status.label}</span>}
     >
       <div className={`tool-trace-detail${isRunning ? ' is-live' : ''}`} onScroll={onProcessScroll}>
@@ -2116,8 +2361,11 @@ function ToolTrace({
               </div>
             )}
             {generatedImages.length > 0 && <GeneratedImagePreviews images={generatedImages} />}
-            {activity?.html_validation?.valid === false && activity.html_validation.errors?.length ? (
-              <div className="tool-trace-result">{activity.html_validation.errors.join('；')}</div>
+            {htmlValidation?.valid === false && htmlValidation.errors?.length ? (
+              <div className="tool-trace-result">{htmlValidation.errors.join('；')}</div>
+            ) : null}
+            {htmlValidation?.warnings?.length ? (
+              <div className="tool-trace-summary">HTML5 兼容提示：{htmlValidation.warnings.join('；')}</div>
             ) : null}
             {toolErrorMetadata(tool) && <div className="tool-trace-summary">{toolErrorMetadata(tool)}</div>}
             {tool.read_range && !activity && (
@@ -2233,7 +2481,7 @@ function GeneratedImagePreviews({ images }: { images: GeneratedImagePreview[] })
 function toolDetailResult(tool: ToolExecution): string {
   const result = tool.result?.trim()
   if (!result) return ''
-  if (tool.status === 'error') return result
+  if (tool.status === 'error') return toolHtmlValidation(tool)?.errors?.length ? '' : result
   const summary = tool.activity?.summary?.trim()
   if (!summary) return result
 
@@ -2264,6 +2512,17 @@ function toolErrorMetadata(tool: ToolExecution): string {
     return `本次请求读取 ${requested} 个排版块，上限为 ${maximum} 个。`
   }
   return ''
+}
+
+function toolHtmlValidation(tool: ToolExecution): NonNullable<NonNullable<ToolExecution['activity']>['html_validation']> | undefined {
+  if (tool.activity?.html_validation) return tool.activity.html_validation
+  const nested = tool.activity?.details?.validation
+  if (!nested || typeof nested !== 'object' || Array.isArray(nested)) return undefined
+  const value = nested as Record<string, unknown>
+  return {
+    valid: typeof value.valid === 'boolean' ? value.valid : undefined,
+    errors: Array.isArray(value.errors) ? value.errors.filter((item): item is string => typeof item === 'string') : undefined,
+  }
 }
 
 function toolStatusSummary(tool: ToolExecution): { label: string; tone: 'running' | 'error' | 'changed' | 'success' } {

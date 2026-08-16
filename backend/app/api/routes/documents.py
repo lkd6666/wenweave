@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -9,15 +10,16 @@ from uuid import uuid4
 
 import httpx
 import jwt
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import desc
 from sqlalchemy.orm import Session, selectinload
 
+from app.api.browser_capture_upload import BrowserCaptureUploadError, read_browser_capture_upload
 from app.api.deps import get_current_user
 from app.api.sse import SSE_RESPONSE_HEADERS
 from app.core.security import create_scoped_token, decode_access_token
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.chat_message import ChatMessage, MessageRole
 from app.models.chat_session import ChatSession
@@ -70,6 +72,7 @@ from app.schemas.wechat import (
     WeChatDraftRead,
     WeChatDraftTargetRead,
 )
+from app.schemas.layout_reference import LayoutCaptureSessionRead
 from app.schemas.chat import ChatRevertRequest
 from app.services import local_uploads, oss_client
 from app.services.chat_sessions import ensure_default_chat_session
@@ -89,22 +92,32 @@ from app.services.document_image_localization import (
     localize_document_html,
 )
 from app.services.external_fetch import PublicFetchError, fetch_public_image
-from app.services.image_localization import ImageLocalizationError
+from app.services.image_localization import ImageLocalizationError, ImageLocalizationResult
 from app.services.chat_images import ChatImageError, delete_document_attachments
 from app.services.document_shares import revoke_document_shares
 from app.services.web_article_import import (
     WebArticleImportError,
+    WebArticleImportExpiredError,
     cancel_web_article_import,
+    complete_captured_web_article_import,
     complete_web_article_import,
+    create_web_article_capture_session,
     create_web_article_import,
     get_web_article_import_preview_asset,
     web_article_import_preview_payload,
 )
+from app.services.browser_capture import WechatVerificationRequiredError
 from app.services.wechat_official_account import BodyImageCacheEntry, CoverImage, WeChatApiError, WeChatOfficialAccountClient
 from app.models.operation_log import OperationLogStatus
-from app.services.operation_logs import append_operation_log, get_operation_request_id, get_operation_request_metadata
+from app.services.operation_logs import (
+    append_operation_log,
+    get_operation_request_id,
+    get_operation_request_metadata,
+    set_request_audit_actor,
+)
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+logger = logging.getLogger(__name__)
 
 MAX_IMPORT_FILE_SIZE = 30 * 1024 * 1024
 MAX_REPLACEMENT_IMAGE_SIZE = 10 * 1024 * 1024
@@ -230,6 +243,11 @@ def _wechat_draft_read(draft: WeChatDraft) -> WeChatDraftRead:
         created_by_name=(draft.created_by.display_name or draft.created_by.username) if draft.created_by else None,
         created_at=draft.created_at,
     )
+
+
+def _unexpected_wechat_push_detail(request_id: str) -> str:
+    reference = f"请求编号 {request_id}" if request_id else "请求时间"
+    return f"推送服务发生内部错误，已记录失败；请重试，如仍失败请联系管理员并提供{reference}"
 
 
 def _apply_wechat_metadata(document: Document, metadata: WeChatArticleMetadata) -> bool:
@@ -362,8 +380,9 @@ def _local_document_image_payload(db: Session, document: Document, source: str) 
     """Read a locally stored article image for server-side WeChat material upload."""
     manual_prefix = "/api/documents/local-images/"
     import_prefix = "/api/documents/import-assets/"
-    if source.startswith(manual_prefix):
-        image_name = source.removeprefix(manual_prefix)
+    path = urlsplit(source).path if source.lower().startswith(("http://", "https://")) else source
+    if path.startswith(manual_prefix):
+        image_name = path.removeprefix(manual_prefix)
         if not LOCAL_MANUAL_IMAGE_NAME_PATTERN.fullmatch(image_name):
             return None
         try:
@@ -372,8 +391,8 @@ def _local_document_image_payload(db: Session, document: Document, source: str) 
         except (OSError, local_uploads.LocalUploadError) as exc:
             raise WeChatApiError("本地图片不存在或已损坏，请重新上传") from exc
         return data, image.content_type, image_name
-    if source.startswith(import_prefix):
-        asset_id = source.removeprefix(import_prefix)
+    if path.startswith(import_prefix):
+        asset_id = path.removeprefix(import_prefix)
         asset = db.get(DocumentImportAsset, asset_id)
         if (
             asset is None
@@ -391,6 +410,13 @@ def _local_document_image_payload(db: Session, document: Document, source: str) 
             raise WeChatApiError("本地导入图片类型异常，请重新导入")
         return data, image.content_type, _safe_filename(asset.filename, f"image.{image.extension}")
     return None
+
+
+def _localize_html_for_document_save(db: Session, document: Document, html: str) -> ImageLocalizationResult:
+    try:
+        return asyncio.run(localize_document_html(db, document, html))
+    except ImageLocalizationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"正文图片不可发布：{exc}") from exc
 
 
 def _local_source_url(document: Document, user: User) -> str:
@@ -899,12 +925,97 @@ async def preview_web_article_import(
         import_session, preview_token = await create_web_article_import(payload.url, current_user.id, db)
         db.commit()
         return web_article_import_preview_payload(import_session, preview_token)
+    except WechatVerificationRequiredError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "wechat_verification_required",
+                "message": str(exc),
+                "url": exc.canonical_url,
+            },
+        ) from exc
     except WebArticleImportError as exc:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="文章链接解析失败，请稍后重试或更换公开链接") from exc
+
+
+@router.post(
+    "/link-imports/capture-sessions",
+    response_model=LayoutCaptureSessionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def start_web_article_capture_session(
+    payload: WebArticleImportPreviewRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        capture_session, token = create_web_article_capture_session(payload.url, current_user.id, db)
+        db.commit()
+        return {
+            "id": capture_session.id,
+            "token": token,
+            "canonical_url": capture_session.canonical_url,
+            "expires_at": capture_session.expires_at,
+            "purpose": capture_session.purpose,
+        }
+    except WebArticleImportError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+
+@router.post(
+    "/link-imports/capture-sessions/{capture_id}/complete",
+    response_model=WebArticleImportPreview,
+)
+async def complete_web_article_browser_capture(
+    capture_id: str,
+    request: Request,
+    source_html: str = Form(..., min_length=1),
+    title: str = Form(default="", max_length=256),
+    manifest: str = Form(..., min_length=2),
+    files: list[UploadFile] = File(default=[]),
+    capture_token: str = Header(..., alias="X-Layout-Capture-Token", min_length=20, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        capture_manifest, captured_assets = await read_browser_capture_upload(manifest, files)
+        import_session, preview_token = complete_captured_web_article_import(
+            db,
+            capture_id,
+            capture_token,
+            capture_manifest.url,
+            source_html,
+            title,
+            captured_assets,
+            capture_manifest.omitted_asset_count,
+            capture_manifest.cover_asset_id,
+        )
+        actor = db.get(User, import_session.owner_id)
+        if actor is not None:
+            set_request_audit_actor(request, actor)
+        db.commit()
+        return web_article_import_preview_payload(import_session, preview_token)
+    except BrowserCaptureUploadError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except WebArticleImportExpiredError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except WebArticleImportError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.exception("浏览器采集链接导入失败", exc_info=exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="浏览器采集处理失败，请重新发起抓取") from exc
+    finally:
+        for file in files:
+            await file.close()
 
 
 @router.get("/link-imports/{import_id}/assets/{asset_id}")
@@ -1132,11 +1243,6 @@ def update_document(
     if next_title is not None and _synchronize_document_title(document, next_title):
         changed = True
         version_changed = True
-    if payload.current_html is not None:
-        if document.current_html != payload.current_html:
-            document.current_html = payload.current_html
-            changed = True
-            version_changed = True
     if payload.wechat_metadata is not None:
         changed = _apply_wechat_metadata(document, payload.wechat_metadata) or changed
     if "group_id" in payload.model_fields_set and document.group_id != payload.group_id:
@@ -1154,11 +1260,23 @@ def update_document(
         visibility_mode = payload.visibility_mode or document.visibility_mode.value
         _apply_visibility(document, db, visibility_mode, payload.allowed_user_ids, payload.allowed_group_ids)
         changed = True
-    if changed:
-        touch_document(document, current_user.id)
-    if version_changed:
-        create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "手动保存")
-    db.commit()
+    if payload.current_html is not None:
+        if document.current_html != payload.current_html:
+            localization = _localize_html_for_document_save(db, document, payload.current_html)
+            document.current_html = localization.html
+            changed = True
+            version_changed = True
+    try:
+        if changed:
+            touch_document(document, current_user.id)
+        if version_changed:
+            create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "手动保存")
+        db.commit()
+    except Exception:
+        if payload.current_html is not None and 'localization' in locals():
+            cleanup_document_localization(db, localization)
+        db.rollback()
+        raise
     db.refresh(document)
     return document
 
@@ -1230,13 +1348,13 @@ def revert_last_ai_change(
     return document
 
 
-@router.patch("/{document_id}/content", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@router.patch("/{document_id}/content", response_model=DocumentImageLocalizationResult)
 def patch_document_content(
     document_id: int,
     payload: DocumentHtmlPatch,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> None:
+) -> DocumentImageLocalizationResult:
     """Persist a compact client-side splice without returning the full HTML again."""
     document = (
         db.query(Document)
@@ -1249,7 +1367,7 @@ def patch_document_content(
     if content_checksum(document.current_html) != payload.base_checksum:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="文档已被其他修改更新，请刷新后再保存")
     try:
-        document.current_html = apply_single_splice(
+        next_html = apply_single_splice(
             document.current_html,
             payload.prefix_length,
             payload.suffix_length,
@@ -1257,9 +1375,17 @@ def patch_document_content(
         )
     except DocumentVersionStorageError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="保存补丁无效") from exc
-    touch_document(document, current_user.id)
-    create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "手动保存")
-    db.commit()
+    localization = _localize_html_for_document_save(db, document, next_html)
+    try:
+        document.current_html = localization.html
+        touch_document(document, current_user.id)
+        create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "手动保存")
+        db.commit()
+        return DocumentImageLocalizationResult(html=document.current_html, localized_count=localization.localized_count)
+    except Exception:
+        cleanup_document_localization(db, localization)
+        db.rollback()
+        raise
 
 
 @router.get("/local-images/{image_name}")
@@ -1390,6 +1516,8 @@ def list_wechat_drafts(
     db: Session = Depends(get_db),
 ) -> list[WeChatDraftRead]:
     document = _get_accessible_document(db, document_id, current_user)
+    # History belongs to the document, not to the person who triggered a sync.
+    # Every user with access to this document sees the same records.
     drafts = (
         db.query(WeChatDraft)
         .filter(WeChatDraft.document_id == document.id)
@@ -1477,11 +1605,37 @@ async def _push_wechat_draft(
     trusted_image_hosts = _trusted_oss_image_hosts(db)
     cover: CoverImage | None = None
     try:
-        await report("validating", 29, "正在校验微信字段、正文结构和图片地址…")
+        await report("validating", 29, "正在检查正文图片，必要时自动转存…")
+        try:
+            localization = await localize_document_html(db, document, document.current_html)
+        except ImageLocalizationError as exc:
+            raise WeChatApiError(f"同步前自动转存正文图片失败：{exc}") from exc
+        if localization.localized_count:
+            try:
+                document.current_html = localization.html
+                touch_document(document, current_user.id)
+                create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "同步前自动转存图片")
+                db.commit()
+                db.refresh(document)
+            except Exception:
+                cleanup_document_localization(db, localization)
+                db.rollback()
+                raise
+            await report("validating", 32, f"已自动转存 {localization.localized_count} 张正文图片，正在继续校验…")
+        else:
+            await report("validating", 32, "正文图片无需转存，正在继续校验…")
+        await report("validating", 33, "正在校验微信字段、正文结构和图片地址…")
         WeChatOfficialAccountClient.validate_draft_input(metadata, document.current_html)
-        if sync_mode == WeChatDraftSyncMode.UPDATE and payload.sync_mode == "update":
-            await report("validating", 33, "正在确认要覆盖的微信草稿…")
-            await client.validate_draft_target(account, target_media_id)
+        if sync_mode == WeChatDraftSyncMode.UPDATE:
+            await report("validating", 34, "正在确认要覆盖的微信草稿…")
+            try:
+                await client.validate_draft_target(account, target_media_id)
+            except WeChatApiError as exc:
+                if payload.sync_mode != "auto" or exc.code != 40007:
+                    raise
+                sync_mode = WeChatDraftSyncMode.CREATE
+                target_media_id = ""
+                await report("validating", 35, "上次同步的微信草稿已不存在，正在创建新的草稿…")
         await report("cover", 36, "正在下载并校验封面图片…")
         local_cover = _local_document_image_payload(db, document, metadata.cover_url)
         if local_cover is None:
@@ -1530,8 +1684,12 @@ async def _push_wechat_draft(
             result = await client.update_draft(
                 account,
                 target_media_id=target_media_id,
+                fallback_to_create_on_invalid_target=payload.sync_mode == "auto",
                 **push_kwargs,
             )
+            if result.created_new_draft:
+                sync_mode = WeChatDraftSyncMode.CREATE
+                target_media_id = ""
         else:
             result = await client.create_draft(account, **push_kwargs)
     except WeChatApiError as exc:
@@ -1568,6 +1726,58 @@ async def _push_wechat_draft(
         db.refresh(draft)
         http_status = status.HTTP_502_BAD_GATEWAY if exc.code is not None else status.HTTP_422_UNPROCESSABLE_ENTITY
         raise HTTPException(status_code=http_status, detail=str(exc)) from exc
+    except HTTPException:
+        if cover is not None:
+            cover.close()
+        raise
+    except Exception as exc:  # noqa: BLE001 - the stream must not hide application failures.
+        if cover is not None:
+            cover.close()
+        detail = _unexpected_wechat_push_detail(request_id)
+        logger.exception(
+            "wechat_draft_push_unexpected_failure request_id=%s document_id=%s account_id=%s",
+            request_id or "-",
+            document.id,
+            account.id,
+        )
+        try:
+            db.rollback()
+            draft = WeChatDraft(
+                document_id=document.id,
+                account_id=account.id,
+                created_by_id=current_user.id,
+                status=WeChatDraftStatus.FAILED,
+                sync_mode=sync_mode,
+                article_title=metadata.title,
+                error_message=detail[:1024],
+            )
+            db.add(draft)
+            append_operation_log(
+                db,
+                actor=current_user,
+                action="wechat.draft.push",
+                resource_type="wechat_draft",
+                resource_id=str(document.id),
+                resource_name=document.title,
+                document_id=document.id,
+                status=OperationLogStatus.FAILED,
+                summary="公众号草稿推送失败",
+                error_summary="推送服务内部错误",
+                details={"account_id": account.id, "sync_mode": sync_mode.value},
+                request_id=request_id,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+            db.commit()
+        except Exception:  # noqa: BLE001 - a database outage must not mask the original failure.
+            db.rollback()
+            logger.exception(
+                "wechat_draft_failure_record_unavailable request_id=%s document_id=%s account_id=%s",
+                request_id or "-",
+                document.id,
+                account.id,
+            )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail) from exc
     except BaseException:
         if cover is not None:
             cover.close()
@@ -1642,6 +1852,35 @@ async def _push_wechat_draft(
     return _wechat_draft_read(draft)
 
 
+async def _push_wechat_draft_in_task_session(
+    document_id: int,
+    payload: WeChatDraftCreate,
+    current_user_id: int,
+    progress_callback=None,
+    request_id: str = "",
+    client_ip: str = "",
+    user_agent: str = "",
+) -> WeChatDraftRead:
+    """Run an SSE push using data attached to a task-owned database session."""
+    task_db = SessionLocal()
+    try:
+        current_user = task_db.get(User, current_user_id)
+        if current_user is None or not current_user.is_active:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录或登录已过期")
+        return await _push_wechat_draft(
+            document_id,
+            payload,
+            current_user,
+            task_db,
+            progress_callback,
+            request_id,
+            client_ip,
+            user_agent,
+        )
+    finally:
+        task_db.close()
+
+
 @router.post("/{document_id}/wechat-drafts", response_model=WeChatDraftRead)
 async def create_wechat_draft(
     document_id: int,
@@ -1674,6 +1913,7 @@ async def stream_wechat_draft(
 ) -> StreamingResponse:
     request_id = get_operation_request_id()
     metadata = get_operation_request_metadata()
+    current_user_id = current_user.id
 
     async def event_stream():
         progress_events: asyncio.Queue[dict[str, object]] = asyncio.Queue()
@@ -1682,11 +1922,10 @@ async def stream_wechat_draft(
             await progress_events.put({"stage": stage, "percent": percent, "detail": detail})
 
         task = asyncio.create_task(
-            _push_wechat_draft(
+            _push_wechat_draft_in_task_session(
                 document_id,
                 payload,
-                current_user,
-                db,
+                current_user_id,
                 report,
                 request_id,
                 metadata.client_ip,
@@ -1706,7 +1945,13 @@ async def stream_wechat_draft(
             except HTTPException as exc:
                 yield _wechat_draft_sse_event("error", {"status": exc.status_code, "detail": exc.detail})
             except Exception:  # noqa: BLE001
-                yield _wechat_draft_sse_event("error", {"status": 500, "detail": "推送公众号草稿时发生未预期错误"})
+                detail = _unexpected_wechat_push_detail(request_id)
+                logger.exception(
+                    "wechat_draft_stream_unexpected_failure request_id=%s document_id=%s",
+                    request_id or "-",
+                    document_id,
+                )
+                yield _wechat_draft_sse_event("error", {"status": 500, "detail": detail})
             else:
                 yield _wechat_draft_sse_event("result", draft.model_dump(mode="json"))
         finally:

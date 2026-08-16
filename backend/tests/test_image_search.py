@@ -21,6 +21,7 @@ from app.services.image_search import (
     ImageSearchTokenError,
     IMAGE_SEARCH_SCOPE,
     _search_cache,
+    _search_timeout_seconds,
     decode_candidate_reference,
     decode_candidate_reference_or_token,
     decode_candidate_token,
@@ -68,6 +69,13 @@ class _SearchClient:
 
 
 class ImageSearchTests(unittest.TestCase):
+    def test_search_timeout_uses_configured_value_without_an_upper_cap(self) -> None:
+        with patch(
+            "app.services.image_search.get_settings",
+            return_value=SimpleNamespace(SEARXNG_TIMEOUT_SECONDS=9.0),
+        ):
+            self.assertEqual(_search_timeout_seconds(), 9.0)
+
     def candidate(self) -> ImageSearchCandidate:
         return ImageSearchCandidate(
             id="candidate-1",

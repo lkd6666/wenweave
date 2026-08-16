@@ -264,7 +264,7 @@ def _store_cached_page(query: str, page: int, candidates: list[ImageSearchCandid
 
 
 def _search_timeout_seconds() -> float:
-    return max(1.0, min(float(get_settings().SEARXNG_TIMEOUT_SECONDS), 4.0))
+    return float(get_settings().SEARXNG_TIMEOUT_SECONDS)
 
 
 async def _fetch_search_page(
@@ -768,7 +768,7 @@ def candidate_payload(candidate: ImageSearchCandidate, token: str) -> dict:
 
 
 async def fetch_candidate_image(candidate: ImageSearchCandidate) -> tuple[bytes, local_uploads.ImageInfo]:
-    timeout_seconds = max(1.0, min(float(get_settings().SEARXNG_TIMEOUT_SECONDS), 30.0))
+    timeout_seconds = _search_timeout_seconds()
     timeout = httpx.Timeout(timeout_seconds, connect=timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
         try:
@@ -795,7 +795,7 @@ async def fetch_candidate_preview(candidate: ImageSearchCandidate) -> tuple[byte
     preview = candidate.preview_url
     parsed = urlsplit(preview)
     base = urlsplit(base_url)
-    timeout_seconds = max(1.0, min(float(get_settings().SEARXNG_TIMEOUT_SECONDS), 30.0))
+    timeout_seconds = _search_timeout_seconds()
     timeout = httpx.Timeout(timeout_seconds, connect=timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
         if parsed.hostname == base.hostname and parsed.port == base.port and parsed.scheme == base.scheme:

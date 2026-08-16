@@ -360,6 +360,14 @@ class ChatUserQuestionRead(BaseModel):
     event_sequence: int | None = None
 
 
+class PendingChatUserQuestionRead(BaseModel):
+    document_id: int
+    document_title: str
+    session_id: int
+    created_at: datetime
+    question: ChatUserQuestionRead
+
+
 class ChatUserQuestionActivityRead(BaseModel):
     timeout_at: datetime | None = None
     inactivity_seconds: int = Field(default=120, ge=1)

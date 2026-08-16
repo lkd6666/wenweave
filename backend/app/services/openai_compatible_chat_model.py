@@ -7,6 +7,21 @@ from langchain_core.messages import AIMessageChunk
 from langchain_openai import ChatOpenAI
 
 
+def _reasoning_delta_value(value: Any) -> str:
+    """Extract provider-supplied reasoning text without inventing a summary."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_reasoning_delta_value(item) for item in value)
+    if not isinstance(value, dict):
+        return ""
+    for key in ("text", "content", "reasoning", "thinking", "reasoning_content"):
+        text = _reasoning_delta_value(value.get(key))
+        if text:
+            return text
+    return _reasoning_delta_value(value.get("summary"))
+
+
 class OpenAICompatibleChatModel(ChatOpenAI):
     """保留兼容接口在 SSE delta 中返回的 reasoning_content。
 
@@ -36,7 +51,7 @@ class OpenAICompatibleChatModel(ChatOpenAI):
 
         for field in ("reasoning_content", "reasoning", "thinking", "thought"):
             value = delta.get(field)
-            if isinstance(value, str) and value:
+            if _reasoning_delta_value(value):
                 generation_chunk.message.additional_kwargs[field] = value
                 break
         return generation_chunk

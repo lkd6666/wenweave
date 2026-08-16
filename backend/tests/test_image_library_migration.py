@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import app.models  # noqa: F401 - registers all tables used by migrate_schema.
@@ -10,11 +9,12 @@ from sqlalchemy import create_engine, inspect, text
 
 from app import bootstrap
 from app.db.base import Base
+from tests.workspace_temp import WorkspaceTempDirectory
 
 
 class ImageLibraryMigrationTests(unittest.TestCase):
     def test_legacy_image_generation_table_gets_timeout_default_idempotently(self) -> None:
-        with TemporaryDirectory() as temp_dir:
+        with WorkspaceTempDirectory("image-library-migration") as temp_dir:
             database_path = Path(temp_dir) / "legacy-generation.db"
             engine = create_engine(f"sqlite:///{database_path.as_posix()}")
             Base.metadata.create_all(engine)
@@ -42,7 +42,7 @@ class ImageLibraryMigrationTests(unittest.TestCase):
             engine.dispose()
 
     def test_half_built_sqlite_table_gets_library_lifecycle_columns_idempotently(self) -> None:
-        with TemporaryDirectory() as temp_dir:
+        with WorkspaceTempDirectory("image-library-migration") as temp_dir:
             database_path = Path(temp_dir) / "half-built.db"
             engine = create_engine(f"sqlite:///{database_path.as_posix()}")
             Base.metadata.create_all(engine)

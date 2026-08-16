@@ -55,6 +55,14 @@ class AIModel(Base):
         server_default=str(DEFAULT_TOOL_RESULT_MAX_TOKENS),
     )
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # A disabled model is retained for administration and history, but cannot
+    # be selected for a newly submitted request.
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    # Empty means available all day. The provider schedule is applied in
+    # addition to this model-specific schedule.
+    availability_time_ranges: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     # This is an explicit administrator capability flag.  Model discovery APIs
     # are inconsistent, so new and existing models stay text-only until enabled.
     is_multimodal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
@@ -66,8 +74,8 @@ class AIModel(Base):
     default_thinking_effort: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
     )
-    # Explicit cache breakpoints require an endpoint that supports the current
-    # OpenAI prompt-caching request fields, so this remains opt-in per model.
+    # Stable cache routing is opt-in because compatible gateways do not all
+    # accept OpenAI's prompt_cache_key request field.
     prompt_cache_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )

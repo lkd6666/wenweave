@@ -42,7 +42,7 @@
 .aicss-thinking-reasoning {
   display: flex;
   flex-direction: column;
-  width: min(360px, 100%);
+  width: 100%;
   min-width: 0;
   max-width: 100%;
 }
@@ -600,8 +600,15 @@
 .aicss-todo-head:hover .aicss-todo-chevron { opacity: 1; }
 .aicss-todo-head[aria-expanded='false'] .aicss-todo-chevron { transform: rotate(-90deg); }
 
-.aicss-todo-title { font-weight: 500; }
-.aicss-todo-count { margin-left: auto; color: var(--aicss-muted); font-variant-numeric: tabular-nums; }
+.aicss-todo-title { display: inline-flex; min-width: 0; flex: 1; font-weight: 500; }
+.aicss-todo-title-label,
+.aicss-todo-head-summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aicss-todo-head-summary { display: none; font-weight: 500; }
+.aicss-todo-head[aria-expanded='false'] .aicss-todo-title-label { display: none; }
+.aicss-todo-head[aria-expanded='false'] .aicss-todo-head-summary { display: block; }
+.aicss-todo-head-summary.is-active { color: transparent; background: linear-gradient(90deg, var(--aicss-text) 0%, var(--aicss-text) 30%, color-mix(in srgb, var(--aicss-text) 45%, transparent) 45%, color-mix(in srgb, var(--aicss-text) 45%, transparent) 55%, var(--aicss-text) 70%, var(--aicss-text) 100%); background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; animation: aicss-shine 2.25s cubic-bezier(0.25, 0.1, 0.25, 1) infinite; }
+.aicss-todo-head-summary.is-done { color: var(--aicss-muted); }
+.aicss-todo-count { flex: none; margin-left: auto; color: var(--aicss-muted); font-variant-numeric: tabular-nums; }
 .aicss-todo-items { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 10px 0 0; list-style: none; }
 
 .aicss-todo-items li {
@@ -756,6 +763,7 @@ html[data-theme='dark'] .aicss-tool-call-icon.is-plan { background: #1d3152; col
   .aicss-reasoning-sentence,
   .aicss-todo-items li,
   .aicss-todo-item-label::before,
+  .aicss-todo-head-summary.is-active,
   .aicss-web-search.is-running .aicss-web-search-head > span,
   .aicss-image-generation.is-running strong,
   .aicss-image-generation-canvas::after { animation: none !important; }

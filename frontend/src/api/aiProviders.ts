@@ -3,6 +3,7 @@ import type {
   AIImageModelItem,
   AIModelItem,
   AIProviderItem,
+  AvailabilityTimeRange,
   ModelDiscoveryResult,
   ProviderPresetItem,
   ProviderType,
@@ -13,6 +14,8 @@ export interface CreateProviderPayload {
   provider_type: ProviderType
   base_url: string
   api_key: string
+  is_enabled?: boolean
+  availability_time_ranges?: AvailabilityTimeRange[]
 }
 
 export interface UpdateProviderPayload {
@@ -22,6 +25,8 @@ export interface UpdateProviderPayload {
   api_key?: string
   image_protocol?: '' | 'openai_images' | 'dashscope_images' | 'volcengine_ark_images'
   image_base_url?: string
+  is_enabled?: boolean
+  availability_time_ranges?: AvailabilityTimeRange[]
 }
 
 export interface CreateImageModelPayload {
@@ -31,6 +36,8 @@ export interface CreateImageModelPayload {
   supported_aspect_ratios?: Array<'square' | 'portrait' | 'landscape'>
   supported_qualities?: string[]
   is_default?: boolean
+  is_enabled?: boolean
+  availability_time_ranges?: AvailabilityTimeRange[]
   access_mode?: 'all' | 'restricted'
   allowed_user_ids?: number[]
   allowed_group_ids?: number[]
@@ -51,6 +58,8 @@ export interface CreateModelPayload {
   max_output_tokens: number
   tool_result_max_tokens: number
   is_default: boolean
+  is_enabled: boolean
+  availability_time_ranges?: AvailabilityTimeRange[]
   is_multimodal: boolean
   supports_disabled_thinking: boolean
   default_thinking_effort: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -66,6 +75,8 @@ export interface UpdateModelPayload {
   max_output_tokens?: number
   tool_result_max_tokens?: number
   is_default?: boolean
+  is_enabled?: boolean
+  availability_time_ranges?: AvailabilityTimeRange[]
   is_multimodal?: boolean
   supports_disabled_thinking?: boolean
   default_thinking_effort?: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -108,6 +119,8 @@ export interface BulkModelPayload {
     context_compaction_threshold_tokens: number
     max_output_tokens: number
     tool_result_max_tokens: number
+    is_enabled?: boolean
+    availability_time_ranges?: AvailabilityTimeRange[]
     is_multimodal: boolean
     supports_disabled_thinking: boolean
     thinking_config: Record<string, unknown>

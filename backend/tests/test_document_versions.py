@@ -128,7 +128,8 @@ class DocumentVersionStorageTests(unittest.TestCase):
             self.user,
             self.db,
         )
-        self.assertIsNone(result)
+        self.assertEqual(result.html, next_html)
+        self.assertEqual(result.localized_count, 0)
         self.db.refresh(document)
         self.assertEqual(document.current_html, next_html)
         latest = (

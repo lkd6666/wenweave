@@ -21,6 +21,23 @@ from app.models.document import Document, DocumentSourceType
 from app.models.document_version import DocumentVersionSource
 from app.models.web_article_import import WebArticleImport, WebArticleImportAsset, WebArticleImportStatus
 from app.models.user import User
+from app.models.layout_capture_session import LayoutCaptureSession
+from app.services import local_uploads
+from app.services.browser_capture import (
+    CAPTURE_PURPOSE_WEB_ARTICLE_IMPORT,
+    BrowserCaptureError,
+    BrowserCaptureExpiredError,
+    MAX_CAPTURE_ASSETS,
+    MAX_CAPTURE_HTML_BYTES,
+    MAX_CAPTURE_IMAGE_BYTES,
+    MAX_CAPTURE_IMAGE_TOTAL_BYTES,
+    WechatVerificationRequiredError,
+    complete_browser_capture_session,
+    create_browser_capture_session,
+    is_wechat_verification_page,
+    load_browser_capture_session,
+    resolve_wechat_capture_url,
+)
 from app.services.document_images import DocumentImageStorageError, store_document_image
 from app.services.document_versions import create_document_version
 from app.services.chat_sessions import ensure_default_chat_session
@@ -44,6 +61,9 @@ _DISCARDED_TAGS = {
     "video", "audio", "source", "track", "dialog",
 }
 _DANGEROUS_STYLE = re.compile(r"(?:expression\s*\(|@import|behavior\s*:|-moz-binding|url\s*\()", re.IGNORECASE)
+_CAPTURE_DANGEROUS_STYLE = re.compile(r"(?:expression\s*\(|@import|behavior\s*:|-moz-binding)", re.IGNORECASE)
+_CAPTURE_ASSET_URL_RE = re.compile(r"^layout-capture://([a-f0-9]{32})$", re.IGNORECASE)
+_CSS_URL_RE = re.compile(r"url\(\s*(?P<quote>['\"]?)(?P<url>.*?)(?P=quote)\s*\)", re.IGNORECASE | re.DOTALL)
 _IMAGE_SOURCE_ATTRIBUTES = ("data-src", "data-original", "data-actualsrc", "src")
 CapturedAsset = tuple[str, str, str, bytes, int, int]
 
@@ -200,6 +220,110 @@ def _sanitize_article(source: str, canonical_url: str) -> tuple[str, str, list[s
     return title, rendered, []
 
 
+def _captured_style(value: str) -> tuple[str, set[str]]:
+    clean = value.strip()
+    if not clean or _CAPTURE_DANGEROUS_STYLE.search(clean):
+        return "", set()
+    declarations: list[str] = []
+    used_ids: set[str] = set()
+    for declaration in clean.split(";"):
+        name, separator, raw_value = declaration.partition(":")
+        if not separator:
+            continue
+        normalized_name = name.strip().lower()
+        normalized_value = raw_value.strip()
+        if not normalized_name or not normalized_value:
+            continue
+        hidden_value = normalized_value.lower().replace("!important", "").strip()
+        if normalized_name == "display" and hidden_value == "none":
+            continue
+        if normalized_name == "visibility" and hidden_value in {"hidden", "collapse"}:
+            continue
+        if "url(" in normalized_value.lower():
+            matches = list(_CSS_URL_RE.finditer(normalized_value))
+            if not matches:
+                continue
+            valid = True
+            declaration_ids: set[str] = set()
+
+            def replace_url(match: re.Match[str]) -> str:
+                nonlocal valid
+                captured = _CAPTURE_ASSET_URL_RE.fullmatch(match.group("url").strip())
+                if captured is None:
+                    valid = False
+                    return ""
+                asset_id = captured.group(1).lower()
+                declaration_ids.add(asset_id)
+                return f'url("{_ASSET_URL_PREFIX}{asset_id}")'
+
+            rewritten = _CSS_URL_RE.sub(replace_url, normalized_value)
+            if not valid or "url(" in _CSS_URL_RE.sub("", normalized_value).lower():
+                continue
+            normalized_value = rewritten
+            used_ids.update(declaration_ids)
+        declarations.append(f"{normalized_name}:{normalized_value}")
+    return ";".join(declarations)[:4000], used_ids
+
+
+def _sanitize_captured_article(source: str, canonical_url: str) -> tuple[str, set[str]]:
+    soup = BeautifulSoup(source, "html.parser")
+    root = _select_article_root(soup, canonical_url)
+    if root is None:
+        raise WebArticleImportError("未能从浏览器采集内容中提取公众号正文")
+    for tag in root.find_all(list(_DISCARDED_TAGS)):
+        tag.decompose()
+
+    fragment = BeautifulSoup("<section></section>", "html.parser")
+    container = fragment.section
+    assert container is not None
+    for child in list(root.contents):
+        container.append(child.extract())
+
+    used_ids: set[str] = set()
+    for tag in list(container.find_all(True)):
+        name = tag.name.lower()
+        if name in _DISCARDED_TAGS:
+            tag.decompose()
+            continue
+        if name not in _ALLOWED_TAGS:
+            tag.unwrap()
+            continue
+        attributes: dict[str, str] = {}
+        if tag.has_attr("style"):
+            style, style_ids = _captured_style(str(tag.get("style") or ""))
+            if style:
+                attributes["style"] = style
+                used_ids.update(style_ids)
+        for attribute_name in ("align", "valign", "colspan", "rowspan", "width", "height"):
+            attribute_value = str(tag.get(attribute_name) or "").strip()
+            if attribute_value and len(attribute_value) <= 32:
+                attributes[attribute_name] = attribute_value
+        if tag.name == "a":
+            href = _safe_link(str(tag.get("href") or ""), canonical_url)
+            if href:
+                attributes["href"] = href
+        if tag.name == "img":
+            captured = _CAPTURE_ASSET_URL_RE.fullmatch(str(tag.get("src") or "").strip())
+            if captured is None:
+                tag.decompose()
+                continue
+            asset_id = captured.group(1).lower()
+            used_ids.add(asset_id)
+            attributes["src"] = f"{_ASSET_URL_PREFIX}{asset_id}"
+            alt = str(tag.get("alt") or "").strip()
+            if alt:
+                attributes["alt"] = alt[:512]
+        tag.attrs = attributes
+
+    rendered = str(container)
+    plain = re.sub(r"\s+", " ", container.get_text(" ", strip=True)).strip()
+    if not plain and not container.find("img"):
+        raise WebArticleImportError("未能从浏览器采集内容中提取公众号正文")
+    if len(rendered.encode("utf-8")) > get_settings().MAX_DOCUMENT_HTML_BYTES:
+        raise WebArticleImportError("文章正文超过允许大小")
+    return rendered, used_ids
+
+
 def _image_source_from_tag(tag: Tag) -> str:
     return next((str(tag.get(name) or "").strip() for name in _IMAGE_SOURCE_ATTRIBUTES if tag.get(name)), "")
 
@@ -347,6 +471,9 @@ def web_article_import_preview_payload(import_session: WebArticleImport, preview
 async def create_web_article_import(raw_url: str, user_id: int, db: Session) -> tuple[WebArticleImport, str]:
     try:
         canonical_url, source = await fetch_public_html(raw_url)
+        if is_wechat_verification_page(source, canonical_url):
+            capture_url = resolve_wechat_capture_url(canonical_url, raw_url) or canonical_url
+            raise WechatVerificationRequiredError(capture_url)
         title, html_template, warnings = _sanitize_article(source, canonical_url)
         cover_result, images_result = await asyncio.gather(
             _capture_article_cover(source, canonical_url),
@@ -389,6 +516,105 @@ async def create_web_article_import(raw_url: str, user_id: int, db: Session) -> 
                 data=data,
             )
         )
+    db.flush()
+    db.refresh(import_session)
+    return import_session, preview_token
+
+
+def create_web_article_capture_session(raw_url: str, user_id: int, db: Session) -> tuple[LayoutCaptureSession, str]:
+    try:
+        return create_browser_capture_session(raw_url, user_id, CAPTURE_PURPOSE_WEB_ARTICLE_IMPORT, db)
+    except BrowserCaptureError as exc:
+        raise WebArticleImportError(str(exc)) from exc
+
+
+def complete_captured_web_article_import(
+    db: Session,
+    capture_id: str,
+    capture_token: str,
+    captured_url: str,
+    source_html: str,
+    title: str,
+    captured_assets: dict[str, tuple[bytes, local_uploads.ImageInfo]],
+    omitted_asset_count: int = 0,
+    cover_asset_id: str | None = None,
+) -> tuple[WebArticleImport, str]:
+    try:
+        capture_session = load_browser_capture_session(
+            db,
+            capture_id,
+            capture_token,
+            captured_url,
+            CAPTURE_PURPOSE_WEB_ARTICLE_IMPORT,
+        )
+    except BrowserCaptureExpiredError as exc:
+        raise WebArticleImportExpiredError(str(exc)) from exc
+    except BrowserCaptureError as exc:
+        raise WebArticleImportError(str(exc)) from exc
+    if len(source_html.encode("utf-8")) > MAX_CAPTURE_HTML_BYTES:
+        raise WebArticleImportError("浏览器采集正文超过 5MB 限制")
+    if len(captured_assets) > MAX_CAPTURE_ASSETS:
+        raise WebArticleImportError(f"浏览器采集图片超过 {MAX_CAPTURE_ASSETS} 张限制")
+    if any(len(data) > MAX_CAPTURE_IMAGE_BYTES for data, _ in captured_assets.values()):
+        raise WebArticleImportError("浏览器采集图片超过 10MB 限制")
+    if sum(len(data) for data, _ in captured_assets.values()) > MAX_CAPTURE_IMAGE_TOTAL_BYTES:
+        raise WebArticleImportError("浏览器采集图片总大小超过 50MB 限制")
+
+    html_template, body_asset_ids = _sanitize_captured_article(source_html, capture_session.canonical_url)
+    normalized_cover_id = cover_asset_id.lower() if cover_asset_id else None
+    expected_ids = set(body_asset_ids)
+    if normalized_cover_id:
+        expected_ids.add(normalized_cover_id)
+    if expected_ids != set(captured_assets):
+        raise WebArticleImportError("浏览器采集图片清单与正文或封面占位符不一致")
+
+    warnings: list[str] = []
+    if omitted_asset_count:
+        warnings.append(f"有 {omitted_asset_count} 个正文图片素材未能由浏览器采集，已从导入内容中移除。")
+    if normalized_cover_id:
+        cover_image = captured_assets[normalized_cover_id][1]
+        if cover_image.content_type not in _WECHAT_COVER_CONTENT_TYPES:
+            warnings.append("文章封面格式不受公众号支持，请在公众号草稿中手动上传。")
+            normalized_cover_id = None
+    else:
+        warnings.append("未能识别或保存文章封面，请在公众号草稿中手动上传。")
+
+    active_ids = set(body_asset_ids)
+    if normalized_cover_id:
+        active_ids.add(normalized_cover_id)
+    import_id = str(uuid4())
+    preview_token = token_urlsafe(32)
+    normalized_title = re.sub(r"\s+", " ", title).strip()[:256] or "未命名推文"
+    image_count = len(BeautifulSoup(html_template, "html.parser").find_all("img"))
+    import_session = WebArticleImport(
+        id=import_id,
+        owner_id=capture_session.user_id,
+        title=normalized_title,
+        html_template=html_template,
+        warnings_json=json.dumps(warnings, ensure_ascii=False),
+        image_count=image_count,
+        imported_image_count=image_count,
+        external_image_count=0,
+        cover_asset_id=normalized_cover_id,
+        cover_requires_crops=False,
+        preview_token_hash=hashlib.sha256(preview_token.encode("utf-8")).hexdigest(),
+        expires_at=_utcnow() + WEB_ARTICLE_IMPORT_TTL,
+    )
+    db.add(import_session)
+    for asset_id in active_ids:
+        data, image = captured_assets[asset_id]
+        db.add(
+            WebArticleImportAsset(
+                import_id=import_id,
+                asset_id=asset_id,
+                content_type=image.content_type,
+                extension=image.extension,
+                width=image.width,
+                height=image.height,
+                data=data,
+            )
+        )
+    complete_browser_capture_session(capture_session)
     db.flush()
     db.refresh(import_session)
     return import_session, preview_token

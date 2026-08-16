@@ -122,6 +122,10 @@ class GzhThemeGeneration(Base):
     reference_asset_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     output_json: Mapped[str] = mapped_column(LONG_TEXT, nullable=False, default="{}")
     validation_json: Mapped[str] = mapped_column(LONG_TEXT, nullable=False, default="[]")
+    progress_stage: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    progress_current: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_message: Mapped[str] = mapped_column(String(256), nullable=False, default="")
     error_message: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
     status: Mapped[GzhThemeGenerationStatus] = mapped_column(
         Enum(GzhThemeGenerationStatus, values_callable=lambda cls: [item.value for item in cls]),

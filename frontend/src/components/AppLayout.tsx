@@ -15,17 +15,34 @@ import {
   DashboardOutlined,
   SettingOutlined,
   PictureOutlined,
+  FontSizeOutlined,
 } from '@ant-design/icons'
 import { DesktopOutlined, MoonOutlined, SunOutlined } from '@ant-design/icons'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { useAuthStore } from '../store/authStore'
 import ChangePasswordModal from './ChangePasswordModal'
+import GlobalUserQuestionNotifications from './GlobalUserQuestionNotifications'
 import ViewportFitGuide from './ViewportFitGuide'
 import { useAppTheme } from '../theme/appTheme'
 import { brandingAssetUrl, useAppBranding } from '../brand/appBranding'
 
 const { Header, Sider, Content } = Layout
 const { Text } = Typography
+
+const adminMenuGroups = [
+  {
+    key: 'admin-system',
+    paths: ['/admin/models', '/admin/storage'],
+  },
+  {
+    key: 'admin-content',
+    paths: ['/admin/branding', '/admin/image-library', '/admin/article-typography', '/admin/wechat-accounts'],
+  },
+  {
+    key: 'admin-users',
+    paths: ['/admin/users', '/admin/user-groups', '/admin/operation-logs'],
+  },
+] as const
 
 export default function AppLayout() {
   const navigate = useNavigate()
@@ -37,6 +54,10 @@ export default function AppLayout() {
   const [changePasswordOpen, setChangePasswordOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => location.pathname.startsWith('/editor/'))
   const [navigationOpen, setNavigationOpen] = useState(false)
+  const [openMenuKeys, setOpenMenuKeys] = useState<string[]>(() => {
+    const group = adminMenuGroups.find(({ paths }) => paths.some((path) => location.pathname.startsWith(path)))
+    return group ? [group.key] : []
+  })
   const screens = Grid.useBreakpoint()
   const isCompact = !screens.lg
   const isEditorPage = location.pathname.startsWith('/editor/')
@@ -45,6 +66,13 @@ export default function AppLayout() {
     if (isEditorPage) setSidebarCollapsed(true)
   }, [isEditorPage])
 
+  useEffect(() => {
+    const group = adminMenuGroups.find(({ paths }) => paths.some((path) => location.pathname.startsWith(path)))
+    if (group) {
+      setOpenMenuKeys((keys) => (keys.includes(group.key) ? keys : [...keys, group.key]))
+    }
+  }, [location.pathname])
+
   const menuItems = useMemo(() => {
     const items: MenuProps['items'] = [
       { key: '/', icon: <DashboardOutlined />, label: '工作看板' },
@@ -52,33 +80,52 @@ export default function AppLayout() {
     ]
     if (user?.role === 'admin') {
       items.push(
-        { key: '/admin/models', icon: <RobotOutlined />, label: 'AI 模型管理' },
-        { key: '/admin/storage', icon: <CloudOutlined />, label: '存储设置' },
-        { key: '/admin/branding', icon: <SettingOutlined />, label: '品牌设置' },
-        { key: '/admin/image-library', icon: <PictureOutlined />, label: '图片库设置' },
-        { key: '/admin/wechat-accounts', icon: <SendOutlined />, label: '公众号账号' },
-        { key: '/admin/operation-logs', icon: <HistoryOutlined />, label: '操作日志' },
-        { key: '/admin/users', icon: <TeamOutlined />, label: '用户管理' },
-        { key: '/admin/user-groups', icon: <TeamOutlined />, label: '用户组' },
+        {
+          key: 'admin-system',
+          icon: <SettingOutlined />,
+          label: '系统配置',
+          children: [
+            { key: '/admin/models', icon: <RobotOutlined />, label: 'AI 模型管理' },
+            { key: '/admin/storage', icon: <CloudOutlined />, label: '存储设置' },
+          ],
+        },
+        {
+          key: 'admin-content',
+          icon: <FileTextOutlined />,
+          label: '内容管理',
+          children: [
+            { key: '/admin/branding', icon: <SettingOutlined />, label: '品牌设置' },
+            { key: '/admin/image-library', icon: <PictureOutlined />, label: '图片库设置' },
+            { key: '/admin/article-typography', icon: <FontSizeOutlined />, label: '正文排版' },
+            { key: '/admin/wechat-accounts', icon: <SendOutlined />, label: '公众号账号' },
+          ],
+        },
+        {
+          key: 'admin-users',
+          icon: <TeamOutlined />,
+          label: '用户与审计',
+          children: [
+            { key: '/admin/users', icon: <TeamOutlined />, label: '用户管理' },
+            { key: '/admin/user-groups', icon: <TeamOutlined />, label: '用户组' },
+            { key: '/admin/operation-logs', icon: <HistoryOutlined />, label: '操作日志' },
+          ],
+        },
       )
     }
     return items
   }, [user])
 
   const selectedKey = useMemo(() => {
-    const match = menuItems?.find(
-      (item) =>
-        item &&
-        String(item.key) !== '/' &&
-        (location.pathname === String(item.key) ||
-          location.pathname.startsWith(`${String(item.key)}/`)),
-    )
-
-    if (match) return [String(match.key)]
+    const group = adminMenuGroups.find(({ paths }) => paths.some((path) => location.pathname === path || location.pathname.startsWith(`${path}/`)))
+    if (group) {
+      const path = group.paths.find((item) => location.pathname === item || location.pathname.startsWith(`${item}/`))
+      if (path) return [path]
+    }
 
     if (location.pathname.startsWith('/editor/')) return ['/workbench']
-    return location.pathname === '/' ? ['/'] : []
-  }, [menuItems, location.pathname])
+    if (location.pathname === '/') return ['/']
+    return location.pathname.startsWith('/workbench') ? ['/workbench'] : []
+  }, [location.pathname])
 
   const userMenu: MenuProps['items'] = [
     { key: 'change-password', icon: <KeyOutlined />, label: '修改密码' },
@@ -107,8 +154,10 @@ export default function AppLayout() {
     <Menu
       mode="inline"
       selectedKeys={selectedKey}
+      openKeys={openMenuKeys}
       items={menuItems}
       onClick={({ key }) => navigateTo(String(key))}
+      onOpenChange={setOpenMenuKeys}
       style={{ borderInlineEnd: 'none' }}
     />
   )
@@ -190,6 +239,7 @@ export default function AppLayout() {
           <Outlet />
         </Content>
       </Layout>
+      <GlobalUserQuestionNotifications systemName={branding.system_name} iconUrl={logoUrl} />
       <ViewportFitGuide />
       <Drawer
         title={branding.system_name}

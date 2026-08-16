@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from html import unescape
 from typing import Awaitable, Callable
 
 import httpx
@@ -12,7 +13,7 @@ from bs4 import BeautifulSoup
 from app.services import local_uploads
 
 
-_CSS_URL_PATTERN = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.IGNORECASE)
+CSS_URL_PATTERN = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.IGNORECASE)
 
 
 class ImageLocalizationError(ValueError):
@@ -45,7 +46,7 @@ def _is_ignorable_source(source: str) -> bool:
     return not source or source.startswith("#")
 
 
-def _srcset_source_spans(value: str) -> list[tuple[int, int, str]]:
+def srcset_source_spans(value: str) -> list[tuple[int, int, str]]:
     """Return URL spans from a conventional srcset value.
 
     A data URL contains a comma after its MIME type, so splitting blindly on
@@ -83,7 +84,15 @@ def _srcset_source_spans(value: str) -> list[tuple[int, int, str]]:
 
 
 def _srcset_sources(value: str) -> list[str]:
-    return [source for _start, _end, source in _srcset_source_spans(value)]
+    return [source for _start, _end, source in srcset_source_spans(value)]
+
+
+def css_url_sources(value: str) -> list[str]:
+    return [
+        match.group(2).strip()
+        for match in CSS_URL_PATTERN.finditer(value)
+        if match.group(2).strip() and not _is_ignorable_source(match.group(2).strip())
+    ]
 
 
 def _collect_sources(soup: BeautifulSoup) -> list[str]:
@@ -96,18 +105,15 @@ def _collect_sources(soup: BeautifulSoup) -> list[str]:
         if srcset:
             sources.extend(_srcset_sources(srcset))
         style = str(tag.get("style") or "")
-        for match in _CSS_URL_PATTERN.finditer(style):
-            source = match.group(2).strip()
-            if source and not _is_ignorable_source(source):
-                sources.append(source)
+        sources.extend(css_url_sources(style))
     return sources
 
 
-def _replace_srcset(value: str, replacements: dict[str, str]) -> str:
+def replace_srcset_sources(value: str, replacements: dict[str, str]) -> str:
     parts: list[str] = []
     cursor = 0
-    for start, end, source in _srcset_source_spans(value):
-        replacement = replacements.get(source)
+    for start, end, source in srcset_source_spans(value):
+        replacement = replacements.get(source) or replacements.get(unescape(source).strip())
         if not replacement:
             continue
         parts.append(value[cursor:start])
@@ -119,29 +125,30 @@ def _replace_srcset(value: str, replacements: dict[str, str]) -> str:
     return "".join(parts)
 
 
-def _replace_css_urls(value: str, replacements: dict[str, str]) -> str:
+def replace_css_urls(value: str, replacements: dict[str, str]) -> str:
     def replace_url(match: re.Match[str]) -> str:
         source = match.group(2).strip()
-        replacement = replacements.get(source)
+        replacement = replacements.get(source) or replacements.get(unescape(source).strip())
         if not replacement:
             return match.group(0)
         quote = match.group(1)
         return f"url({quote}{replacement}{quote})"
 
-    return _CSS_URL_PATTERN.sub(replace_url, value)
+    return CSS_URL_PATTERN.sub(replace_url, value)
 
 
 def _apply_replacements(soup: BeautifulSoup, replacements: dict[str, str]) -> None:
     for tag in soup.find_all(True):
         src = str(tag.get("src") or "").strip()
-        if src in replacements:
-            tag["src"] = replacements[src]
+        replacement = replacements.get(src) or replacements.get(unescape(src).strip())
+        if replacement:
+            tag["src"] = replacement
         srcset = str(tag.get("srcset") or "")
         if srcset:
-            tag["srcset"] = _replace_srcset(srcset, replacements)
+            tag["srcset"] = replace_srcset_sources(srcset, replacements)
         style = str(tag.get("style") or "")
         if style:
-            tag["style"] = _replace_css_urls(style, replacements)
+            tag["style"] = replace_css_urls(style, replacements)
 
 
 async def localize_html_images(

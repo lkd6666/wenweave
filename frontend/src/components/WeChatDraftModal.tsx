@@ -25,9 +25,11 @@ import {
 import { HistoryOutlined, SendOutlined, UploadOutlined } from '@ant-design/icons'
 import { documentsApi, type WeChatDraftPushProgressEvent } from '../api/documents'
 import { ApiError } from '../api/client'
+import { wechatAccountsApi } from '../api/wechatAccounts'
 import type {
   WeChatArticleMetadata,
   WeChatAvailableAccount,
+  DocumentDetail,
   WeChatDraftRecord,
 } from '../types'
 
@@ -49,12 +51,10 @@ interface DraftPushActivity extends DraftPushProgress {
 interface WeChatDraftModalProps {
   open: boolean
   documentId: number
-  documentTitle: string
-  metadata: WeChatArticleMetadata
-  accounts: WeChatAvailableAccount[]
   disabled: boolean
   onClose: () => void
   onMetadataSaved: (metadata: WeChatArticleMetadata, title: string) => void
+  onDocumentRefreshed: (document: DocumentDetail) => void
 }
 
 const CROP_MODE_LABELS: Record<CropMode, string> = {
@@ -193,16 +193,18 @@ function CoverCropPreview({ source, area, aspect, label }: CoverCropPreviewProps
 export default function WeChatDraftModal({
   open,
   documentId,
-  documentTitle,
-  metadata,
-  accounts,
   disabled,
   onClose,
   onMetadataSaved,
+  onDocumentRefreshed,
 }: WeChatDraftModalProps) {
   const [form] = Form.useForm()
   const [history, setHistory] = useState<WeChatDraftRecord[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
+  const [availableAccounts, setAvailableAccounts] = useState<WeChatAvailableAccount[]>([])
+  const [refreshingData, setRefreshingData] = useState(open)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
   const [saving, setSaving] = useState(false)
   const [sending, setSending] = useState(false)
   const [draftPushProgress, setDraftPushProgress] = useState<DraftPushProgress | null>(null)
@@ -235,20 +237,50 @@ export default function WeChatDraftModal({
 
   useEffect(() => {
     if (!open || pushInFlightRef.current) return
-    const next = initialMetadata(metadata, documentTitle)
-    form.setFieldsValue({
-      ...next,
-      only_fans_can_comment: Boolean(next.need_open_comment && next.only_fans_can_comment),
-      account_id: accounts[0]?.id,
-    })
+    let cancelled = false
+
     setCropMode('pic_crop_235_1')
     setCrop(undefined)
     coverImageDimensionsRef.current = null
     setDraftPushProgress(null)
     setDraftPushActivities([])
     hasAutoScrolledProgressRef.current = false
-    void loadHistory()
-  }, [accounts, documentTitle, form, loadHistory, metadata, open])
+    setHistory([])
+    setAvailableAccounts([])
+    setRefreshingData(true)
+    setRefreshError(null)
+
+    const refreshOpenData = async () => {
+      try {
+        const [document, nextAccounts, nextHistory] = await Promise.all([
+          documentsApi.get(documentId),
+          wechatAccountsApi.available(),
+          documentsApi.listWeChatDrafts(documentId),
+        ])
+        if (cancelled) return
+
+        const next = initialMetadata(document.wechat_metadata, document.title)
+        setAvailableAccounts(nextAccounts)
+        setHistory(nextHistory)
+        form.setFieldsValue({
+          ...next,
+          only_fans_can_comment: Boolean(next.need_open_comment && next.only_fans_can_comment),
+          account_id: nextAccounts[0]?.id,
+        })
+      } catch (err) {
+        if (cancelled) return
+        const detail = err instanceof ApiError ? String(err.detail) : err instanceof Error ? err.message : '无法刷新推送信息'
+        setRefreshError(detail)
+      } finally {
+        if (!cancelled) setRefreshingData(false)
+      }
+    }
+
+    void refreshOpenData()
+    return () => {
+      cancelled = true
+    }
+  }, [documentId, form, open, refreshKey])
 
   useEffect(() => {
     if (!draftPushProgress || hasAutoScrolledProgressRef.current) return
@@ -258,6 +290,8 @@ export default function WeChatDraftModal({
     })
     return () => window.cancelAnimationFrame(frame)
   }, [draftPushProgress])
+
+  const interactionDisabled = disabled || refreshingData || Boolean(refreshError)
 
   const collectMetadata = async (): Promise<WeChatArticleMetadata> => {
     const values = await form.validateFields([
@@ -285,6 +319,7 @@ export default function WeChatDraftModal({
   }
 
   const saveMetadata = async (): Promise<WeChatArticleMetadata | null> => {
+    if (interactionDisabled) return null
     try {
       setSaving(true)
       const next = await collectMetadata()
@@ -301,7 +336,7 @@ export default function WeChatDraftModal({
   }
 
   const send = async (syncMode: DraftSyncMode) => {
-    if (disabled) return
+    if (interactionDisabled) return
     let progress: DraftPushProgress = {
       stage: 'validating',
       percent: 3,
@@ -340,8 +375,9 @@ export default function WeChatDraftModal({
         updateProgress({ ...event })
       })
       const completedVerb = result.sync_mode === 'update' ? '草稿已覆盖' : '草稿已创建'
-      updateProgress({ stage: 'history', percent: 99, detail: `${completedVerb}，正在刷新本篇推送记录…` })
-      await loadHistory()
+      updateProgress({ stage: 'history', percent: 99, detail: `${completedVerb}，正在刷新文章和本篇推送记录…` })
+      const [refreshedDocument] = await Promise.all([documentsApi.get(documentId), loadHistory()])
+      onDocumentRefreshed(refreshedDocument)
       updateProgress({ stage: 'completed', percent: 100, detail: `${completedVerb}，推送记录已刷新`, status: 'success' })
       message.success(result.sync_mode === 'update'
         ? `已覆盖「${result.account_name}」草稿箱中的目标图文`
@@ -449,16 +485,21 @@ export default function WeChatDraftModal({
       footer={(
         <Space className="wechat-draft-footer-actions" wrap>
           <Button onClick={onClose}>关闭</Button>
-          <Button loading={saving} disabled={sending || uploadingCover} onClick={() => void saveMetadata()}>保存信息</Button>
+          {refreshError && <Button onClick={() => setRefreshKey((value) => value + 1)}>重新加载</Button>}
+          <Button loading={saving} disabled={interactionDisabled || sending || uploadingCover} onClick={() => void saveMetadata()}>保存信息</Button>
           <Button
-            disabled={disabled || uploadingCover || sending || accounts.length === 0}
+            disabled={interactionDisabled || uploadingCover || sending || availableAccounts.length === 0}
             onClick={() => void send('create')}
           >
             新建草稿
           </Button>
-          <Tooltip title={disabled
-            ? '请先保存正文中的手动修改后再推送'
-            : accounts.length === 0
+          <Tooltip title={refreshingData
+            ? '正在刷新最新文章与封面信息'
+            : refreshError
+              ? '请先重新加载推送信息'
+              : disabled
+                ? '请先保存正文中的手动修改后再推送'
+            : availableAccounts.length === 0
               ? '暂无可用公众号账号'
               : latestSuccessfulDraft
                 ? '自动覆盖该公众号最近一次成功同步的草稿'
@@ -467,7 +508,7 @@ export default function WeChatDraftModal({
               type="primary"
               icon={<SendOutlined />}
               loading={sending}
-              disabled={disabled || uploadingCover || sending || accounts.length === 0}
+              disabled={interactionDisabled || uploadingCover || sending || availableAccounts.length === 0}
               onClick={() => void send('auto')}
             >
               {sending ? '同步中' : latestSuccessfulDraft ? '更新上次草稿' : '同步草稿'}
@@ -476,10 +517,13 @@ export default function WeChatDraftModal({
         </Space>
       )}
     >
+      {refreshingData && <Alert type="info" showIcon message="正在刷新文章、封面和公众号信息…" style={{ marginBottom: 16 }} />}
+      {refreshError && <Alert type="error" showIcon message={`刷新推送信息失败：${refreshError}，请重新加载后再试。`} style={{ marginBottom: 16 }} />}
       {disabled && <Alert type="warning" showIcon message="正文有未保存修改，请先保存后再推送，以确保草稿使用当前内容。" style={{ marginBottom: 16 }} />}
-      {accounts.length === 0 && <Alert type="warning" showIcon message="暂无可用公众号账号。请联系管理员配置账号并授予推送权限。" style={{ marginBottom: 16 }} />}
+      {!refreshingData && availableAccounts.length === 0 && <Alert type="warning" showIcon message="暂无可用公众号账号。请联系管理员配置账号并授予推送权限。" style={{ marginBottom: 16 }} />}
       <Form
         form={form}
+        disabled={interactionDisabled || sending || uploadingCover}
         layout="vertical"
         initialValues={{ need_open_comment: false, only_fans_can_comment: false }}
         onValuesChange={(changedValues) => {
@@ -487,7 +531,7 @@ export default function WeChatDraftModal({
         }}
       >
         <Form.Item name="account_id" label="目标公众号" rules={[{ required: true, message: '请选择目标公众号' }]}>
-          <Select disabled={sending} placeholder="选择公众号" options={accounts.map((account) => ({ value: account.id, label: account.name }))} />
+          <Select disabled={interactionDisabled || sending} placeholder="选择公众号" options={availableAccounts.map((account) => ({ value: account.id, label: account.name }))} />
         </Form.Item>
         <Alert
           type="info"
@@ -522,7 +566,7 @@ export default function WeChatDraftModal({
             <Upload
               accept="image/jpeg,image/png,image/gif,image/bmp"
               showUploadList={false}
-              disabled={uploadingCover}
+              disabled={interactionDisabled || uploadingCover}
               beforeUpload={(file) => {
                 if (file.size > 10 * 1024 * 1024) {
                   message.error('封面不能超过 10MB')
@@ -606,6 +650,7 @@ export default function WeChatDraftModal({
                   <div>
                     <Space wrap size={[6, 4]}>
                       <strong>{item.account_name}</strong>
+                      <span>操作人：{item.created_by_name || '已删除用户'}</span>
                       <Tag color={item.status === 'succeeded' ? 'green' : 'red'}>{item.status === 'succeeded' ? '已同步' : '失败'}</Tag>
                       <Tag color={item.sync_mode === 'update' ? 'orange' : 'blue'}>{item.sync_mode === 'update' ? '覆盖原图文' : '新建图文'}</Tag>
                       <span>{new Date(item.created_at).toLocaleString()}</span>

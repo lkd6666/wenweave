@@ -42,14 +42,7 @@ class OpenAIResponsesClient:
             if block_type in {"text", "input_text", "output_text"}:
                 text = block.get("text")
                 if isinstance(text, str):
-                    item = {"type": "input_text", "text": text}
-                    # Explicit prompt caching annotates the stable text block;
-                    # keep the marker when translating LangChain-style content
-                    # into Responses input items.
-                    breakpoint = block.get("prompt_cache_breakpoint")
-                    if isinstance(breakpoint, dict):
-                        item["prompt_cache_breakpoint"] = breakpoint
-                    blocks.append(item)
+                    blocks.append({"type": "input_text", "text": text})
             elif block_type in {"image_url", "input_image"}:
                 image_url = block.get("image_url")
                 if isinstance(image_url, dict):

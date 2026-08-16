@@ -133,6 +133,44 @@ def _run(
 
 
 class AgentLoopEndToEndTests(unittest.TestCase):
+    def test_invalid_replace_document_returns_structured_html_errors_to_model_and_ui(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "replace_document",
+                        {
+                            "revision": session.document_map()["revision"],
+                            "html": "<section>\n  <strong>broken\n</section>",
+                        },
+                    )
+                },
+                {"text": "已根据明确的标签位置重新检查。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+
+        failed = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "replace_document"
+        )
+        validation = failed["activity"]["html_validation"]
+        self.assertFalse(validation["valid"])
+        self.assertEqual(validation["issues"][0]["code"], "missing_end_tag_before_close")
+        self.assertIn("请在 </section> 前补上 </strong>", failed["result"])
+        self.assertEqual(session.html, SOURCE_HTML)
+
+        self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
+        tool_payload = json.loads(str(model.seen_messages[1][-1].content))
+        self.assertEqual(tool_payload["validation"]["issues"][0]["line"], 3)
+        self.assertEqual(tool_payload["validation"]["issues"][0]["tag"], "section")
+        self.assertIn("不要只根据标签数量猜测", tool_payload["next_step"])
+
     def test_session_history_result_reaches_model_and_timeline_with_call_id(self) -> None:
         """A tool that only returns ToolMessage must still settle the live UI."""
         session = HtmlEditSession(SOURCE_HTML)
@@ -1441,6 +1479,15 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     None,
                     [],
                     session=session,
+                    article_typography_settings={
+                        "horizontal_padding_px": 12,
+                        "paragraph_spacing_px": 8,
+                        "font_size_px": 16,
+                        "line_height_em": 1.8,
+                        "letter_spacing_px": 0.5,
+                        "text_indent_em": 1.5,
+                        "text_color": "#123456",
+                    },
                 )
             ]
 
@@ -1480,6 +1527,15 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                         ),
                     },
                     prior_context_events=pause_data["completed_context_events"],
+                    article_typography_settings={
+                        "horizontal_padding_px": 12,
+                        "paragraph_spacing_px": 8,
+                        "font_size_px": 16,
+                        "line_height_em": 1.8,
+                        "letter_spacing_px": 0.5,
+                        "text_indent_em": 1.5,
+                        "text_color": "#123456",
+                    },
                 )
             ]
 
@@ -1489,6 +1545,8 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertIn("确认的排版方向", final["data"]["content"])
         self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
         self.assertEqual(model.seen_messages[1][-1].tool_call_id, tool_call_id)
+        self.assertIn("font-size:16px", str(model.seen_messages[1][0].content))
+        self.assertIn("#123456", str(model.seen_messages[1][0].content))
         ledger = final["data"]["context_events"]
         calls = {
             call["id"]
@@ -1502,6 +1560,45 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             if event["kind"] == "tool"
         }
         self.assertEqual(calls, results)
+
+    def test_ask_user_can_pause_after_an_html_write(self) -> None:
+        """A later design decision may require confirmation after a partial edit."""
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "replace_document",
+                        {
+                            "revision": session.document_map()["revision"],
+                            "html": "<section><h1>新标题</h1><p>正文内容</p></section>",
+                        },
+                    )
+                },
+                {
+                    "tool": (
+                        "ask_user",
+                        {
+                            "question": "后续内容希望延续现有节奏还是改为更强的视觉层次？",
+                            "options": [{"label": "延续现有节奏"}, {"label": "增强视觉层次"}],
+                        },
+                    )
+                },
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(model, session)
+
+        self.assertTrue(session.edited)
+        self.assertIn("新标题", session.html)
+        self.assertEqual(events[-1]["event"], "user_question")
+        self.assertEqual(events[-1]["data"]["question"]["question"], "后续内容希望延续现有节奏还是改为更强的视觉层次？")
+        self.assertIn(
+            "replace_document",
+            [event["data"].get("name") for event in events if event["event"] == "tool_result"],
+        )
 
     def test_ask_user_normalizes_stable_options_and_rejects_invalid_style_examples(self) -> None:
         question = normalise_user_question(

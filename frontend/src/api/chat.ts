@@ -76,6 +76,11 @@ export interface ReaskDocumentConflict {
   current_checksum: string
 }
 
+export interface ReaskSourceUnavailable {
+  code: 'reask_source_unavailable'
+  message: string
+}
+
 export interface ReaskConflictResolution {
   resolution: 'discard_current_changes'
   currentChecksum: string
@@ -90,6 +95,13 @@ export function reaskDocumentConflictFromError(error: unknown): ReaskDocumentCon
     || typeof detail.current_checksum !== 'string'
   ) return null
   return { code: detail.code, message: detail.message, current_checksum: detail.current_checksum }
+}
+
+export function reaskSourceUnavailableFromError(error: unknown): ReaskSourceUnavailable | null {
+  if (!(error instanceof ApiError) || error.status !== 409 || !error.detail || typeof error.detail !== 'object') return null
+  const detail = error.detail as Partial<ReaskSourceUnavailable>
+  if (detail.code !== 'reask_source_unavailable' || typeof detail.message !== 'string') return null
+  return { code: detail.code, message: detail.message }
 }
 
 export type SequencedChatStreamEvent = ChatStreamEvent & { sequence: number; eventAgeMs: number }

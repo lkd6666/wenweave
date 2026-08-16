@@ -118,6 +118,13 @@ class GzhThemeGenerationCreate(BaseModel):
     theme_id: int | None = Field(default=None, gt=0)
 
 
+class GzhThemeGenerationProgressRead(BaseModel):
+    stage: str = "pending"
+    current: int = Field(default=0, ge=0)
+    total: int = Field(default=0, ge=0)
+    message: str = ""
+
+
 class GzhThemeGenerationRead(BaseModel):
     id: str
     status: str
@@ -130,6 +137,7 @@ class GzhThemeGenerationRead(BaseModel):
     preview_html: str = ""
     component_count: int = 0
     recipe_count: int = 0
+    progress: GzhThemeGenerationProgressRead = Field(default_factory=GzhThemeGenerationProgressRead)
     created_at: datetime
     finished_at: datetime | None = None
 

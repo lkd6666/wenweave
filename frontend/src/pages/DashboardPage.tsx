@@ -14,14 +14,13 @@ import {
   LockOutlined,
   LinkOutlined,
   MoreOutlined,
-  RightOutlined,
   SafetyCertificateOutlined,
   SendOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
 import { useNavigate } from 'react-router'
 import { documentGroupsApi } from '../api/documentGroups'
-import { documentsApi } from '../api/documents'
+import { documentsApi, isWebArticleImportPreview } from '../api/documents'
 import { workbenchApi } from '../api/workbench'
 import type { Page, WorkbenchDocument, WorkbenchGroupedPage } from '../api/workbench'
 import { wechatAccountsApi } from '../api/wechatAccounts'
@@ -36,6 +35,13 @@ import type { ParsedImport } from '../imports/types'
 import type { WebArticleImportPreview } from '../api/documents'
 import { useAuthStore } from '../store/authStore'
 import type { DocumentDetail, DocumentGroup, DocumentSourceType, DocumentSummary, UserReference, VisibilitySettings, WeChatAvailableAccount } from '../types'
+import {
+  LayoutCaptureBridge,
+  getWechatVerificationDetail,
+  resolveWechatCaptureUrl,
+  type WechatVerificationDetail,
+} from '../utils/layoutCaptureBridge'
+import type { CaptureUiState } from '../components/WechatCaptureFallback'
 
 const { Title, Text } = Typography
 
@@ -84,6 +90,7 @@ function replaceDocumentInPage<T extends DocumentSummary>(page: Page<T> | null, 
 
 export default function DashboardPage() {
   const navigate = useNavigate()
+  const [modal, modalContextHolder] = Modal.useModal()
   const currentUserId = useAuthStore((state) => state.user?.id)
   const isAdmin = useAuthStore((state) => state.user?.role === 'admin')
   const [groupOptions, setGroupOptions] = useState<DocumentGroup[]>([])
@@ -92,6 +99,9 @@ export default function DashboardPage() {
   const [searchResults, setSearchResults] = useState<Page<WorkbenchDocument> | null>(null)
   const [loading, setLoading] = useState(false)
   const [creating, setCreating] = useState(false)
+  const [createBlankOpen, setCreateBlankOpen] = useState(false)
+  const [createBlankTitle, setCreateBlankTitle] = useState('未命名推文')
+  const [createBlankGroupId, setCreateBlankGroupId] = useState<number | null>(null)
   const [importing, setImporting] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
   const [importReviewOpen, setImportReviewOpen] = useState(false)
@@ -102,6 +112,9 @@ export default function DashboardPage() {
   const [linkImporting, setLinkImporting] = useState(false)
   const [linkImportPreview, setLinkImportPreview] = useState<WebArticleImportPreview | null>(null)
   const [linkImportError, setLinkImportError] = useState('')
+  const [linkImportWechatFallback, setLinkImportWechatFallback] = useState<WechatVerificationDetail | null>(null)
+  const [linkImportCaptureState, setLinkImportCaptureState] = useState<CaptureUiState>('idle')
+  const [linkImportCaptureError, setLinkImportCaptureError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [view, setView] = useState<WorkspaceView>('grouped')
@@ -116,6 +129,8 @@ export default function DashboardPage() {
   const [loadingWeChatDocumentId, setLoadingWeChatDocumentId] = useState<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const importAbortRef = useRef<AbortController | null>(null)
+  const linkImportBridgeRef = useRef<LayoutCaptureBridge<WebArticleImportPreview> | null>(null)
+  const linkImportRequestVersionRef = useRef(0)
   const screens = Grid.useBreakpoint()
   const isCompact = !screens.lg
   const hasAiEditingDocument = Boolean(
@@ -124,6 +139,33 @@ export default function DashboardPage() {
     || allDocuments?.items.some((document) => document.is_ai_editing)
     || searchResults?.items.some((document) => document.is_ai_editing),
   )
+
+  useEffect(() => {
+    if (!linkImportOpen) return
+    const bridge = new LayoutCaptureBridge<WebArticleImportPreview>((event) => {
+      if (event.type === 'status') {
+        setLinkImportCaptureState(event.status)
+        setLinkImportCaptureError(null)
+        return
+      }
+      if (event.type === 'error') {
+        setLinkImportCaptureState('error')
+        setLinkImportCaptureError(event.message)
+        return
+      }
+      setLinkImportPreview(event.preview)
+      setLinkImportWechatFallback(null)
+      setLinkImportCaptureState('idle')
+      setLinkImportCaptureError(null)
+      setLinkImportError('')
+    }, window, window.location.origin, undefined, isWebArticleImportPreview)
+    linkImportBridgeRef.current = bridge
+    return () => {
+      linkImportRequestVersionRef.current += 1
+      bridge.dispose()
+      if (linkImportBridgeRef.current === bridge) linkImportBridgeRef.current = null
+    }
+  }, [linkImportOpen])
   const showInitialLoading = loading && !groupedWorkspace && !allDocuments && !searchResults
 
   const loadGroupOptions = async () => {
@@ -270,7 +312,7 @@ export default function DashboardPage() {
 
   const handleCreateGroup = () => {
     let name = ''
-    Modal.confirm({
+    modal.confirm({
       title: '新建推文分组',
       content: <Input autoFocus placeholder="例如：品牌活动" onChange={(event) => (name = event.target.value)} />,
       onOk: async () => {
@@ -287,7 +329,7 @@ export default function DashboardPage() {
 
   const handleRenameGroup = (group: DocumentGroup) => {
     let name = group.name
-    Modal.confirm({
+    modal.confirm({
       title: '修改分组名称',
       content: <Input autoFocus defaultValue={name} onChange={(event) => (name = event.target.value)} />,
       onOk: async () => {
@@ -303,7 +345,7 @@ export default function DashboardPage() {
   }
 
   const handleDeleteGroup = (group: DocumentGroup) => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除分组「${group.name}」？`,
       content: '该分组内的推文会移动到“未分组”，推文本身不会被删除。',
       okButtonProps: { danger: true },
@@ -316,36 +358,23 @@ export default function DashboardPage() {
   }
 
   const handleCreateBlank = (defaultGroupId: number | null = null) => {
-    let title = '未命名推文'
-    let groupId = defaultGroupId
-    Modal.confirm({
-      title: '新建空白推文',
-      content: (
-        <Space orientation="vertical" style={{ display: 'flex' }}>
-          <Input defaultValue={title} placeholder="请输入标题" onChange={(event) => (title = event.target.value)} />
-          <Select
-            allowClear
-            placeholder="选择分组（可选）"
-            defaultValue={groupId ?? undefined}
-            options={groupOptions.map((group) => ({ value: group.id, label: group.name }))}
-            onChange={(value) => (groupId = value ?? null)}
-          />
-        </Space>
-      ),
-      onOk: async () => {
-        setCreating(true)
-        try {
-          const doc = await documentsApi.create(title.trim() || '未命名推文', groupId)
-          message.success('已创建')
-          navigate(`/editor/${doc.id}`)
-        } catch (err) {
-          message.error(err instanceof ApiError ? String(err.detail) : '创建失败')
-          return Promise.reject(err)
-        } finally {
-          setCreating(false)
-        }
-      },
-    })
+    setCreateBlankTitle('未命名推文')
+    setCreateBlankGroupId(defaultGroupId)
+    setCreateBlankOpen(true)
+  }
+
+  const submitCreateBlank = async () => {
+    setCreating(true)
+    try {
+      const doc = await documentsApi.create(createBlankTitle.trim() || '未命名推文', createBlankGroupId)
+      setCreateBlankOpen(false)
+      message.success('已创建')
+      navigate(`/editor/${doc.id}`)
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '创建失败')
+    } finally {
+      setCreating(false)
+    }
   }
 
   const handleImportClick = () => {
@@ -404,19 +433,70 @@ export default function DashboardPage() {
       setLinkImportError('请输入公开 HTTPS 文章链接')
       return
     }
+    const requestVersion = linkImportRequestVersionRef.current + 1
+    linkImportRequestVersionRef.current = requestVersion
+    linkImportBridgeRef.current?.cancel()
     releaseLinkImportPreview()
     setLinkImportPreview(null)
     setLinkImportLoading(true)
     setLinkImportError('')
+    setLinkImportWechatFallback(null)
+    setLinkImportCaptureState('idle')
+    setLinkImportCaptureError(null)
     try {
       const preview = await documentsApi.previewWebArticleImport(url)
+      if (linkImportRequestVersionRef.current !== requestVersion) return
       setLinkImportPreview(preview)
     } catch (err) {
-      const detail = err instanceof ApiError ? String(err.detail) : err instanceof Error ? err.message : '文章链接解析失败'
-      setLinkImportError(detail)
+      if (linkImportRequestVersionRef.current !== requestVersion) return
+      const verification = getWechatVerificationDetail(err)
+      if (verification) {
+        const captureUrl = resolveWechatCaptureUrl(verification.url, url) || verification.url
+        setLinkImportWechatFallback({ ...verification, url: captureUrl })
+        setLinkImportCaptureState('checking')
+        const connection = await linkImportBridgeRef.current?.connect('web_article_import') ?? 'missing'
+        if (linkImportRequestVersionRef.current === requestVersion) {
+          setLinkImportCaptureState(connection === 'available' ? 'ready' : connection)
+        }
+      } else {
+        const detail = err instanceof ApiError ? String(err.detail) : err instanceof Error ? err.message : '文章链接解析失败'
+        setLinkImportError(detail)
+      }
     } finally {
-      setLinkImportLoading(false)
+      if (linkImportRequestVersionRef.current === requestVersion) setLinkImportLoading(false)
     }
+  }
+
+  const detectLinkImportExtension = async () => {
+    setLinkImportCaptureState('checking')
+    setLinkImportCaptureError(null)
+    const connection = await linkImportBridgeRef.current?.connect('web_article_import') ?? 'missing'
+    setLinkImportCaptureState(connection === 'available' ? 'ready' : connection)
+  }
+
+  const startLinkImportCapture = async () => {
+    if (!linkImportWechatFallback || !linkImportBridgeRef.current) return
+    setLinkImportCaptureState('opening')
+    setLinkImportCaptureError(null)
+    try {
+      const session = await documentsApi.createWebArticleCaptureSession(linkImportWechatFallback.url)
+      linkImportBridgeRef.current.startSession(session)
+    } catch (err) {
+      setLinkImportCaptureState('error')
+      setLinkImportCaptureError(err instanceof ApiError ? String(err.detail) : '创建浏览器采集会话失败，请重试')
+    }
+  }
+
+  const resetLinkImportCapture = () => {
+    linkImportRequestVersionRef.current += 1
+    linkImportBridgeRef.current?.cancel()
+    releaseLinkImportPreview()
+    setLinkImportPreview(null)
+    setLinkImportError('')
+    setLinkImportWechatFallback(null)
+    setLinkImportCaptureState('idle')
+    setLinkImportCaptureError(null)
+    setLinkImportLoading(false)
   }
 
   const handleLinkImportConfirm = async () => {
@@ -438,14 +518,12 @@ export default function DashboardPage() {
   }
 
   const handleLinkImportClose = () => {
-    releaseLinkImportPreview()
+    resetLinkImportCapture()
     setLinkImportOpen(false)
-    setLinkImportPreview(null)
-    setLinkImportError('')
   }
 
   const handleDelete = (doc: DocumentSummary) => {
-    Modal.confirm({
+    modal.confirm({
       title: `确认删除「${doc.title}」？`,
       content: '删除后无法恢复。',
       okButtonProps: { danger: true },
@@ -860,9 +938,9 @@ export default function DashboardPage() {
               <Button
                 aria-label={`${collapsed ? '展开' : '收起'}分组 ${group.name}`}
                 aria-expanded={!collapsed}
-                className="dashboard-group-toggle"
+                className={`dashboard-group-toggle${collapsed ? ' is-collapsed' : ''}`}
                 type="text"
-                icon={collapsed ? <RightOutlined /> : <DownOutlined />}
+                icon={<DownOutlined className="dashboard-group-toggle-icon" />}
                 onClick={(event) => {
                   event.stopPropagation()
                   toggleGroup(groupKey)
@@ -910,13 +988,15 @@ export default function DashboardPage() {
             )}
           </Space>
         </div>
-        {!collapsed && (
-          <div className="dashboard-group-content">
-            {renderDocuments(item.documents, (page, pageSize) => {
-              void loadGroupedDocumentPage(group.id, pageSize === item.documents.page_size ? page : 1, pageSize)
-            }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+        <div className={`dashboard-group-collapse${collapsed ? ' is-collapsed' : ''}`} aria-hidden={collapsed}>
+          <div className="dashboard-group-collapse-inner" inert={collapsed}>
+            <div className="dashboard-group-content">
+              {renderDocuments(item.documents, (page, pageSize) => {
+                void loadGroupedDocumentPage(group.id, pageSize === item.documents.page_size ? page : 1, pageSize)
+              }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+            </div>
           </div>
-        )}
+        </div>
       </section>
     )
   }
@@ -943,6 +1023,7 @@ export default function DashboardPage() {
 
   return (
     <div className="dashboard-page">
+      {modalContextHolder}
       <div className="dashboard-page-header">
         <Title level={4} style={{ margin: 0 }}>
           推文工作台
@@ -1021,9 +1102,9 @@ export default function DashboardPage() {
                             <Button
                               aria-label={`${collapsedGroups.ungrouped ? '展开' : '收起'}未分组推文`}
                               aria-expanded={!collapsedGroups.ungrouped}
-                              className="dashboard-group-toggle"
+                              className={`dashboard-group-toggle${collapsedGroups.ungrouped ? ' is-collapsed' : ''}`}
                               type="text"
-                              icon={collapsedGroups.ungrouped ? <RightOutlined /> : <DownOutlined />}
+                              icon={<DownOutlined className="dashboard-group-toggle-icon" />}
                               onClick={(event) => {
                                 event.stopPropagation()
                                 toggleGroup('ungrouped')
@@ -1045,13 +1126,15 @@ export default function DashboardPage() {
                           </Tooltip>
                         </Space>
                       </div>
-                      {!collapsedGroups.ungrouped && (
-                        <div className="dashboard-group-content">
-                          {renderDocuments(groupedWorkspace.ungrouped, (page, pageSize) => {
-                            void loadUngroupedDocumentPage(pageSize === groupedWorkspace.ungrouped.page_size ? page : 1, pageSize)
-                          }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+                      <div className={`dashboard-group-collapse${collapsedGroups.ungrouped ? ' is-collapsed' : ''}`} aria-hidden={Boolean(collapsedGroups.ungrouped)}>
+                        <div className="dashboard-group-collapse-inner" inert={Boolean(collapsedGroups.ungrouped)}>
+                          <div className="dashboard-group-content">
+                            {renderDocuments(groupedWorkspace.ungrouped, (page, pageSize) => {
+                              void loadUngroupedDocumentPage(pageSize === groupedWorkspace.ungrouped.page_size ? page : 1, pageSize)
+                            }, false, GROUP_DOCUMENT_PAGE_SIZE_OPTIONS)}
+                          </div>
                         </div>
-                      )}
+                      </div>
                     </section>
                   )}
                   {groupedWorkspace.groups.total > groupedWorkspace.groups.page_size && (
@@ -1075,6 +1158,36 @@ export default function DashboardPage() {
           </>
         )}
       </Card>
+      <Modal
+        className="create-blank-document-modal"
+        title="新建空白推文"
+        open={createBlankOpen}
+        okText="确定"
+        cancelText="取消"
+        confirmLoading={creating}
+        onCancel={() => {
+          if (!creating) setCreateBlankOpen(false)
+        }}
+        onOk={() => void submitCreateBlank()}
+      >
+        <div className="create-blank-document-fields">
+          <Input
+            autoFocus
+            value={createBlankTitle}
+            placeholder="请输入标题"
+            onChange={(event) => setCreateBlankTitle(event.target.value)}
+            onPressEnter={() => void submitCreateBlank()}
+          />
+          <Select
+            allowClear
+            value={createBlankGroupId ?? undefined}
+            placeholder="选择分组（可选）"
+            options={groupOptions.map((group) => ({ value: group.id, label: group.name }))}
+            onChange={(value) => setCreateBlankGroupId(value ?? null)}
+            popupMatchSelectWidth={false}
+          />
+        </div>
+      </Modal>
       <ImportReviewModal
         file={importFile}
         open={importReviewOpen}
@@ -1103,8 +1216,14 @@ export default function DashboardPage() {
         importing={linkImporting}
         preview={linkImportPreview}
         error={linkImportError}
+        wechatFallback={linkImportWechatFallback}
+        captureState={linkImportCaptureState}
+        captureError={linkImportCaptureError}
         onClose={handleLinkImportClose}
         onPreview={(url) => void handleLinkImportPreview(url)}
+        onUrlChange={resetLinkImportCapture}
+        onDetectExtension={() => { void detectLinkImportExtension() }}
+        onStartCapture={() => { void startLinkImportCapture() }}
         onConfirm={() => void handleLinkImportConfirm()}
       />
       {visibilityTarget && (
@@ -1120,12 +1239,12 @@ export default function DashboardPage() {
         <WeChatDraftModal
           open={wechatDraftTarget !== null}
           documentId={wechatDraftTarget.document.id}
-          documentTitle={wechatDraftTarget.document.title}
-          metadata={wechatDraftTarget.document.wechat_metadata}
-          accounts={wechatDraftTarget.accounts}
           disabled={false}
           onClose={() => setWechatDraftTarget(null)}
           onMetadataSaved={handleWeChatMetadataSaved}
+          onDocumentRefreshed={(document) => {
+            handleWeChatMetadataSaved(document.wechat_metadata, document.title)
+          }}
         />
       )}
     </div>

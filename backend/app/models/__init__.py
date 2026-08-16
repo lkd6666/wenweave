@@ -16,6 +16,7 @@ from app.models.agent_run_event import AgentRunEvent
 from app.models.chat_user_question import ChatUserQuestion
 from app.models.app_runtime_lock import AppRuntimeLock
 from app.models.app_branding import AppBranding
+from app.models.article_typography_settings import ArticleTypographySettings
 from app.models.schema_migration import SchemaMigration
 from app.models.chat_session import (
     ChatSession,
@@ -27,6 +28,7 @@ from app.models.chat_context_snapshot import ChatContextSnapshot
 from app.models.chat_history_archive import ChatHistoryArchive
 from app.models.chat_session_layout_reference import ChatSessionLayoutReference
 from app.models.chat_layout_reference import ChatLayoutReference, ChatLayoutReferenceAsset
+from app.models.layout_capture_session import LayoutCaptureSession
 from app.models.chat_context_event import ChatContextEvent
 from app.models.chat_tool_output import ChatToolOutput
 from app.models.document_agent_memory import DocumentAgentMemory
@@ -62,6 +64,7 @@ __all__ = [
     "ChatUserQuestion",
     "AppRuntimeLock",
     "AppBranding",
+    "ArticleTypographySettings",
     "SchemaMigration",
     "ChatSession",
     "ChatSessionMemory",
@@ -72,6 +75,7 @@ __all__ = [
     "ChatSessionLayoutReference",
     "ChatLayoutReference",
     "ChatLayoutReferenceAsset",
+    "LayoutCaptureSession",
     "ChatContextEvent",
     "ChatToolOutput",
     "DocumentAgentMemory",

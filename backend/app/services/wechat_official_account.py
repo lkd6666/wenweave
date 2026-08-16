@@ -8,9 +8,11 @@ import logging
 import re
 import socket
 import time
+import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html import unescape
+from io import BytesIO
 from pathlib import PurePosixPath
 from tempfile import SpooledTemporaryFile
 from typing import Any, BinaryIO
@@ -18,12 +20,14 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.core.crypto import decrypt_secret
 from app.models.wechat_account import WeChatAccount
 from app.schemas.wechat import WeChatArticleMetadata
 from app.services.agent_run_manager import WORKER_ID
 from app.services.html_validation import validate_html_structure
+from app.services.image_localization import css_url_sources, replace_css_urls, replace_srcset_sources, srcset_source_spans
 from app.services.runtime_diagnostics import log_process_memory
 
 
@@ -44,7 +48,12 @@ TRUSTED_OSS_BENCHMARK_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 WECHAT_EMPTY_DIGEST_PLACEHOLDER = "\u200b"
 COVER_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/bmp"}
 BODY_IMAGE_TYPES = COVER_IMAGE_TYPES
+BODY_IMAGE_SOURCE_TYPES = BODY_IMAGE_TYPES | {"image/webp"}
+BODY_IMAGE_TRANSCODE_TYPES = {"image/webp"}
 TEMPORARY_BODY_IMAGE_TYPES = {"image/jpeg", "image/png"}
+MAX_BODY_IMAGE_PIXELS = 40_000_000
+MAX_BODY_IMAGE_ANIMATION_FRAMES = 300
+MAX_BODY_IMAGE_ANIMATION_PIXELS = 80_000_000
 MAX_DRAFT_TARGETS = 100
 DRAFT_TARGET_PAGE_SIZE = 20
 IMAGE_EXTENSIONS = {
@@ -52,6 +61,7 @@ IMAGE_EXTENSIONS = {
     "image/png": ".png",
     "image/gif": ".gif",
     "image/bmp": ".bmp",
+    "image/webp": ".webp",
 }
 SENSITIVE_QUERY_VALUE_PATTERN = re.compile(
     r"([?&](?:access_token|app_secret|secret|api[_-]?key|signature|sign)=)[^&#\s]+",
@@ -61,13 +71,6 @@ SENSITIVE_FIELD_VALUE_PATTERN = re.compile(
     r"((?:[\"']?)(?:access_token|app_secret|secret|api[_-]?key|signature|sign)(?:[\"']?)\s*[=:]\s*(?:[\"']?))([^\s,}&\"']+)",
     re.IGNORECASE,
 )
-BACKGROUND_IMAGE_URL_PATTERN = re.compile(
-    r"(?P<prefix>\bbackground-image\s*:\s*[^;]*?url\(\s*(?P<quote>[\"']?))"
-    r"(?P<url>[^\s\"')]+)(?P=quote)(?P<suffix>\s*\))",
-    re.IGNORECASE,
-)
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -191,6 +194,7 @@ class DraftPushResult:
     cover_media_id: str
     cover_media_was_uploaded: bool
     body_image_cache_entries: tuple[BodyImageCacheEntry, ...] = ()
+    created_new_draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -279,6 +283,7 @@ class WeChatOfficialAccountClient:
         trusted_image_hosts: set[str] | None = None,
         local_image_loader: LocalImageLoader | None = None,
         progress_callback: ProgressCallback | None = None,
+        fallback_to_create_on_invalid_target: bool = False,
     ) -> DraftPushResult:
         target_media_id = target_media_id.strip()
         if not target_media_id:
@@ -294,6 +299,7 @@ class WeChatOfficialAccountClient:
             trusted_image_hosts=trusted_image_hosts,
             local_image_loader=local_image_loader,
             progress_callback=progress_callback,
+            fallback_to_create_on_invalid_target=fallback_to_create_on_invalid_target,
         )
 
     async def _push_draft_with_cleanup(self, account: WeChatAccount, **kwargs: Any) -> DraftPushResult:
@@ -411,6 +417,7 @@ class WeChatOfficialAccountClient:
         trusted_image_hosts: set[str] | None = None,
         local_image_loader: LocalImageLoader | None = None,
         progress_callback: ProgressCallback | None = None,
+        fallback_to_create_on_invalid_target: bool = False,
     ) -> DraftPushResult:
         self.validate_draft_input(metadata, html)
 
@@ -430,6 +437,7 @@ class WeChatOfficialAccountClient:
                         local_image_loader=local_image_loader,
                         progress_callback=progress_callback,
                     )
+                    self._ensure_publishable_body_image_sources(image_result.html)
                     # Recheck after WeChat image URLs have replaced the source URLs.
                     self._validate_article(metadata, image_result.html)
                     cover_media_id = cached_cover_media_id
@@ -442,47 +450,64 @@ class WeChatOfficialAccountClient:
                     else:
                         await self._report_progress(progress_callback, "cover", 86, "已复用该公众号的封面永久素材…")
                     article = self._article_payload(metadata, image_result.html, cover_media_id)
+                    created_new_draft = False
                     try:
                         media_id = await self._submit_draft(client, token, article, target_media_id, progress_callback)
                     except WeChatApiError as exc:
-                        if not image_result.cached_source_hashes or exc.code not in BODY_IMAGE_CACHE_RETRY_ERROR_CODES:
+                        if (
+                            fallback_to_create_on_invalid_target
+                            and target_media_id
+                            and exc.code == 40007
+                        ):
+                            await self._report_progress(
+                                progress_callback,
+                                "draft",
+                                91,
+                                "上次同步的微信草稿已不存在，正在创建新的草稿…",
+                            )
+                            media_id = await self._submit_draft(client, token, article, None, progress_callback)
+                            created_new_draft = True
+                        elif not image_result.cached_source_hashes or exc.code not in BODY_IMAGE_CACHE_RETRY_ERROR_CODES:
                             raise
-                        await self._report_progress(
-                            progress_callback,
-                            "body-images",
-                            48,
-                            "微信未接受已缓存图片，正在重新上传命中的正文图片后重试一次…",
-                        )
-                        refreshed_image_result = await self._replace_body_images(
-                            client,
-                            token,
-                            html,
-                            trusted_image_hosts=trusted_image_hosts,
-                            cached_body_images=cached_body_images,
-                            force_reupload_source_hashes=image_result.cached_source_hashes,
-                            local_image_loader=local_image_loader,
-                            progress_callback=progress_callback,
-                        )
-                        merged_cache_entries = {
-                            entry.source_url_sha256: entry for entry in image_result.cache_entries
-                        }
-                        merged_cache_entries.update(
-                            {entry.source_url_sha256: entry for entry in refreshed_image_result.cache_entries}
-                        )
-                        image_result = BodyImageReplacementResult(
-                            html=refreshed_image_result.html,
-                            cache_entries=tuple(merged_cache_entries.values()),
-                            cached_source_hashes=refreshed_image_result.cached_source_hashes,
-                        )
-                        self._validate_article(metadata, image_result.html)
-                        article = self._article_payload(metadata, image_result.html, cover_media_id)
-                        media_id = await self._submit_draft(client, token, article, target_media_id, progress_callback)
+                        else:
+                            await self._report_progress(
+                                progress_callback,
+                                "body-images",
+                                48,
+                                "微信未接受已缓存图片，正在重新上传命中的正文图片后重试一次…",
+                            )
+                            refreshed_image_result = await self._replace_body_images(
+                                client,
+                                token,
+                                html,
+                                trusted_image_hosts=trusted_image_hosts,
+                                cached_body_images=cached_body_images,
+                                force_reupload_source_hashes=image_result.cached_source_hashes,
+                                local_image_loader=local_image_loader,
+                                progress_callback=progress_callback,
+                            )
+                            merged_cache_entries = {
+                                entry.source_url_sha256: entry for entry in image_result.cache_entries
+                            }
+                            merged_cache_entries.update(
+                                {entry.source_url_sha256: entry for entry in refreshed_image_result.cache_entries}
+                            )
+                            image_result = BodyImageReplacementResult(
+                                html=refreshed_image_result.html,
+                                cache_entries=tuple(merged_cache_entries.values()),
+                                cached_source_hashes=refreshed_image_result.cached_source_hashes,
+                            )
+                            self._ensure_publishable_body_image_sources(image_result.html)
+                            self._validate_article(metadata, image_result.html)
+                            article = self._article_payload(metadata, image_result.html, cover_media_id)
+                            media_id = await self._submit_draft(client, token, article, target_media_id, progress_callback)
                     await self._report_progress(progress_callback, "draft", 96, "微信草稿已写入，正在保存推送记录…")
                     return DraftPushResult(
                         media_id=media_id,
                         cover_media_id=cover_media_id,
                         cover_media_was_uploaded=uploaded_cover,
                         body_image_cache_entries=image_result.cache_entries,
+                        created_new_draft=created_new_draft,
                     )
             except WeChatApiError as exc:
                 last_error = exc
@@ -577,17 +602,129 @@ class WeChatOfficialAccountClient:
             if not isinstance(source, str) or not source.strip():
                 raise WeChatApiError("正文存在未设置 src 的图片")
             add_source(source)
+            srcset = image.get("srcset")
+            if isinstance(srcset, str):
+                for _start, _end, srcset_source in srcset_source_spans(srcset):
+                    add_source(srcset_source)
         for element in soup.find_all(style=True):
             style = element.get("style")
             if not isinstance(style, str):
                 continue
-            for match in BACKGROUND_IMAGE_URL_PATTERN.finditer(style):
-                add_source(match.group("url"))
+            for source in css_url_sources(style):
+                add_source(source)
         return sources
+
+    @staticmethod
+    def _ensure_publishable_body_image_sources(html: str) -> None:
+        for source in WeChatOfficialAccountClient.body_image_sources(html):
+            parsed = urlsplit(source)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise WeChatApiError("正文图片地址必须在提交前转换为公开的 http:// 或 https:// URL")
 
     @staticmethod
     def body_image_source_sha256(source_url: str) -> str:
         return hashlib.sha256(source_url.strip().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _transcode_body_image(payload: ImagePayload) -> ImagePayload:
+        """Convert browser-supported WebP into a format accepted by WeChat."""
+        if payload.content_type not in BODY_IMAGE_TRANSCODE_TYPES:
+            raise WeChatApiError(f"正文图片格式 {payload.content_type or '未知'} 无法自动转换")
+
+        output = BytesIO()
+        output_type = ""
+        extension = ""
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(payload.rewind()) as image:
+                    if image.format != "WEBP":
+                        raise WeChatApiError("正文图片声明为 WebP，但文件内容不是有效的 WebP")
+                    width, height = image.size
+                    frame_count = int(getattr(image, "n_frames", 1) or 1)
+                    if width <= 0 or height <= 0 or width * height > MAX_BODY_IMAGE_PIXELS:
+                        raise WeChatApiError("正文 WebP 图片像素尺寸过大，无法安全转换")
+                    if frame_count > MAX_BODY_IMAGE_ANIMATION_FRAMES:
+                        raise WeChatApiError("正文 WebP 动画帧数过多，无法安全转换")
+                    if width * height * frame_count > MAX_BODY_IMAGE_ANIMATION_PIXELS:
+                        raise WeChatApiError("正文 WebP 动画总像素量过大，无法安全转换")
+
+                    if frame_count > 1:
+                        frames: list[Image.Image] = []
+                        durations: list[int] = []
+                        try:
+                            for frame_index in range(frame_count):
+                                image.seek(frame_index)
+                                image.load()
+                                frames.append(image.convert("RGBA"))
+                                durations.append(max(20, int(image.info.get("duration", 100) or 100)))
+                            frames[0].save(
+                                output,
+                                format="GIF",
+                                save_all=True,
+                                append_images=frames[1:],
+                                duration=durations,
+                                loop=int(image.info.get("loop", 0) or 0),
+                                disposal=2,
+                                optimize=True,
+                            )
+                        finally:
+                            for frame in frames:
+                                frame.close()
+                        output_type = "image/gif"
+                        extension = ".gif"
+                    else:
+                        image.load()
+                        oriented = ImageOps.exif_transpose(image)
+                        try:
+                            has_alpha = "A" in oriented.getbands() or (
+                                oriented.mode == "P" and "transparency" in oriented.info
+                            )
+                            if has_alpha:
+                                rgba = oriented.convert("RGBA")
+                                try:
+                                    rgba.save(output, format="PNG", optimize=True)
+                                    if output.tell() > BODY_IMAGE_LIMIT:
+                                        output.seek(0)
+                                        output.truncate()
+                                        background = Image.new("RGB", rgba.size, "white")
+                                        try:
+                                            background.paste(rgba, mask=rgba.getchannel("A"))
+                                            background.save(
+                                                output, format="JPEG", quality=90, optimize=True, progressive=True
+                                            )
+                                        finally:
+                                            background.close()
+                                        output_type = "image/jpeg"
+                                        extension = ".jpg"
+                                    else:
+                                        output_type = "image/png"
+                                        extension = ".png"
+                                finally:
+                                    rgba.close()
+                            else:
+                                rgb = oriented.convert("RGB")
+                                try:
+                                    rgb.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
+                                finally:
+                                    rgb.close()
+                                output_type = "image/jpeg"
+                                extension = ".jpg"
+                        finally:
+                            if oriented is not image:
+                                oriented.close()
+        except WeChatApiError:
+            raise
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning, UnidentifiedImageError, OSError, ValueError) as exc:
+            raise WeChatApiError("正文 WebP 图片无法解码或转换，请重新上传为 JPG 或 PNG") from exc
+
+        content = output.getvalue()
+        if not content:
+            raise WeChatApiError("正文 WebP 图片转换结果为空")
+        if len(content) > BODY_IMAGE_LIMIT:
+            raise WeChatApiError(f"正文 WebP 图片转换后超过 {BODY_IMAGE_LIMIT // (1024 * 1024)} MB")
+        stem = PurePosixPath(payload.filename).stem or "body-image"
+        return ImagePayload.from_bytes(content, content_type=output_type, filename=f"{stem}{extension}")
 
     async def _access_token(
         self, client: httpx.AsyncClient, account: WeChatAccount, *, force_refresh: bool = False
@@ -686,7 +823,7 @@ class WeChatOfficialAccountClient:
                 payload = await self._download_image(
                     client,
                     source,
-                    allowed_types=BODY_IMAGE_TYPES,
+                    allowed_types=BODY_IMAGE_SOURCE_TYPES,
                     max_bytes=BODY_IMAGE_LIMIT,
                     label="正文图片",
                     trusted_image_hosts=trusted_image_hosts,
@@ -704,6 +841,16 @@ class WeChatOfficialAccountClient:
                 image_index=index,
             )
             try:
+                if payload.content_type in BODY_IMAGE_TRANSCODE_TYPES:
+                    await self._report_progress(
+                        progress_callback,
+                        "body-images",
+                        48 + ((index - 1) * 29 // total),
+                        f"正文图片 {index}/{total}：正在将 WebP 转换为微信支持的格式…",
+                    )
+                    converted_payload = await asyncio.to_thread(self._transcode_body_image, payload)
+                    payload.close()
+                    payload = converted_payload
                 content_type = payload.content_type
                 if content_type not in BODY_IMAGE_TYPES:
                     raise WeChatApiError(f"正文图片仅支持 {'、'.join(sorted(BODY_IMAGE_TYPES))} 格式")
@@ -787,29 +934,21 @@ class WeChatOfficialAccountClient:
         for element in soup.find_all(style=True):
             style = element.get("style")
             if isinstance(style, str):
-                element["style"] = self._replace_background_image_urls(style, replacements)
+                element["style"] = replace_css_urls(style, replacements)
         for image in soup.find_all("img"):
             source = image.get("src")
             if isinstance(source, str):
                 replacement = replacements.get(unescape(source).strip())
                 if replacement:
                     image["src"] = replacement
+            srcset = image.get("srcset")
+            if isinstance(srcset, str):
+                image["srcset"] = replace_srcset_sources(srcset, replacements)
         return BodyImageReplacementResult(
             html=str(soup),
             cache_entries=tuple(cache_entries),
             cached_source_hashes=frozenset(cached_source_hashes),
         )
-
-    @staticmethod
-    def _replace_background_image_urls(style: str, replacements: dict[str, str]) -> str:
-        def replace_match(match: re.Match[str]) -> str:
-            source = unescape(match.group("url")).strip()
-            replacement = replacements.get(source)
-            if not replacement:
-                return match.group(0)
-            return f"{match.group('prefix')}{replacement}{match.group('quote')}{match.group('suffix')}"
-
-        return BACKGROUND_IMAGE_URL_PATTERN.sub(replace_match, style)
 
     @staticmethod
     def _is_reusable_body_image(entry: BodyImageCacheEntry) -> bool:

@@ -42,6 +42,7 @@ from app.models.document import Document
 from app.models.document_version import DocumentVersionSource
 from app.models.template_library import TemplateLibraryItem
 from app.models.user import User
+from app.services.article_typography import get_or_create_typography_settings, typography_settings_payload
 from app.models.model_call_record import ModelCallRecord, ModelCallSource
 from app.models.operation_log import OperationLogStatus
 from app.schemas.chat import (
@@ -56,6 +57,7 @@ from app.schemas.chat import (
     ChatUserQuestionActivityRead,
     ChatUserQuestionAnswerRequest,
     ChatUserQuestionRead,
+    PendingChatUserQuestionRead,
     ChatSessionCreate,
     ChatSessionImageSettingsUpdate,
     ChatSessionRead,
@@ -71,6 +73,7 @@ from app.services.chat_agent import (
     build_chat_model,
     build_compaction_model,
     build_agent_prompt_cache_key,
+    article_typography_prompt,
     claim_thinking_capability_fallback_data,
     context_budget_prompt,
     restore_resume_messages,
@@ -88,7 +91,7 @@ from app.services.chat_session_context import (
     session_theme_proposal,
 )
 from app.services.document_activity import touch_document, touch_group
-from app.services.document_access import can_access_document
+from app.services.document_access import accessible_documents_query, can_access_document
 from app.services.document_versions import create_document_version
 from app.services.document_history_workspace import DocumentHistoryWorkspace
 from app.services.layout_reference import (
@@ -217,6 +220,7 @@ from app.services.chat_images import (
 )
 
 router = APIRouter(prefix="/api/documents", tags=["chat"])
+user_question_router = APIRouter(prefix="/api/chat-user-questions", tags=["chat"])
 logger = logging.getLogger(__name__)
 
 EXECUTING_RUN_STATUSES = {
@@ -247,6 +251,7 @@ CHAT_IMAGE_PREVIEW_TOKEN_MINUTES = 5
 USER_QUESTION_TIMEOUT_CLIENT_REQUEST_PREFIX = "system-timeout:"
 USER_QUESTION_TIMEOUT_RETRY_DELAY_SECONDS = 0.5
 _user_question_timeout_tasks: dict[str, asyncio.Task[None]] = {}
+USER_QUESTION_SNAPSHOT_INTERVAL_SECONDS = 1.0
 
 
 def _is_context_limit_error(message: str) -> bool:
@@ -417,6 +422,76 @@ def _question_read(
         inactivity_seconds=max(1, int(settings.CHAT_USER_QUESTION_INACTIVITY_SECONDS)),
         timeline=_json_dict(question.timeline_json),
         event_sequence=event_sequence,
+    )
+
+
+def _utc_datetime(value: datetime | None) -> datetime:
+    resolved = value or datetime.now(timezone.utc)
+    return resolved.replace(tzinfo=timezone.utc) if resolved.tzinfo is None else resolved.astimezone(timezone.utc)
+
+
+def _pending_user_question_snapshot(user_id: int) -> list[dict]:
+    """Return the durable, access-filtered question queue for one user."""
+    snapshot_db = SessionLocal()
+    try:
+        actor = snapshot_db.get(User, user_id)
+        if actor is None or not actor.is_active:
+            return []
+        query = (
+            snapshot_db.query(ChatUserQuestion, AgentRun, Document)
+            .join(AgentRun, AgentRun.id == ChatUserQuestion.run_id)
+            .join(Document, Document.id == ChatUserQuestion.document_id)
+            .filter(
+                ChatUserQuestion.user_id == user_id,
+                ChatUserQuestion.status == ChatUserQuestionStatus.WAITING,
+                AgentRun.user_id == user_id,
+                AgentRun.status == AgentRunStatus.WAITING_FOR_INPUT,
+                AgentRun.document_id == ChatUserQuestion.document_id,
+            )
+        )
+        rows = (
+            accessible_documents_query(query, actor)
+            .order_by(ChatUserQuestion.created_at, ChatUserQuestion.id)
+            .all()
+        )
+        result: list[dict] = []
+        for question, run, document in rows:
+            question_payload = _question_read(question, int(run.event_sequence or 0))
+            if question_payload is None:
+                continue
+            result.append(
+                PendingChatUserQuestionRead(
+                    document_id=document.id,
+                    document_title=document.title,
+                    session_id=question.session_id,
+                    created_at=_utc_datetime(question.created_at),
+                    question=question_payload,
+                ).model_dump(mode="json")
+            )
+        return result
+    finally:
+        snapshot_db.close()
+
+
+async def _pending_user_question_event_stream(user_id: int) -> AsyncIterator[dict]:
+    previous_snapshot = ""
+    while True:
+        snapshot = await asyncio.to_thread(_pending_user_question_snapshot, user_id)
+        encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if encoded != previous_snapshot:
+            previous_snapshot = encoded
+            yield {"event": "pending_questions", "data": encoded}
+        await asyncio.sleep(USER_QUESTION_SNAPSHOT_INTERVAL_SECONDS)
+
+
+@user_question_router.get("/events")
+def stream_pending_user_questions(
+    current_user: User = Depends(get_current_user),
+) -> EventSourceResponse:
+    return EventSourceResponse(
+        _pending_user_question_event_stream(current_user.id),
+        ping=15,
+        headers=SSE_RESPONSE_HEADERS,
     )
 
 
@@ -1989,6 +2064,7 @@ def get_chat_context(
         HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
         history_rows,
         context_budget_prompt()
+        + "\n\n" + article_typography_prompt(typography_settings_payload(get_or_create_typography_settings(db)))
         + _layout_reference_context_prompt(
             session_layout_reference_agent_payload(get_session_layout_reference(db, session.id))
         )
@@ -2042,6 +2118,7 @@ def preview_chat_context(
         HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
         history_rows,
         context_budget_prompt()
+        + "\n\n" + article_typography_prompt(typography_settings_payload(get_or_create_typography_settings(db)))
         + _layout_reference_context_prompt(
             session_layout_reference_agent_payload(get_session_layout_reference(db, session.id))
         )
@@ -2081,6 +2158,7 @@ async def compact_chat_context(
         HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
         history_rows,
         context_budget_prompt()
+        + "\n\n" + article_typography_prompt(typography_settings_payload(get_or_create_typography_settings(db)))
         + _layout_reference_context_prompt(
             session_layout_reference_agent_payload(get_session_layout_reference(db, session.id))
         )
@@ -2277,7 +2355,14 @@ async def start_chat_run(
                 },
             ) from exc
         except ChatReaskError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            # A stale client can retain a historical re-ask anchor after that
+            # branch has already been archived. Give it a stable error code so
+            # it can preserve the typed message while falling back to a normal
+            # next turn instead of replaying this invalid anchor forever.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "reask_source_unavailable", "message": str(exc)},
+            ) from exc
     theme_application: dict | None = None
     theme_proposal_id = payload.gzh_theme_proposal_id or inherited_theme_proposal_id
     if theme_proposal_id is None:
@@ -2336,7 +2421,9 @@ async def start_chat_run(
             get_session_layout_reference(db, chat_session.id)
         )
     selected_elements = [element.model_dump() for element in payload.selected_elements]
+    article_typography_settings = typography_settings_payload(get_or_create_typography_settings(db))
     reference_budget_prompt = context_budget_prompt() + _layout_reference_context_prompt(layout_reference)
+    reference_budget_prompt += "\n\n" + article_typography_prompt(article_typography_settings)
     reference_budget_prompt += _attached_template_prompt(attached_templates)
     if theme_application:
         reference_budget_prompt += (
@@ -2449,10 +2536,11 @@ async def start_chat_run(
             layout_reference=layout_reference,
             theme_application=theme_application,
             theme_reference=theme_reference,
-        attached_templates=attached_templates,
-        reask_activated=reask_activation is not None,
-        request_id=get_operation_request_id(),
-    )
+            attached_templates=attached_templates,
+            reask_activated=reask_activation is not None,
+            request_id=get_operation_request_id(),
+            article_typography_settings=article_typography_settings,
+        )
     )
     agent_run_manager.set_task(run.id, task)
     return _run_read(run, reask_activation)
@@ -2831,6 +2919,7 @@ async def answer_chat_user_question(
             attached_templates=execution_context.get("attached_templates") if isinstance(execution_context.get("attached_templates"), list) else [],
             request_id=get_operation_request_id(),
             resume_state=resume_state,
+            article_typography_settings=execution_context.get("article_typography_settings") if isinstance(execution_context.get("article_typography_settings"), dict) else None,
         )
     )
     agent_run_manager.set_task(run.id, task)
@@ -3095,6 +3184,7 @@ async def _execute_agent_run(
     reask_activated: bool = False,
     request_id: str = "",
     resume_state: dict | None = None,
+    article_typography_settings: dict | None = None,
 ) -> None:
     """独立于浏览器 SSE 的执行任务；任何终态均保存已完成过程。"""
     log_process_memory(
@@ -3519,6 +3609,7 @@ async def _execute_agent_run(
             "attached_templates": attached_templates or [],
             "thinking_mode": thinking_status.requested,
             "thinking_effort": thinking_effort,
+            "article_typography_settings": article_typography_settings,
         }
         now = datetime.now(timezone.utc)
         timeout_at = now + timedelta(
@@ -3636,7 +3727,14 @@ async def _execute_agent_run(
             stream_model.tool_result_max_tokens,
             session_factory=SessionLocal,
         )
-        budget_prompt = context_budget_prompt() + _layout_reference_context_prompt(layout_reference)
+        if article_typography_settings is None:
+            article_typography_settings = typography_settings_payload(get_or_create_typography_settings(stream_db))
+        budget_prompt = (
+            context_budget_prompt()
+            + "\n\n"
+            + article_typography_prompt(article_typography_settings)
+            + _layout_reference_context_prompt(layout_reference)
+        )
         selection_budget_context = json.dumps(selected_elements, ensure_ascii=False) if selected_elements else ""
         context_builder = AgentContextBuilder(
             stream_db,
@@ -3852,6 +3950,7 @@ async def _execute_agent_run(
                     image_generation_context=image_generation_context,
                     model_is_multimodal=stream_model.is_multimodal,
                     provider_type=stream_model.provider.provider_type.value,
+                    article_typography_settings=article_typography_settings,
                 )
             ):
                 event = evt["event"]
@@ -4072,7 +4171,12 @@ async def _execute_agent_run(
 
             if context_error:
                 retried_for_context = True
-                retry_budget_prompt = context_budget_prompt() + _layout_reference_context_prompt(layout_reference)
+                retry_budget_prompt = (
+                    context_budget_prompt()
+                    + "\n\n"
+                    + article_typography_prompt(article_typography_settings)
+                    + _layout_reference_context_prompt(layout_reference)
+                )
                 retry_builder = AgentContextBuilder(
                     stream_db,
                     document_id,

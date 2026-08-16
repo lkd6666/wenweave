@@ -1,0 +1,1 @@
+declare const __LAYOUT_CAPTURE_EXTENSION_DOWNLOAD_URL__: string

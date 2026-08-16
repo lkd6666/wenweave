@@ -28,18 +28,18 @@ Define the task to achieve, including specific requirements, constraints, and su
 
 ### 标准段落结构
 - 使用 `section` 包裹 `p`，并保持统一段距与缩进。
-- 标准结构如下：
+- 段落的间距、字号、行高、字距、首行缩进、正文色和左右间距由管理员在「正文排版」设置中统一配置。标准结构如下（方括号字段使用当前设置值）：
   ```html
-  <section style="margin:20px [左右间距] 0 [左右间距];">
-    <p style="margin:0 [左右间距]; font-size:15px; color:rgb(0, 0, 0); letter-spacing:1px; line-height:2em; text-indent:2em; max-width:100%;">
-      <span style="letter-spacing:1px;">文字</span>
+  <section style="margin:[段前距] [左右间距] 0;">
+    <p style="margin:0 [左右间距]; font-size:[字号]; color:[正文色]; letter-spacing:[字距]; line-height:[行高]; text-indent:[首行缩进]; max-width:100%;">
+      <span style="letter-spacing:[字距];">文字</span>
     </p>
   </section>
   ```
-- `[左右间距]` 只能在 `3px`、`4px`、`5px` 中选择一个，全文必须统一。
+- 除非用户在本轮明确指定某项正文参数，否则全文必须统一使用当前管理员设置。
 
 ### 文本与标点规范
-- 正文样式统一：`font-size:15px; line-height:2em; letter-spacing:1px; color:rgb(0, 0, 0);`。
+- 正文样式统一使用当前管理员配置；不在此处固定字号、行高、字距和颜色。
 - 使用中文标点：，。；！？：（）
 - 引号统一转义：双引号使用 `&ldquo;` 与 `&rdquo;`，单引号使用 `&lsquo;` 与 `&rsquo;`。
 - 注意省略号不转义，直接使用`...`。
@@ -54,7 +54,7 @@ Define the task to achieve, including specific requirements, constraints, and su
 
 ### 色彩系统
 - 主色 1-2 种，辅助色最多 1 种。
-- 正文色：`#000000`；次要文字：`#666666`。
+- 正文色使用当前管理员配置；次要文字：`#666666`。
 - 强调色建议低饱和，重点不超过 3 处。
 
 ### 排版细节

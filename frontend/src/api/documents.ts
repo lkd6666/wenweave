@@ -1,5 +1,5 @@
 import { ApiError, api, apiEventStream } from './client'
-import type { DocumentDetail, DocumentShareRecord, DocumentShareVisitList, DocumentSummary, DocumentVersionDetail, DocumentVersionSummary, VisibilitySettings, VisibilityTargets, WeChatArticleMetadata, WeChatDraftRecord, WeChatDraftTarget } from '../types'
+import type { DocumentDetail, DocumentShareRecord, DocumentShareVisitList, DocumentSummary, DocumentVersionDetail, DocumentVersionSummary, LayoutCaptureSession, VisibilitySettings, VisibilityTargets, WeChatArticleMetadata, WeChatDraftRecord, WeChatDraftTarget } from '../types'
 import { useAuthStore } from '../store/authStore'
 
 export interface DirectUploadTarget {
@@ -63,6 +63,17 @@ export interface WebArticleImportPreview {
   external_image_count: number
   warnings: string[]
   expires_at: string
+}
+
+export function isWebArticleImportPreview(value: unknown): value is WebArticleImportPreview {
+  if (typeof value !== 'object' || value === null) return false
+  const preview = value as Record<string, unknown>
+  return typeof preview.id === 'string'
+    && typeof preview.title === 'string'
+    && typeof preview.preview_html === 'string'
+    && typeof preview.image_count === 'number'
+    && Array.isArray(preview.warnings)
+    && typeof preview.expires_at === 'string'
 }
 
 export interface DocumentHtmlPatch {
@@ -188,7 +199,7 @@ export const documentsApi = {
   update: (id: number, payload: { title?: string; current_html?: string; group_id?: number | null; wechat_metadata?: WeChatArticleMetadata } & Partial<VisibilitySettings>) =>
     api.patch<DocumentDetail>(`/documents/${id}`, payload),
   patchContent: (id: number, payload: DocumentHtmlPatch) =>
-    api.patch<void>(`/documents/${id}/content`, payload),
+    api.patch<DocumentImageLocalizationResult>(`/documents/${id}/content`, payload),
   revertLastAiChange: (id: number) => api.post<DocumentDetail>(`/documents/${id}/revert-last-ai-change`),
   revertToMessage: (id: number, messageId: number) =>
     api.post<DocumentDetail>(`/documents/${id}/revert-to-message`, { message_id: messageId }),
@@ -264,6 +275,8 @@ export const documentsApi = {
     api.post<DocumentDetail>(`/documents/imports/${importId}/complete`, payload),
   previewWebArticleImport: (url: string) =>
     api.post<WebArticleImportPreview>('/documents/link-imports/preview', { url }),
+  createWebArticleCaptureSession: (url: string) =>
+    api.post<LayoutCaptureSession>('/documents/link-imports/capture-sessions', { url }),
   completeWebArticleImport: (importId: string) =>
     api.post<DocumentDetail>(`/documents/link-imports/${importId}/complete`, {}),
   cancelWebArticleImport: (importId: string) => api.delete<void>(`/documents/link-imports/${importId}`),

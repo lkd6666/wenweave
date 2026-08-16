@@ -260,6 +260,13 @@ export function AiTodoList({ items, live = false }: { items: AiTodoItem[]; live?
   const active = items.find((item) => item.status === 'in_progress')
   const allDone = items.length > 0 && done === items.length
   const progress = items.length ? Math.round((done / items.length) * 100) : 0
+  const summary = allDone
+    ? '已完成全部任务'
+    : active
+      ? active.step
+      : done > 0
+        ? `已完成 ${done} 项`
+        : '等待开始'
   return (
     <section className={`aicss-todo-list${live ? ' is-live' : ''}`} aria-label="任务清单" aria-live={live ? 'polite' : 'off'}>
       <button type="button" className="aicss-todo-head" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
@@ -271,7 +278,10 @@ export function AiTodoList({ items, live = false }: { items: AiTodoItem[]; live?
           ) : <TodoListIcon />}
           <TodoChevronIcon />
         </span>
-        <span className="aicss-todo-title">任务清单</span>
+        <span className="aicss-todo-title">
+          <span className="aicss-todo-title-label" aria-hidden={!open}>任务清单</span>
+          <span className={`aicss-todo-head-summary${active ? ' is-active' : allDone ? ' is-done' : ''}`} aria-hidden={open} data-label={summary} title={summary}>{summary}</span>
+        </span>
         <span className="aicss-todo-count" aria-label={`${done}/${items.length} 已完成`}>{done}/{items.length}</span>
       </button>
       <div className={`aicss-todo-collapsible${open ? '' : ' is-collapsed'}`}>

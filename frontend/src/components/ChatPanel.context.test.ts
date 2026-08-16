@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AIModelItem, ChatContextStats } from '../types'
-import { contextUsageValues, formatMessageTime, isRuntimeContextCompacting, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, supportsDisabledThinkingOption, visibleTemplateReferenceIndexes } from './ChatPanel'
+import { contextUsageValues, formatMessageTime, isRuntimeContextCompacting, mergeFallbackThoughtBlocks, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, supportsDisabledThinkingOption, visibleAssistantTurnBlocks, visibleTemplateReferenceIndexes } from './ChatPanel'
 import { questionDeadlineMs } from './UserQuestionPanel'
 
 describe('contextUsageValues', () => {
@@ -92,6 +92,60 @@ describe('normaliseAssistantTurnBlocks', () => {
       content: '',
       tool: null,
     }])
+  })
+})
+
+describe('assistant timeline visibility', () => {
+  it('keeps task-plan tool calls in the visible execution timeline', () => {
+    const blocks = visibleAssistantTurnBlocks([{
+      id: 'task-plan',
+      type: 'tool',
+      state: 'done',
+      content: '',
+      tool: {
+        id: 'task-plan',
+        name: 'update_task_plan',
+        arguments: {},
+        status: 'success',
+        preparing: false,
+        result: '任务清单已更新',
+        html_changed: false,
+        activity: { kind: 'plan', summary: '任务清单 1/2 已完成' },
+        read_range: null,
+        change_summary: null,
+      },
+    }])
+
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].tool?.name).toBe('update_task_plan')
+  })
+
+  it('adds saved reasoning when older structured blocks omitted it', () => {
+    const blocks = mergeFallbackThoughtBlocks([{
+      id: 'tool-1',
+      type: 'tool',
+      state: 'done',
+      content: '',
+      tool: null,
+    }], { status: 'complete', content: '先读取文档，再调整层级。', detail: '' })
+
+    expect(blocks[0]).toMatchObject({ type: 'thought', state: 'done', content: '先读取文档，再调整层级。' })
+  })
+
+  it('does not replace the legacy tool fallback when adding saved reasoning', () => {
+    const legacyTools = [{
+      id: 'tool-1',
+      type: 'tool' as const,
+      state: 'done' as const,
+      content: '',
+      tool: null,
+    }]
+    const blocks = mergeFallbackThoughtBlocks(legacyTools, {
+      status: 'complete', content: '先读取文档，再调整层级。', detail: '',
+    })
+
+    expect(blocks).toHaveLength(2)
+    expect(blocks[1]).toBe(legacyTools[0])
   })
 })
 

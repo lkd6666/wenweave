@@ -105,6 +105,26 @@ const FONT_OPTIONS = [
 ]
 const LINE_HEIGHT_OPTIONS = ['1', '1.2', '1.4', '1.5', '1.6', '1.8', '2', '2.4']
 
+function isTransferablePastedImageSource(value: string): boolean {
+  const source = value.trim().toLowerCase()
+  return source.startsWith('data:image/') || source.startsWith('//') || source.startsWith('http://') || source.startsWith('https://')
+}
+
+function pastedHtmlContainsTransferableImage(html: string): boolean {
+  const parser = new DOMParser()
+  const fragment = parser.parseFromString(html, 'text/html')
+  for (const element of Array.from(fragment.body.querySelectorAll<HTMLElement>('[src], [srcset], [style]'))) {
+    if (isTransferablePastedImageSource(element.getAttribute('src') ?? '')) return true
+    const srcset = element.getAttribute('srcset') ?? ''
+    if (/(?:^|[\s,])(?:data:image\/|\/\/|https?:\/\/)/i.test(srcset)) return true
+    const style = element.getAttribute('style') ?? ''
+    for (const match of style.matchAll(/url\(\s*['"]?([^'"\s)]+)['"]?\s*\)/gi)) {
+      if (isTransferablePastedImageSource(match[1])) return true
+    }
+  }
+  return false
+}
+
 function isCrossOriginHttpSource(source: string): boolean {
   try {
     const parsed = new URL(source, window.location.href)
@@ -2380,7 +2400,10 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       if (clipboardHtml.trim()) {
         event.preventDefault()
         event.stopPropagation()
-        pendingExternalImagePasteRef.current = /<img\b[^>]*(?:https?:\/\/|data:image\/)/i.test(clipboardHtml)
+        // Rich paste can put images in srcset or CSS background-image rather
+        // than img.src.  Mark every transferable form so it is immediately
+        // copied into article storage after the paste is saved.
+        pendingExternalImagePasteRef.current = pastedHtmlContainsTransferableImage(clipboardHtml)
         if (!insertPastedHtml(clipboardHtml)) pendingExternalImagePasteRef.current = false
         return
       }

@@ -1,0 +1,235 @@
+:root {
+  color: #111827;
+  background: #fff;
+  font: 13px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 352px;
+  margin: 0;
+  background: #fff;
+}
+
+.popup-shell {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.popup-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.app-mark {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  place-items: center;
+  border-radius: 8px;
+  background: #111827;
+  box-shadow: inset 0 -3px 0 #3b82f6;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+.brand-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+h1 {
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.popup-header p {
+  margin-top: 1px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.connection-badge {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: #4b5563;
+  font-size: 11px;
+}
+
+.connection-badge > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #16a34a;
+  box-shadow: 0 0 0 3px #dcfce7;
+}
+
+.task-panel {
+  padding: 13px 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.task-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: #6b7280;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.state-indicator {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9ca3af;
+}
+
+.task-panel[data-state="idle"] .state-indicator,
+.task-panel[data-state="ready"] .state-indicator {
+  background: #2563eb;
+}
+
+.task-panel[data-state="running"] .state-indicator,
+.task-panel[data-state="loading"] .state-indicator {
+  border: 1px solid #2563eb;
+  border-top-color: transparent;
+  background: transparent;
+  animation: spin 900ms linear infinite;
+}
+
+.task-panel[data-state="error"] {
+  border-color: #fecaca;
+  background: #fff7f7;
+}
+
+.task-panel[data-state="error"] .state-indicator {
+  background: #dc2626;
+}
+
+h2 {
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.status {
+  margin-top: 5px;
+  color: #4b5563;
+  line-height: 1.65;
+}
+
+.target {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+.target code {
+  min-width: 0;
+  overflow: hidden;
+  color: #374151;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+button {
+  min-width: 92px;
+  min-height: 36px;
+  padding: 7px 14px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #111827;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+button.primary {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #fff;
+}
+
+button:not(:disabled):hover {
+  border-color: #9ca3af;
+  background: #f9fafb;
+}
+
+button.primary:not(:disabled):hover {
+  border-color: #1d4ed8;
+  background: #1d4ed8;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+footer > span {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  place-items: center;
+  border-radius: 50%;
+  background: #ecfdf3;
+  color: #15803d;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .state-indicator {
+    animation: none !important;
+  }
+}

@@ -11,6 +11,8 @@ CREATE TABLE ai_providers (
 	base_url VARCHAR(512) NOT NULL,
 	image_protocol VARCHAR(48) NOT NULL DEFAULT '',
 	image_base_url VARCHAR(512) NOT NULL DEFAULT '',
+	is_enabled BOOL NOT NULL DEFAULT '1',
+	availability_time_ranges JSON NOT NULL,
 	api_key_encrypted MEDIUMTEXT NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id)
@@ -52,6 +54,10 @@ CREATE TABLE gzh_theme_generations (
 	reference_asset_ids_json TEXT NOT NULL,
 	output_json LONGTEXT NOT NULL,
 	validation_json LONGTEXT NOT NULL,
+	progress_stage VARCHAR(32) NOT NULL DEFAULT 'pending',
+	progress_current INT NOT NULL DEFAULT 0,
+	progress_total INT NOT NULL DEFAULT 0,
+	progress_message VARCHAR(256) NOT NULL DEFAULT '',
 	error_message VARCHAR(2048) NOT NULL,
 	status ENUM('pending','running','succeeded','failed','cancelled','saved') NOT NULL,
 	cancel_requested BOOL NOT NULL,
@@ -152,6 +158,8 @@ CREATE TABLE ai_image_models (
 	supported_aspect_ratios JSON NOT NULL,
 	supported_qualities JSON NOT NULL,
 	is_default BOOL NOT NULL DEFAULT '0',
+	is_enabled BOOL NOT NULL DEFAULT '1',
+	availability_time_ranges JSON NOT NULL,
 	access_mode VARCHAR(16) NOT NULL DEFAULT 'all',
 	adapter_config JSON NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT now(),
@@ -174,6 +182,8 @@ CREATE TABLE ai_models (
 	max_output_tokens INTEGER NOT NULL DEFAULT '8192',
 	tool_result_max_tokens INTEGER NOT NULL DEFAULT '8192',
 	is_default BOOL NOT NULL,
+	is_enabled BOOL NOT NULL DEFAULT '1',
+	availability_time_ranges JSON NOT NULL,
 	is_multimodal BOOL NOT NULL DEFAULT '0',
 	supports_disabled_thinking BOOL NOT NULL DEFAULT '1',
 	default_thinking_effort VARCHAR(16) NOT NULL DEFAULT 'auto',
@@ -200,6 +210,22 @@ CREATE TABLE app_branding (
 )CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 
 
+CREATE TABLE article_typography_settings (
+	id BIGINT UNSIGNED NOT NULL,
+	horizontal_padding_px FLOAT NOT NULL,
+	paragraph_spacing_px FLOAT NOT NULL,
+	font_size_px FLOAT NOT NULL,
+	line_height_em FLOAT NOT NULL,
+	letter_spacing_px FLOAT NOT NULL,
+	text_indent_em FLOAT NOT NULL,
+	text_color VARCHAR(7) NOT NULL,
+	updated_by_id BIGINT UNSIGNED,
+	updated_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id),
+	FOREIGN KEY(updated_by_id) REFERENCES users (id) ON DELETE SET NULL
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+
+
 CREATE TABLE chat_layout_references (
 	reference_id VARCHAR(36) NOT NULL,
 	user_id BIGINT UNSIGNED NOT NULL,
@@ -219,6 +245,23 @@ CREATE TABLE chat_layout_references (
 )CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
 CREATE INDEX ix_chat_layout_references_expires_at ON chat_layout_references (expires_at);
 CREATE INDEX ix_chat_layout_references_user_id ON chat_layout_references (user_id);
+
+
+CREATE TABLE layout_capture_sessions (
+	id VARCHAR(36) NOT NULL,
+	user_id BIGINT UNSIGNED NOT NULL,
+	canonical_url VARCHAR(2048) NOT NULL,
+	purpose VARCHAR(32) NOT NULL DEFAULT 'layout_reference',
+	token_hash VARCHAR(64) NOT NULL,
+	status VARCHAR(16) NOT NULL,
+	expires_at DATETIME NOT NULL,
+	consumed_at DATETIME,
+	created_at DATETIME NOT NULL DEFAULT now(),
+	PRIMARY KEY (id),
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+)CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_layout_capture_sessions_expires_at ON layout_capture_sessions (expires_at);
+CREATE INDEX ix_layout_capture_sessions_user_id ON layout_capture_sessions (user_id);
 
 
 CREATE TABLE document_groups (
@@ -702,7 +745,7 @@ CREATE TABLE image_library_assets (
 	is_shared BOOL NOT NULL,
 	deleted_at DATETIME,
 	created_at DATETIME NOT NULL DEFAULT now(),
-	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id),
 	FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE CASCADE,
 	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE SET NULL,
@@ -945,7 +988,7 @@ CREATE TABLE image_generations (
 	quantity INTEGER NOT NULL,
 	aspect_ratio VARCHAR(24) NOT NULL,
 	quality VARCHAR(24) NOT NULL,
-	timeout_seconds INTEGER NOT NULL DEFAULT 180,
+	timeout_seconds INTEGER NOT NULL DEFAULT '180',
 	anchor_block_id VARCHAR(128) NOT NULL,
 	source_image_url VARCHAR(4096) NOT NULL,
 	source_image_hash VARCHAR(64) NOT NULL,

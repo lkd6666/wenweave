@@ -1,8 +1,9 @@
 import asyncio
 import base64
-import tempfile
+import shutil
 import unittest
 from pathlib import Path
+from uuid import uuid4
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import create_engine
@@ -19,12 +20,15 @@ from app.services.local_uploads import ImageInfo
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+TEST_TMP_PARENT = Path(__file__).resolve().parents[1] / "data" / "test-temp"
 
 
 class DocumentImageLocalizationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.directory = tempfile.TemporaryDirectory()
-        self.local_root = patch.object(local_uploads, "LOCAL_UPLOAD_ROOT", Path(self.directory.name))
+        TEST_TMP_PARENT.mkdir(parents=True, exist_ok=True)
+        self.directory = TEST_TMP_PARENT / f"tmp-{uuid4().hex}"
+        self.directory.mkdir(parents=True)
+        self.local_root = patch.object(local_uploads, "LOCAL_UPLOAD_ROOT", self.directory)
         self.local_root.start()
         self.engine = create_engine("sqlite://")
         Base.metadata.create_all(self.engine)
@@ -42,7 +46,7 @@ class DocumentImageLocalizationTests(unittest.TestCase):
         Base.metadata.drop_all(self.engine)
         self.engine.dispose()
         self.local_root.stop()
-        self.directory.cleanup()
+        shutil.rmtree(self.directory, ignore_errors=True)
 
     def test_copies_template_and_external_images_to_local_document_storage_once(self) -> None:
         asset_id = "11111111-1111-1111-1111-111111111111"
@@ -79,3 +83,18 @@ class DocumentImageLocalizationTests(unittest.TestCase):
         cleanup_document_localization(self.db, result)
         for stored in result.stored_images:
             self.assertFalse(local_uploads.local_path(stored.handle.object_key).exists())
+
+    def test_treats_a_protocol_relative_image_as_https(self) -> None:
+        fetch = AsyncMock(return_value=(PNG, ImageInfo("image/png", "png")))
+        with patch("app.services.document_image_localization.fetch_public_image", new=fetch):
+            result = asyncio.run(localize_document_html(
+                self.db,
+                self.document,
+                '<div style="background-image:url(//images.example.test/hero.png)"></div>',
+            ))
+
+        self.assertEqual(result.localized_count, 1)
+        fetch.assert_awaited_once()
+        self.assertEqual(fetch.await_args.args[1], "https://images.example.test/hero.png")
+        self.assertTrue(fetch.await_args.kwargs["allow_http"])
+        cleanup_document_localization(self.db, result)

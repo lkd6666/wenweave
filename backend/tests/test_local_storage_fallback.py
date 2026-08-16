@@ -1,7 +1,6 @@
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -18,6 +17,7 @@ from app.models.user import User, UserRole
 from app.services import local_uploads
 from app.services.gzh_theme_generation import create_reference_asset, read_reference_asset_bytes
 from app.services.wechat_official_account import WeChatOfficialAccountClient
+from tests.workspace_temp import WorkspaceTempDirectory
 
 
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -25,7 +25,7 @@ PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
 
 class LocalStorageFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.local_upload_directory = TemporaryDirectory()
+        self.local_upload_directory = WorkspaceTempDirectory("local-storage")
         self.local_root = patch.object(local_uploads, "LOCAL_UPLOAD_ROOT", Path(self.local_upload_directory.name))
         self.local_root.start()
         self.engine = create_engine("sqlite:///:memory:")

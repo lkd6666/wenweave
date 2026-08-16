@@ -21,6 +21,8 @@ from app.services.operation_logs import (
     capture_request_context,
     classify_operation,
     resolve_client_ip,
+    set_request_audit_actor,
+    with_request_audit_actor,
 )
 
 
@@ -148,10 +150,18 @@ class OperationLogTests(unittest.TestCase):
         theme_asset = classify_operation("POST", "/api/gzh-theme-assets")
         generation = classify_operation("POST", "/api/gzh-theme-generations/job-1/save")
         link_import = classify_operation("POST", "/api/documents/link-imports/import-1/complete")
+        capture_create = classify_operation("POST", "/api/documents/link-imports/capture-sessions")
+        capture_complete = classify_operation(
+            "POST",
+            "/api/documents/link-imports/capture-sessions/capture-1/complete",
+        )
         fallback = classify_operation("PATCH", "/api/future-business-feature/42")
         self.assertEqual(theme_asset.action if theme_asset else "", "theme.reference_asset.upload")
         self.assertEqual(generation.action if generation else "", "theme.generation.save")
         self.assertEqual(link_import.action if link_import else "", "document.link_import.complete")
+        self.assertEqual(capture_create.action if capture_create else "", "document.link_import.capture.create")
+        self.assertEqual(capture_complete.action if capture_complete else "", "document.link_import.capture.complete")
+        self.assertEqual(capture_complete.resource_id if capture_complete else "", "capture-1")
         self.assertEqual(fallback.action if fallback else "", "api.patch")
 
     def test_classifies_auth_refresh_as_account_operation(self) -> None:
@@ -185,6 +195,36 @@ class OperationLogTests(unittest.TestCase):
         self.assertEqual(context.actor_user_id, user.id)
         self.assertEqual(context.actor_username, user.username)
         self.assertEqual(context.actor_display_name, user.display_name)
+
+    def test_only_typed_server_actor_override_can_attribute_anonymous_request(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/api/documents/link-imports/capture-sessions/capture-1/complete",
+                "headers": [(b"x-user-id", str(self.user.id).encode())],
+                "client": ("127.0.0.1", 1234),
+                "server": ("testserver", 443),
+            }
+        )
+        context = asyncio.run(capture_request_context(request))
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIsNone(context.actor_user_id)
+
+        request.state.operation_audit_actor = {
+            "user_id": self.user.id,
+            "username": self.user.username,
+            "display_name": self.user.display_name,
+        }
+        self.assertIsNone(with_request_audit_actor(context, request).actor_user_id)
+
+        set_request_audit_actor(request, self.user)
+        attributed = with_request_audit_actor(context, request)
+        self.assertEqual(attributed.actor_user_id, self.user.id)
+        self.assertEqual(attributed.actor_username, self.user.username)
+        self.assertEqual(attributed.actor_display_name, self.user.display_name)
 
     def test_resolves_real_ip_only_for_trusted_proxy(self) -> None:
         def request(peer: str, headers: dict[str, str]) -> Request:

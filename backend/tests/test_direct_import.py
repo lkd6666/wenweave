@@ -1,7 +1,6 @@
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -27,11 +26,12 @@ from app.schemas.document import (
     DocumentImportCreate,
     DocumentCreate,
 )
+from tests.workspace_temp import WorkspaceTempDirectory
 
 
 class DirectImportRouteTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.local_upload_directory = TemporaryDirectory()
+        self.local_upload_directory = WorkspaceTempDirectory("direct-import")
         self.local_root = patch.object(local_uploads, "LOCAL_UPLOAD_ROOT", Path(self.local_upload_directory.name))
         self.local_root.start()
         self.engine = create_engine("sqlite:///:memory:")

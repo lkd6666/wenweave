@@ -3,18 +3,28 @@ import base64
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401 - register the referenced user table for test DDL
 from app.db.base import Base
+from app.api.routes import layout_references as layout_reference_routes
+from app.models.layout_capture_session import LayoutCaptureSession
+from app.schemas.layout_reference import LayoutCaptureSessionRead
 
 from app.services.layout_reference import (
+    MAX_REFERENCE_IMAGE_BYTES,
+    MAX_REFERENCE_IMAGE_TOTAL_BYTES,
+    MAX_RESPONSE_BYTES,
     LayoutReference,
     LayoutReferenceAsset,
     LayoutReferenceError,
     LayoutReferenceExpiredError,
+    WechatVerificationRequiredError,
     _AssetSource,
     _asset_role,
     _ReferenceCache,
@@ -24,14 +34,36 @@ from app.services.layout_reference import (
     _is_allowed_resolved_address,
     _normalise_url,
     cleanup_expired_layout_references,
+    cleanup_expired_layout_capture_sessions,
+    complete_layout_capture_session,
+    create_layout_capture_session,
+    create_layout_reference,
     extract_layout_reference,
     get_layout_reference,
     get_layout_reference_preview_asset,
     layout_reference_cache,
     persist_layout_reference,
 )
+from app.services.external_fetch import _is_allowed_address
 from app.services.local_uploads import ImageInfo
 from app.services.chat_agent import build_system_prompt
+
+
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+class LayoutCaptureSessionSchemaTests(unittest.TestCase):
+    def test_serialises_naive_database_expiry_as_utc(self) -> None:
+        payload = LayoutCaptureSessionRead(
+            id="capture-id",
+            token="capture-token-with-enough-entropy",
+            canonical_url="https://mp.weixin.qq.com/s/captured",
+            expires_at=datetime(2026, 8, 15, 6, 30),
+        )
+
+        self.assertEqual(payload.model_dump(mode="json")["expires_at"], "2026-08-15T06:30:00Z")
 
 
 class LayoutReferenceExtractionTests(unittest.TestCase):
@@ -121,10 +153,76 @@ class LayoutReferenceExtractionTests(unittest.TestCase):
     def test_allows_only_official_wechat_hosts_for_compatibility_proxy_range(self) -> None:
         self.assertTrue(_is_allowed_resolved_address("mp.weixin.qq.com", "198.18.1.67"))
         self.assertTrue(_is_allowed_resolved_address("mmbiz.qpic.cn", "198.18.1.67"))
+        self.assertTrue(_is_allowed_resolved_address("mmecoa.qpic.cn", "198.18.1.67"))
         self.assertTrue(_is_allowed_resolved_address("res.wx.qq.com", "198.18.1.67"))
+        self.assertTrue(_is_allowed_address("mmecoa.qpic.cn", "198.18.1.67"))
         self.assertFalse(_is_allowed_resolved_address("example.com", "198.18.1.67"))
+        self.assertFalse(_is_allowed_address("example.com", "198.18.1.67"))
         self.assertFalse(_is_allowed_resolved_address("mmbiz.qpic.cn.attacker.example", "198.18.1.67"))
+        self.assertFalse(_is_allowed_address("mmecoa.qpic.cn.attacker.example", "198.18.1.67"))
         self.assertFalse(_is_allowed_resolved_address("mp.weixin.qq.com", "127.0.0.1"))
+        self.assertFalse(_is_allowed_address("mmecoa.qpic.cn", "127.0.0.1"))
+
+    def test_wechat_verification_page_returns_structured_capture_fallback(self) -> None:
+        source = "<html><body><h2>环境异常</h2><p>当前环境异常，完成验证后即可继续访问。</p><a>去验证</a></body></html>"
+        db = MagicMock()
+        user = SimpleNamespace(id=7)
+        with patch(
+            "app.services.layout_reference._fetch_html",
+            new=AsyncMock(return_value=("https://mp.weixin.qq.com/s/example", source)),
+        ):
+            with self.assertRaises(WechatVerificationRequiredError):
+                asyncio.run(create_layout_reference("https://mp.weixin.qq.com/s/example", 7, db))
+
+        with patch(
+            "app.api.routes.layout_references.create_layout_reference",
+            new=AsyncMock(side_effect=WechatVerificationRequiredError("https://mp.weixin.qq.com/s/example")),
+        ):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(
+                    layout_reference_routes.preview_layout_reference(
+                        layout_reference_routes.LayoutReferencePreviewRequest(
+                            url="https://mp.weixin.qq.com/s/example"
+                        ),
+                        user,
+                        db,
+                    )
+                )
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.detail["code"], "wechat_verification_required")
+        self.assertEqual(caught.exception.detail["url"], "https://mp.weixin.qq.com/s/example")
+        db.rollback.assert_called()
+
+    def test_wechat_captcha_redirect_keeps_the_original_article_url(self) -> None:
+        source = "<html><body><h2>环境异常</h2><p>当前环境异常，完成验证后即可继续访问。</p></body></html>"
+        article_url = "https://mp.weixin.qq.com/s/example?scene=1"
+        captcha_url = (
+            "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=secret&"
+            "target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fexample%3Fscene%3D1"
+        )
+        with patch(
+            "app.services.layout_reference._fetch_html",
+            new=AsyncMock(return_value=(captcha_url, source)),
+        ):
+            with self.assertRaises(WechatVerificationRequiredError) as caught:
+                asyncio.run(create_layout_reference(article_url, 7, MagicMock()))
+
+        self.assertEqual(caught.exception.canonical_url, article_url)
+        self.assertNotIn("poc_token", caught.exception.canonical_url)
+
+    def test_normal_wechat_content_does_not_trigger_verification_fallback(self) -> None:
+        source = '<html><body><div id="js_content"><p>正文中也可以谈论环境异常和验证。</p></div></body></html>'
+        with patch(
+            "app.services.layout_reference._fetch_html",
+            new=AsyncMock(return_value=("https://mp.weixin.qq.com/s/example", source)),
+        ), patch(
+            "app.services.layout_reference._fetch_reference_assets",
+            new=AsyncMock(return_value=[]),
+        ), patch("app.services.layout_reference.persist_layout_reference"):
+            reference = asyncio.run(create_layout_reference("https://mp.weixin.qq.com/s/example", 7, MagicMock()))
+
+        self.assertEqual(reference.extracted_from, "公众号正文")
 
     def test_agent_prompt_treats_reference_as_untrusted_visual_data(self) -> None:
         prompt = build_system_prompt(
@@ -164,9 +262,9 @@ class LayoutReferenceExtractionTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("正文段落的字体与文字排版以本提示下方的「标准段落结构」和「正文样式统一」为唯一准则", prompt)
+        self.assertIn("正文段落的字体与文字排版以本提示下方的「正文排版默认值」为唯一默认准则", prompt)
         self.assertIn("font-size:15px; line-height:2em; letter-spacing:1px;", prompt)
-        self.assertIn("不得复制、继承或模仿参考文章正文的 `font-family`、字号、行高、字距或缩进", prompt)
+        self.assertIn("不得复制、继承或模仿参考文章正文的 `font-family`", prompt)
         self.assertIn("标题、导语、分节标题、卡片标签等非正文元素可按参考文章的视觉风格调整", prompt)
 
     def test_maximum_imitation_prompt_requires_flex_structure_to_be_read_and_preserved(self) -> None:
@@ -356,3 +454,172 @@ class LayoutReferencePersistenceTests(unittest.TestCase):
         with self.Session() as db:
             with self.assertRaises(LayoutReferenceExpiredError):
                 get_layout_reference(db, reference.reference_id, reference.user_id)
+
+
+class LayoutCaptureSessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+        layout_reference_cache._items.clear()
+
+    def tearDown(self) -> None:
+        self.db.close()
+        layout_reference_cache._items.clear()
+        self.engine.dispose()
+
+    def _start(self) -> tuple[LayoutCaptureSession, str]:
+        return create_layout_capture_session("https://mp.weixin.qq.com/s/captured", 7, self.db)
+
+    def test_capture_session_recovers_article_target_from_wechat_captcha_url(self) -> None:
+        captcha_url = (
+            "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=secret&"
+            "target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fcaptured%3Fscene%3D1"
+        )
+        capture_session, _ = create_layout_capture_session(captcha_url, 7, self.db)
+
+        self.assertEqual(capture_session.canonical_url, "https://mp.weixin.qq.com/s/captured?scene=1")
+        self.assertNotIn("poc_token", capture_session.canonical_url)
+
+        with self.assertRaisesRegex(LayoutReferenceError, "仅支持微信公众号文章"):
+            create_layout_capture_session(
+                "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?"
+                "target_url=https%3A%2F%2Fexample.com%2Fs%2Fcaptured",
+                7,
+                self.db,
+            )
+
+    def test_captured_dom_and_images_create_reference_without_network_fetch(self) -> None:
+        capture_session, token = self._start()
+        image = ImageInfo("image/png", "png", 1, 1)
+        source = (
+            '<div id="js_content"><section style="background-image:url(layout-capture://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)">'
+            '<p>浏览器正文<img src="layout-capture://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"></p>'
+            "</section></div>"
+        )
+        with patch("app.services.layout_reference._fetch_remote_image", new=AsyncMock()) as remote_fetch:
+            reference = complete_layout_capture_session(
+                self.db,
+                capture_session.id,
+                token,
+                capture_session.canonical_url,
+                source,
+                "浏览器采集文章",
+                {
+                    "a" * 32: (PNG, image),
+                    "b" * 32: (PNG, image),
+                },
+                omitted_asset_count=2,
+            )
+
+        remote_fetch.assert_not_awaited()
+        self.assertEqual(reference.title, "浏览器采集文章")
+        self.assertEqual(reference.extracted_from, "浏览器采集的公众号正文")
+        self.assertEqual(len(reference.assets), 2)
+        self.assertIn("2 个图片素材未能", reference.warning or "")
+        self.assertEqual(capture_session.status, "completed")
+        self.assertIsNotNone(capture_session.consumed_at)
+
+        with self.assertRaisesRegex(LayoutReferenceExpiredError, "已使用"):
+            complete_layout_capture_session(
+                self.db,
+                capture_session.id,
+                token,
+                capture_session.canonical_url,
+                '<div id="js_content"><p>再次提交</p></div>',
+                "重放",
+                {},
+            )
+
+    def test_capture_rejects_expired_token_url_mismatch_and_unknown_assets(self) -> None:
+        expired, expired_token = self._start()
+        expired.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.db.flush()
+        with self.assertRaisesRegex(LayoutReferenceExpiredError, "已过期"):
+            complete_layout_capture_session(
+                self.db,
+                expired.id,
+                expired_token,
+                expired.canonical_url,
+                '<div id="js_content"><p>正文</p></div>',
+                "过期",
+                {},
+            )
+
+        mismatched, mismatched_token = self._start()
+        with self.assertRaisesRegex(LayoutReferenceError, "当前文章"):
+            complete_layout_capture_session(
+                self.db,
+                mismatched.id,
+                mismatched_token,
+                "https://mp.weixin.qq.com/s/other",
+                '<div id="js_content"><p>正文</p></div>',
+                "错页",
+                {},
+            )
+
+        unknown, unknown_token = self._start()
+        with self.assertRaisesRegex(LayoutReferenceError, "占位符"):
+            complete_layout_capture_session(
+                self.db,
+                unknown.id,
+                unknown_token,
+                unknown.canonical_url,
+                '<div id="js_content"><img src="layout-capture://cccccccccccccccccccccccccccccccc"></div>',
+                "缺图",
+                {},
+            )
+
+    def test_capture_enforces_html_per_image_and_total_image_limits(self) -> None:
+        image = ImageInfo("image/png", "png", 1, 1)
+
+        oversized_html, html_token = self._start()
+        with self.assertRaisesRegex(LayoutReferenceError, "正文超过 5MB"):
+            complete_layout_capture_session(
+                self.db,
+                oversized_html.id,
+                html_token,
+                oversized_html.canonical_url,
+                "x" * (MAX_RESPONSE_BYTES + 1),
+                "大正文",
+                {},
+            )
+
+        oversized_image, image_token = self._start()
+        with self.assertRaisesRegex(LayoutReferenceError, "图片超过 10MB"):
+            complete_layout_capture_session(
+                self.db,
+                oversized_image.id,
+                image_token,
+                oversized_image.canonical_url,
+                '<div id="js_content"><p>正文</p></div>',
+                "大图片",
+                {"a" * 32: (b"x" * (MAX_REFERENCE_IMAGE_BYTES + 1), image)},
+            )
+
+        oversized_total, total_token = self._start()
+        ten_megabytes = b"x" * MAX_REFERENCE_IMAGE_BYTES
+        with self.assertRaisesRegex(LayoutReferenceError, "总大小超过 50MB"):
+            complete_layout_capture_session(
+                self.db,
+                oversized_total.id,
+                total_token,
+                oversized_total.canonical_url,
+                '<div id="js_content"><p>正文</p></div>',
+                "图片总量",
+                {f"{index:032x}": (ten_megabytes, image) for index in range(6)},
+            )
+        self.assertGreater(6 * len(ten_megabytes), MAX_REFERENCE_IMAGE_TOTAL_BYTES)
+
+    def test_expired_capture_sessions_are_cleaned(self) -> None:
+        expired, _ = self._start()
+        expired.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        active, _ = self._start()
+        expired_id = expired.id
+        active_id = active.id
+        self.db.commit()
+
+        self.assertEqual(cleanup_expired_layout_capture_sessions(self.db), 1)
+        self.assertIsNone(self.db.get(LayoutCaptureSession, expired_id))
+        self.assertIsNotNone(self.db.get(LayoutCaptureSession, active_id))

@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
@@ -47,7 +48,7 @@ class Settings(BaseSettings):
     # is accepted only for loopback addresses by the image-search adapter.
     SEARXNG_HOST_PORT: int = 8088
     SEARXNG_BASE_URL: str = ""
-    SEARXNG_TIMEOUT_SECONDS: float = 4.0
+    SEARXNG_TIMEOUT_SECONDS: float = Field(default=4.0, gt=0)
     SEARXNG_SEARCH_CACHE_SECONDS: float = 300.0
     SEARXNG_SECRET: str = ""
 

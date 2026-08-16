@@ -78,6 +78,7 @@ then run:
 docker compose -f deploy/searxng/compose.yaml up -d
 ```
 
-The application search deadline is four seconds. SearXNG fans out to the
-enabled engines with a 3.2 second request timeout, so a slow source is skipped
-while faster sources can still provide candidates.
+The application search deadline defaults to four seconds and follows
+`SEARXNG_TIMEOUT_SECONDS` in `backend/.env`. SearXNG fans out to the enabled
+engines with a 3.2 second request timeout, so a slow source is skipped while
+faster sources can still provide candidates.

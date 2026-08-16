@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { parseSseChunk, recordChatUserQuestionActivity, startChatRun } from './chat'
+import { parseSseChunk, recordChatUserQuestionActivity, reaskSourceUnavailableFromError, startChatRun } from './chat'
+import { ApiError } from './client'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -36,6 +37,25 @@ describe('startChatRun', () => {
 
     const [, request] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(JSON.parse(String(request.body))).not.toHaveProperty('template_ids')
+  })
+})
+
+describe('re-ask errors', () => {
+  it('recognizes an unavailable history anchor without treating document conflicts as retryable', () => {
+    const unavailable = new ApiError(409, {
+      code: 'reask_source_unavailable',
+      message: '未找到当前对话中可重新提问的消息',
+    })
+
+    expect(reaskSourceUnavailableFromError(unavailable)).toEqual({
+      code: 'reask_source_unavailable',
+      message: '未找到当前对话中可重新提问的消息',
+    })
+    expect(reaskSourceUnavailableFromError(new ApiError(409, {
+      code: 'reask_document_conflict',
+      message: '文档已变化',
+      current_checksum: 'a'.repeat(64),
+    }))).toBeNull()
   })
 })
 

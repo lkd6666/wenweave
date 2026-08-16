@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import List
 
-from sqlalchemy import DateTime, Enum, String, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -30,6 +30,14 @@ class AIProvider(Base):
     # configured for this provider.
     image_protocol: Mapped[str] = mapped_column(String(48), nullable=False, default="", server_default="")
     image_base_url: Mapped[str] = mapped_column(String(512), nullable=False, default="", server_default="")
+    # Availability is independent from per-model visibility permissions. A disabled
+    # provider remains configurable by administrators but cannot serve new calls.
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    # Empty means available all day. Ranges are evaluated in Asia/Shanghai by
+    # model_access before a new request is allowed.
+    availability_time_ranges: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     api_key_encrypted: Mapped[str] = mapped_column(MEDIUM_TEXT, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

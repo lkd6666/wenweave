@@ -16,6 +16,7 @@ const AdminWeChatAccountsPage = lazy(() => import('./pages/admin/AdminWeChatAcco
 const AdminOperationLogsPage = lazy(() => import('./pages/admin/AdminOperationLogsPage'))
 const AdminBrandingPage = lazy(() => import('./pages/admin/AdminBrandingPage'))
 const AdminImageLibraryPage = lazy(() => import('./pages/admin/AdminImageLibraryPage'))
+const AdminArticleTypographyPage = lazy(() => import('./pages/admin/AdminArticleTypographyPage'))
 const PublicSharePage = lazy(() => import('./pages/PublicSharePage'))
 
 function RouteLoadingFallback() {
@@ -101,6 +102,14 @@ export default function App() {
               element={
                 <ProtectedRoute adminOnly>
                   <AdminImageLibraryPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="admin/article-typography"
+              element={
+                <ProtectedRoute adminOnly>
+                  <AdminArticleTypographyPage />
                 </ProtectedRoute>
               }
             />

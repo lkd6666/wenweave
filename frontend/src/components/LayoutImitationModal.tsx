@@ -1,10 +1,22 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Checkbox, Descriptions, Input, Modal, Segmented, Spin } from 'antd'
-import { LinkOutlined, ReloadOutlined } from '@ant-design/icons'
+import {
+  LinkOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons'
 import { layoutReferencesApi } from '../api/layoutReferences'
 import { ApiError } from '../api/client'
 import type { LayoutReferenceImitationStrength, LayoutReferencePreview } from '../types'
+import {
+  LayoutCaptureBridge,
+  getWechatVerificationDetail,
+  resolveWechatCaptureUrl,
+  type WechatVerificationDetail,
+} from '../utils/layoutCaptureBridge'
 import { frameDocumentWithNewWindowLinks, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { WechatCaptureFallback, type CaptureUiState } from './WechatCaptureFallback'
+
+export { LayoutCaptureInstallGuide } from './WechatCaptureFallback'
 
 interface LayoutImitationModalProps {
   open: boolean
@@ -51,15 +63,51 @@ export default function LayoutImitationModal({
   const [reference, setReference] = useState<LayoutReferencePreview | null>(null)
   const [parsing, setParsing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [wechatFallback, setWechatFallback] = useState<WechatVerificationDetail | null>(null)
+  const [captureState, setCaptureState] = useState<CaptureUiState>('idle')
+  const [captureError, setCaptureError] = useState<string | null>(null)
   const [assetsConfirmed, setAssetsConfirmed] = useState(false)
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([])
   const [imitationStrength, setImitationStrength] = useState<LayoutReferenceImitationStrength>('structure')
+  const bridgeRef = useRef<LayoutCaptureBridge | null>(null)
+  const requestVersionRef = useRef(0)
 
   useEffect(() => {
-    if (open) return
+    if (open) {
+      const bridge = new LayoutCaptureBridge((event) => {
+        if (event.type === 'status') {
+          setCaptureState(event.status)
+          setCaptureError(null)
+          return
+        }
+        if (event.type === 'error') {
+          setCaptureState('error')
+          setCaptureError(event.message)
+          return
+        }
+        setReference(event.preview)
+        setUrl(event.preview.canonical_url)
+        setSelectedAssetIds(event.preview.assets.filter((asset) => asset.default_selected).map((asset) => asset.asset_id))
+        setAssetsConfirmed(false)
+        setWechatFallback(null)
+        setCaptureState('idle')
+        setCaptureError(null)
+        setError(null)
+      })
+      bridgeRef.current = bridge
+      return () => {
+        requestVersionRef.current += 1
+        bridge.dispose()
+        if (bridgeRef.current === bridge) bridgeRef.current = null
+      }
+    }
+
     setUrl('')
     setReference(null)
     setError(null)
+    setWechatFallback(null)
+    setCaptureState('idle')
+    setCaptureError(null)
     setParsing(false)
     setAssetsConfirmed(false)
     setSelectedAssetIds([])
@@ -74,19 +122,60 @@ export default function LayoutImitationModal({
       setError('请输入公开文章链接')
       return
     }
+    const requestVersion = requestVersionRef.current + 1
+    requestVersionRef.current = requestVersion
+    bridgeRef.current?.cancel()
     setParsing(true)
     setError(null)
+    setWechatFallback(null)
+    setCaptureState('idle')
+    setCaptureError(null)
     setReference(null)
     setAssetsConfirmed(false)
     setSelectedAssetIds([])
     try {
       const parsed = await layoutReferencesApi.preview(value)
+      if (requestVersionRef.current !== requestVersion) return
       setReference(parsed)
       setSelectedAssetIds(parsed.assets.filter((asset) => asset.default_selected).map((asset) => asset.asset_id))
     } catch (err) {
-      setError(err instanceof ApiError ? String(err.detail) : '解析参考页面失败，请稍后重试')
+      if (requestVersionRef.current !== requestVersion) return
+      const verification = getWechatVerificationDetail(err)
+      if (verification) {
+        const captureUrl = resolveWechatCaptureUrl(verification.url, value) || verification.url
+        const normalizedVerification = { ...verification, url: captureUrl }
+        setWechatFallback(normalizedVerification)
+        setUrl(captureUrl)
+        setCaptureState('checking')
+        const connection = await bridgeRef.current?.connect('layout_reference') ?? 'missing'
+        if (requestVersionRef.current === requestVersion) {
+          setCaptureState(connection === 'available' ? 'ready' : connection)
+        }
+      } else {
+        setError(err instanceof ApiError ? String(err.detail) : '解析参考页面失败，请稍后重试')
+      }
     } finally {
-      setParsing(false)
+      if (requestVersionRef.current === requestVersion) setParsing(false)
+    }
+  }
+
+  const detectExtension = async () => {
+    setCaptureState('checking')
+    setCaptureError(null)
+    const connection = await bridgeRef.current?.connect('layout_reference') ?? 'missing'
+    setCaptureState(connection === 'available' ? 'ready' : connection)
+  }
+
+  const startBrowserCapture = async () => {
+    if (!wechatFallback || !bridgeRef.current) return
+    setCaptureState('opening')
+    setCaptureError(null)
+    try {
+      const session = await layoutReferencesApi.createCaptureSession(wechatFallback.url)
+      bridgeRef.current.startSession(session)
+    } catch (err) {
+      setCaptureState('error')
+      setCaptureError(err instanceof ApiError ? String(err.detail) : '创建浏览器采集会话失败，请重试')
     }
   }
 
@@ -134,9 +223,14 @@ export default function LayoutImitationModal({
             prefix={<LinkOutlined />}
             placeholder="粘贴公开文章链接（公众号文章优先）"
             onChange={(event) => {
+              requestVersionRef.current += 1
+              bridgeRef.current?.cancel()
               setUrl(event.target.value)
               setReference(null)
               setError(null)
+              setWechatFallback(null)
+              setCaptureState('idle')
+              setCaptureError(null)
             }}
             onPressEnter={() => { void parseReference() }}
           />
@@ -147,6 +241,16 @@ export default function LayoutImitationModal({
         {!modelAvailable && <Alert type="warning" showIcon message="请先在排版助手中选择可用模型" />}
         {error && <Alert type="error" showIcon message={error} />}
         {parsing && <div className="layout-imitation-loading"><Spin tip="正在提取参考排版…" /></div>}
+        {wechatFallback && !parsing && (
+          <WechatCaptureFallback
+            verification={wechatFallback}
+            state={captureState}
+            error={captureError}
+            purpose="layout_reference"
+            onDetect={() => { void detectExtension() }}
+            onStart={() => { void startBrowserCapture() }}
+          />
+        )}
         {reference && !parsing && (
           <>
             <Descriptions className="layout-imitation-meta" size="small" column={1} bordered>

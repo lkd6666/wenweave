@@ -69,7 +69,7 @@ def _token_values(row: object, *, prefix: str = "") -> WorkboardTokenStats:
 
 def _visible_calls(db: Session, current_user: User, start_at: datetime, end_at: datetime) -> SqlQuery:
     query = db.query(ModelCallRecord).join(AIModel, AIModel.id == ModelCallRecord.model_id)
-    return accessible_models_query(query, current_user).filter(
+    return accessible_models_query(query, current_user, require_enabled=False).filter(
         ModelCallRecord.started_at >= start_at,
         ModelCallRecord.started_at < end_at,
     )

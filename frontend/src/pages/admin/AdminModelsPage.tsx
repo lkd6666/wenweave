@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import dayjs from 'dayjs'
 import {
   Alert,
   Button,
@@ -17,17 +18,18 @@ import {
   Table,
   Tag,
   Tabs,
+  TimePicker,
   Typography,
   message,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
-import { CloudDownloadOutlined, PlusOutlined, SafetyCertificateOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { CloudDownloadOutlined, DeleteOutlined, PlusOutlined, SafetyCertificateOutlined, SearchOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { aiProvidersApi } from '../../api/aiProviders'
 import type { CreateImageModelPayload, UpdateProviderPayload } from '../../api/aiProviders'
 import { ApiError } from '../../api/client'
 import { userGroupsApi } from '../../api/userGroups'
 import { usersApi } from '../../api/users'
-import type { AIImageModelItem, AIModelItem, AIProviderItem, DiscoveredModelItem, ModelDiscoveryResult, ProviderPresetItem, ProviderType, User, UserGroup } from '../../types'
+import type { AIImageModelItem, AIModelItem, AIProviderItem, AvailabilityTimeRange, DiscoveredModelItem, ModelDiscoveryResult, ProviderPresetItem, ProviderType, User, UserGroup } from '../../types'
 import { deriveModelTokenBudget, formatKTokens, tokensToWholeK } from '../../utils/modelTokenBudget'
 
 const { Title, Text, Paragraph } = Typography
@@ -69,6 +71,57 @@ function thinkingEffortsFromJson(value: unknown): string[] {
   }
 }
 
+function availabilityTimeRangeFormValue(ranges: AvailabilityTimeRange[] | undefined) {
+  return (ranges ?? []).map((item) => ({
+    range: [dayjs(`2000-01-01T${item.start}:00`), dayjs(`2000-01-01T${item.end}:00`)],
+  }))
+}
+
+function availabilityTimeRangesPayload(value: unknown): AvailabilityTimeRange[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    const range = isRecord(item) ? item.range : undefined
+    if (!Array.isArray(range) || range.length !== 2 || !dayjs.isDayjs(range[0]) || !dayjs.isDayjs(range[1])) {
+      return []
+    }
+    return [{ start: range[0].format('HH:mm'), end: range[1].format('HH:mm') }]
+  })
+}
+
+function availabilityTimeRangeSummary(ranges: AvailabilityTimeRange[] | undefined): string {
+  return (ranges?.length ?? 0) > 0
+    ? ranges!.map((item) => `${item.start}-${item.end}`).join(' / ')
+    : '全天可用'
+}
+
+function AvailabilityTimeRangesFormItem() {
+  return (
+    <Form.Item label="可用时段（中国标准时间）" extra="留空即全天可用；支持跨午夜，例如 22:00-02:00。">
+      <Form.List name="availability_time_ranges">
+        {(fields, { add, remove }) => (
+          <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+            {fields.map((field) => (
+              <Space key={field.key} align="center" wrap>
+                <Form.Item name={[field.name, 'range']} noStyle rules={[{ required: true, message: '请选择开始和结束时间' }]}>
+                  <TimePicker.RangePicker format="HH:mm" minuteStep={1} allowClear={false} inputReadOnly order={false} />
+                </Form.Item>
+                <Button
+                  type="text"
+                  danger
+                  icon={<DeleteOutlined />}
+                  aria-label="删除可用时段"
+                  onClick={() => remove(field.name)}
+                />
+              </Space>
+            ))}
+            <Button type="dashed" icon={<PlusOutlined />} onClick={() => add({})}>添加时段</Button>
+          </Space>
+        )}
+      </Form.List>
+    </Form.Item>
+  )
+}
+
 const THINKING_EFFORT_OPTIONS = [
   { label: '极简', value: 'minimal' },
   { label: '低', value: 'low' },
@@ -108,6 +161,7 @@ export default function AdminModelsPage() {
   const [discoverModalProvider, setDiscoverModalProvider] = useState<AIProviderItem | null>(null)
   const [discovery, setDiscovery] = useState<ModelDiscoveryResult | null>(null)
   const [selectedDiscoveredModels, setSelectedDiscoveredModels] = useState<string[]>([])
+  const [discoveredModelSearch, setDiscoveredModelSearch] = useState('')
   const [discoveringProviderId, setDiscoveringProviderId] = useState<number | null>(null)
   const [importingModels, setImportingModels] = useState(false)
 
@@ -134,10 +188,31 @@ export default function AdminModelsPage() {
     return option ? [option] : []
   })
   const modelModalProvider = providers.find((provider) => provider.id === modelModalProviderId)
-  const supportsExplicitPromptCache = modelModalProvider?.provider_type === 'openai_compatible'
+  const supportsPromptCache = modelModalProvider?.provider_type === 'openai_compatible'
     || modelModalProvider?.provider_type === 'openai_responses'
   const isAnthropicProvider = modelModalProvider?.provider_type === 'anthropic'
   const automaticTokenBudget = deriveModelTokenBudget(inputLimitK, outputLimitK)
+  const discoveredModelQuery = discoveredModelSearch.trim().toLocaleLowerCase()
+  const filteredDiscoveredModels = (discovery?.models ?? []).filter((model) => (
+    !discoveredModelQuery
+    || model.display_name.toLocaleLowerCase().includes(discoveredModelQuery)
+    || model.model_name.toLocaleLowerCase().includes(discoveredModelQuery)
+  ))
+  const existingDiscoveredModelNames = new Set(
+    discoverModalProvider?.models.map((model) => model.model_name) ?? [],
+  )
+  const filteredSelectableModelNames = filteredDiscoveredModels
+    .filter((model) => !existingDiscoveredModelNames.has(model.model_name))
+    .map((model) => model.model_name)
+  const selectableDiscoveredModelCount = (discovery?.models ?? []).filter(
+    (model) => !existingDiscoveredModelNames.has(model.model_name),
+  ).length
+  const selectedDiscoveredModelNames = new Set(selectedDiscoveredModels)
+  const allFilteredModelsSelected = filteredSelectableModelNames.length > 0
+    && filteredSelectableModelNames.every((modelName) => selectedDiscoveredModelNames.has(modelName))
+  const someFilteredModelsSelected = filteredSelectableModelNames.some(
+    (modelName) => selectedDiscoveredModelNames.has(modelName),
+  )
 
   const loadProviders = async () => {
     setLoading(true)
@@ -178,7 +253,7 @@ export default function AdminModelsPage() {
   const openCreateProvider = () => {
     setEditingProvider(null)
     providerForm.resetFields()
-    providerForm.setFieldsValue({ provider_type: 'openai_compatible' })
+    providerForm.setFieldsValue({ provider_type: 'openai_compatible', is_enabled: true, availability_time_ranges: [] })
     setProviderModalOpen(true)
   }
 
@@ -190,6 +265,8 @@ export default function AdminModelsPage() {
       base_url: provider.base_url,
       image_protocol: provider.image_protocol || '',
       image_base_url: provider.image_base_url || '',
+      is_enabled: provider.is_enabled,
+      availability_time_ranges: availabilityTimeRangeFormValue(provider.availability_time_ranges),
       api_key: '',
     })
     setProviderModalOpen(true)
@@ -206,12 +283,18 @@ export default function AdminModelsPage() {
           base_url: values.base_url,
           image_protocol: values.image_protocol || '',
           image_base_url: values.image_base_url || '',
+          is_enabled: values.is_enabled,
+          availability_time_ranges: availabilityTimeRangesPayload(values.availability_time_ranges),
         }
         if (values.api_key) payload.api_key = values.api_key
         await aiProvidersApi.update(editingProvider.id, payload)
         message.success('Provider 已更新')
       } else {
-        await aiProvidersApi.create(values)
+        await aiProvidersApi.create({
+          ...values,
+          is_enabled: values.is_enabled,
+          availability_time_ranges: availabilityTimeRangesPayload(values.availability_time_ranges),
+        })
         message.success('Provider 创建成功')
       }
       setProviderModalOpen(false)
@@ -233,11 +316,22 @@ export default function AdminModelsPage() {
     }
   }
 
+  const handleProviderEnabledChange = async (provider: AIProviderItem, isEnabled: boolean) => {
+    try {
+      await aiProvidersApi.update(provider.id, { is_enabled: isEnabled })
+      message.success(isEnabled ? 'Provider 已启用' : 'Provider 已停用')
+      void loadProviders()
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '更新 Provider 状态失败')
+    }
+  }
+
   const openCreateModel = (providerId: number) => {
     setEditingModel(null)
     modelForm.resetFields()
     modelForm.setFieldsValue({
       is_default: false,
+      is_enabled: true,
       is_multimodal: false,
       supports_disabled_thinking: true,
       input_limit_k: 24,
@@ -246,6 +340,7 @@ export default function AdminModelsPage() {
       thinking_efforts: [],
       default_thinking_effort: 'auto',
       prompt_cache_enabled: false,
+      availability_time_ranges: [],
     })
     setModelModalProviderId(providerId)
   }
@@ -253,13 +348,13 @@ export default function AdminModelsPage() {
   const openCreateImageModel = (providerId: number) => {
     setEditingImageModel(null)
     imageModelForm.resetFields()
-    imageModelForm.setFieldsValue({ supported_aspect_ratios: ['landscape', 'portrait', 'square'], supported_qualities: ['auto', 'medium'], is_default: false, access_mode: 'all' })
+    imageModelForm.setFieldsValue({ supported_aspect_ratios: ['landscape', 'portrait', 'square'], supported_qualities: ['auto', 'medium'], is_default: false, is_enabled: true, availability_time_ranges: [], access_mode: 'all' })
     setImageModelModalProviderId(providerId)
   }
 
   const openEditImageModel = (model: AIImageModelItem) => {
     setEditingImageModel(model)
-    imageModelForm.setFieldsValue({ ...model, allowed_user_ids: model.allowed_user_ids ?? [], allowed_group_ids: model.allowed_group_ids ?? [] })
+    imageModelForm.setFieldsValue({ ...model, availability_time_ranges: availabilityTimeRangeFormValue(model.availability_time_ranges), allowed_user_ids: model.allowed_user_ids ?? [], allowed_group_ids: model.allowed_group_ids ?? [] })
     setImageModelModalProviderId(model.provider_id)
   }
 
@@ -268,7 +363,12 @@ export default function AdminModelsPage() {
     try {
       const values = await imageModelForm.validateFields()
       const parseIds = (value: unknown) => (Array.isArray(value) ? value : String(value ?? '').split(',')).map((item) => Number(String(item).trim())).filter((item) => Number.isInteger(item) && item > 0)
-      const normalizedValues = { ...values, allowed_user_ids: parseIds(values.allowed_user_ids), allowed_group_ids: parseIds(values.allowed_group_ids) }
+      const normalizedValues = {
+        ...values,
+        availability_time_ranges: availabilityTimeRangesPayload(values.availability_time_ranges),
+        allowed_user_ids: parseIds(values.allowed_user_ids),
+        allowed_group_ids: parseIds(values.allowed_group_ids),
+      }
       setSavingImageModel(true)
       if (editingImageModel) {
         await aiProvidersApi.updateImageModel(editingImageModel.id, normalizedValues)
@@ -296,15 +396,25 @@ export default function AdminModelsPage() {
     }
   }
 
+  const handleImageModelEnabledChange = async (model: AIImageModelItem, isEnabled: boolean) => {
+    try {
+      await aiProvidersApi.updateImageModel(model.id, { is_enabled: isEnabled })
+      message.success(isEnabled ? '图片模型已启用' : '图片模型已停用')
+      void loadProviders()
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '更新图片模型状态失败')
+    }
+  }
+
   const imageModelList = (provider: AIProviderItem) => (
     <div className="responsive-card-list admin-model-card-list">
       {(() => {
         const imageModels = provider.image_models ?? []
         return imageModels.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无图片模型" /> : imageModels.map((model) => (
         <article className="responsive-data-card" key={model.id}>
-          <div className="responsive-data-card-heading"><div><strong>{model.display_name}</strong><div className="responsive-data-card-secondary">{model.model_name}</div></div>{model.is_default && <Tag color="blue">默认</Tag>}</div>
+          <div className="responsive-data-card-heading"><div><strong>{model.display_name}</strong><div className="responsive-data-card-secondary">{model.model_name}</div></div><Space size={4}>{model.is_default && <Tag color="blue">默认</Tag>}<Switch size="small" aria-label={`切换图片模型 ${model.display_name} 的启用状态`} checked={model.is_enabled} onChange={(isEnabled) => void handleImageModelEnabledChange(model, isEnabled)} /></Space></div>
           {model.description && <div className="responsive-data-card-description">{model.description}</div>}
-          <div className="responsive-data-card-tags"><Tag>{model.supported_aspect_ratios.join(' / ')}</Tag><Tag>{model.supported_qualities.join(' / ')}</Tag><Tag color={(model.operations ?? []).includes('edit') ? 'green' : 'default'}>{(model.operations ?? []).includes('edit') ? '支持 AI 编辑' : '仅支持生成'}</Tag>{Array.isArray(model.adapter_config?.operations) && <Tag color="blue">能力已覆盖</Tag>}{model.access_mode === 'restricted' && <Tag color="orange">受限</Tag>}</div>
+          <div className="responsive-data-card-tags"><Tag>{model.supported_aspect_ratios.join(' / ')}</Tag><Tag>{model.supported_qualities.join(' / ')}</Tag><Tag color={(model.operations ?? []).includes('edit') ? 'green' : 'default'}>{(model.operations ?? []).includes('edit') ? '支持 AI 编辑' : '仅支持生成'}</Tag>{Array.isArray(model.adapter_config?.operations) && <Tag color="blue">能力已覆盖</Tag>}{model.access_mode === 'restricted' && <Tag color="orange">受限</Tag>}<Tag>{availabilityTimeRangeSummary(model.availability_time_ranges)}</Tag></div>
           <Space className="responsive-data-card-actions"><Button size="small" onClick={() => openEditImageModel(model)}>编辑</Button>{!model.is_default && <Button size="small" type="link" onClick={() => void aiProvidersApi.updateImageModel(model.id, { is_default: true }).then(loadProviders)}>设为默认</Button>}<Popconfirm title="确认删除该图片模型？" onConfirm={() => void handleDeleteImageModel(model)}><Button size="small" danger>删除</Button></Popconfirm></Space>
         </article>
         ))
@@ -322,6 +432,8 @@ export default function AdminModelsPage() {
       input_limit_k: tokensToWholeK(model.context_compaction_threshold_tokens),
       output_limit_k: tokensToWholeK(model.max_output_tokens),
       is_default: model.is_default,
+      is_enabled: model.is_enabled,
+      availability_time_ranges: availabilityTimeRangeFormValue(model.availability_time_ranges),
       is_multimodal: model.is_multimodal,
       supports_disabled_thinking: model.supports_disabled_thinking,
       thinking_config_text: Object.keys(model.thinking_config ?? {}).length ? JSON.stringify(model.thinking_config, null, 2) : '',
@@ -392,10 +504,12 @@ export default function AdminModelsPage() {
           description: values.description?.trim() ?? '',
           ...tokenBudget,
           is_default: values.is_default,
+          is_enabled: values.is_enabled,
+          availability_time_ranges: availabilityTimeRangesPayload(values.availability_time_ranges),
           is_multimodal: values.is_multimodal,
           supports_disabled_thinking: values.supports_disabled_thinking,
           default_thinking_effort: defaultThinkingEffort,
-          prompt_cache_enabled: supportsExplicitPromptCache && Boolean(values.prompt_cache_enabled),
+          prompt_cache_enabled: supportsPromptCache && Boolean(values.prompt_cache_enabled),
           thinking_config: thinkingConfig,
         })
         message.success('模型已更新')
@@ -406,10 +520,12 @@ export default function AdminModelsPage() {
           description: values.description?.trim() ?? '',
           ...tokenBudget,
           is_default: values.is_default,
+          is_enabled: values.is_enabled,
+          availability_time_ranges: availabilityTimeRangesPayload(values.availability_time_ranges),
           is_multimodal: values.is_multimodal,
           supports_disabled_thinking: values.supports_disabled_thinking,
           default_thinking_effort: defaultThinkingEffort,
-          prompt_cache_enabled: supportsExplicitPromptCache && Boolean(values.prompt_cache_enabled),
+          prompt_cache_enabled: supportsPromptCache && Boolean(values.prompt_cache_enabled),
           thinking_config: thinkingConfig,
         })
         message.success('模型已添加')
@@ -430,6 +546,16 @@ export default function AdminModelsPage() {
       loadProviders()
     } catch (err) {
       message.error(err instanceof ApiError ? String(err.detail) : '设置失败')
+    }
+  }
+
+  const handleModelEnabledChange = async (model: AIModelItem, isEnabled: boolean) => {
+    try {
+      await aiProvidersApi.updateModel(model.id, { is_enabled: isEnabled })
+      message.success(isEnabled ? '模型已启用' : '模型已停用')
+      void loadProviders()
+    } catch (err) {
+      message.error(err instanceof ApiError ? String(err.detail) : '更新模型状态失败')
     }
   }
 
@@ -587,6 +713,7 @@ export default function AdminModelsPage() {
       const existingNames = new Set(provider.models.map((model) => model.model_name))
       setDiscoverModalProvider(provider)
       setDiscovery(result)
+      setDiscoveredModelSearch('')
       setSelectedDiscoveredModels(
         result.models.filter((model) => !existingNames.has(model.model_name)).map((model) => model.model_name),
       )
@@ -595,6 +722,29 @@ export default function AdminModelsPage() {
     } finally {
       setDiscoveringProviderId(null)
     }
+  }
+
+  const handleSelectFilteredDiscoveredModels = (selected: boolean) => {
+    const filteredNames = new Set(filteredSelectableModelNames)
+    setSelectedDiscoveredModels((current) => {
+      if (!selected) return current.filter((modelName) => !filteredNames.has(modelName))
+
+      const next = new Set([...current, ...filteredSelectableModelNames])
+      return (discovery?.models ?? [])
+        .map((model) => model.model_name)
+        .filter((modelName) => next.has(modelName))
+    })
+  }
+
+  const handleToggleDiscoveredModel = (modelName: string, selected: boolean) => {
+    setSelectedDiscoveredModels((current) => {
+      if (!selected) return current.filter((currentName) => currentName !== modelName)
+
+      const next = new Set([...current, modelName])
+      return (discovery?.models ?? [])
+        .map((model) => model.model_name)
+        .filter((currentName) => next.has(currentName))
+    })
   }
 
   const handleImportDiscoveredModels = async () => {
@@ -676,7 +826,7 @@ export default function AdminModelsPage() {
         <Space size={4} wrap>
           {model.is_multimodal ? <Tag color="green">多模态</Tag> : <Text type="secondary">文本</Text>}
           {model.supports_disabled_thinking ? <Tag color="blue">可不思考</Tag> : <Tag>仅默认思考</Tag>}
-          {model.prompt_cache_enabled && <Tag color="gold">显式缓存</Tag>}
+          {model.prompt_cache_enabled && <Tag color="gold">提示缓存</Tag>}
         </Space>
       ),
     },
@@ -692,7 +842,22 @@ export default function AdminModelsPage() {
           <Button size="small" type="link" onClick={() => handleSetDefault(model)}>
             设为默认
           </Button>
-        ),
+      ),
+    },
+    {
+      title: '状态',
+      dataIndex: 'is_enabled',
+      key: 'is_enabled',
+      width: 118,
+      render: (isEnabled: boolean, model) => (
+        <Switch size="small" aria-label={`切换模型 ${model.display_name} 的启用状态`} checked={isEnabled} onChange={(next) => void handleModelEnabledChange(model, next)} />
+      ),
+    },
+    {
+      title: '可用时段',
+      key: 'availability_time_ranges',
+      width: 190,
+      render: (_, model) => <Text type="secondary">{availabilityTimeRangeSummary(model.availability_time_ranges)}</Text>,
     },
     {
       title: '使用范围',
@@ -742,10 +907,18 @@ export default function AdminModelsPage() {
                 <Tag color={providerProtocolColor(provider.provider_type)}>
                   {providerProtocolLabel(provider.provider_type)}
                 </Tag>
+                {!provider.is_enabled && <Tag>已停用</Tag>}
+                <Tag>{availabilityTimeRangeSummary(provider.availability_time_ranges)}</Tag>
               </Space>
             }
             extra={
               <Space wrap>
+                <Switch
+                  size="small"
+                  aria-label={`切换 Provider ${provider.name} 的启用状态`}
+                  checked={provider.is_enabled}
+                  onChange={(isEnabled) => void handleProviderEnabledChange(provider, isEnabled)}
+                />
                 <Button
                   size="small"
                   icon={<CloudDownloadOutlined />}
@@ -781,15 +954,20 @@ export default function AdminModelsPage() {
                         <strong>{model.display_name}</strong>
                         <div className="responsive-data-card-secondary">{model.model_name}</div>
                       </div>
-                      {model.is_default ? <Tag color="blue">默认</Tag> : (
-                        <Button size="small" type="link" onClick={() => handleSetDefault(model)}>设为默认</Button>
-                      )}
+                      <Space size={4}>
+                        {model.is_default ? <Tag color="blue">默认</Tag> : (
+                          <Button size="small" type="link" onClick={() => handleSetDefault(model)}>设为默认</Button>
+                        )}
+                        <Switch size="small" aria-label={`切换模型 ${model.display_name} 的启用状态`} checked={model.is_enabled} onChange={(isEnabled) => void handleModelEnabledChange(model, isEnabled)} />
+                      </Space>
                     </div>
                     {model.description && <div className="responsive-data-card-description">{model.description}</div>}
                     <div className="responsive-data-card-tags">
                       {Object.keys(model.thinking_config ?? {}).length ? <Tag color="cyan">推理已配置</Tag> : <Tag>自动推理</Tag>}
                        {thinkingEfforts(model.thinking_config).map((effort) => <Tag key={effort}>{effort}</Tag>)}
-                       {model.prompt_cache_enabled && <Tag color="gold">显式缓存</Tag>}
+                       {model.prompt_cache_enabled && <Tag color="gold">提示缓存</Tag>}
+                      {!model.is_enabled && <Tag>已停用</Tag>}
+                      <Tag>{availabilityTimeRangeSummary(model.availability_time_ranges)}</Tag>
                       {modelAccess(model)}
                     </div>
                     <div className="responsive-data-card-actions">{modelActions(provider, model)}</div>
@@ -864,6 +1042,10 @@ export default function AdminModelsPage() {
           <Form.Item name="image_base_url" label="图片 Base URL" extra="留空则不启用图片模型。OpenAI Images 可填 API 根地址、/v1、/v1/images 或完整 /v1/images/generations，系统会自动补全正确端点；百炼原生填 https://dashscope.aliyuncs.com/api/v1。">
             <Input placeholder="https://api.openai.com/v1" />
           </Form.Item>
+          <Form.Item name="is_enabled" label="启用 Provider" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <AvailabilityTimeRangesFormItem />
         </Form>
       </Modal>
 
@@ -882,6 +1064,8 @@ export default function AdminModelsPage() {
           <Form.Item name="supported_aspect_ratios" label="支持比例"><Checkbox.Group options={[{ label: '方形', value: 'square' }, { label: '竖图', value: 'portrait' }, { label: '横图', value: 'landscape' }]} /></Form.Item>
           <Form.Item name="supported_qualities" label="质量选项"><Select mode="tags" options={['auto', 'low', 'medium', 'high'].map((value) => ({ label: value, value }))} /></Form.Item>
           <Form.Item name="is_default" valuePropName="checked"><Checkbox>设为默认图片模型</Checkbox></Form.Item>
+          <Form.Item name="is_enabled" label="启用图片模型" valuePropName="checked"><Switch /></Form.Item>
+          <AvailabilityTimeRangesFormItem />
           <Form.Item name="access_mode" label="使用范围"><Select options={[{ value: 'all', label: '所有有权限用户' }, { value: 'restricted', label: '仅管理员（可在权限中细分）' }]} /></Form.Item>
           <Form.Item name="allowed_user_ids" label="授权用户"><Select mode="multiple" allowClear loading={loadingAccessTargets} options={accessUsers.map((user) => ({ value: user.id, label: `${user.display_name}（${user.username}）` }))} placeholder="选择受限用户" /></Form.Item>
           <Form.Item name="allowed_group_ids" label="授权用户组"><Select mode="multiple" allowClear loading={loadingAccessTargets} options={accessGroups.map((group) => ({ value: group.id, label: `${group.name}（${group.members.length} 人）` }))} placeholder="选择受限用户组" /></Form.Item>
@@ -979,6 +1163,7 @@ export default function AdminModelsPage() {
         onCancel={() => {
           setDiscoverModalProvider(null)
           setDiscovery(null)
+          setDiscoveredModelSearch('')
         }}
         onOk={handleImportDiscoveredModels}
         okText="添加选中模型"
@@ -991,28 +1176,67 @@ export default function AdminModelsPage() {
         {discovery && (
           <>
             <Text type="secondary">模型来源：{discovery.source}</Text>
-            <Checkbox.Group
-              value={selectedDiscoveredModels}
-              onChange={(values) => setSelectedDiscoveredModels(values as string[])}
-              style={{ width: '100%', marginTop: 12, maxHeight: 420, overflowY: 'auto' }}
-            >
-              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-                {discovery.models.map((model: DiscoveredModelItem) => {
-                  const exists = discoverModalProvider?.models.some((item) => item.model_name === model.model_name)
-                  return (
-                    <Checkbox key={model.model_name} value={model.model_name} disabled={exists}>
-                      {model.display_name}
-                      <Text type="secondary" style={{ marginLeft: 8 }}>{model.model_name}</Text>
-                       {exists && <Tag style={{ marginLeft: 8 }}>已添加</Tag>}
-                       {model.thinking_efforts.length > 0 && <Tag color="cyan" style={{ marginLeft: 8 }}>{model.thinking_efforts.join(' / ')}</Tag>}
-                       <Tag color={model.context_window_source === '供应商接口' ? 'green' : 'gold'} style={{ marginLeft: 8 }}>
-                         输入 {formatKTokens(model.context_compaction_threshold_tokens)} / 输出 {formatKTokens(model.max_output_tokens)}
-                       </Tag>
-                    </Checkbox>
-                  )
-                })}
-              </Space>
-            </Checkbox.Group>
+            <Space orientation="vertical" size={10} style={{ width: '100%', marginTop: 12 }}>
+              <Input
+                allowClear
+                prefix={<SearchOutlined />}
+                placeholder="搜索模型名称"
+                aria-label="搜索模型"
+                value={discoveredModelSearch}
+                onChange={(event) => setDiscoveredModelSearch(event.target.value)}
+              />
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                <Space size={12}>
+                  <Checkbox
+                    checked={allFilteredModelsSelected}
+                    indeterminate={!allFilteredModelsSelected && someFilteredModelsSelected}
+                    disabled={filteredSelectableModelNames.length === 0}
+                    onChange={(event) => handleSelectFilteredDiscoveredModels(event.target.checked)}
+                  >
+                    全选
+                  </Checkbox>
+                  <Button
+                    type="link"
+                    size="small"
+                    disabled={!someFilteredModelsSelected}
+                    onClick={() => handleSelectFilteredDiscoveredModels(false)}
+                    style={{ paddingInline: 0 }}
+                  >
+                    全不选
+                  </Button>
+                </Space>
+                <Text type="secondary">
+                  已选 {selectedDiscoveredModels.length} / 可添加 {selectableDiscoveredModelCount}
+                </Text>
+              </div>
+              <div style={{ maxHeight: 350, overflowY: 'auto' }}>
+                {filteredDiscoveredModels.length > 0 ? (
+                  <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                    {filteredDiscoveredModels.map((model: DiscoveredModelItem) => {
+                      const exists = existingDiscoveredModelNames.has(model.model_name)
+                      return (
+                        <Checkbox
+                          key={model.model_name}
+                          checked={selectedDiscoveredModelNames.has(model.model_name)}
+                          disabled={exists}
+                          onChange={(event) => handleToggleDiscoveredModel(model.model_name, event.target.checked)}
+                        >
+                          {model.display_name}
+                          <Text type="secondary" style={{ marginLeft: 8 }}>{model.model_name}</Text>
+                          {exists && <Tag style={{ marginLeft: 8 }}>已添加</Tag>}
+                          {model.thinking_efforts.length > 0 && <Tag color="cyan" style={{ marginLeft: 8 }}>{model.thinking_efforts.join(' / ')}</Tag>}
+                          <Tag color={model.context_window_source === '供应商接口' ? 'green' : 'gold'} style={{ marginLeft: 8 }}>
+                            输入 {formatKTokens(model.context_compaction_threshold_tokens)} / 输出 {formatKTokens(model.max_output_tokens)}
+                          </Tag>
+                        </Checkbox>
+                      )
+                    })}
+                  </Space>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的模型" />
+                )}
+              </div>
+            </Space>
           </>
         )}
       </Modal>
@@ -1020,7 +1244,8 @@ export default function AdminModelsPage() {
       <Modal
         title={editingModel ? `编辑模型：${editingModel.display_name}` : '添加模型'}
         open={modelModalProviderId !== null}
-        className="admin-model-modal"
+        className="admin-model-modal admin-model-editor-modal"
+        width={1120}
         onCancel={() => {
           setModelModalProviderId(null)
           setEditingModel(null)
@@ -1029,66 +1254,80 @@ export default function AdminModelsPage() {
         confirmLoading={savingModel}
         destroyOnHidden
       >
-        <Form form={modelForm} layout="vertical">
-          <Form.Item
-            name="model_name"
-            label="模型名称（调用 API 时使用）"
-            rules={[{ required: true, message: '请输入模型名称' }]}
-          >
-            <Input disabled={!!editingModel} placeholder="例如：deepseek-chat / claude-sonnet-4-5-20250929" />
-          </Form.Item>
-          <Form.Item name="display_name" label="展示名称" rules={[{ required: true, message: '请输入展示名称' }]}>
-            <Input placeholder="用于前端模型选择器展示" />
-          </Form.Item>
-          <Form.Item name="description" label="模型描述" extra="在编辑器的模型下拉选择器中显示，便于区分模型的擅长场景与限制。">
-            <Input.TextArea
-              autoSize={{ minRows: 2, maxRows: 4 }}
-              maxLength={1024}
-              showCount
-              placeholder="例如：适合长文改写与结构化排版，速度较快"
-            />
-          </Form.Item>
-          <Form.Item
-            name="input_limit_k"
-            label="最大输入（K tokens）"
-            rules={[{ required: true, message: '请输入最大输入' }]}
-          >
-            <InputNumber min={1} max={1999} step={1} precision={0} style={{ width: '100%' }} />
-          </Form.Item>
-          <Form.Item
-            name="output_limit_k"
-            label="单次最大输出（K tokens）"
-            rules={[{ required: true, message: '请输入最大输出' }]}
-          >
-            <InputNumber min={1} max={1000} step={1} precision={0} style={{ width: '100%' }} />
-          </Form.Item>
-          {automaticTokenBudget && (
-            <Space size={[8, 8]} wrap style={{ marginTop: -8, marginBottom: 16 }} aria-label="自动配置">
-              <Text type="secondary">自动配置</Text>
-              <Tag>压缩开始约 {formatKTokens(Math.floor(automaticTokenBudget.context_compaction_threshold_tokens * 0.9))}</Tag>
-              <Tag>压缩目标约 {formatKTokens(Math.min(automaticTokenBudget.context_compaction_threshold_tokens, 20_000))}</Tag>
-              <Tag>工具预览 {formatKTokens(automaticTokenBudget.tool_result_max_tokens)}</Tag>
-            </Space>
-          )}
-          <Form.Item name="is_default" label="设为默认模型" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item
-            name="is_multimodal"
-            label="支持图片交互"
-            valuePropName="checked"
-            extra="开启后，用户可在聊天输入框选择或粘贴图片。请仅为确认支持视觉输入的模型开启。"
-          >
-            <Switch />
-          </Form.Item>
-          <Form.Item
-            name="supports_disabled_thinking"
-            label="支持不思考"
-            valuePropName="checked"
-            extra="关闭后，编辑器不会发送禁止思考参数，已保存的旧请求也会自动按默认思考设置执行。"
-          >
-            <Switch />
-          </Form.Item>
+        <Form form={modelForm} layout="vertical" className="model-editor-form">
+          <div className="model-editor-form-grid">
+            <div>
+              <Form.Item
+                name="model_name"
+                label="模型名称（调用 API 时使用）"
+                rules={[{ required: true, message: '请输入模型名称' }]}
+              >
+                <Input disabled={!!editingModel} placeholder="例如：deepseek-chat / claude-sonnet-4-5-20250929" />
+              </Form.Item>
+              <Form.Item name="display_name" label="展示名称" rules={[{ required: true, message: '请输入展示名称' }]}>
+                <Input placeholder="用于前端模型选择器展示" />
+              </Form.Item>
+              <Form.Item name="description" label="模型描述" extra="在编辑器的模型下拉选择器中显示，便于区分模型的擅长场景与限制。">
+                <Input.TextArea
+                  autoSize={{ minRows: 2, maxRows: 4 }}
+                  maxLength={1024}
+                  showCount
+                  placeholder="例如：适合长文改写与结构化排版，速度较快"
+                />
+              </Form.Item>
+              <div className="model-editor-token-grid">
+                <Form.Item
+                  name="input_limit_k"
+                  label="最大输入（K tokens）"
+                  rules={[{ required: true, message: '请输入最大输入' }]}
+                >
+                  <InputNumber min={1} max={1999} step={1} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item
+                  name="output_limit_k"
+                  label="单次最大输出（K tokens）"
+                  rules={[{ required: true, message: '请输入最大输出' }]}
+                >
+                  <InputNumber min={1} max={1000} step={1} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </div>
+              {automaticTokenBudget && (
+                <Space size={[8, 8]} wrap className="model-editor-automatic-budget" aria-label="自动配置">
+                  <Text type="secondary">自动配置</Text>
+                  <Tag>压缩开始约 {formatKTokens(Math.floor(automaticTokenBudget.context_compaction_threshold_tokens * 0.9))}</Tag>
+                  <Tag>压缩目标约 {formatKTokens(Math.min(automaticTokenBudget.context_compaction_threshold_tokens, 20_000))}</Tag>
+                  <Tag>工具预览 {formatKTokens(automaticTokenBudget.tool_result_max_tokens)}</Tag>
+                </Space>
+              )}
+            </div>
+            <div>
+              <div className="model-editor-switch-grid">
+                <Form.Item name="is_default" label="设为默认模型" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="is_enabled" label="启用模型" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+              </div>
+              <AvailabilityTimeRangesFormItem />
+              <Form.Item
+                name="is_multimodal"
+                label="支持图片交互"
+                valuePropName="checked"
+                extra="开启后，用户可在聊天输入框选择或粘贴图片。请仅为确认支持视觉输入的模型开启。"
+              >
+                <Switch />
+              </Form.Item>
+              <Form.Item
+                name="supports_disabled_thinking"
+                label="支持不思考"
+                valuePropName="checked"
+                extra="关闭后，编辑器不会发送禁止思考参数，已保存的旧请求也会自动按默认思考设置执行。"
+              >
+                <Switch />
+              </Form.Item>
+            </div>
+          </div>
           <Form.Item
             name="thinking_efforts"
             label="思考强度"
@@ -1114,12 +1353,12 @@ export default function AdminModelsPage() {
               ]}
             />
           </Form.Item>
-          {supportsExplicitPromptCache && (
+          {supportsPromptCache && (
             <Form.Item
               name="prompt_cache_enabled"
-              label="显式提示缓存"
+              label="提示缓存优化"
               valuePropName="checked"
-              extra="仅在当前网关已支持 prompt_cache_key、显式断点和 prompt_cache_options 时开启。启用后只缓存 Agent 的固定规则，不缓存文档或工具历史。"
+              extra="仅在当前网关支持 prompt_cache_key 时开启。模型仍使用服务端自动缓存；此选项只提供稳定路由键以提高重复前缀的命中率，不会复用旧回答。"
             >
               <Switch />
             </Form.Item>

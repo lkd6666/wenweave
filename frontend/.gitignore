@@ -9,6 +9,12 @@ lerna-debug.log*
 
 node_modules
 dist
+extension-dist
+public/downloads/layout-capture-extension.zip
+public/downloads/layout-capture-extension.zip.sha256
+public/downloads/layout-capture-extension-*.zip
+public/downloads/layout-capture-extension-*.zip.sha256
+public/downloads/layout-capture-extension.json
 dist-ssr
 *.local
 

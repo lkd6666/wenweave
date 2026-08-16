@@ -21,6 +21,7 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _WECHAT_PROXY_HOSTS = {
     "mp.weixin.qq.com",
     "mmbiz.qpic.cn",
+    "mmecoa.qpic.cn",
     "res.wx.qq.com",
     "wx.qlogo.cn",
     # Xiumi embeds resolve to the same reserved proxy range in some
@@ -49,22 +50,31 @@ def browser_headers() -> dict[str, str]:
     }
 
 
-def normalize_public_https_url(raw_url: str) -> str:
+def normalize_public_https_url(raw_url: str, *, allow_http: bool = False) -> str:
+    """Normalize a public image URL without relaxing the network boundary.
+
+    Page imports remain HTTPS-only.  Article-image localization may opt into
+    public HTTP because WeChat itself accepts it, but it still gets the same
+    hostname, port and resolved-address checks as HTTPS.
+    """
     value = raw_url.strip()
     try:
         parsed = urlsplit(value)
     except ValueError as exc:
         raise PublicFetchError("链接格式无效") from exc
-    if parsed.scheme.lower() != "https":
-        raise PublicFetchError("仅支持公开 HTTPS 链接")
+    scheme = parsed.scheme.lower()
+    allowed_schemes = {"https", "http"} if allow_http else {"https"}
+    if scheme not in allowed_schemes:
+        raise PublicFetchError("仅支持公开 HTTP 或 HTTPS 链接" if allow_http else "仅支持公开 HTTPS 链接")
     if not parsed.hostname or parsed.username or parsed.password:
         raise PublicFetchError("链接必须包含有效域名，且不能包含账号信息")
     try:
         port = parsed.port
     except ValueError as exc:
         raise PublicFetchError("链接端口无效") from exc
-    if port not in {None, 443}:
-        raise PublicFetchError("仅支持标准 HTTPS 端口")
+    standard_ports = {None, 443, 80} if allow_http else {None, 443}
+    if port not in standard_ports:
+        raise PublicFetchError("仅支持标准 HTTP 或 HTTPS 端口" if allow_http else "仅支持标准 HTTPS 端口")
     host = parsed.hostname.lower().rstrip(".")
     if not host:
         raise PublicFetchError("链接域名无效")
@@ -74,7 +84,7 @@ def normalize_public_https_url(raw_url: str) -> str:
         ip = None
     if ip is not None and not ip.is_global:
         raise PublicFetchError("不允许访问本机或内网地址")
-    return urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
+    return urlunsplit((scheme, host, parsed.path or "/", parsed.query, ""))
 
 
 def _is_allowed_address(host: str, address: str, trusted_proxy_hosts: frozenset[str] = frozenset()) -> bool:
@@ -98,6 +108,10 @@ async def ensure_public_host(url: str, *, trusted_proxy_hosts: frozenset[str] = 
     if not host:
         raise PublicFetchError("链接域名无效")
     try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError as exc:
+        raise PublicFetchError("链接端口无效") from exc
+    try:
         literal_ip = ipaddress.ip_address(host)
     except ValueError:
         literal_ip = None
@@ -107,7 +121,7 @@ async def ensure_public_host(url: str, *, trusted_proxy_hosts: frozenset[str] = 
         return
     try:
         records = await asyncio.get_running_loop().getaddrinfo(
-            host, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+            host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
         )
     except OSError as exc:
         raise PublicFetchError("无法解析链接域名") from exc
@@ -181,13 +195,14 @@ async def fetch_public_image(
     canonical_url: str | None = None,
     *,
     trusted_proxy_hosts: set[str] | frozenset[str] | None = None,
+    allow_http: bool = False,
 ) -> tuple[bytes, local_uploads.ImageInfo]:
     if source.lower().startswith("data:"):
         return _decode_data_image(source)
     trusted_hosts = frozenset(
         str(host).lower().rstrip(".") for host in (trusted_proxy_hosts or set()) if str(host).strip()
     )
-    current_url = normalize_public_https_url(urljoin(canonical_url or "", source))
+    current_url = normalize_public_https_url(urljoin(canonical_url or "", source), allow_http=allow_http)
     for redirect_count in range(MAX_REDIRECTS + 1):
         await ensure_public_host(current_url, trusted_proxy_hosts=trusted_hosts)
         headers = {
@@ -202,7 +217,7 @@ async def fetch_public_image(
                     location = response.headers.get("location")
                     if not location or redirect_count >= MAX_REDIRECTS:
                         raise PublicFetchError("图片重定向失败")
-                    current_url = normalize_public_https_url(urljoin(current_url, location))
+                    current_url = normalize_public_https_url(urljoin(current_url, location), allow_http=allow_http)
                     continue
                 if response.status_code >= 400:
                     raise PublicFetchError(f"图片无法访问（HTTP {response.status_code}）")

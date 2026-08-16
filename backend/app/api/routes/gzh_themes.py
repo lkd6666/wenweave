@@ -23,6 +23,7 @@ from app.models.user import User, UserRole
 from app.schemas.gzh_theme import (
     GzhThemeCreate,
     GzhThemeGenerationCreate,
+    GzhThemeGenerationProgressRead,
     GzhThemeGenerationRead,
     GzhThemeGenerationSave,
     GzhThemeManagerRead,
@@ -168,6 +169,12 @@ def _generation_read(generation: GzhThemeGeneration) -> GzhThemeGenerationRead:
         preview_html=str(output.get("preview_html") or "") if generation.status in {GzhThemeGenerationStatus.SUCCEEDED, GzhThemeGenerationStatus.SAVED} else "",
         component_count=len(manifest.get("components", [])),
         recipe_count=len(manifest.get("recipes", [])),
+        progress=GzhThemeGenerationProgressRead(
+            stage=generation.progress_stage or "pending",
+            current=max(0, int(generation.progress_current or 0)),
+            total=max(0, int(generation.progress_total or 0)),
+            message=generation.progress_message or "",
+        ),
         created_at=generation.created_at,
         finished_at=generation.finished_at,
     )

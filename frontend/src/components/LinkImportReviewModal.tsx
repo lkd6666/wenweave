@@ -3,6 +3,8 @@ import { Alert, Button, Input, Modal, Spin, Tag } from 'antd'
 import { LinkOutlined, PictureOutlined } from '@ant-design/icons'
 import type { WebArticleImportPreview } from '../api/documents'
 import { frameDocumentWithNewWindowLinks, SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import type { WechatVerificationDetail } from '../utils/layoutCaptureBridge'
+import { WechatCaptureFallback, type CaptureUiState } from './WechatCaptureFallback'
 
 interface LinkImportReviewModalProps {
   open: boolean
@@ -10,8 +12,14 @@ interface LinkImportReviewModalProps {
   importing: boolean
   preview: WebArticleImportPreview | null
   error: string
+  wechatFallback: WechatVerificationDetail | null
+  captureState: CaptureUiState
+  captureError: string | null
   onClose: () => void
   onPreview: (url: string) => void
+  onUrlChange: () => void
+  onDetectExtension: () => void
+  onStartCapture: () => void
   onConfirm: () => void
 }
 
@@ -21,8 +29,14 @@ export default function LinkImportReviewModal({
   importing,
   preview,
   error,
+  wechatFallback,
+  captureState,
+  captureError,
   onClose,
   onPreview,
+  onUrlChange,
+  onDetectExtension,
+  onStartCapture,
   onConfirm,
 }: LinkImportReviewModalProps) {
   const [url, setUrl] = useState('')
@@ -31,7 +45,8 @@ export default function LinkImportReviewModal({
     if (!open) setUrl('')
   }, [open])
 
-  const busy = loading || importing
+  const captureBusy = ['opening', 'awaiting_verification', 'capturing', 'uploading'].includes(captureState)
+  const busy = loading || importing || captureBusy
   const requestPreview = () => onPreview(url.trim())
 
   return (
@@ -41,11 +56,11 @@ export default function LinkImportReviewModal({
       width={1060}
       className="import-review-modal link-import-review-modal"
       destroyOnClose
-      onCancel={busy ? undefined : onClose}
+      onCancel={loading || importing ? undefined : onClose}
       footer={(
         <div className="link-import-review-actions">
-          <Button disabled={busy} onClick={onClose}>取消</Button>
-          <Button loading={loading} disabled={!url.trim() || importing} onClick={requestPreview}>
+          <Button disabled={loading || importing} onClick={onClose}>取消</Button>
+          <Button loading={loading} disabled={!url.trim() || importing || captureBusy} onClick={requestPreview}>
             {preview ? '重新抓取' : '抓取文章'}
           </Button>
           <Button type="primary" loading={importing} disabled={!preview || loading} onClick={onConfirm}>
@@ -60,11 +75,24 @@ export default function LinkImportReviewModal({
         disabled={busy}
         prefix={<LinkOutlined />}
         placeholder="粘贴公开 HTTPS 文章链接"
-        onChange={(event) => setUrl(event.target.value)}
+        onChange={(event) => {
+          setUrl(event.target.value)
+          onUrlChange()
+        }}
         onPressEnter={requestPreview}
       />
       {loading && <div className="import-preview-loading"><Spin description="正在抓取文章与正文图片…" /></div>}
       {error && !loading && <Alert style={{ marginTop: 16 }} type="error" showIcon message="链接导入失败" description={error} />}
+      {wechatFallback && !loading && (
+        <WechatCaptureFallback
+          verification={wechatFallback}
+          state={captureState}
+          error={captureError}
+          purpose="web_article_import"
+          onDetect={onDetectExtension}
+          onStart={onStartCapture}
+        />
+      )}
       {preview && !loading && (
         <>
           <div className="import-review-header link-import-review-header">

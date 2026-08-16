@@ -38,7 +38,13 @@ from app.services.agent_run_manager import WORKER_ID, cleanup_expired_agent_run_
 from app.services.tool_output_store import cleanup_expired_tool_outputs
 from app.services.chat_images import cleanup_expired_drafts
 from app.services.gzh_theme_generation import cleanup_expired_reference_assets
-from app.services.layout_reference import cleanup_expired_layout_references, layout_reference_cache
+from app.services.layout_reference import (
+    MAX_REFERENCE_IMAGE_TOTAL_BYTES,
+    MAX_RESPONSE_BYTES,
+    cleanup_expired_layout_capture_sessions,
+    cleanup_expired_layout_references,
+    layout_reference_cache,
+)
 from app.services.web_article_import import cleanup_expired_web_article_imports
 from app.services.image_generation import cleanup_unused_assets, recover_pending_generations, start_generation
 from app.services.operation_logs import (
@@ -49,6 +55,7 @@ from app.services.operation_logs import (
     reset_operation_request_id,
     set_operation_request_metadata,
     set_operation_request_id,
+    with_request_audit_actor,
     with_request_id,
 )
 from app.services.runtime_diagnostics import log_process_memory, read_process_memory
@@ -194,6 +201,7 @@ def _run_cleanup_cycle(app: FastAPI) -> None:
         ("theme_reference_assets", cleanup_expired_reference_assets),
         ("agent_run_events", cleanup_expired_agent_run_events),
         ("layout_references", cleanup_expired_layout_references),
+        ("layout_capture_sessions", cleanup_expired_layout_capture_sessions),
         ("web_article_imports", cleanup_expired_web_article_imports),
         ("generated_image_assets", cleanup_unused_assets),
     )
@@ -340,6 +348,7 @@ MULTIPART_OVERHEAD_ALLOWANCE = 256 * 1024
 MAX_IMPORT_UPLOAD_BYTES = 30 * 1024 * 1024
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_BRANDING_ASSET_BYTES = 2 * 1024 * 1024
+MAX_LAYOUT_CAPTURE_UPLOAD_BYTES = MAX_RESPONSE_BYTES + MAX_REFERENCE_IMAGE_TOTAL_BYTES + MULTIPART_OVERHEAD_ALLOWANCE
 
 
 def _upload_size_limit(path: str) -> int | None:
@@ -354,6 +363,18 @@ def _upload_size_limit(path: str) -> int | None:
         return MAX_IMAGE_UPLOAD_BYTES
     if parts == ["api", "gzh-theme-assets"]:
         return MAX_IMAGE_UPLOAD_BYTES
+    if (
+        len(parts) == 5
+        and parts[:3] == ["api", "layout-references", "capture-sessions"]
+        and parts[4] == "complete"
+    ):
+        return MAX_LAYOUT_CAPTURE_UPLOAD_BYTES
+    if (
+        len(parts) == 6
+        and parts[:4] == ["api", "documents", "link-imports", "capture-sessions"]
+        and parts[5] == "complete"
+    ):
+        return MAX_LAYOUT_CAPTURE_UPLOAD_BYTES
     if parts in (["api", "branding", "logo"], ["api", "branding", "favicon"]):
         return MAX_BRANDING_ASSET_BYTES
     return None
@@ -420,8 +441,11 @@ async def operation_audit(request: Request, call_next):
         try:
             response = await call_next(request)
         except Exception:
+            context = with_request_audit_actor(context, request)
+            context = with_request_id(context, str(getattr(request.state, "request_id", "")))
             persist_request_audit(context, 500, exception=True)
             raise
+        context = with_request_audit_actor(context, request)
         context = with_request_id(context, str(getattr(request.state, "request_id", "")))
         if not context.route.deferred_terminal or response.status_code >= 400:
             persist_request_audit(context, response.status_code)

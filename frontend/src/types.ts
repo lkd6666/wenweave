@@ -62,6 +62,22 @@ export interface TokenResponse {
 
 export type ProviderType = 'openai_compatible' | 'openai_responses' | 'anthropic'
 
+export interface AvailabilityTimeRange {
+  start: string
+  end: string
+}
+
+export interface ArticleTypographySettings {
+  horizontal_padding_px: number
+  paragraph_spacing_px: number
+  font_size_px: number
+  line_height_em: number
+  letter_spacing_px: number
+  text_indent_em: number
+  text_color: string
+  updated_at: string | null
+}
+
 export interface AIModelItem {
   id: number
   provider_id: number
@@ -74,6 +90,8 @@ export interface AIModelItem {
   max_output_tokens: number
   tool_result_max_tokens: number
   is_default: boolean
+  is_enabled: boolean
+  availability_time_ranges: AvailabilityTimeRange[]
   is_multimodal: boolean
   supports_disabled_thinking: boolean
   default_thinking_effort: 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -138,6 +156,8 @@ export interface AIProviderItem {
   base_url: string
   image_protocol: '' | 'openai_images' | 'dashscope_images' | 'volcengine_ark_images'
   image_base_url: string
+  is_enabled: boolean
+  availability_time_ranges: AvailabilityTimeRange[]
   api_key_masked: string
   models: AIModelItem[]
   image_models: AIImageModelItem[]
@@ -152,6 +172,8 @@ export interface AIImageModelItem {
   supported_aspect_ratios: Array<'square' | 'portrait' | 'landscape'>
   supported_qualities: string[]
   is_default: boolean
+  is_enabled: boolean
+  availability_time_ranges: AvailabilityTimeRange[]
   access_mode: 'all' | 'restricted'
   allowed_user_ids: number[]
   allowed_group_ids: number[]
@@ -369,6 +391,14 @@ export interface LayoutReferencePreview {
   warning: string | null
 }
 
+export interface LayoutCaptureSession {
+  id: string
+  token: string
+  canonical_url: string
+  expires_at: string
+  purpose: 'layout_reference' | 'web_article_import'
+}
+
 export type DocumentVersionSource = 'initial' | 'manual' | 'ai' | 'restore'
 
 export interface DocumentVersionSummary {
@@ -413,6 +443,14 @@ export interface ChatUserQuestion {
     reasoning?: ReasoningTrace
   }
   event_sequence?: number
+}
+
+export interface PendingChatUserQuestion {
+  document_id: number
+  document_title: string
+  session_id: number
+  created_at: string
+  question: ChatUserQuestion
 }
 
 export type ReasoningStatus = 'idle' | 'thinking' | 'complete' | 'unavailable'
@@ -466,6 +504,22 @@ export interface TaskPlanItem {
   status: 'pending' | 'in_progress' | 'done'
 }
 
+export interface HtmlValidationIssue {
+  code: string
+  message: string
+  line?: number | null
+  column?: number | null
+  tag?: string
+  severity?: 'error' | 'warning'
+}
+
+export interface HtmlValidationReport {
+  valid?: boolean
+  errors?: string[]
+  warnings?: string[]
+  issues?: HtmlValidationIssue[]
+}
+
 export interface ToolActivity {
   kind: 'map' | 'search' | 'read' | 'edit' | 'check' | 'plan' | 'reference' | 'error' | string
   summary: string
@@ -475,7 +529,7 @@ export interface ToolActivity {
   character_delta?: number
   targets?: ToolActivityTarget[]
   details?: Record<string, unknown>
-  html_validation?: { valid?: boolean; errors?: string[] }
+  html_validation?: HtmlValidationReport
 }
 
 export interface ChatContextStats {
@@ -879,6 +933,12 @@ export interface GzhThemeGeneration {
   preview_html: string
   component_count: number
   recipe_count: number
+  progress: {
+    stage: string
+    current: number
+    total: number
+    message: string
+  }
   created_at: string
   finished_at: string | null
 }

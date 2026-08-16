@@ -7,6 +7,9 @@ param(
     [string]$MySqlDumpPath = '',
     [string]$SevenZipPath = '',
     [string]$PrivateArchivePasswordEnvironmentVariable = '',
+    [string]$LayoutCaptureAppOrigin = $env:LAYOUT_CAPTURE_APP_ORIGIN,
+    [ValidatePattern('^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){0,3}$')]
+    [string]$LayoutCaptureExtensionVersion = (Get-Date -Format 'yyyy.M.d.HHmm'),
     [switch]$SkipPrivateArchive
 )
 
@@ -18,6 +21,21 @@ if (-not $OutputRoot) {
     $OutputRoot = Join-Path (Split-Path -Parent $repoRoot) 'yibanpaiban-artifacts'
 }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
+
+if ([string]::IsNullOrWhiteSpace($LayoutCaptureAppOrigin)) {
+    throw 'A production HTTPS application origin is required. Pass -LayoutCaptureAppOrigin or set LAYOUT_CAPTURE_APP_ORIGIN.'
+}
+$layoutCaptureUri = $null
+if (-not [Uri]::TryCreate($LayoutCaptureAppOrigin, [UriKind]::Absolute, [ref]$layoutCaptureUri) -or
+    $layoutCaptureUri.Scheme -ne 'https' -or
+    $layoutCaptureUri.GetLeftPart([UriPartial]::Authority).TrimEnd('/') -ne $LayoutCaptureAppOrigin.TrimEnd('/')) {
+    throw 'LayoutCaptureAppOrigin must be an HTTPS origin without a path, query, or fragment.'
+}
+foreach ($versionPart in $LayoutCaptureExtensionVersion.Split('.')) {
+    if ([int]$versionPart -gt 65535) {
+        throw 'Each LayoutCaptureExtensionVersion component must be at most 65535.'
+    }
+}
 
 function Invoke-Checked {
     param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory = $repoRoot)
@@ -108,6 +126,20 @@ function Write-Sha256 {
     Set-Content -LiteralPath "$FilePath.sha256" -Value $line -Encoding ascii
 }
 
+function Write-DirectorySha256 {
+    param([string]$Directory)
+    $root = [System.IO.Path]::GetFullPath($Directory).TrimEnd([char[]]@('\', '/'))
+    $lines = Get-ChildItem -LiteralPath $root -Recurse -Force -File |
+        Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+        Sort-Object FullName |
+        ForEach-Object {
+            $relativePath = $_.FullName.Substring($root.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $relativePath"
+        }
+    Set-Content -LiteralPath (Join-Path $root 'SHA256SUMS.txt') -Value $lines -Encoding ascii
+}
+
 function Remove-ExistingPath {
     param([string]$Path, [switch]$Recurse)
     if (Test-Path -LiteralPath $Path) {
@@ -195,14 +227,18 @@ $privateStage = Join-Path $outputVersionDir 'private-stage'
 $sourceArchive = Join-Path $outputVersionDir 'source.zip'
 $releaseZip = Join-Path $outputVersionDir "yibanpaiban-release-$Version.zip"
 $privateArchive = Join-Path $outputVersionDir "yibanpaiban-private-$Version.private.7z"
+$extensionPackageDir = Join-Path $outputVersionDir "layout-capture-extension-$Version"
+$extensionArchive = Join-Path $outputVersionDir "layout-capture-extension-enterprise-$Version.zip"
 $releaseZipCandidate = "$releaseZip.new"
 $privateArchiveCandidate = "$privateArchive.new"
+$extensionArchiveCandidate = "$extensionArchive.new"
 
 New-Item -ItemType Directory -Force -Path $outputVersionDir | Out-Null
 foreach ($stage in @($releaseStage, $privateStage)) {
     Remove-ExistingPath -Path $stage -Recurse
 }
-foreach ($temporaryPath in @($sourceArchive, $releaseZipCandidate, $privateArchiveCandidate)) {
+Remove-ExistingPath -Path $extensionPackageDir -Recurse
+foreach ($temporaryPath in @($sourceArchive, $releaseZipCandidate, $privateArchiveCandidate, $extensionArchiveCandidate)) {
     Remove-ExistingPath -Path $temporaryPath
 }
 
@@ -211,7 +247,43 @@ Expand-Archive -LiteralPath $sourceArchive -DestinationPath $releaseStage -Force
 
 $releaseFrontendDir = Join-Path $releaseStage 'frontend'
 Invoke-Checked -FilePath 'npm.cmd' -Arguments @('--prefix', $releaseFrontendDir, 'ci')
+$previousCaptureOrigin = [Environment]::GetEnvironmentVariable('LAYOUT_CAPTURE_APP_ORIGIN', 'Process')
+$previousCaptureMode = [Environment]::GetEnvironmentVariable('LAYOUT_CAPTURE_BUILD_MODE', 'Process')
+$previousCaptureVersion = [Environment]::GetEnvironmentVariable('LAYOUT_CAPTURE_EXTENSION_VERSION', 'Process')
+try {
+    [Environment]::SetEnvironmentVariable('LAYOUT_CAPTURE_APP_ORIGIN', $LayoutCaptureAppOrigin.TrimEnd('/'), 'Process')
+    [Environment]::SetEnvironmentVariable('LAYOUT_CAPTURE_BUILD_MODE', 'production', 'Process')
+    [Environment]::SetEnvironmentVariable('LAYOUT_CAPTURE_EXTENSION_VERSION', $LayoutCaptureExtensionVersion, 'Process')
+    Invoke-Checked -FilePath 'npm.cmd' -Arguments @('--prefix', $releaseFrontendDir, 'run', 'build:layout-capture-extension')
+}
+finally {
+    [Environment]::SetEnvironmentVariable('LAYOUT_CAPTURE_APP_ORIGIN', $previousCaptureOrigin, 'Process')
+    [Environment]::SetEnvironmentVariable('LAYOUT_CAPTURE_BUILD_MODE', $previousCaptureMode, 'Process')
+    [Environment]::SetEnvironmentVariable('LAYOUT_CAPTURE_EXTENSION_VERSION', $previousCaptureVersion, 'Process')
+}
 Invoke-Checked -FilePath 'npm.cmd' -Arguments @('--prefix', $releaseFrontendDir, 'run', 'build')
+$extensionBuildDir = Join-Path $releaseFrontendDir 'extension-dist'
+if (-not (Test-Path -LiteralPath (Join-Path $extensionBuildDir 'manifest.json'))) {
+    throw 'Layout capture extension build did not produce manifest.json.'
+}
+$extensionDownloadMetadata = Join-Path $releaseFrontendDir 'dist\downloads\layout-capture-extension.json'
+if (-not (Test-Path -LiteralPath $extensionDownloadMetadata)) {
+    throw 'Frontend build did not include the layout capture extension download metadata.'
+}
+$extensionDownloadFileName = (Get-Content -Raw -LiteralPath $extensionDownloadMetadata | ConvertFrom-Json).file_name
+if (-not $extensionDownloadFileName -or [System.IO.Path]::GetFileName($extensionDownloadFileName) -ne $extensionDownloadFileName) {
+    throw 'Layout capture extension download metadata contains an invalid file name.'
+}
+$extensionWebDownload = Join-Path $releaseFrontendDir "dist\downloads\$extensionDownloadFileName"
+if (-not (Test-Path -LiteralPath $extensionWebDownload)) {
+    throw 'Frontend build did not include the layout capture extension download.'
+}
+Copy-Item -LiteralPath $extensionBuildDir -Destination $extensionPackageDir -Recurse -Force
+Write-DirectorySha256 -Directory $extensionPackageDir
+New-PortableZip -SourceDirectory $extensionPackageDir -DestinationFile $extensionArchiveCandidate
+Move-FileIntoPlace -Source $extensionArchiveCandidate -Destination $extensionArchive
+Write-Sha256 -FilePath $extensionArchive
+Remove-Item -LiteralPath $extensionBuildDir -Recurse -Force
 Remove-Item -LiteralPath (Join-Path $releaseFrontendDir 'node_modules') -Recurse -Force
 
 Invoke-Checked -FilePath $PythonExecutable -Arguments @('scripts/export_mysql_schema.py', '--output', (Join-Path $releaseStage 'deploy\mysql-schema.sql')) -WorkingDirectory (Join-Path $repoRoot 'backend')
@@ -219,6 +291,7 @@ Set-Content -LiteralPath (Join-Path $releaseStage 'RELEASE_MANIFEST.txt') -Encod
     "commit=$commit",
     "version=$Version",
     'frontend=prebuilt',
+    "layout-capture-extension=$LayoutCaptureExtensionVersion ($($LayoutCaptureAppOrigin.TrimEnd('/')))",
     'database=mysql-schema-only',
     'private-runtime-data=excluded'
 )
@@ -278,8 +351,12 @@ if (-not $SkipPrivateArchive) {
 Remove-TemporaryPath -Path $releaseStage -Recurse
 Remove-TemporaryPath -Path $sourceArchive
 Remove-TemporaryPath -Path $releaseZipCandidate
+Remove-TemporaryPath -Path $extensionArchiveCandidate
 Write-Host "Release package: $releaseZip"
 Write-Host "Release checksum: $releaseZip.sha256"
+Write-Host "Layout capture extension directory: $extensionPackageDir"
+Write-Host "Layout capture extension package: $extensionArchive"
+Write-Host "Layout capture extension checksum: $extensionArchive.sha256"
 if (-not $SkipPrivateArchive) {
     Write-Host "Private archive: $privateArchive"
     Write-Host "Private checksum: $privateArchive.sha256"

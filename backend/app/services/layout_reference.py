@@ -24,7 +24,25 @@ from sqlalchemy.orm import Session
 
 from app.models.chat_layout_reference import ChatLayoutReference, ChatLayoutReferenceAsset
 from app.models.chat_session_layout_reference import ChatSessionLayoutReference
+from app.models.layout_capture_session import LayoutCaptureSession
 from app.services import local_uploads
+from app.services.browser_capture import (
+    CAPTURE_PURPOSE_LAYOUT_REFERENCE,
+    BrowserCaptureError,
+    BrowserCaptureExpiredError,
+    MAX_CAPTURE_ASSETS,
+    MAX_CAPTURE_HTML_BYTES,
+    MAX_CAPTURE_IMAGE_BYTES,
+    MAX_CAPTURE_IMAGE_TOTAL_BYTES,
+    WechatVerificationRequiredError,
+    cleanup_expired_browser_capture_sessions,
+    complete_browser_capture_session,
+    create_browser_capture_session,
+    is_wechat_verification_page,
+    load_browser_capture_session,
+    normalize_wechat_article_url,
+    resolve_wechat_capture_url,
+)
 from app.services.document_images import DocumentImageStorageError, store_document_image
 from app.services.external_fetch import PublicFetchError, fetch_public_html, fetch_public_image
 
@@ -32,16 +50,17 @@ from app.services.external_fetch import PublicFetchError, fetch_public_html, fet
 REFERENCE_TTL_SECONDS = 15 * 60
 FETCH_TIMEOUT_SECONDS = 10.0
 MAX_REDIRECTS = 3
-MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_RESPONSE_BYTES = MAX_CAPTURE_HTML_BYTES
 MAX_REFERENCE_HTML_CHARS = 48_000
-MAX_REFERENCE_IMAGES = 50
-MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_REFERENCE_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_REFERENCE_IMAGES = MAX_CAPTURE_ASSETS
+MAX_REFERENCE_IMAGE_BYTES = MAX_CAPTURE_IMAGE_BYTES
+MAX_REFERENCE_IMAGE_TOTAL_BYTES = MAX_CAPTURE_IMAGE_TOTAL_BYTES
 REFERENCE_IMAGE_FETCH_CONCURRENCY = 4
 _WECHAT_HOST = "mp.weixin.qq.com"
 _WECHAT_COMPAT_PROXY_HOSTS = {
     _WECHAT_HOST,
     "mmbiz.qpic.cn",
+    "mmecoa.qpic.cn",
     "res.wx.qq.com",
     "wx.qlogo.cn",
 }
@@ -64,6 +83,7 @@ _DATA_IMAGE_URL_RE = re.compile(
 )
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.IGNORECASE | re.DOTALL)
 _IMAGE_SOURCE_ATTRIBUTES = ("data-src", "data-original", "data-actualsrc", "src")
+_CAPTURE_ASSET_URL_RE = re.compile(r"^layout-capture://([a-f0-9]{32})$", re.IGNORECASE)
 
 
 class LayoutReferenceError(ValueError):
@@ -462,6 +482,10 @@ def cleanup_expired_layout_references(db: Session, now: datetime | None = None) 
     return len(expired_ids)
 
 
+def cleanup_expired_layout_capture_sessions(db: Session, now: datetime | None = None) -> int:
+    return cleanup_expired_browser_capture_sessions(db, now)
+
+
 def _normalise_url(raw_url: str) -> str:
     value = raw_url.strip()
     try:
@@ -489,6 +513,18 @@ def _normalise_url(raw_url: str) -> str:
         raise LayoutReferenceError("不允许访问本机或内网地址")
     path = parsed.path or "/"
     return urlunsplit(("https", host, path, parsed.query, ""))
+
+
+def _wechat_article_url(raw_url: str) -> str | None:
+    return normalize_wechat_article_url(raw_url)
+
+
+def _wechat_verification_target_url(verification_url: str, requested_url: str = "") -> str | None:
+    return resolve_wechat_capture_url(verification_url, requested_url)
+
+
+def _is_wechat_verification_page(source: str, canonical_url: str) -> bool:
+    return is_wechat_verification_page(source, canonical_url)
 
 
 async def _ensure_public_host(url: str) -> None:
@@ -1175,8 +1211,100 @@ def session_layout_reference_summary(binding: ChatSessionLayoutReference | None)
     }
 
 
+def create_layout_capture_session(raw_url: str, user_id: int, db: Session) -> tuple[LayoutCaptureSession, str]:
+    try:
+        return create_browser_capture_session(raw_url, user_id, CAPTURE_PURPOSE_LAYOUT_REFERENCE, db)
+    except BrowserCaptureError as exc:
+        raise LayoutReferenceError(str(exc)) from exc
+
+
+def _captured_reference_assets(
+    asset_sources: list[_AssetSource],
+    captured_assets: dict[str, tuple[bytes, local_uploads.ImageInfo]],
+) -> list[tuple[_AssetSource, bytes, local_uploads.ImageInfo]]:
+    resolved: list[tuple[_AssetSource, bytes, local_uploads.ImageInfo]] = []
+    used_ids: set[str] = set()
+    for asset_source in asset_sources:
+        matched = _CAPTURE_ASSET_URL_RE.fullmatch(asset_source.source)
+        if not matched:
+            raise LayoutReferenceError("浏览器采集正文包含未授权的外部图片地址")
+        captured_id = matched.group(1).lower()
+        captured = captured_assets.get(captured_id)
+        if captured is None:
+            raise LayoutReferenceError("浏览器采集图片清单与正文占位符不一致")
+        used_ids.add(captured_id)
+        data, image = captured
+        resolved.append((asset_source, data, image))
+    if used_ids != set(captured_assets):
+        raise LayoutReferenceError("浏览器采集图片清单包含正文未引用的素材")
+    return resolved
+
+
+def complete_layout_capture_session(
+    db: Session,
+    capture_id: str,
+    capture_token: str,
+    captured_url: str,
+    source_html: str,
+    title: str,
+    captured_assets: dict[str, tuple[bytes, local_uploads.ImageInfo]],
+    omitted_asset_count: int = 0,
+) -> LayoutReference:
+    try:
+        capture_session = load_browser_capture_session(
+            db,
+            capture_id,
+            capture_token,
+            captured_url,
+            CAPTURE_PURPOSE_LAYOUT_REFERENCE,
+        )
+    except BrowserCaptureExpiredError as exc:
+        raise LayoutReferenceExpiredError(str(exc)) from exc
+    except BrowserCaptureError as exc:
+        raise LayoutReferenceError(str(exc)) from exc
+    if len(source_html.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise LayoutReferenceError("浏览器采集正文超过 5MB 限制")
+    if len(captured_assets) > MAX_REFERENCE_IMAGES:
+        raise LayoutReferenceError(f"浏览器采集图片超过 {MAX_REFERENCE_IMAGES} 张限制")
+    if any(len(data) > MAX_REFERENCE_IMAGE_BYTES for data, _ in captured_assets.values()):
+        raise LayoutReferenceError("浏览器采集图片超过 10MB 限制")
+    if sum(len(data) for data, _ in captured_assets.values()) > MAX_REFERENCE_IMAGE_TOTAL_BYTES:
+        raise LayoutReferenceError("浏览器采集图片总大小超过 50MB 限制")
+
+    rendered, block_count, image_slots, asset_sources, _, extraction_warning = (
+        _extract_layout_reference_with_assets(source_html, capture_session.canonical_url)
+    )
+    fetched_assets = _captured_reference_assets(asset_sources, captured_assets)
+    warning_parts = [part for part in (extraction_warning,) if part]
+    if omitted_asset_count:
+        warning_parts.append(f"有 {omitted_asset_count} 个图片素材未能由浏览器采集，已从参考结构中移除")
+    normalized_title = re.sub(r"\s+", " ", title).strip()[:200] or "未命名参考文章"
+    reference = LayoutReference(
+        reference_id=str(uuid4()),
+        user_id=capture_session.user_id,
+        canonical_url=capture_session.canonical_url,
+        title=normalized_title,
+        site_name=_WECHAT_HOST,
+        html_template=rendered,
+        block_count=block_count,
+        image_slots=image_slots,
+        extracted_from="浏览器采集的公众号正文",
+        warning="；".join(warning_parts) or None,
+        expires_at=time.monotonic() + REFERENCE_TTL_SECONDS,
+        preview_token=token_urlsafe(32),
+    )
+    _store_reference_assets(reference, fetched_assets)
+    complete_browser_capture_session(capture_session)
+    persist_layout_reference(db, reference)
+    layout_reference_cache.put(reference)
+    return reference
+
+
 async def create_layout_reference(raw_url: str, user_id: int, db: Session) -> LayoutReference:
     canonical_url, source = await _fetch_html(raw_url)
+    if _is_wechat_verification_page(source, canonical_url):
+        capture_url = _wechat_verification_target_url(canonical_url, raw_url) or canonical_url
+        raise WechatVerificationRequiredError(capture_url)
     rendered, block_count, image_slots, asset_sources, extracted_from, warning = _extract_layout_reference_with_assets(source, canonical_url)
     parsed = urlsplit(canonical_url)
     reference = LayoutReference(

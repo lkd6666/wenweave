@@ -17,15 +17,18 @@ import { modelsApi } from '../api/models'
 import { aiProvidersApi } from '../api/aiProviders'
 import { complianceApi } from '../api/compliance'
 import { wechatAccountsApi } from '../api/wechatAccounts'
-import { cancelChatRun, chatApi, reaskDocumentConflictFromError, startChatRun, streamChatRunEvents } from '../api/chat'
+import { cancelChatRun, chatApi, reaskDocumentConflictFromError, reaskSourceUnavailableFromError, startChatRun, streamChatRunEvents } from '../api/chat'
 import type { ReaskConflictResolution, ThinkingEffort, ThinkingMode } from '../api/chat'
 import { ApiError } from '../api/client'
-import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, PreviewImageTarget, ReasoningTrace, SelectedElementContext, TemplateItem, ToolExecution, VisibilitySettings, WeChatArticleMetadata, WeChatAvailableAccount } from '../types'
+import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, PreviewImageTarget, ReasoningTrace, SelectedElementContext, TemplateItem, ToolExecution, VisibilitySettings, WeChatAvailableAccount } from '../types'
 import { sanitizeSelectedElement, sanitizeSelectedElements } from '../utils/selectedElements'
 import { prepareWeChatBodyImage } from '../utils/wechatBodyImage'
 import { clearChatComposerDraft, clearChatComposerDraftForRequest, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
 import { moveQueuedChatItem, updateQueuedChatContent } from '../utils/chatQueue'
+import { createChatRunConnection, detachChatRunConnection, requestChatRunStop, retireChatRunConnection } from '../utils/chatRunConnection'
+import type { ChatRunConnection } from '../utils/chatRunConnection'
 import { resolveThinkingPreference, saveThinkingPreference } from '../utils/thinkingPreference'
+import { requestChatQuestionNotificationPermissionOnce } from '../utils/chatQuestionNotifications'
 import { useAuthStore } from '../store/authStore'
 
 const CodeViewer = lazy(() => import('../components/CodeViewer'))
@@ -242,23 +245,6 @@ function appendStreamTextBlock(
   ]
 }
 
-function startThinkingBlock(blocks: AssistantTurnBlock[], occurredAtMs = Date.now()): AssistantTurnBlock[] {
-  const last = blocks.at(-1)
-  if (last?.type === 'thought' && last.state === 'active') return blocks
-  return [
-    ...finishActiveTextBlock(blocks, occurredAtMs),
-    {
-      id: `thought-${blocks.length + 1}`,
-      type: 'thought',
-      state: 'active',
-      content: '',
-      duration_ms: null,
-      started_at_ms: occurredAtMs,
-      tool: null,
-    },
-  ]
-}
-
 function preserveRetriedToolPreviews(
   checkpoint: {
     tools: ToolExecution[]
@@ -418,10 +404,6 @@ export default function EditorPage() {
   const [themeGalleryInitialKey, setThemeGalleryInitialKey] = useState<string | null>(null)
   const [wechatDraftOpen, setWechatDraftOpen] = useState(false)
   const [documentShareOpen, setDocumentShareOpen] = useState(false)
-  const [wechatMetadata, setWechatMetadata] = useState<WeChatArticleMetadata>({
-    title: '', author: '', digest: '', content_source_url: '', cover_url: '',
-    pic_crop_235_1: '', pic_crop_1_1: '', need_open_comment: false, only_fans_can_comment: false,
-  })
   const [wechatAccounts, setWechatAccounts] = useState<WeChatAvailableAccount[]>([])
   const [saving, setSaving] = useState(false)
   const [materializingTemplateImages, setMaterializingTemplateImages] = useState(false)
@@ -488,7 +470,8 @@ export default function EditorPage() {
   const [compliance, setCompliance] = useState<ComplianceReport | null>(null)
   const [complianceLoading, setComplianceLoading] = useState(false)
 
-  const abortRef = useRef<AbortController | null>(null)
+  const chatRunConnectionRef = useRef<ChatRunConnection | null>(null)
+  const attachedEditorDocumentRef = useRef<number | null>(null)
   const activeRunRef = useRef<string | null>(null)
   const resumedRunRef = useRef<string | null>(null)
   const resumeHandlerRef = useRef<((runId: string, sessionId?: number) => Promise<void>) | null>(null)
@@ -772,7 +755,6 @@ export default function EditorPage() {
         allowed_user_ids: doc.allowed_user_ids,
         allowed_group_ids: doc.allowed_group_ids,
       })
-      setWechatMetadata(doc.wechat_metadata)
       applyExternalHtml(doc.current_html)
       setPreviewRevision((value) => value + 1)
       setActiveCaretTarget(null)
@@ -872,13 +854,15 @@ export default function EditorPage() {
   }, [docId])
 
   useEffect(() => {
+    attachedEditorDocumentRef.current = docId ?? null
     loadDocument()
     return () => {
-      abortRef.current?.abort()
+      if (attachedEditorDocumentRef.current === (docId ?? null)) attachedEditorDocumentRef.current = null
+      detachChatRunConnection(chatRunConnectionRef.current)
       if (complianceTimerRef.current) clearTimeout(complianceTimerRef.current)
       cancelAutoSave()
     }
-  }, [cancelAutoSave, loadDocument])
+  }, [cancelAutoSave, docId, loadDocument])
 
   useEffect(() => {
     if (!docId || Number.isNaN(docId) || !modelId || !activeChatSessionId || activeChatSession?.is_archived) {
@@ -951,19 +935,20 @@ export default function EditorPage() {
             ...buildHtmlSplice(htmlRef.current, snapshot),
             base_checksum: await sha256(htmlRef.current),
           }
-          await documentsApi.patchContent(docId, patch)
-          htmlRef.current = snapshot
-          setHtml(snapshot)
+          const result = await documentsApi.patchContent(docId, patch)
+          const savedHtml = result.html
+          htmlRef.current = savedHtml
+          setHtml(savedHtml)
 
           // 用户在请求中继续编辑时保留新草稿，下一轮循环会自动保存它。
           if (draftHtmlRef.current === snapshot) {
-            draftHtmlRef.current = snapshot
-            setDraftHtml(snapshot)
-            runComplianceCheck(snapshot)
+            draftHtmlRef.current = savedHtml
+            setDraftHtml(savedHtml)
+            runComplianceCheck(savedHtml)
           }
           setPreviewRevision((value) => value + 1)
           setVersionRefreshToken((value) => value + 1)
-          return snapshot
+          return savedHtml
         } catch (err) {
           message.error(err instanceof ApiError ? String(err.detail) : '保存失败')
           return null
@@ -1418,9 +1403,11 @@ export default function EditorPage() {
       return
     }
 
-    abortRef.current?.abort()
-    const controller = new AbortController()
-    abortRef.current = controller
+    retireChatRunConnection(chatRunConnectionRef.current)
+    const connection = createChatRunConnection()
+    connection.detached = attachedEditorDocumentRef.current !== docId
+    const { controller } = connection
+    chatRunConnectionRef.current = connection
 
     let optimisticMessageId: number | null = null
     if (!existingRunId) {
@@ -1511,7 +1498,7 @@ export default function EditorPage() {
     if (submittedDraft) {
       writeChatComposerDraft(docId, sessionId, { ...submittedDraft, phase: 'starting' })
     }
-    const restoreSubmittedDraft = (withFreshRequestId = false) => {
+    const restoreSubmittedDraft = (withFreshRequestId = false, nextReaskFromMessageId = submittedDraft?.reaskFromMessageId ?? null) => {
       if (!submittedDraft) return
       const storedDraft = readChatComposerDraft(docId, sessionId)
       const hasNewerDraft = Boolean(
@@ -1520,7 +1507,7 @@ export default function EditorPage() {
       )
       if (hasNewerDraft) return
       setContextDraft(submittedDraft.message)
-      setPendingReaskMessageId(submittedDraft.reaskFromMessageId)
+      setPendingReaskMessageId(nextReaskFromMessageId)
       restoreSubmittedElements()
       writeChatComposerDraft(
         docId,
@@ -1528,10 +1515,10 @@ export default function EditorPage() {
         withFreshRequestId
           ? {
               message: submittedDraft.message,
-              reaskFromMessageId: submittedDraft.reaskFromMessageId,
+              reaskFromMessageId: nextReaskFromMessageId,
               phase: 'retry',
             }
-          : { ...submittedDraft, phase: 'retry' },
+          : { ...submittedDraft, reaskFromMessageId: nextReaskFromMessageId, phase: 'retry' },
       )
     }
 
@@ -1632,15 +1619,16 @@ export default function EditorPage() {
       }
       runId = run.run_id
       activeRunRef.current = run.run_id
+      connection.phase = 'streaming'
 
-      if (controller.signal.aborted) {
+      if (connection.stopRequested) {
         try {
           await cancelChatRun(docId, run.run_id)
         } catch {
           // The persisted run remains discoverable and the next page resume
           // will continue cancellation/reconciliation if this request failed.
         }
-        if (abortRef.current === controller) {
+        if (chatRunConnectionRef.current === connection) {
           const [freshDocument, freshMessages] = await Promise.all([
             documentsApi.get(docId),
             chatApi.listMessages(docId, sessionId),
@@ -1652,6 +1640,7 @@ export default function EditorPage() {
         }
         completed = true
       }
+      if (connection.detached) return
 
       let reconnectAttempts = 0
       let pendingTransientContent = ''
@@ -1865,12 +1854,11 @@ export default function EditorPage() {
           setThinkingStatus(evt.data.thinking.detail)
           if (evt.data.thinking.applied || evt.data.thinking.requested === 'enabled') {
             activeReasoning = {
-              status: evt.data.thinking.applied ? 'thinking' : 'unavailable',
-              content: '',
+              status: evt.data.thinking.applied
+                ? (activeReasoning.content ? 'thinking' : 'idle')
+                : 'unavailable',
+              content: activeReasoning.content,
               detail: evt.data.thinking.detail,
-            }
-            if (evt.data.thinking.applied) {
-              activeBlocks = startThinkingBlock(activeBlocks, eventOccurredAtMs)
             }
           }
           flushStreamRender()
@@ -1896,16 +1884,21 @@ export default function EditorPage() {
           const retryDelay = evt.data.retry_after_seconds ?? evt.data.delay_seconds
           const returnedError = evt.data.detail?.trim() || retryReason
           const errorCode = evt.data.reason?.trim()
-          const remainingAttempts = Math.max(0, evt.data.max_attempts - evt.data.attempt)
-          const retrySchedule = `${retryDelay} 秒后重试（第 ${evt.data.attempt}/${evt.data.max_attempts} 次，剩余 ${remainingAttempts} 次）`
+          // The provider attempt is the next total request (the initial
+          // connection is attempt 1). Keep that initial request out of the
+          // user-facing retry count.
+          const maxRetries = Math.max(1, evt.data.max_attempts - 1)
+          const retryAttempt = Math.min(maxRetries, Math.max(1, evt.data.attempt - 1))
           setStreamNotice({
             kind: 'retrying',
             title: '正在重新连接模型服务',
-            detail: `${returnedError}；${retrySchedule}。${errorCode ? `（错误码：${errorCode}）` : ''}`,
-            attempt: evt.data.attempt,
-            maxAttempts: evt.data.max_attempts,
+            detail: `${returnedError}${errorCode ? `（错误码：${errorCode}）` : ''}`,
+            attempt: retryAttempt,
+            maxAttempts: maxRetries,
+            retryDelaySeconds: retryDelay,
+            retryStartedAtMs: Date.now() - received.eventAgeMs,
           })
-          setThinkingStatus(`${retryReason}，${retryDelay} 秒后重试`)
+          setThinkingStatus(retryReason)
         } else if (evt.event === 'context_stats') {
           setContextStats(evt.data)
         } else if (evt.event === 'heartbeat') {
@@ -2045,10 +2038,19 @@ export default function EditorPage() {
       if (!runId) restoreSentDraftImages()
       if ((err as Error).name !== 'AbortError') {
         const conflict = reaskDocumentConflictFromError(err)
+        const unavailableReaskSource = reaskSourceUnavailableFromError(err)
         if (conflict && reaskFromMessageId !== null) {
           restoreSubmittedDraft()
           setReaskConflict({ kind: 'server', currentChecksum: conflict.current_checksum })
           setConversationError(null)
+        } else if (unavailableReaskSource && reaskFromMessageId !== null) {
+          // The selected historical message was already retired. Keep the
+          // user's instruction, but make the next send a normal continuation
+          // rather than persisting an anchor that can never succeed.
+          restoreSubmittedDraft(true, null)
+          setReaskConflict(null)
+          setConversationError(null)
+          message.warning('历史重新提问已失效，已保留输入并切换为普通对话，请直接再次发送')
         } else {
           if (isNewRun) restoreSubmittedDraft()
           setConversationError(err instanceof ApiError ? String(err.detail) : '对话请求失败')
@@ -2058,6 +2060,7 @@ export default function EditorPage() {
     } finally {
       cancelStreamRender()
       finishStarting()
+      if (chatRunConnectionRef.current === connection) chatRunConnectionRef.current = null
       if (!pausedForUserQuestion && runId && activeRunRef.current === runId) activeRunRef.current = null
       setStreaming(false)
       setStopping(false)
@@ -2419,8 +2422,11 @@ export default function EditorPage() {
 
   const handleStopAgent = async () => {
     const runId = activeRunRef.current
-    if (!docId || !runId) {
-      abortRef.current?.abort()
+    if (!docId) return
+    if (!runId) {
+      setStopping(true)
+      setThinkingStatus('正在等待任务创建后停止…')
+      requestChatRunStop(chatRunConnectionRef.current)
       return
     }
     try {
@@ -2782,13 +2788,7 @@ export default function EditorPage() {
     const saved = await persistDraftHtml(false, true)
     if (saved === null) throw new Error('正文保存失败')
     try {
-      const updated = await imageLibraryApi.setCover(assetId, docId)
-      setWechatMetadata((metadata) => ({
-        ...metadata,
-        cover_url: updated.url,
-        pic_crop_235_1: '',
-        pic_crop_1_1: '',
-      }))
+      await imageLibraryApi.setCover(assetId, docId)
       setVersionRefreshToken((value) => value + 1)
       message.success('已设为文章封面')
     } catch (error) {
@@ -3170,6 +3170,7 @@ export default function EditorPage() {
             onMoveQueuedMessage={moveQueuedChatRequest}
             onEditRequest={handleEditRequest}
             onSend={(text, references, images) => {
+              requestChatQuestionNotificationPermissionOnce()
               // Clear the submitted draft immediately. The request handler
               // still owns recovery if persisting or starting the run fails.
               setContextDraft('')
@@ -3503,15 +3504,18 @@ export default function EditorPage() {
           <WeChatDraftModal
             open
             documentId={docId}
-            documentTitle={title}
-            metadata={wechatMetadata}
-            accounts={wechatAccounts}
             disabled={streaming || saving || draftHtml !== html}
             onClose={() => setWechatDraftOpen(false)}
-            onMetadataSaved={(nextMetadata, nextTitle) => {
-              setWechatMetadata(nextMetadata)
+            onMetadataSaved={(_nextMetadata, nextTitle) => {
               setTitle(nextTitle)
               setVersionRefreshToken((value) => value + 1)
+            }}
+            onDocumentRefreshed={(document) => {
+              applyExternalHtml(document.current_html)
+              setTitle(document.title)
+              setPreviewRevision((value) => value + 1)
+              setVersionRefreshToken((value) => value + 1)
+              scheduleComplianceCheck(document.current_html)
             }}
           />
         </Suspense>

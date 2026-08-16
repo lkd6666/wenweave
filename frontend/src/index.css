@@ -219,12 +219,25 @@ body {
 }
 
 .app-layout {
-  min-height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
   background: var(--app-page-bg);
 }
 
+.app-layout > .ant-layout {
+  min-height: 0;
+}
+
 .app-sider {
+  height: 100%;
   border-right: 1px solid var(--app-border);
+}
+
+.app-sider .ant-layout-sider-children {
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .app-brand {
@@ -263,6 +276,7 @@ body {
 }
 
 .app-header {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -283,6 +297,10 @@ body {
 }
 
 .app-content {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   padding: 24px;
   background: var(--app-page-bg);
 }
@@ -340,6 +358,26 @@ body {
 .branding-name-card,
 .branding-assets-card {
   max-width: 760px;
+}
+
+.article-typography-settings-card {
+  max-width: 760px;
+}
+
+.article-typography-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+}
+
+.article-typography-settings-grid .ant-input-number {
+  width: 100%;
+}
+
+@media (max-width: 576px) {
+  .article-typography-settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .branding-assets-card {
@@ -1374,6 +1412,15 @@ body {
   margin: auto;
 }
 
+.theme-wizard-progress {
+  display: grid;
+  gap: 10px;
+}
+
+.theme-wizard-progress .ant-progress {
+  margin: 0 2px;
+}
+
 .theme-wizard-running {
   display: grid;
   min-height: 100%;
@@ -1717,7 +1764,6 @@ body {
 
 .image-library-apply:disabled {
   cursor: not-allowed;
-  opacity: .62;
 }
 
 .image-library-apply img {
@@ -1752,7 +1798,7 @@ body {
 }
 
 .image-library-card:hover .image-library-card-actions,
-.image-library-card:focus-within .image-library-card-actions {
+.image-library-card-actions:has(.ant-btn:focus-visible) {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
@@ -2600,11 +2646,16 @@ body {
 
 .chat-panel-title-copy {
   display: flex;
-  flex: 1;
+  flex: 0 0 auto;
   align-items: baseline;
   min-width: 0;
   gap: 7px;
   line-height: 1.35;
+}
+
+.chat-panel-title-copy .ant-typography:first-child {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .chat-panel-title-copy .ant-typography:last-child {
@@ -2747,9 +2798,14 @@ body {
 
 .chat-live-status,
 .chat-streaming-label {
+  min-width: 0;
   gap: 6px;
   color: var(--aicss-muted, #737373);
   font-size: 12px;
+}
+
+.chat-live-status {
+  flex: 1 1 auto;
 }
 
 .chat-live-status-text,
@@ -2776,6 +2832,7 @@ body {
 
 .chat-live-status i,
 .chat-streaming-label i {
+  flex: 0 0 auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -3308,6 +3365,11 @@ body {
   background: #eaf4ff;
 }
 
+.chat-queue-item.is-editing {
+  border-color: #1677ff;
+  background: #eaf4ff;
+}
+
 .chat-queue-item-leading {
   display: flex;
   align-items: center;
@@ -3390,19 +3452,6 @@ body {
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
-}
-
-.chat-queue-editor.ant-input {
-  min-width: 0;
-  flex: 1 1 auto;
-  padding: 5px 7px;
-  border-color: #91caff;
-  border-radius: 4px;
-  background: #fff;
-  color: #1f2937;
-  font-size: 13px;
-  line-height: 1.55;
-  resize: none;
 }
 
 .chat-queue-actions {
@@ -4544,6 +4593,31 @@ body {
   flex-shrink: 0;
 }
 
+/* Keep the answer controls reachable when a question has more options than
+   the remaining editor height. The options list owns the overflow. */
+.chat-input-area.has-user-question {
+  display: flex;
+  max-height: min(68dvh, 620px);
+}
+
+.chat-input-area.has-user-question .chat-composer-shell,
+.chat-input-area.has-user-question .user-question-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.chat-input-area.has-user-question .user-question-options {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.chat-input-area.has-user-question .user-question-actions {
+  flex: 0 0 auto;
+}
+
 .chat-composer-shell {
   overflow: hidden;
   border: 1px solid #dbe1e8;
@@ -4557,9 +4631,69 @@ body {
   box-shadow: 0 0 0 2px rgba(22, 119, 255, 0.1);
 }
 
+.chat-queue-composer-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  padding: 0 8px 0 10px;
+  border-bottom: 1px solid #d6e7fb;
+  background: #f0f7ff;
+  color: #1768b3;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-queue-composer-status .ant-btn {
+  color: #1768b3;
+}
+
 .user-question-panel {
   padding: 14px;
   background: var(--app-surface, #fff);
+}
+
+.global-user-question-modal .ant-modal-body {
+  max-height: min(76dvh, 680px);
+  overflow: hidden;
+  padding: 0;
+}
+
+.global-user-question-modal-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.global-user-question-modal-title > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-user-question-modal-title .ant-btn {
+  flex: 0 0 auto;
+}
+
+.global-user-question-float {
+  right: 24px;
+  bottom: 24px;
+}
+
+.global-user-question-modal .user-question-panel {
+  display: flex;
+  max-height: min(76dvh, 680px);
+  min-height: 0;
+  flex-direction: column;
+}
+
+.global-user-question-modal .user-question-options {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
 }
 
 .user-question-panel-head {
@@ -4952,7 +5086,147 @@ html[data-theme='dark'] .user-question-option.is-selected {
   place-items: center;
 }
 
+.layout-capture-fallback {
+  display: grid;
+  gap: 10px;
+}
+
+.layout-capture-status {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-inline-start: 3px solid #3879d9;
+  background: #f3f7ff;
+  color: #344054;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.layout-capture-install-guide {
+  padding: 12px 2px 4px;
+  border-block: 1px solid #e4e7ec;
+}
+
+.layout-capture-install-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: #1d2939;
+}
+
+.layout-capture-install-title > span {
+  flex: none;
+  color: #667085;
+  font-size: 12px;
+}
+
+.layout-capture-install-steps {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.layout-capture-install-steps > li {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.layout-capture-install-step-number {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 50%;
+  background: #e8f1ff;
+  color: #175cd3;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.layout-capture-install-step-copy {
+  min-width: 0;
+  color: #344054;
+}
+
+.layout-capture-install-step-copy > strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #1d2939;
+  font-size: 13px;
+}
+
+.layout-capture-install-step-copy > p {
+  margin: 0 0 8px;
+  color: #475467;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.layout-capture-install-step-copy code,
+.layout-capture-install-browser-row > code {
+  overflow-wrap: anywhere;
+  color: #344054;
+  font-size: 12px;
+}
+
+.layout-capture-install-browser-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.layout-capture-install-browser-row > code {
+  min-width: 0;
+  padding: 4px 7px;
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+  background: #f9fafb;
+}
+
+.layout-capture-install-managed-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 14px 0 0 36px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.layout-capture-install-managed-note .anticon {
+  margin-top: 3px;
+  color: #3879d9;
+}
+
+.layout-capture-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 @container (max-width: 420px) {
+  .layout-capture-install-browser-row {
+    align-items: stretch;
+  }
+
+  .layout-capture-install-browser-row > code {
+    width: 100%;
+  }
+
+  .layout-capture-install-managed-note {
+    margin-left: 0;
+  }
+
   .layout-imitation-strength {
     grid-template-columns: 1fr;
     gap: 4px;
@@ -6292,6 +6566,56 @@ html[data-theme='dark'] .user-question-option.is-selected {
   justify-content: flex-end;
 }
 
+/* A zoomed desktop can leave too little room for all four document actions.
+   Keep the action bar intact and move the search field beneath it. */
+@media (min-width: 1101px) and (max-width: 1420px) {
+  .dashboard-page-header {
+    grid-template-areas:
+      'title actions'
+      'search search';
+    grid-template-columns: minmax(160px, 1fr) auto;
+    gap: 12px 16px;
+  }
+
+  .dashboard-page-header > .ant-typography {
+    grid-area: title;
+  }
+
+  .dashboard-search {
+    grid-area: search;
+  }
+
+  .dashboard-actions {
+    grid-area: actions;
+  }
+}
+
+@media (max-width: 1100px) {
+  .dashboard-page-header {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .dashboard-page-header > .ant-typography,
+  .dashboard-search,
+  .dashboard-actions {
+    grid-column: 1;
+  }
+
+  .dashboard-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .dashboard-actions .ant-space-item {
+    flex: 1 1 auto;
+  }
+
+  .dashboard-actions .ant-btn {
+    width: 100%;
+  }
+}
+
 .dashboard-document-item {
   display: grid !important;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -6413,6 +6737,14 @@ html[data-theme='dark'] .user-question-option.is-selected {
   color: var(--app-text-secondary);
 }
 
+.dashboard-group-toggle-icon {
+  transition: transform 180ms ease;
+}
+
+.dashboard-group-toggle.is-collapsed .dashboard-group-toggle-icon {
+  transform: rotate(-90deg);
+}
+
 .dashboard-group-icon {
   display: inline-grid;
   width: 30px;
@@ -6490,6 +6822,30 @@ html[data-theme='dark'] .user-question-option.is-selected {
   background: #edf5ff;
 }
 
+.dashboard-group-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 220ms ease;
+}
+
+.dashboard-group-collapse.is-collapsed {
+  grid-template-rows: 0fr;
+}
+
+.dashboard-group-collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 150ms ease, transform 220ms ease;
+}
+
+.dashboard-group-collapse.is-collapsed .dashboard-group-collapse-inner {
+  opacity: 0;
+  transform: translateY(-6px);
+  pointer-events: none;
+}
+
 .dashboard-group-content {
   padding: 0 6px 2px 42px;
   border: 0;
@@ -6501,6 +6857,14 @@ html[data-theme='dark'] .user-question-option.is-selected {
 
 .dashboard-group-content .dashboard-group-pagination {
   padding-bottom: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-group-collapse,
+  .dashboard-group-collapse-inner,
+  .dashboard-group-toggle-icon {
+    transition: none;
+  }
 }
 
 .dashboard-ungrouped .dashboard-group-icon {
@@ -6530,6 +6894,15 @@ html[data-theme='dark'] .dashboard-ungrouped .dashboard-group-icon {
   border-color: var(--app-border);
   color: var(--app-text-secondary);
   background: var(--app-surface-subtle);
+}
+
+.create-blank-document-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.create-blank-document-fields .ant-select {
+  width: min(100%, 280px);
 }
 
 .dashboard-document-avatar,
@@ -9027,7 +9400,8 @@ html[data-theme='dark'] .assistant-process-timeline::before {
   display: none;
 }
 
-html[data-theme='dark'] .assistant-process-entry.has-next-process::after {
+html[data-theme='dark'] .assistant-process-entry.has-next-process::after,
+html[data-theme='dark'] .assistant-process-entry + .assistant-process-entry::before {
   background: #415064;
 }
 
@@ -9360,6 +9734,43 @@ html[data-theme='dark'] .image-crop-canvas {
   background: #111820;
 }
 
+html[data-theme='dark'] .layout-capture-status {
+  border-inline-start-color: #4b9bff;
+  background: #172b46;
+  color: var(--app-text);
+}
+
+html[data-theme='dark'] .layout-capture-install-guide {
+  border-block-color: var(--app-border);
+}
+
+html[data-theme='dark'] .layout-capture-install-title,
+html[data-theme='dark'] .layout-capture-install-step-copy > strong {
+  color: var(--app-text);
+}
+
+html[data-theme='dark'] .layout-capture-install-title > span,
+html[data-theme='dark'] .layout-capture-install-step-copy,
+html[data-theme='dark'] .layout-capture-install-step-copy > p,
+html[data-theme='dark'] .layout-capture-install-managed-note {
+  color: var(--app-text-secondary);
+}
+
+html[data-theme='dark'] .layout-capture-install-step-number {
+  background: #173b68;
+  color: #91caff;
+}
+
+html[data-theme='dark'] .layout-capture-install-step-copy code,
+html[data-theme='dark'] .layout-capture-install-browser-row > code {
+  color: var(--app-text);
+}
+
+html[data-theme='dark'] .layout-capture-install-browser-row > code {
+  border-color: var(--app-border);
+  background: #111820;
+}
+
 html[data-theme='dark'] .preview-block-style-row > span,
 html[data-theme='dark'] .preview-block-style-field > span,
 html[data-theme='dark'] .preview-text-toolbar-field,
@@ -9406,14 +9817,23 @@ html[data-theme='dark'] .chat-queue-item.is-drop-target {
   background: #173b68;
 }
 
+html[data-theme='dark'] .chat-queue-item.is-editing {
+  border-color: #4b9bff;
+  background: #173b68;
+}
+
 html[data-theme='dark'] .chat-queue-message {
   color: var(--app-text);
 }
 
-html[data-theme='dark'] .chat-queue-editor.ant-input {
+html[data-theme='dark'] .chat-queue-composer-status {
   border-color: #315b87;
-  background: var(--app-surface);
-  color: var(--app-text);
+  background: #173b68;
+  color: #91caff;
+}
+
+html[data-theme='dark'] .chat-queue-composer-status .ant-btn {
+  color: #91caff;
 }
 
 html[data-theme='dark'] .chat-session-resource-kind,
@@ -9695,6 +10115,45 @@ html[data-theme='dark'] .preview-block-toolbar-count {
     overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-y;
+  }
+}
+
+.admin-model-editor-modal.ant-modal {
+  max-width: calc(100vw - 48px);
+}
+
+.model-editor-form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.model-editor-token-grid,
+.model-editor-switch-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.model-editor-automatic-budget {
+  margin-top: -8px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 760px) {
+  .admin-model-editor-modal.ant-modal {
+    max-width: calc(100vw - 16px);
+  }
+
+  .model-editor-form-grid,
+  .model-editor-token-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .model-editor-switch-grid {
+    gap: 12px;
   }
 }
 

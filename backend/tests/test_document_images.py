@@ -1,4 +1,3 @@
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -6,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from app.services.document_images import store_document_image
 from app.services.layout_reference import LayoutReference, LayoutReferenceAsset, materialize_layout_reference
 from app.services.local_uploads import ImageInfo
+from tests.workspace_temp import WorkspaceTempDirectory
 
 
 class DocumentImageStorageTests(unittest.TestCase):
@@ -59,7 +59,7 @@ class DocumentImageStorageTests(unittest.TestCase):
                 LayoutReferenceAsset("b" * 32, "local/layout-references/b.png", "image/png", "png"),
             ],
         )
-        with tempfile.TemporaryDirectory() as directory:
+        with WorkspaceTempDirectory("document-images") as directory:
             source = Path(directory) / "asset.png"
             source.write_bytes(b"image")
             with (

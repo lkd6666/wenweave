@@ -6,6 +6,7 @@ import ElementRenderPreview from './ElementRenderPreview'
 
 export interface PromptComposerHandle {
   getPayload: () => { message: string; references: SelectedElementContext[]; templateIds: number[] }
+  focus: () => void
 }
 
 interface PromptComposerProps {
@@ -228,7 +229,10 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     onChange(nextValue)
   }
 
-  useImperativeHandle(ref, () => ({ getPayload: payload }))
+  useImperativeHandle(ref, () => ({
+    getPayload: payload,
+    focus: () => editorRef.current?.focus(),
+  }))
 
   useEffect(() => {
     const editor = editorRef.current

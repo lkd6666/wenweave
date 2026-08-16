@@ -69,6 +69,13 @@ class AuditRequestContext:
     user_agent: str
 
 
+@dataclass(frozen=True)
+class AuditActorSnapshot:
+    user_id: int
+    username: str
+    display_name: str
+
+
 _operation_request_metadata: ContextVar[OperationRequestMetadata] = ContextVar(
     "operation_request_metadata", default=OperationRequestMetadata()
 )
@@ -215,6 +222,14 @@ def classify_operation(method: str, raw_path: str) -> AuditRoute | None:
         resource_id = path_parts[3] if len(path_parts) > 3 else ""
         if path.endswith("/preview"):
             return AuditRoute("document.link_import.preview", "document_import")
+        if path == "/api/documents/link-imports/capture-sessions":
+            return AuditRoute("document.link_import.capture.create", "document_import")
+        if re.match(r"^/api/documents/link-imports/capture-sessions/[^/]+/complete$", path):
+            return AuditRoute(
+                "document.link_import.capture.complete",
+                "document_import",
+                resource_id=path_parts[4],
+            )
         if path.endswith("/complete"):
             return AuditRoute("document.link_import.complete", "document_import", resource_id=resource_id)
         return AuditRoute(
@@ -303,6 +318,8 @@ def classify_operation(method: str, raw_path: str) -> AuditRoute | None:
     if path in {"/api/branding/assets/logo", "/api/branding/assets/favicon"}:
         asset = path.rsplit("/", 1)[-1]
         return AuditRoute(f"branding.{asset}.delete", "branding", resource_id=asset)
+    if path == "/api/article-typography-settings":
+        return AuditRoute("typography_settings.update", "article_typography_settings", resource_id="1")
 
     mappings = (
         ("/api/document-groups", "document_group"),
@@ -586,6 +603,28 @@ def persist_request_audit(context: AuditRequestContext, response_status: int, *,
 
 def with_request_id(context: AuditRequestContext, request_id: str) -> AuditRequestContext:
     return replace(context, request_id=_safe_text(request_id, 128)) if request_id else context
+
+
+def set_request_audit_actor(request: Request, actor: User) -> None:
+    """Attach an actor resolved from server-validated credentials inside a route."""
+    request.state.operation_audit_actor = AuditActorSnapshot(
+        user_id=actor.id,
+        username=_safe_text(actor.username, 64),
+        display_name=_safe_text(actor.display_name, 64),
+    )
+
+
+def with_request_audit_actor(context: AuditRequestContext, request: Request) -> AuditRequestContext:
+    """Apply only the typed server-side actor override; request input is never consulted."""
+    actor = getattr(request.state, "operation_audit_actor", None)
+    if not isinstance(actor, AuditActorSnapshot):
+        return context
+    return replace(
+        context,
+        actor_user_id=actor.user_id,
+        actor_username=actor.username,
+        actor_display_name=actor.display_name,
+    )
 
 
 def set_operation_request_id(request_id: str) -> Token[str]:

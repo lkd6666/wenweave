@@ -78,6 +78,9 @@ describe('AICSS output components', () => {
     expect(html).toContain('aria-label="任务步骤"')
     expect(html).toContain('aicss-todo-progress')
     expect(html).toContain('aicss-todo-state is-visible')
+    expect(html).toContain('aicss-todo-head-summary')
+    expect(html).toContain('aria-hidden="false"')
+    expect(html).toContain('修改样式')
     expect(html).toContain('aria-live="polite"')
     expect(html).toContain('aicss-inline-citation')
     expect(html).toContain('aicss-comparison-table')
@@ -102,5 +105,13 @@ describe('AICSS output components', () => {
 
     expect(html).toContain('aria-expanded="false"')
     expect(html).toContain('aria-hidden="true"')
+  })
+
+  it('shows a completion summary when every task is done', () => {
+    const html = renderToStaticMarkup(
+      <AiTodoList items={[{ step: '读取排版块', status: 'done' }, { step: '修改样式', status: 'done' }]} />,
+    )
+
+    expect(html).toContain('已完成全部任务')
   })
 })

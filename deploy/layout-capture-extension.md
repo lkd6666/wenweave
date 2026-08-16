@@ -17,7 +17,7 @@ npm run build:layout-capture-extension
 生产构建必须提供不含路径的 HTTPS 系统域名：
 
 ```powershell
-$env:LAYOUT_CAPTURE_APP_ORIGIN = 'https://ybpb.dycz667.cn'
+$env:LAYOUT_CAPTURE_APP_ORIGIN = 'https://example.com'
 $env:LAYOUT_CAPTURE_BUILD_MODE = 'production'
 npm --prefix frontend run build:layout-capture-extension
 ```
@@ -53,7 +53,7 @@ npm --prefix frontend run build:layout-capture-extension
 正式发布时传入系统域名：
 
 ```powershell
-.\scripts\package-release.ps1 -LayoutCaptureAppOrigin 'https://ybpb.dycz667.cn'
+.\scripts\package-release.ps1 -LayoutCaptureAppOrigin 'https://example.com'
 ```
 
 发布目录额外包含：

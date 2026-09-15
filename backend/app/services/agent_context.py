@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
@@ -43,6 +44,11 @@ COMPACTION_MODEL_MAX_OUTPUT_TOKENS = 12_000
 # reserve keeps preflight below provider limits even when a provider adds JSON
 # envelope tokens that tiktoken cannot see.
 AGENT_TOOL_SCHEMA_RESERVE_TOKENS = 3_500
+# Provider-reported usage for Chinese HTML is materially higher than the
+# provider-neutral cl100k estimate.  Apply the same conservative factor during
+# preflight and runtime compaction so the app compacts before the provider
+# limit, not after it has already been exceeded.
+PROVIDER_TOKEN_ESTIMATE_SAFETY_MULTIPLIER = 1.60
 MEMORY_ITEM_LIMIT = 12
 MEMORY_ITEM_MAX_CHARS = 360
 MEMORY_OBJECTIVE_MAX_CHARS = 900
@@ -367,6 +373,7 @@ class AgentContextBuilder:
         additional_context: str = "",
         current_image_count: int = 0,
         budget_multiplier: float = 1.0,
+        token_estimate_multiplier: float = PROVIDER_TOKEN_ESTIMATE_SAFETY_MULTIPLIER,
         exclude_message_id: int = 0,
         model_call_tracker_factory: Callable[[], ModelCallTracker] | None = None,
     ):
@@ -382,6 +389,7 @@ class AgentContextBuilder:
         self.exclude_message_id = exclude_message_id
         self.model_call_tracker_factory = model_call_tracker_factory
         self.budget_multiplier = min(1.0, max(0.35, budget_multiplier))
+        self.token_estimate_multiplier = min(3.0, max(1.0, token_estimate_multiplier))
         self.window = int(model.context_window_tokens)
         self.max_output_tokens = int(model.max_output_tokens)
         self.usable_budget = int(model.context_compaction_threshold_tokens)
@@ -595,9 +603,14 @@ class AgentContextBuilder:
 
     def _record_tokens(self, record: ContextRecord) -> int:
         if record.kind == ContextEventKind.TOOL.value:
-            return estimate_tokens(record._stale_tool_content(self.workspace.revision, self.tool_result_max_tokens))
+            return self._provider_text_tokens(
+                record._stale_tool_content(self.workspace.revision, self.tool_result_max_tokens)
+            )
         image_tokens = len(record.image_attachments) * CHAT_IMAGE_TOKEN_COST if self.model.is_multimodal else 0
-        return estimate_tokens(json.dumps(record.payload, ensure_ascii=False)) + image_tokens
+        return self._provider_text_tokens(json.dumps(record.payload, ensure_ascii=False)) + image_tokens
+
+    def _provider_text_tokens(self, value: str) -> int:
+        return math.ceil(estimate_tokens(value) * self.token_estimate_multiplier)
 
     def _valid_records(self, records: Sequence[ContextRecord]) -> list[ContextRecord]:
         """Drop incomplete persisted tool cycles before any provider sees them."""
@@ -650,11 +663,11 @@ class AgentContextBuilder:
         # prompt and tool-schema overhead. Applying it to the whole request
         # would make a small-window model impossible to compact.
         fixed_overhead = (
-            estimate_tokens(self.base_prompt)
-            + estimate_tokens(self._render_map())
-            + estimate_tokens(json.dumps(memory, ensure_ascii=False))
-            + estimate_tokens(self.current_request)
-            + estimate_tokens(self.additional_context)
+            self._provider_text_tokens(self.base_prompt)
+            + self._provider_text_tokens(self._render_map())
+            + self._provider_text_tokens(json.dumps(memory, ensure_ascii=False))
+            + self._provider_text_tokens(self.current_request)
+            + self._provider_text_tokens(self.additional_context)
             + AGENT_TOOL_SCHEMA_RESERVE_TOKENS
         )
         preserve = min(
@@ -691,14 +704,14 @@ class AgentContextBuilder:
         state: str,
         checkpoint: ChatContextSnapshot | ChatSessionMemory | None,
     ) -> dict[str, Any]:
-        map_tokens = estimate_tokens(self._render_map())
-        system_tokens = estimate_tokens(self.base_prompt)
-        memory_tokens = estimate_tokens(json.dumps(memory, ensure_ascii=False))
+        map_tokens = self._provider_text_tokens(self._render_map())
+        system_tokens = self._provider_text_tokens(self.base_prompt)
+        memory_tokens = self._provider_text_tokens(json.dumps(memory, ensure_ascii=False))
         replay_tokens = sum(self._record_tokens(record) for record in replayed)
         tool_tokens = sum(self._record_tokens(record) for record in replayed if record.kind == ContextEventKind.TOOL.value)
         current_image_tokens = self.current_image_count * CHAT_IMAGE_TOKEN_COST if self.model.is_multimodal else 0
-        current_request_tokens = estimate_tokens(self.current_request) + current_image_tokens
-        additional_context_tokens = estimate_tokens(self.additional_context)
+        current_request_tokens = self._provider_text_tokens(self.current_request) + current_image_tokens
+        additional_context_tokens = self._provider_text_tokens(self.additional_context)
         schema_tokens = AGENT_TOOL_SCHEMA_RESERVE_TOKENS
         used = system_tokens + map_tokens + memory_tokens + replay_tokens + current_request_tokens + additional_context_tokens + schema_tokens
         source_records = self._source_records()
@@ -743,6 +756,7 @@ class AgentContextBuilder:
             "tool_result_max_tokens": self.tool_result_max_tokens,
             "effective_tool_preview_tokens": self.tool_result_max_tokens,
             "budget_multiplier": self.budget_multiplier,
+            "token_estimate_multiplier": self.token_estimate_multiplier,
             "ledger_tokens": all_tokens,
             "compiled_input_tokens": used,
             "raw_input_tokens": used,

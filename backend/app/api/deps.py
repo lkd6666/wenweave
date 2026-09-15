@@ -15,7 +15,7 @@ from app.models.user import User, UserRole
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 
-def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def _resolve_current_user(token: Optional[str], db: Session) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="未登录或登录已过期",
@@ -39,6 +39,20 @@ def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session 
     if user is None or not user.is_active:
         raise credentials_exception
     return user
+
+
+def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    user = _resolve_current_user(token, db)
+    if user.password_change_required:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="当前密码存在安全风险，请先修改密码")
+    return user
+
+
+def get_current_user_allow_password_change(
+    token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)
+) -> User:
+    """Allow only the account endpoints to work while a password is being replaced."""
+    return _resolve_current_user(token, db)
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:

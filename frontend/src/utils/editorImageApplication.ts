@@ -41,6 +41,7 @@ export function applyLibraryImageToDom(
     image.setAttribute('src', source)
     image.removeAttribute('data-crop-source')
     image.removeAttribute('data-crop-rect')
+    image.removeAttribute('data-crop-rotation')
     image.removeAttribute('srcset')
     image.removeAttribute('sizes')
     return { mode: 'replace', image, paragraph: null }

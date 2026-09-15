@@ -16,6 +16,7 @@ from app.models.chat_session import ChatSession
 from app.models.document import DocumentSourceType
 from app.models.document_import import DocumentImport
 from app.models.document_visibility import VisibilityMode
+from app.models.image_generation import ImageLibraryAsset, ImageLibrarySource
 from app.models.storage_config import StorageConfig
 from app.models.user import User, UserRole
 from app.services import local_uploads
@@ -92,6 +93,31 @@ class DirectImportRouteTests(unittest.TestCase):
     def _upload(data: bytes, filename: str, content_type: str) -> UploadFile:
         return UploadFile(file=BytesIO(data), filename=filename, headers={"content-type": content_type})
 
+    def test_direct_import_allows_files_up_to_50_mb(self) -> None:
+        result = documents.create_direct_import(
+            DocumentImportCreate(
+                filename="maximum-size.pdf",
+                content_type="application/pdf",
+                size=documents.MAX_IMPORT_FILE_SIZE,
+            ),
+            self.user,
+            self.db,
+        )
+        self.assertEqual(self.db.get(DocumentImport, result.id).source_size, documents.MAX_IMPORT_FILE_SIZE)
+
+        with self.assertRaises(HTTPException) as context:
+            documents.create_direct_import(
+                DocumentImportCreate(
+                    filename="too-large.pdf",
+                    content_type="application/pdf",
+                    size=documents.MAX_IMPORT_FILE_SIZE + 1,
+                ),
+                self.user,
+                self.db,
+            )
+        self.assertEqual(context.exception.status_code, 413)
+        self.assertIn("50MB", str(context.exception.detail))
+
     def test_direct_import_only_signs_fixed_keys_and_completes_once(self) -> None:
         started = documents.create_direct_import(
             DocumentImportCreate(
@@ -142,6 +168,10 @@ class DirectImportRouteTests(unittest.TestCase):
             self.db.query(ChatSession).filter_by(document_id=result.id, is_archived=False).count(),
             1,
         )
+        library_asset = self.db.query(ImageLibraryAsset).filter_by(document_id=result.id).one()
+        self.assertEqual(library_asset.source, ImageLibrarySource.UPLOAD)
+        self.assertEqual(library_asset.object_key, asset.upload.object_key)
+        self.assertEqual(library_asset.owner_id, self.user.id)
 
         repeated = documents.complete_direct_import(
             started.id,
@@ -369,6 +399,10 @@ class DirectImportRouteTests(unittest.TestCase):
         )
         self.assertTrue(document.source_object_key.startswith("local/"))
         self.assertIn(f"/api/documents/import-assets/{asset.asset_id}", document.current_html)
+        library_asset = self.db.query(ImageLibraryAsset).filter_by(document_id=document.id).one()
+        self.assertEqual(library_asset.source, ImageLibrarySource.UPLOAD)
+        self.assertEqual(library_asset.object_key, self.db.get(documents.DocumentImportAsset, asset.asset_id).object_key)
+        self.assertEqual(library_asset.storage_mode, "local")
         self.assertTrue(local_uploads.local_path(document.source_object_key).is_file())
         access = documents.get_document_source_access(document.id, self.user, self.db)
         self.assertIn(f"/api/documents/{document.id}/source-file?token=", access.url)

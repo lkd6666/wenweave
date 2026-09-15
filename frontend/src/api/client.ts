@@ -29,6 +29,7 @@ interface EventStreamOptions {
 
 interface TokenResponse {
   access_token: string
+  password_change_required?: boolean
 }
 
 let refreshPromise: Promise<boolean> | null = null
@@ -56,7 +57,10 @@ async function refreshAccessToken(): Promise<boolean> {
 
       const { user, setAuth } = useAuthStore.getState()
       if (!user) return false
-      setAuth(payload.access_token, user)
+      setAuth(payload.access_token, {
+        ...user,
+        password_change_required: payload.password_change_required ?? user.password_change_required ?? false,
+      })
       return true
     } catch {
       return false

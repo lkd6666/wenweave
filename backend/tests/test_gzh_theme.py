@@ -571,7 +571,10 @@ class GzhThemeServiceTests(unittest.TestCase):
         generation_id = generation.id
 
         blueprint = standard_blueprint()
-        first_batch_invalid = {"components": [{"id": "1", "html": "<p>太短</p>"}]}
+        first_batch_invalid = standard_component_payload(THEME_COMPONENT_IDS[:3])
+        first_batch_invalid["components"][0]["html"] = (
+            '<div style="margin:12px 0"><p><span leaf="">错误容器</span></p></div>'
+        )
         responses = [blueprint, first_batch_invalid]
         for start in range(0, len(THEME_COMPONENT_IDS), 3):
             responses.append(standard_component_payload(THEME_COMPONENT_IDS[start:start + 3]))
@@ -589,6 +592,51 @@ class GzhThemeServiceTests(unittest.TestCase):
         self.assertEqual(completed.progress_stage, "succeeded")
         self.assertEqual(completed.progress_current, completed.progress_total)
         self.assertEqual(ask_model.await_count, 1 + 1 + 1 + (len(THEME_COMPONENT_IDS) // 3 - 1))
+        repair_prompt = ask_model.await_args_list[2].args[2]
+        self.assertIn("<validation_feedback>", repair_prompt)
+        self.assertIn("组件 1 严格检查未通过", repair_prompt)
+        self.assertIn("绝不能使用 <div>", repair_prompt)
+        check_db.close()
+
+    def test_generation_reconnects_once_after_a_transient_model_error(self) -> None:
+        from app.services import gzh_theme_generation as generation_service
+
+        run_db = Session(self.engine)
+        generation = GzhThemeGeneration(
+            id="generation-reconnect",
+            model_id=1,
+            user_id=7,
+            brief="蓝色教程主题",
+            status=GzhThemeGenerationStatus.PENDING,
+        )
+        run_db.add(generation)
+        run_db.commit()
+        generation_id = generation.id
+
+        responses = [standard_blueprint(), ConnectionError("Connection error.")]
+        for start in range(0, len(THEME_COMPONENT_IDS), 3):
+            responses.append(standard_component_payload(THEME_COMPONENT_IDS[start:start + 3]))
+        ask_model = AsyncMock(side_effect=responses)
+        progress_stages: list[str] = []
+        original_set_progress = generation_service._set_progress
+
+        def record_progress(*args, **kwargs):
+            progress_stages.append(kwargs["stage"])
+            return original_set_progress(*args, **kwargs)
+
+        with patch("app.services.gzh_theme_generation.SessionLocal", return_value=run_db), patch(
+            "app.services.gzh_theme_generation._ask_json_prompt", ask_model
+        ), patch("app.services.gzh_theme_generation._set_progress", side_effect=record_progress), patch(
+            "app.services.gzh_theme_generation.asyncio.sleep", AsyncMock()
+        ):
+            asyncio.run(run_generation(generation_id))
+
+        check_db = Session(self.engine)
+        completed = check_db.get(GzhThemeGeneration, generation_id)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.status, GzhThemeGenerationStatus.SUCCEEDED)
+        self.assertIn("reconnecting", progress_stages)
+        self.assertEqual(ask_model.await_count, 1 + 1 + (len(THEME_COMPONENT_IDS) // 3))
         check_db.close()
 
     def test_generation_stops_after_cancellation_between_stages(self) -> None:

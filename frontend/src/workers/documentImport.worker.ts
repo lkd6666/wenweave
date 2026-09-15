@@ -3,6 +3,14 @@ import { readWordImageOccurrences } from '../imports/docxCropMetadata'
 import { applyWordImportFormatting, readWordImportFormatting } from '../imports/wordImportFormatting'
 import { cropImageBlob, isFullCropRect, serializeCropRect } from '../utils/imageCrop'
 import {
+  hasRasterImageTransform,
+  pdfImageDisplayAspectRatio,
+  pdfMatrixToImageTransform,
+  rasterImageTransformKey,
+  transformImageBlob,
+  transformedImageDisplaySize,
+} from '../utils/imageTransform'
+import {
   buildPdfTextBlocks,
   createPdfImageBlock,
   orderPdfBlocks,
@@ -51,8 +59,25 @@ const report = (percent: number, detail: string) => {
 
 function wordImageStyle(occurrence: Awaited<ReturnType<typeof readWordImageOccurrences>>[number] | undefined): string {
   const styles = ['max-width:100%', 'height:auto', 'box-sizing:border-box']
-  if (occurrence?.displaySize?.widthPx) styles.unshift(`width:${occurrence.displaySize.widthPx}px`)
+  if (occurrence?.displaySize?.widthPx) {
+    const size = transformedImageDisplaySize(
+      occurrence.displaySize.widthPx,
+      occurrence.displaySize.heightPx,
+      occurrence.transform,
+    )
+    styles.unshift(`width:${Math.max(1, Math.round(size.width))}px`)
+  }
   return `${styles.join(';')};`
+}
+
+function wordImageTransformAspectRatio(occurrence: Awaited<ReturnType<typeof readWordImageOccurrences>>[number] | undefined) {
+  if (!occurrence?.displaySize) return undefined
+  const size = transformedImageDisplaySize(
+    occurrence.displaySize.widthPx,
+    occurrence.displaySize.heightPx,
+    occurrence.transform,
+  )
+  return size.width > 0 && size.height > 0 ? size.width / size.height : undefined
 }
 
 async function parseWord(buffer: ArrayBuffer): Promise<ParsedImport> {
@@ -92,34 +117,56 @@ async function parseWord(buffer: ArrayBuffer): Promise<ParsedImport> {
         const sourceUrl = `direct-import://asset/${sourceAsset.clientId}`
         const cropRect = occurrence?.cropRect
         const style = wordImageStyle(occurrence)
-        if (!cropRect || isFullCropRect(cropRect)) {
+        let renderedBlob = blob
+        let hasCrop = false
+        if (cropRect && !isFullCropRect(cropRect)) {
+          try {
+            renderedBlob = await cropImageBlob(renderedBlob, cropRect)
+            hasCrop = true
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : '无法还原裁剪'
+            warnings.push(`第 ${instanceNumber} 张 Word 图片未还原裁剪：${detail}`)
+          }
+        }
+
+        const transform = occurrence?.transform
+        let hasTransform = false
+        if (hasRasterImageTransform(transform)) {
+          try {
+            renderedBlob = await transformImageBlob(renderedBlob, transform!, {
+              outputAspectRatio: wordImageTransformAspectRatio(occurrence),
+            })
+            hasTransform = true
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : '无法还原旋转'
+            warnings.push(`第 ${instanceNumber} 张 Word 图片未还原旋转：${detail}`)
+          }
+        }
+
+        if (!hasCrop && !hasTransform) {
           report(Math.min(88, 30 + imageIndex * 3), `已提取 ${imageIndex} 张 Word 图片…`)
           return { src: sourceUrl, style }
         }
 
-        try {
-          const croppedBlob = await cropImageBlob(blob, cropRect)
-          const clientId = `word-crop-${instanceNumber}`
-          const croppedContentType = croppedBlob.type || 'image/png'
-          assets.push({
-            clientId,
-            filename: `${clientId}.${extensionForContentType(croppedContentType)}`,
-            contentType: croppedContentType,
-            blob: croppedBlob,
-          })
-          report(Math.min(88, 30 + imageIndex * 3), `已还原 ${imageIndex} 张 Word 图片的裁剪…`)
+        const clientId = `${hasTransform ? 'word-transform' : 'word-crop'}-${instanceNumber}`
+        const renderedContentType = renderedBlob.type || 'image/png'
+        assets.push({
+          clientId,
+          filename: `${clientId}.${extensionForContentType(renderedContentType)}`,
+          contentType: renderedContentType,
+          blob: renderedBlob,
+        })
+        const detail = hasCrop && hasTransform ? '裁剪与旋转' : hasTransform ? '旋转' : '裁剪'
+        report(Math.min(88, 30 + imageIndex * 3), `已还原 ${imageIndex} 张 Word 图片的${detail}…`)
+        if (hasCrop && !hasTransform) {
           return {
             src: `direct-import://asset/${clientId}`,
             style,
             'data-crop-source': sourceUrl,
-            'data-crop-rect': serializeCropRect(cropRect),
+            'data-crop-rect': serializeCropRect(cropRect!),
           }
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : '无法还原裁剪'
-          warnings.push(`第 ${instanceNumber} 张 Word 图片未还原裁剪：${detail}`)
-          report(Math.min(88, 30 + imageIndex * 3), `已提取 ${imageIndex} 张 Word 图片…`)
-          return { src: sourceUrl, style }
         }
+        return { src: `direct-import://asset/${clientId}`, style }
       }),
     },
   )
@@ -250,16 +297,32 @@ async function parsePdf(buffer: ArrayBuffer): Promise<ParsedImport> {
       let transform = [1, 0, 0, 1, 0, 0]
       const imageAssets = new Map<string, string>()
       const appendImage = async (imageValue: unknown, imageTransform: number[], objectId: string, rect?: { x?: number; y?: number; width?: number; height?: number }) => {
-      let clientId = objectId ? imageAssets.get(objectId) : undefined
+      const rasterTransform = pdfMatrixToImageTransform(imageTransform)
+      const imageWidth = Math.max(0.01, rect?.width ?? 1)
+      const imageHeight = Math.max(0.01, rect?.height ?? 1)
+      const displayAspectRatio = pdfImageDisplayAspectRatio(imageTransform, imageWidth, imageHeight)
+      const transformKey = rasterImageTransformKey(rasterTransform)
+      const aspectKey = displayAspectRatio ? Math.round(displayAspectRatio * 1000) / 1000 : 'unknown'
+      const assetKey = objectId ? `${objectId}:${transformKey}:${aspectKey}` : ''
+      let clientId = assetKey ? imageAssets.get(assetKey) : undefined
       if (!clientId) {
-        const blob = await imageObjectToPng(imageValue)
+        let blob = await imageObjectToPng(imageValue)
         if (!blob) {
           skippedImages += 1
           return
         }
+        if (hasRasterImageTransform(rasterTransform)) {
+          try {
+            blob = await transformImageBlob(blob, rasterTransform, {
+              outputAspectRatio: displayAspectRatio,
+            })
+          } catch (error) {
+            console.warn('PDF image transform conversion failed; preserving the original pixels', error)
+          }
+        }
         pageImageCount += 1
         clientId = `pdf-p${pageNumber}-image-${pageImageCount}`
-        if (objectId) imageAssets.set(objectId, clientId)
+        if (assetKey) imageAssets.set(assetKey, clientId)
         assets.push({ clientId, filename: `${clientId}.png`, contentType: 'image/png', blob })
       }
         blocks.push(createPdfImageBlock(clientId, imageTransform, pageHeight, operatorList.fnArray.length + blocks.length, rect))

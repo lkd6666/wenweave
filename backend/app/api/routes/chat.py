@@ -47,8 +47,10 @@ from app.models.model_call_record import ModelCallRecord, ModelCallSource
 from app.models.operation_log import OperationLogStatus
 from app.schemas.chat import (
     AgentRunRead,
+    AgentRunTimelineRead,
     ChatContextPreviewRequest,
     ChatContextCompactRequest,
+    ChatContextCompactResult,
     ChatContextStatsRead,
     ChatMessageRead,
     ChatHistoryArchiveRead,
@@ -66,7 +68,7 @@ from app.schemas.chat import (
 )
 from app.schemas.chat_images import ChatImageAttachmentRead
 from app.services.agent_run_manager import TERMINAL_STATUSES, agent_run_manager
-from app.services.agent_run_recovery import recover_interrupted_turn
+from app.services.agent_run_recovery import recover_interrupted_turn, replay_agent_turn
 from app.services.agent_context import AGENT_TOOL_SCHEMA_RESERVE_TOKENS, AgentContextBuilder, ContextBudgetError, ContextRecord, context_prefix_hash
 from app.services.chat_agent import (
     HtmlEditSession,
@@ -78,6 +80,7 @@ from app.services.chat_agent import (
     context_budget_prompt,
     restore_resume_messages,
     run_agent_loop,
+    validate_gzh_theme_candidate,
 )
 from app.services.chat_sessions import ensure_default_chat_session
 from app.services.chat_reask import ChatReaskConflictError, ChatReaskError, ReaskActivation, activate_reask
@@ -380,6 +383,40 @@ def _message_read(message: ChatMessage, user: User, model_usage: dict | None = N
     return payload
 
 
+def _context_compaction_notice_content(before_stats: dict, after_stats: dict) -> str:
+    """Describe one manual compaction from the actual before/after input size."""
+    before_tokens = max(0, int(before_stats.get("compiled_input_tokens") or before_stats.get("used_tokens") or 0))
+    after_tokens = max(0, int(after_stats.get("compiled_input_tokens") or after_stats.get("used_tokens") or 0))
+    saved_tokens = max(0, before_tokens - after_tokens)
+    if after_stats.get("state") != "compacted":
+        return f"上下文检查完成，本次无需压缩（当前 {after_tokens:,} tokens）。"
+    compression_rate = round(saved_tokens / max(1, before_tokens) * 100)
+    return (
+        f"压缩上下文成功，节省 {saved_tokens:,} tokens，压缩率 {compression_rate}%"
+        f"（{before_tokens:,} → {after_tokens:,} tokens）。"
+    )
+
+
+def _persist_context_compaction_notice(
+    db: Session,
+    *,
+    document_id: int,
+    session_id: int,
+    before_stats: dict,
+    after_stats: dict,
+) -> ChatMessage:
+    """Store a display-only compaction result outside the provider event ledger."""
+    notice = ChatMessage(
+        document_id=document_id,
+        session_id=session_id,
+        role=MessageRole.TOOL,
+        content=_context_compaction_notice_content(before_stats, after_stats),
+    )
+    db.add(notice)
+    db.flush()
+    return notice
+
+
 def _pending_attachments(
     db: Session, document_id: int, user_id: int, attachment_ids: list[str], *, require_unbound: bool = True
 ) -> list[ChatImageAttachment]:
@@ -537,6 +574,7 @@ def _run_read(
     run: AgentRun,
     reask_activation: ReaskActivation | None = None,
     user_question: ChatUserQuestion | None = None,
+    timeline: AgentRunTimelineRead | None = None,
 ) -> AgentRunRead:
     return AgentRunRead(
         run_id=run.id,
@@ -545,6 +583,8 @@ def _run_read(
         user_message_id=run.user_message_id,
         assistant_message_id=run.assistant_message_id,
         error_message=run.error_message,
+        event_sequence=max(0, int(run.event_sequence or 0)),
+        timeline=timeline,
         reask_activation=(
             ChatReaskActivationRead(
                 archive_id=reask_activation.archive_id,
@@ -555,6 +595,36 @@ def _run_read(
             else None
         ),
         user_question=_question_read(user_question, int(run.event_sequence or 0)),
+    )
+
+
+def _live_run_timeline(db: Session, run: AgentRun) -> AgentRunTimelineRead | None:
+    """Return a point-in-time replay snapshot for an executing Agent run."""
+    if run.status not in EXECUTING_RUN_STATUSES:
+        return None
+    event_sequence = max(0, int(run.event_sequence or 0))
+    if event_sequence == 0:
+        return None
+    events = (
+        db.query(AgentRunEvent)
+        .filter(AgentRunEvent.run_id == run.id, AgentRunEvent.sequence <= event_sequence)
+        .order_by(AgentRunEvent.sequence)
+        .all()
+    )
+    if not events:
+        return None
+    questions = db.query(ChatUserQuestion).filter(ChatUserQuestion.run_id == run.id).all()
+    question_timelines = {
+        question.id: _json_dict(question.timeline_json)
+        for question in questions
+    }
+    replayed = replay_agent_turn(events, question_timelines=question_timelines)
+    if not replayed.has_recovered_context:
+        return None
+    return AgentRunTimelineRead(
+        tool_calls=replayed.tool_calls,
+        reasoning=replayed.reasoning_trace,
+        turn_blocks=replayed.turn_blocks,
     )
 
 
@@ -573,6 +643,16 @@ def _merge_runtime_context_stats(prepared_stats: dict, event_data: dict) -> dict
         value = event_data.get(name)
         return value if isinstance(value, int) else 0
 
+    def breakdown(name: str) -> dict[str, int]:
+        value = event_data.get(name)
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key): item
+            for key, item in value.items()
+            if isinstance(item, int) and item >= 0
+        }
+
     runtime_state = str(event_data.get("state", ""))
     merged = {
         **prepared_stats,
@@ -586,6 +666,19 @@ def _merge_runtime_context_stats(prepared_stats: dict, event_data: dict) -> dict
             "runtime_input_tokens": metric("used_tokens"),
             "last_model_output_tokens": metric("last_turn_output_tokens"),
             "last_model_cached_input_tokens": metric("cached_input_tokens"),
+            "runtime_context_tokens": metric("used_tokens"),
+            "runtime_context_source": "provider_reported",
+            "runtime_context_is_estimate": False,
+        }
+    if runtime_state == "tool_result_context":
+        return {
+            **merged,
+            "runtime_context_tokens": metric("used_tokens"),
+            "runtime_context_breakdown": breakdown("breakdown"),
+            "runtime_context_source": str(event_data.get("context_source") or "server_recomputed_after_tool"),
+            "runtime_context_is_estimate": bool(event_data.get("context_is_estimate", True)),
+            "runtime_context_tool_call_id": str(event_data.get("tool_call_id") or ""),
+            "runtime_context_tool_name": str(event_data.get("tool_name") or ""),
         }
     if runtime_state == "in_run_compacted":
         return {
@@ -616,6 +709,22 @@ def _merge_runtime_context_stats(prepared_stats: dict, event_data: dict) -> dict
             "tool_output_retention_days": metric("tool_output_retention_days"),
         }
     return merged
+
+
+def _context_compaction_event_data(before_stats: dict, after_stats: dict) -> dict:
+    """Build the compact, user-visible result for preflight context compaction."""
+    before_tokens = max(0, int(before_stats.get("compiled_input_tokens") or before_stats.get("used_tokens") or 0))
+    after_tokens = max(0, int(after_stats.get("compiled_input_tokens") or after_stats.get("used_tokens") or 0))
+    return {
+        "summary": "较早对话和工具结果已整理为工作记忆。",
+        "original_tokens": before_tokens,
+        "used_tokens": after_tokens,
+        "summarized_cycles": 0,
+        "digested_cycles": 0,
+        "dropped_cycles": 0,
+        "summary_tokens": 0,
+        "durable_snapshot": after_stats.get("state") == "compacted",
+    }
 
 
 def _persist_context_events(
@@ -2131,7 +2240,7 @@ def preview_chat_context(
     return builder.snapshot()
 
 
-@router.post("/{document_id}/chat-context/compact", response_model=ChatContextStatsRead)
+@router.post("/{document_id}/chat-context/compact", response_model=ChatContextCompactResult)
 async def compact_chat_context(
     document_id: int,
     payload: ChatContextCompactRequest,
@@ -2172,6 +2281,7 @@ async def compact_chat_context(
         ),
     )
     compaction_model = build_compaction_model(model.provider, model)
+    before_stats = builder.snapshot()
     try:
         prepared = await builder.prepare(
             compaction_model,
@@ -2187,6 +2297,15 @@ async def compact_chat_context(
     fallback_data = claim_thinking_capability_fallback_data(model.id, compaction_model)
     if fallback_data is not None:
         prepared.stats["thinking_capability_fallback"] = fallback_data
+    notice = _persist_context_compaction_notice(
+        db,
+        document_id=document.id,
+        session_id=session.id,
+        before_stats=before_stats,
+        after_stats=prepared.stats,
+    )
+    db.commit()
+    prepared.stats["compaction_notice"] = _message_read(notice, current_user)
     return prepared.stats
 
 
@@ -2203,6 +2322,7 @@ def get_active_run(
             AgentRun.status.in_(ACTIVE_RUN_STATUSES),
         )
         .order_by(AgentRun.created_at.desc())
+        .with_for_update()
         .first()
     )
     question = (
@@ -2212,7 +2332,7 @@ def get_active_run(
         if run
         else None
     )
-    return _run_read(run, user_question=question) if run else None
+    return _run_read(run, user_question=question, timeline=_live_run_timeline(db, run)) if run else None
 
 
 @router.get("/{document_id}/chat-runs/by-client-request/{client_request_id}", response_model=AgentRunRead | None)
@@ -2255,7 +2375,7 @@ def get_chat_run(
         .filter(ChatUserQuestion.run_id == run.id, ChatUserQuestion.status == ChatUserQuestionStatus.WAITING)
         .first()
     )
-    return _run_read(run, user_question=question)
+    return _run_read(run, user_question=question, timeline=_live_run_timeline(db, run))
 
 
 @router.post("/{document_id}/chat", response_model=AgentRunRead, status_code=status.HTTP_202_ACCEPTED)
@@ -3240,6 +3360,31 @@ async def _execute_agent_run(
             block["_started_at"] = perf_counter()
         turn_blocks.append(block)
 
+    async def publish_context_compaction(data: dict) -> None:
+        """Append and publish one compression card in the current assistant turn."""
+        normalized = {
+            "summary": str(data.get("summary") or ""),
+            "original_tokens": max(0, int(data.get("original_tokens") or 0)),
+            "used_tokens": max(0, int(data.get("used_tokens") or 0)),
+            "summarized_cycles": max(0, int(data.get("summarized_cycles") or 0)),
+            "digested_cycles": max(0, int(data.get("digested_cycles") or 0)),
+            "dropped_cycles": max(0, int(data.get("dropped_cycles") or 0)),
+            "summary_tokens": max(0, int(data.get("summary_tokens") or 0)),
+            "durable_snapshot": bool(data.get("durable_snapshot")),
+        }
+        turn_blocks.append(
+            {
+                "id": str(data.get("id") or f"context-compaction-{len(turn_blocks) + 1}"),
+                "type": "context_compaction",
+                "state": "done",
+                "content": "",
+                "duration_ms": None,
+                "tool": None,
+                "context_compaction": normalized,
+            }
+        )
+        await agent_run_manager.publish(run_id, "context_compaction", normalized)
+
     def partial_content(default: str) -> str:
         text = "".join(
             str(block.get("content", "")) for block in turn_blocks if block.get("type") == "content"
@@ -3718,6 +3863,7 @@ async def _execute_agent_run(
             stream_model.tool_result_max_tokens,
             checkpoint_callback=persist_agent_checkpoint,
             cancel_requested=lambda: agent_run_manager.is_cancel_requested(run_id),
+            candidate_validator=validate_gzh_theme_candidate if theme_application else None,
         )
         # History reads happen after potentially long model calls. Give them
         # isolated sessions so a stale stream connection cannot fail the run.
@@ -3768,6 +3914,8 @@ async def _execute_agent_run(
                 },
             )
         prepared_context = await context_builder.prepare(compaction_model)
+        if preflight_stats.get("requires_compaction") and prepared_context.stats.get("state") == "compacted":
+            await publish_context_compaction(_context_compaction_event_data(preflight_stats, prepared_context.stats))
         fallback_data = claim_thinking_capability_fallback_data(model_id, compaction_model)
         if fallback_data is not None:
             await agent_run_manager.publish(run_id, "thinking_capability_fallback", fallback_data)
@@ -4114,13 +4262,22 @@ async def _execute_agent_run(
                     completed = True
                     break
                 elif event == "context_stats":
-                    # 运行时的 provider 用量和工具循环压缩是诊断信息；主仪表盘
-                    # 仍表示本轮构建完成后的下次输入预算，不能被单次调用覆盖。
+                    # 保留初始构建的账本和预算字段；每次工具结果后的独立运行时
+                    # 快照会驱动仪表盘，直到下一次模型调用给出提供方实报。
                     await agent_run_manager.publish(
                         run_id,
                         "context_stats",
                         _merge_runtime_context_stats(prepared_context.stats, data),
                     )
+                    continue
+                elif event == "context_compaction":
+                    # Runtime compression is a user-visible process step. Keep
+                    # the compact metadata on the assistant timeline so it is
+                    # persisted with the final message and replayable later.
+                    # The graph event is local to this worker until it is
+                    # published here. The helper also normalizes the payload
+                    # so preflight and in-run compression share one format.
+                    await publish_context_compaction(data)
                     continue
                 elif event == "error":
                     detail = str(data.get("message", "Agent 执行失败"))
@@ -4202,7 +4359,10 @@ async def _execute_agent_run(
                     "context_stats",
                     {**retry_builder.snapshot(), "state": "retrying_after_provider_limit"},
                 )
+                retry_preflight_stats = retry_builder.snapshot()
                 prepared_context = await retry_builder.prepare(compaction_model)
+                if retry_preflight_stats.get("requires_compaction") and prepared_context.stats.get("state") == "compacted":
+                    await publish_context_compaction(_context_compaction_event_data(retry_preflight_stats, prepared_context.stats))
                 fallback_data = claim_thinking_capability_fallback_data(model_id, compaction_model)
                 if fallback_data is not None:
                     await agent_run_manager.publish(run_id, "thinking_capability_fallback", fallback_data)

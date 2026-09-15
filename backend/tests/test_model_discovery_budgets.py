@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.routes.ai_providers import _model_discovery_item, _sync_default_discovered_budgets
 from app.db.base import Base
 from app.models.ai_model import AIModel
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 
 
 class ModelDiscoveryBudgetTests(unittest.TestCase):
@@ -51,6 +52,7 @@ class ModelDiscoveryBudgetTests(unittest.TestCase):
 
         self.assertEqual(result.context_window_tokens, 32768)
         self.assertEqual(result.context_compaction_threshold_tokens, 24576)
+        self.assertEqual(result.tool_result_max_tokens, DEFAULT_TOOL_RESULT_MAX_TOKENS)
         self.assertEqual(result.context_window_source, "保守默认值")
 
     def test_deepseek_v4_catalogue_fills_one_million_context_without_provider_metadata(self) -> None:

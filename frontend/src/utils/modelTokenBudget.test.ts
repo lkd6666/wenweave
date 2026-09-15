@@ -11,6 +11,10 @@ describe('model token budget', () => {
     })
   })
 
+  it('uses the Codex-aligned preview budget for standard context windows', () => {
+    expect(deriveModelTokenBudget(24, 8)?.tool_result_max_tokens).toBe(10_000)
+  })
+
   it('rejects limits outside the persisted model budget range', () => {
     expect(deriveModelTokenBudget(1, 1)).toBeNull()
     expect(deriveModelTokenBudget(1_500, 600)).toBeNull()

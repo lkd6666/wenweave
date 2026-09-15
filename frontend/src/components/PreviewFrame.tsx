@@ -44,6 +44,7 @@ import { documentsApi } from '../api/documents'
 import ImageCropModal from './ImageCropModal'
 import type { CropRect } from '../utils/imageCrop'
 import { ImageCropError, cropImageBlob, isFullCropRect, parseCropRect, serializeCropRect } from '../utils/imageCrop'
+import { normalizeImageRotationDegrees } from '../utils/imageTransform'
 import { applyLibraryImageToDom, resolveImageApplicationTarget, stepEditHistory } from '../utils/editorImageApplication'
 
 export type PreviewMode = 'browse' | 'select' | 'edit'
@@ -180,7 +181,9 @@ interface BlockStyleValues {
 
 interface ImageCropSession {
   source: string
+  sourceBlob: Blob
   initialRect: CropRect | null
+  initialRotationDegrees: number
   hasExistingCrop: boolean
 }
 
@@ -292,10 +295,13 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const imageActionRef = useRef<HTMLDivElement | null>(null)
   const activeImageRef = useRef<HTMLImageElement | null>(null)
   const cropTargetRef = useRef<HTMLImageElement | null>(null)
+  const cropSourceLoadingRef = useRef(false)
   const imageInputModeRef = useRef<'replace' | 'insert'>('replace')
   const pendingInsertRangeRef = useRef<Range | null>(null)
   const pendingBlockImageInsertionRef = useRef<HTMLElement | null>(null)
   const uploadingImageRef = useRef(false)
+  const pendingImageUploadsRef = useRef(new Map<string, string>())
+  const nextPendingImageUploadIdRef = useRef(1)
   const editUndoStackRef = useRef<string[]>([])
   const editRedoStackRef = useRef<string[]>([])
   const pendingInputHistoryRef = useRef<string | null>(null)
@@ -383,6 +389,8 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       blockHandleRef.current?.remove()
       blockDropIndicatorRef.current?.remove()
       blockDragCleanupRef.current?.()
+      pendingImageUploadsRef.current.forEach((url) => URL.revokeObjectURL(url))
+      pendingImageUploadsRef.current.clear()
     },
     [],
   )
@@ -683,6 +691,16 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return clone.innerHTML
   }
 
+  const serialiseBodyForDraft = (body: HTMLElement) => {
+    const clone = body.cloneNode(true) as HTMLElement
+    clone.querySelectorAll<HTMLImageElement>('img[data-preview-upload-id]').forEach((image) => {
+      const parent = image.parentElement
+      image.remove()
+      if (parent?.tagName === 'P' && !parent.textContent?.trim() && parent.children.length === 0) parent.remove()
+    })
+    return serialiseBody(clone)
+  }
+
   const copyArticle = async (): Promise<'copied' | 'empty' | 'failed'> => {
     ensureRenderedHtml()
     const frameDocument = iframeRef.current?.contentDocument
@@ -767,7 +785,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       canRedo: editRedoStackRef.current.length > 0,
     })
     replacePreviewBody(targetHtml)
-    onHtmlChangeRef.current(targetHtml)
+    const persistedHtml = serialiseBodyForDraft(body)
+    renderedHtmlRef.current = persistedHtml
+    onHtmlChangeRef.current(persistedHtml)
     return true
   }
 
@@ -1290,7 +1310,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     const body = iframeRef.current?.contentDocument?.body
     if (!body) return
     markLinksToOpenInNewWindow(body)
-    const nextHtml = serialiseBody(body)
+    // Pending pasted images use temporary blob URLs. They are visible in the
+    // frame, but must not be persisted before their upload returns a real URL.
+    const nextHtml = serialiseBodyForDraft(body)
     // 父组件以草稿作为输入时，标记 iframe 已渲染到同一版本，避免输入后被回写重置。
     renderedHtmlRef.current = nextHtml
     onHtmlChangeRef.current(nextHtml)
@@ -1605,7 +1627,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     if (link && !link.textContent?.trim() && link.children.length === 0) link.remove()
     removeImageAction()
     recordEditChange(previousHtml)
-    const nextHtml = serialiseBody(body)
+    const nextHtml = serialiseBodyForDraft(body)
     renderedHtmlRef.current = nextHtml
     onHtmlChangeRef.current(nextHtml)
     syncHeight()
@@ -1726,25 +1748,40 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     imageInputRef.current?.click()
   }
 
-  const openImageCrop = (image: HTMLImageElement) => {
+  const openImageCrop = async (image: HTMLImageElement) => {
+    if (cropSourceLoadingRef.current || croppingImage) return
     const source = image.dataset.cropSource || image.currentSrc || image.src
     if (!source) {
       message.error('找不到图片原图，无法裁剪')
       return
     }
-    cropTargetRef.current = image
-    setImageCropSession({
-      source,
-      initialRect: parseCropRect(image.dataset.cropRect),
-      hasExistingCrop: Boolean(image.dataset.cropSource),
-    })
-    removeImageAction()
+    cropSourceLoadingRef.current = true
+    const closeLoading = message.loading({ content: '正在加载原图…', key: 'image-crop-source', duration: 0 })
+    try {
+      const sourceBlob = await readCropSource(source)
+      if (!image.isConnected) return
+      cropTargetRef.current = image
+      setImageCropSession({
+        source,
+        sourceBlob,
+        initialRect: parseCropRect(image.dataset.cropRect),
+        initialRotationDegrees: normalizeImageRotationDegrees(Number(image.dataset.cropRotation)),
+        hasExistingCrop: Boolean(image.dataset.cropSource),
+      })
+      removeImageAction()
+    } catch (error) {
+      const detail = error instanceof ImageCropError ? error.message : '无法读取原图或旋转图片，请确认图片地址允许跨域读取'
+      message.error(detail)
+    } finally {
+      cropSourceLoadingRef.current = false
+      closeLoading()
+    }
   }
 
   const commitImageMutation = (target: HTMLImageElement, previousHtml: string) => {
     const body = target.ownerDocument.body
     recordEditChange(previousHtml)
-    const nextHtml = serialiseBody(body)
+    const nextHtml = serialiseBodyForDraft(body)
     renderedHtmlRef.current = nextHtml
     onHtmlChangeRef.current(nextHtml)
     syncHeight()
@@ -1758,6 +1795,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     target.src = session.source
     target.removeAttribute('data-crop-source')
     target.removeAttribute('data-crop-rect')
+    target.removeAttribute('data-crop-rotation')
     target.addEventListener('load', syncHeight, { once: true })
     commitImageMutation(target, previousHtml)
     setImageCropSession(null)
@@ -1765,7 +1803,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     removeImageAction()
   }
 
-  const applyImageCrop = async (rect: CropRect) => {
+  const applyImageCrop = async (rect: CropRect, rotationDegrees: number) => {
     const session = imageCropSession
     const target = cropTargetRef.current
     if (!session || !target?.isConnected || !target.ownerDocument.body) {
@@ -1773,7 +1811,8 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       setImageCropSession(null)
       return
     }
-    if (isFullCropRect(rect)) {
+    const rotation = normalizeImageRotationDegrees(rotationDegrees)
+    if (isFullCropRect(rect) && rotation === 0) {
       if (session.hasExistingCrop) resetImageCrop()
       else setImageCropSession(null)
       return
@@ -1781,8 +1820,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
     setCroppingImage(true)
     try {
-      const sourceBlob = await readCropSource(session.source)
-      const croppedBlob = await cropImageBlob(sourceBlob, rect)
+      const croppedBlob = await cropImageBlob(session.sourceBlob, rect, rotation)
       const contentType = croppedBlob.type || 'image/png'
       const filename = contentType === 'image/jpeg' ? 'cropped-image.jpg' : 'cropped-image.png'
       const file = new File([croppedBlob], filename, { type: contentType })
@@ -1790,8 +1828,11 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       if (!target.isConnected || !target.ownerDocument.body) throw new ImageCropError('图片已发生变化，请重新选择裁剪')
       const previousHtml = serialiseBody(target.ownerDocument.body)
       target.src = url
+      target.removeAttribute('data-preview-upload-id')
       target.dataset.cropSource = session.source
       target.dataset.cropRect = serializeCropRect(rect)
+      if (rotation) target.dataset.cropRotation = String(rotation)
+      else target.removeAttribute('data-crop-rotation')
       target.removeAttribute('srcset')
       target.removeAttribute('sizes')
       target.addEventListener('load', syncHeight, { once: true })
@@ -1879,7 +1920,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     }
     markLinksToOpenInNewWindow(body)
     recordEditChange(previousHtml)
-    const nextHtml = serialiseBody(body)
+    const nextHtml = serialiseBodyForDraft(body)
     renderedHtmlRef.current = nextHtml
     onHtmlChangeRef.current(nextHtml)
     syncHeight()
@@ -1887,24 +1928,31 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return true
   }
 
-  const insertUploadedImage = async (file: File, range: Range | null, afterBlock: HTMLElement | null = null) => {
-    if (uploadingImageRef.current || modeRef.current !== 'edit') return
-    uploadingImageRef.current = true
+  const insertUploadedImage = (file: File, range: Range | null, afterBlock: HTMLElement | null = null) => {
+    if (modeRef.current !== 'edit') return
+    const contentType = file.type.toLowerCase()
+    const needsFilename = !file.name || !/\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(file.name)
+    const uploadFile = ACCEPTED_IMAGE_TYPES.has(contentType) && needsFilename
+      ? new File([file], `pasted-image.${extensionForImageType(contentType)}`, { type: contentType })
+      : file
+    const localUrl = URL.createObjectURL(uploadFile)
+    const uploadId = `paste-${nextPendingImageUploadIdRef.current++}`
+    pendingImageUploadsRef.current.set(uploadId, localUrl)
+
     try {
-      const contentType = file.type.toLowerCase()
-      const needsFilename = !file.name || !/\.(?:avif|bmp|gif|jpe?g|png|webp)$/i.test(file.name)
-      const uploadFile = ACCEPTED_IMAGE_TYPES.has(contentType) && needsFilename
-        ? new File([file], `pasted-image.${extensionForImageType(contentType)}`, { type: contentType })
-        : file
-      const url = await onUploadImageRef.current(uploadFile)
       const document = iframeRef.current?.contentDocument
       const body = document?.body
-      if (!body || modeRef.current !== 'edit') return
+      if (!body || modeRef.current !== 'edit') {
+        pendingImageUploadsRef.current.delete(uploadId)
+        URL.revokeObjectURL(localUrl)
+        return
+      }
 
       const previousHtml = serialiseBody(body)
       const image = document.createElement('img')
-      image.src = url
+      image.src = localUrl
       image.alt = ''
+      image.dataset.previewUploadId = uploadId
       image.style.display = 'block'
       image.style.maxWidth = '100%'
       image.style.height = 'auto'
@@ -1931,11 +1979,47 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       recordEditChange(previousHtml)
       const nextHtml = serialiseBody(body)
       renderedHtmlRef.current = nextHtml
-      onHtmlChangeRef.current(nextHtml)
       syncHeight()
-    } finally {
-      uploadingImageRef.current = false
+    } catch (error) {
+      pendingImageUploadsRef.current.delete(uploadId)
+      URL.revokeObjectURL(localUrl)
+      throw error
     }
+
+    void Promise.resolve()
+      .then(() => onUploadImageRef.current(uploadFile))
+      .then((url) => {
+        const document = iframeRef.current?.contentDocument
+        const body = document?.body
+        const pendingImage = body?.querySelector<HTMLImageElement>(`img[data-preview-upload-id="${uploadId}"]`)
+        if (!body || !pendingImage) return
+
+        const previousHtml = serialiseBody(body)
+        pendingImage.src = url
+        pendingImage.removeAttribute('data-preview-upload-id')
+        pendingImage.addEventListener('load', syncHeight, { once: true })
+        recordEditChange(previousHtml)
+        const nextHtml = serialiseBodyForDraft(body)
+        renderedHtmlRef.current = nextHtml
+        onHtmlChangeRef.current(nextHtml)
+        syncHeight()
+      })
+      .catch(() => {
+        const document = iframeRef.current?.contentDocument
+        const body = document?.body
+        const pendingImage = body?.querySelector<HTMLImageElement>(`img[data-preview-upload-id="${uploadId}"]`)
+        if (!body || !pendingImage) return
+        pendingImage.remove()
+        const nextHtml = serialiseBodyForDraft(body)
+        renderedHtmlRef.current = nextHtml
+        onHtmlChangeRef.current(nextHtml)
+        syncHeight()
+      })
+      .finally(() => {
+        const url = pendingImageUploadsRef.current.get(uploadId)
+        pendingImageUploadsRef.current.delete(uploadId)
+        if (url) URL.revokeObjectURL(url)
+      })
   }
 
   const openImagePickerForInsert = (afterSelectedBlock = false) => {
@@ -1979,13 +2063,15 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       if (!target.isConnected || !target.ownerDocument.body) return
       const previousHtml = serialiseBody(target.ownerDocument.body)
       target.src = url
+      target.removeAttribute('data-preview-upload-id')
       target.removeAttribute('data-crop-source')
       target.removeAttribute('data-crop-rect')
+      target.removeAttribute('data-crop-rotation')
       target.removeAttribute('srcset')
       target.removeAttribute('sizes')
       target.addEventListener('load', syncHeight, { once: true })
       recordEditChange(previousHtml)
-      const nextHtml = serialiseBody(target.ownerDocument.body)
+      const nextHtml = serialiseBodyForDraft(target.ownerDocument.body)
       renderedHtmlRef.current = nextHtml
       onHtmlChangeRef.current(nextHtml)
       syncHeight()
@@ -2060,6 +2146,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       const nextImage = clone.querySelectorAll<HTMLImageElement>('img')[target.imageIndex]
       if (!nextImage) return null
       nextImage.setAttribute('src', nextUrl)
+      nextImage.removeAttribute('data-preview-upload-id')
       return serialiseBody(clone)
     },
     getImageApplicationTarget: () => {
@@ -2087,13 +2174,14 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       )
       const result = applyLibraryImageToDom(document, body, target, url, alt)
       if (!result) return null
+      result.image.removeAttribute('data-preview-upload-id')
       result.image.addEventListener('load', syncHeight, { once: true })
       if (result.paragraph) {
         clearBlockSelection()
         activeCaretBlockRef.current = result.paragraph
       }
       recordEditChange(previousHtml)
-      const nextHtml = serialiseBody(body)
+      const nextHtml = serialiseBodyForDraft(body)
       renderedHtmlRef.current = nextHtml
       onHtmlChangeRef.current(nextHtml)
       syncHeight()
@@ -2138,7 +2226,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
     markLinksToOpenInNewWindow(body)
     recordEditChange(previousHtml)
-    const nextHtml = serialiseBody(body)
+    const nextHtml = serialiseBodyForDraft(body)
     renderedHtmlRef.current = nextHtml
     onHtmlChangeRef.current(nextHtml)
     notifyExternalImagesPasted()
@@ -2823,15 +2911,16 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       {imageCropSession && (
         <ImageCropModal
           open
-          source={imageCropSession.source}
+          source={imageCropSession.sourceBlob}
           initialRect={imageCropSession.initialRect}
+          initialRotationDegrees={imageCropSession.initialRotationDegrees}
           saving={croppingImage}
           onCancel={() => {
             if (croppingImage) return
             setImageCropSession(null)
             cropTargetRef.current = null
           }}
-          onApply={(rect) => { void applyImageCrop(rect) }}
+          onApply={(rect, rotationDegrees) => { void applyImageCrop(rect, rotationDegrees) }}
           onReset={imageCropSession.hasExistingCrop ? resetImageCrop : null}
         />
       )}

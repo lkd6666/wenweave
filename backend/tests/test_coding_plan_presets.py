@@ -119,11 +119,19 @@ class CodingPlanPresetTests(unittest.TestCase):
                         item.context_window_tokens,
                     )
 
-    def test_preset_ids_and_base_urls_remain_unique(self) -> None:
+    def test_preset_ids_are_unique_and_shared_gateways_declare_key_prefixes(self) -> None:
         ids = [preset["id"] for preset in PROVIDER_PRESETS]
         self.assertEqual(len(ids), len(set(ids)))
-        keys = [(preset["provider_type"], preset["base_url"].rstrip("/").lower()) for preset in PROVIDER_PRESETS]
-        self.assertEqual(len(keys), len(set(keys)), "base_url 重复会让 find_provider_preset 取错预设")
+        grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for preset in PROVIDER_PRESETS:
+            key = (preset["provider_type"], preset["base_url"].rstrip("/").lower())
+            grouped.setdefault(key, []).append(preset)
+        for key, presets in grouped.items():
+            if len(presets) <= 1:
+                continue
+            prefixes = [str(preset.get("api_key_prefix") or "") for preset in presets]
+            self.assertEqual(len(prefixes), len(set(prefixes)), key)
+            self.assertTrue(all(prefixes), key)
 
 
 if __name__ == "__main__":

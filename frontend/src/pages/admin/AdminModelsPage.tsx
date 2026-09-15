@@ -38,17 +38,20 @@ const PROVIDER_TYPE_OPTIONS = [
   { value: 'openai_compatible', label: 'OpenAI 兼容接口（DeepSeek/Qwen/Kimi/GLM/vLLM 等）' },
   { value: 'openai_responses', label: 'OpenAI Responses API' },
   { value: 'anthropic', label: 'Anthropic（Claude 系列）' },
+  { value: 'gemini_native', label: 'Google Gemini 原生 API（generateContent）' },
 ]
 
 function providerProtocolLabel(providerType: string): string {
   if (providerType === 'anthropic') return 'Anthropic Messages'
   if (providerType === 'openai_responses') return 'OpenAI Responses API'
+  if (providerType === 'gemini_native') return 'Gemini 原生 GenerateContent'
   return 'OpenAI Chat Completions 兼容'
 }
 
 function providerProtocolColor(providerType: string): string {
   if (providerType === 'anthropic') return 'purple'
   if (providerType === 'openai_responses') return 'green'
+  if (providerType === 'gemini_native') return 'gold'
   return 'geekblue'
 }
 
@@ -191,6 +194,7 @@ export default function AdminModelsPage() {
   const supportsPromptCache = modelModalProvider?.provider_type === 'openai_compatible'
     || modelModalProvider?.provider_type === 'openai_responses'
   const isAnthropicProvider = modelModalProvider?.provider_type === 'anthropic'
+  const isGeminiNativeProvider = modelModalProvider?.provider_type === 'gemini_native'
   const automaticTokenBudget = deriveModelTokenBudget(inputLimitK, outputLimitK)
   const discoveredModelQuery = discoveredModelSearch.trim().toLocaleLowerCase()
   const filteredDiscoveredModels = (discovery?.models ?? []).filter((model) => (
@@ -475,7 +479,11 @@ export default function AdminModelsPage() {
           if (!isRecord(effortConfigs[effort])) {
             effortConfigs[effort] = isAnthropicProvider
               ? { thinking: { type: 'adaptive' }, effort }
-              : { reasoning_effort: effort }
+              : isGeminiNativeProvider
+                ? { thinkingConfig: values.model_name?.toString().toLowerCase().startsWith('gemini-3')
+                    ? { includeThoughts: true, thinkingLevel: effort === 'low' ? 'low' : 'high' }
+                    : { includeThoughts: true, thinkingBudget: effort === 'minimal' ? 512 : effort === 'low' ? 1024 : effort === 'medium' ? 4096 : effort === 'high' ? 8192 : -1 } }
+                : { reasoning_effort: effort }
           }
         }
         thinkingConfig = {
@@ -483,9 +491,21 @@ export default function AdminModelsPage() {
           enabled: thinkingConfig.enabled ?? (
             isAnthropicProvider
               ? { thinking: { type: 'adaptive' }, effort: 'medium' }
-              : { reasoning_effort: 'medium' }
+              : isGeminiNativeProvider
+                ? { thinkingConfig: values.model_name?.toString().toLowerCase().startsWith('gemini-3')
+                    ? { includeThoughts: true, thinkingLevel: 'high' }
+                    : { includeThoughts: true, thinkingBudget: -1 } }
+                : { reasoning_effort: 'medium' }
           ),
-          disabled: thinkingConfig.disabled ?? (isAnthropicProvider ? {} : { reasoning_effort: 'none' }),
+          disabled: thinkingConfig.disabled ?? (
+            isAnthropicProvider
+              ? {}
+              : isGeminiNativeProvider
+                ? { thinkingConfig: values.model_name?.toString().toLowerCase().startsWith('gemini-3')
+                    ? { includeThoughts: false, thinkingLevel: 'low' }
+                    : { includeThoughts: false, thinkingBudget: 0 } }
+                : { reasoning_effort: 'none' }
+          ),
           efforts: effortConfigs,
         }
       }
@@ -1333,12 +1353,16 @@ export default function AdminModelsPage() {
             label="思考强度"
             extra={isAnthropicProvider
               ? 'Claude 通过 Anthropic adaptive thinking 与 output_config.effort 传递强度。'
-              : 'OpenAI 兼容协议通过 reasoning_effort 传递极简、低、中、高、超高或最大强度。'}
+              : isGeminiNativeProvider
+                ? 'Gemini 2.5 使用 thinkingBudget；Gemini 3 使用 thinkingLevel。'
+                : 'OpenAI 兼容协议通过 reasoning_effort 传递极简、低、中、高、超高或最大强度。'}
           >
             <Checkbox.Group
-              options={isAnthropicProvider
-                ? THINKING_EFFORT_OPTIONS.filter((option) => option.value !== 'minimal')
-                : THINKING_EFFORT_OPTIONS}
+            options={isAnthropicProvider
+              ? THINKING_EFFORT_OPTIONS.filter((option) => option.value !== 'minimal')
+              : isGeminiNativeProvider
+                ? THINKING_EFFORT_OPTIONS.filter((option) => ['minimal', 'low', 'medium', 'high', 'max'].includes(option.value))
+              : THINKING_EFFORT_OPTIONS}
             />
           </Form.Item>
           <Form.Item
@@ -1368,12 +1392,16 @@ export default function AdminModelsPage() {
             label="高级思考参数 JSON（可选）"
             extra={isAnthropicProvider
               ? 'Claude 示例：{"enabled":{"thinking":{"type":"adaptive"},"effort":"medium"},"disabled":{},"efforts":{"xhigh":{"thinking":{"type":"adaptive"},"effort":"xhigh"}}}'
-              : 'OpenAI 示例：{"enabled":{"reasoning_effort":"medium"},"disabled":{"reasoning_effort":"none"},"efforts":{"high":{"reasoning_effort":"high"}}}'}
+              : isGeminiNativeProvider
+                ? 'Gemini 示例：{"enabled":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}},"disabled":{"thinkingConfig":{"includeThoughts":false,"thinkingBudget":0}}}'
+                : 'OpenAI 示例：{"enabled":{"reasoning_effort":"medium"},"disabled":{"reasoning_effort":"none"},"efforts":{"high":{"reasoning_effort":"high"}}}'}
           >
             <Input.TextArea
               autoSize={{ minRows: 3, maxRows: 8 }}
-              placeholder={isAnthropicProvider
-                ? '例如：{"enabled":{"thinking":{"type":"adaptive"},"effort":"medium"}}'
+            placeholder={isAnthropicProvider
+              ? '例如：{"enabled":{"thinking":{"type":"adaptive"},"effort":"medium"}}'
+              : isGeminiNativeProvider
+                ? '例如：{"enabled":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}}}'
                 : '例如：{"enabled":{"reasoning_effort":"medium"},"disabled":{"reasoning_effort":"none"}}'}
             />
           </Form.Item>

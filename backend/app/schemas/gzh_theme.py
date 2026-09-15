@@ -109,7 +109,7 @@ class GzhThemeReferenceAssetRead(BaseModel):
 
 class GzhThemeGenerationCreate(BaseModel):
     model_id: int = Field(gt=0)
-    brief: str = Field(min_length=8, max_length=4000)
+    brief: str = Field(min_length=8, max_length=8192)
     name_hint: str = Field(default="", max_length=128)
     slug_hint: str = Field(default="", max_length=96)
     accent_color: str = Field(default="", max_length=32)

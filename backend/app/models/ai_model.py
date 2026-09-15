@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 from app.db.base import Base
 from app.db.types import ID_TYPE
 from app.models.user_group import model_group_access, model_user_access
@@ -13,8 +14,6 @@ from app.models.user_group import model_group_access, model_user_access
 DEFAULT_CONTEXT_WINDOW_TOKENS = 32_768
 DEFAULT_CONTEXT_COMPACTION_THRESHOLD_TOKENS = 24_576
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
-# This is a provider-visible preview cap, not a cap on retained tool data.
-DEFAULT_TOOL_RESULT_MAX_TOKENS = 8_192
 
 
 class AIModel(Base):

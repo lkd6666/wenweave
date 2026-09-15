@@ -846,6 +846,251 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         self.assertEqual(checkpointed_html, [session.html])
         self.assertTrue(asset.is_applied)
 
+    def test_agent_bakes_body_transform_and_clears_stale_image_variants(self) -> None:
+        source_url = "/api/documents/local-images/original.png"
+        source_html = (
+            f'<section class="hero"><img src="{source_url}" alt="原图" style="width:66%" '
+            'srcset="original-2x.png 2x" sizes="66vw" data-crop-source="older.png" '
+            'data-crop-rect="0,0,100000,100000" data-crop-rotation="90" '
+            'data-preview-upload-id="preview-1"></section>'
+        )
+        workspace = HtmlWorkspace(source_html)
+        image_fingerprint = workspace.image_inventory()["images"][0]["source_fingerprint"]
+        checkpointed_html: list[str] = []
+        session = HtmlEditSession(source_html, checkpoint_callback=checkpointed_html.append)
+        document = SimpleNamespace(id=1, current_html=source_html)
+        stored = StoredDocumentImage(
+            url="/api/documents/local-images/transformed.png",
+            object_key="local/images/transformed.png",
+            storage_mode="local",
+        )
+        db = MagicMock()
+
+        class _Query:
+            def __init__(self, value: Any) -> None:
+                self.value = value
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def with_for_update(self) -> "_Query":
+                return self
+            def first(self) -> Any:
+                return self.value
+
+        # The transform first looks up storage, then locks the document.
+        db.query.side_effect = lambda model: _Query(None if model.__name__ == "StorageConfig" else document)
+        model = _ScriptedToolModel(
+            script=[
+                {
+                    "tool": (
+                        "transform_document_image",
+                        {
+                            "target": "article",
+                            "image_slot": 1,
+                            "revision": workspace.revision,
+                            "source_fingerprint": image_fingerprint,
+                            "rotation_degrees": 90,
+                        },
+                    )
+                },
+                {"text": "图片已裁切并旋转。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "将正文图片右转 90 度",
+                    workspace.map_payload(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="transform-body-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        transformed = SimpleNamespace(
+            data=b"transformed-png",
+            content_type="image/png",
+            width=300,
+            height=200,
+        )
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.image_generation.materialize_source_image", new=AsyncMock(return_value=(b"source-png", "image/png"))) as materialize,
+            patch("app.services.document_image_transform.transform_document_image", return_value=transformed) as bake,
+            patch("app.services.document_images.store_tracked_document_image", return_value=stored) as store,
+            patch("app.services.chat_agent.touch_document") as touch,
+            patch("app.services.chat_agent.create_document_version") as create_version,
+        ):
+            events = asyncio.run(run())
+
+        result = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "transform_document_image")
+        self.assertEqual(result["activity"]["kind"], "image_application")
+        self.assertIn('src="/api/documents/local-images/transformed.png"', session.html)
+        self.assertIn('alt="原图"', session.html)
+        self.assertIn('style="width:66%"', session.html)
+        self.assertNotIn("srcset=", session.html)
+        self.assertNotIn("sizes=", session.html)
+        self.assertNotIn("data-crop-", session.html)
+        self.assertNotIn("data-preview-upload-id", session.html)
+        self.assertEqual(document.current_html, session.html)
+        self.assertEqual(checkpointed_html, [session.html])
+        materialize.assert_awaited_once()
+        bake.assert_called_once()
+        store.assert_called_once()
+        touch.assert_called_once_with(document, 7)
+        create_version.assert_called_once()
+        db.commit.assert_called_once()
+        self.assertIn("transform_document_image", model.bound_tool_names)
+
+    def test_agent_bakes_cover_transform_and_resets_wechat_crops(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        source_url = "https://cdn.example.test/original-cover.png"
+        document = SimpleNamespace(
+            id=1,
+            current_html=source_html,
+            wechat_cover_url=source_url,
+            wechat_pic_crop_235_1="cover-crop",
+            wechat_pic_crop_1_1="square-crop",
+        )
+        stored = StoredDocumentImage(
+            url="/api/documents/local-images/transformed-cover.png",
+            object_key="local/images/transformed-cover.png",
+            storage_mode="local",
+        )
+        db = MagicMock()
+
+        class _Query:
+            def __init__(self, value: Any) -> None:
+                self.value = value
+            def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def with_for_update(self) -> "_Query":
+                return self
+            def first(self) -> Any:
+                return self.value
+
+        db.query.side_effect = lambda model: _Query(None if model.__name__ == "StorageConfig" else document)
+        db.get.side_effect = lambda model, item_id: document if model is Document and item_id == 1 else None
+        model = _ScriptedToolModel(
+            script=[
+                {
+                    "tool": (
+                        "transform_document_image",
+                        {
+                            "target": "cover",
+                            "source_fingerprint": cover_source_fingerprint(source_url),
+                            "rotation_degrees": 90,
+                        },
+                    )
+                },
+                {"text": "封面已旋转。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "将封面右转 90 度",
+                    HtmlWorkspace(source_html).map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="transform-cover-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                )
+            ]
+
+        transformed = SimpleNamespace(
+            data=b"transformed-png",
+            content_type="image/png",
+            width=300,
+            height=200,
+        )
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.image_generation.materialize_source_image", new=AsyncMock(return_value=(b"source-png", "image/png"))),
+            patch("app.services.document_image_transform.transform_document_image", return_value=transformed),
+            patch("app.services.document_images.store_tracked_document_image", return_value=stored),
+            patch("app.services.chat_agent.touch_document") as touch,
+            patch("app.services.chat_agent.create_document_version") as create_version,
+        ):
+            events = asyncio.run(run())
+
+        result = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "transform_document_image")
+        self.assertEqual(result["activity"]["details"]["target"], "cover")
+        self.assertEqual(document.wechat_cover_url, stored.url)
+        self.assertEqual(document.wechat_pic_crop_235_1, "")
+        self.assertEqual(document.wechat_pic_crop_1_1, "")
+        touch.assert_called_once_with(document, 7)
+        create_version.assert_called_once()
+        db.commit.assert_called_once()
+
+    def test_agent_can_view_cover_dimensions_and_fingerprint(self) -> None:
+        source_html = "<section><p>正文保持不变</p></section>"
+        source_url = "https://cdn.example.test/current-cover.png"
+        document = SimpleNamespace(id=1, wechat_cover_url=source_url)
+        db = MagicMock()
+        db.query.return_value.first.return_value = None
+        db.get.return_value = document
+        model = _ScriptedToolModel(
+            script=[
+                {"tool": ("view_article_images", {"references": [{"kind": "cover"}]})},
+                {"text": "已读取封面尺寸。"},
+            ],
+            seen_messages=[],
+            bound_tool_names=[],
+        )
+
+        async def run() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "测试文章",
+                    source_html,
+                    "查看封面尺寸",
+                    HtmlWorkspace(source_html).map_payload(),
+                    None,
+                    [],
+                    session=HtmlEditSession(source_html),
+                    tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="view-cover-test"),
+                    actor_user_id=7,
+                    image_generation_context={},
+                    model_is_multimodal=False,
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.image_generation.materialize_source_image", new=AsyncMock(return_value=(b"cover-png", "image/png"))),
+            patch("app.services.document_image_transform.read_document_image_dimensions", return_value=("image/png", 1200, 628)),
+        ):
+            events = asyncio.run(run())
+
+        result = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images")
+        item = result["activity"]["details"]["items"][0]
+        self.assertEqual((item["width"], item["height"]), (1200, 628))
+        self.assertEqual(item["source_fingerprint"], cover_source_fingerprint(source_url))
+
     def test_agent_can_apply_edited_cover_and_clears_crop(self) -> None:
         source_html = "<section><p>正文保持不变</p></section>"
         workspace = HtmlWorkspace(source_html)

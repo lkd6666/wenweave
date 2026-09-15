@@ -2,6 +2,7 @@ import json
 import unittest
 
 from app.services.html_workspace import MAX_PATCH_OPERATIONS, HtmlWorkspace, WorkspaceError
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 from app.services.selected_elements import redact_inline_data, redact_inline_data_for_identity
 from app.services.token_budget import estimate_tokens
 
@@ -12,6 +13,10 @@ class HtmlWorkspaceTests(unittest.TestCase):
             source,
             redact=lambda value: value.replace("data:image/png;base64,AAAA", "__YIBAN_INLINE_DATA_1__"),
         )
+
+    def test_default_preview_budget_matches_codex_tool_output_limit(self) -> None:
+        self.assertEqual(HtmlWorkspace("<p>正文</p>").tool_result_max_tokens, DEFAULT_TOOL_RESULT_MAX_TOKENS)
+        self.assertEqual(DEFAULT_TOOL_RESULT_MAX_TOKENS, 10_000)
 
     def test_search_prefers_exact_leaf_block_in_minified_html(self) -> None:
         workspace = self.make_workspace(

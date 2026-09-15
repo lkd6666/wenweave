@@ -298,7 +298,8 @@ def _model_discovery_item(
         description=known.get("description", "") if known else "",
         **budget,
         thinking_config=thinking_config,
-        supports_disabled_thinking=True,
+        is_multimodal=bool(known.get("is_multimodal", False)) if known else False,
+        supports_disabled_thinking=bool(known.get("supports_disabled_thinking", True)) if known else True,
         thinking_efforts=thinking_efforts(thinking_config),
         source=source,
         context_window_source=context_window_source,
@@ -380,6 +381,8 @@ def _model_discovery_config(provider_type: str, preset: dict[str, Any] | None) -
         return preset["model_discovery"]
     if provider_type == "anthropic":
         return {"adapter": "anthropic", "path": "/v1/models", "response_key": "data"}
+    if provider_type == "gemini_native":
+        return {"adapter": "gemini_native", "path": "/models", "response_key": "models", "strip_prefix": "models/"}
     if provider_type in {"openai_compatible", "openai_responses"}:
         return {"adapter": "openai_compatible", "path": "/models", "response_key": "data"}
     return {"adapter": "openai_compatible", "path": "/models", "response_key": "data"}
@@ -409,7 +412,7 @@ async def _fetch_connection_models(
         params: dict[str, Any] = {"limit": 100}
     elif adapter == "gemini_native":
         headers = {"x-goog-api-key": api_key}
-        url = config["url"]
+        url = config.get("url") or f"{base_url.rstrip('/')}{config.get('path', '/models')}"
         params = {"pageSize": 100}
     elif adapter == "volcengine_ark":
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -578,8 +581,8 @@ async def discover_preset_models(
             provider_type, preset["base_url"], payload.api_key, preset
         )
     except ModelDiscoveryUnsupported as exc:
-        # 预期情况，不是故障：这类套餐端点只有 /v1/messages。直接展示内置模型，
-        # 且不要提示「检查 API Key」——此时密钥并未被验证过。
+        # 预期情况，不是故障：这类套餐端点没有可用的模型列表查询。直接展示内置
+        # 模型，且不要提示「检查 API Key」——此时密钥并未被验证过。
         return ModelDiscoveryResult(
             models=[
                 _model_discovery_item({"model_name": model["model_name"], "metadata": {}}, preset, CATALOG_SOURCE)
@@ -803,7 +806,11 @@ async def discover_models(provider_id: int, db: Session = Depends(get_db)) -> Mo
     if not provider:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider 不存在")
 
-    preset = find_provider_preset(provider.base_url, provider.provider_type.value)
+    preset = find_provider_preset(
+        provider.base_url,
+        provider.provider_type.value,
+        decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else None,
+    )
     try:
         models = await _fetch_provider_models(provider, preset)
     except ModelDiscoveryUnsupported as exc:

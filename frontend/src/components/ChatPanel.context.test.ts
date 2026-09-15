@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AIModelItem, ChatContextStats } from '../types'
-import { contextUsageValues, formatMessageTime, isRuntimeContextCompacting, mergeFallbackThoughtBlocks, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, supportsDisabledThinkingOption, visibleAssistantTurnBlocks, visibleTemplateReferenceIndexes } from './ChatPanel'
+import { contextCompactionNotice, contextUsageValues, formatMessageTime, isRuntimeContextCompacting, mergeFallbackThoughtBlocks, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, parseCompactionSummary, supportsDisabledThinkingOption, visibleAssistantTurnBlocks, visibleTemplateReferenceIndexes } from './ChatPanel'
 import { questionDeadlineMs } from './UserQuestionPanel'
 
 describe('contextUsageValues', () => {
@@ -9,14 +9,30 @@ describe('contextUsageValues', () => {
       used_tokens: 26_800,
       compiled_input_tokens: 26_800,
       ledger_tokens: 185_000,
-      runtime_projected_tokens: 0,
+      runtime_context_tokens: 0,
       conversation_tokens: 185_000,
     } as ChatContextStats
 
     expect(contextUsageValues(stats)).toEqual({
       compiledInputTokens: 26_800,
       ledgerTokens: 185_000,
-      runtimeProjectionTokens: 0,
+      runtimeContextTokens: 0,
+    })
+  })
+
+  it('uses the server-recomputed next input after a completed tool', () => {
+    const stats = {
+      used_tokens: 26_800,
+      compiled_input_tokens: 26_800,
+      ledger_tokens: 185_000,
+      runtime_context_tokens: 31_200,
+      runtime_context_source: 'server_recomputed_after_tool',
+    } as ChatContextStats
+
+    expect(contextUsageValues(stats)).toEqual({
+      compiledInputTokens: 31_200,
+      ledgerTokens: 185_000,
+      runtimeContextTokens: 31_200,
     })
   })
 
@@ -95,7 +111,86 @@ describe('normaliseAssistantTurnBlocks', () => {
   })
 })
 
+describe('contextCompactionNotice', () => {
+  it('distinguishes a completed compression from a no-op check', () => {
+    expect(contextCompactionNotice('压缩上下文成功，节省 10,207 tokens，压缩率 17%（60,469 → 50,262 tokens）。')).toEqual({
+      kind: 'success',
+      title: '上下文已压缩',
+      detail: '节省 10,207 tokens，压缩率 17%（60,469 → 50,262 tokens）。',
+    })
+
+    expect(contextCompactionNotice('上下文检查完成，本次无需压缩（当前 50,262 tokens）。')).toEqual({
+      kind: 'info',
+      title: '无需压缩',
+      detail: '本次无需压缩（当前 50,262 tokens）。',
+    })
+  })
+})
+
+describe('parseCompactionSummary', () => {
+  it('formats the runtime work-summary schema into labelled sections', () => {
+    const summary = parseCompactionSummary(JSON.stringify({
+      objective: '为高净值客户制作西藏高端定制自驾游排版',
+      constraints: '拒绝小清新风格，保留三种定价。',
+      decisions: '背景使用 CSS 实现，不使用 SVG。',
+      completed: '完成首屏与路线表格。',
+      active_work: '检查营地段落与图片分布。',
+      blockers: '无',
+      next_steps: '继续优化服务权益卡片。',
+      source_refs: 'event:2103026918',
+    }))
+
+    expect(summary?.objective).toBe('为高净值客户制作西藏高端定制自驾游排版')
+    expect(summary?.sections).toEqual(expect.arrayContaining([
+        { key: 'active_work', label: '正在处理', values: ['检查营地段落与图片分布。'] },
+        { key: 'next_steps', label: '下一步', values: ['继续优化服务权益卡片。'] },
+        { key: 'constraints', label: '约束条件', values: ['拒绝小清新风格，保留三种定价。'] },
+    ]))
+  })
+
+  it('supports the durable-memory schema and fenced JSON', () => {
+    const summary = parseCompactionSummary('```json\n{"objective":"继续完成排版","active_work":["压缩早期历史"],"pending_tasks":["继续处理最近回合"],"narrative":"模型生成的会话工作摘要"}\n```')
+
+    expect(summary).toEqual({
+      objective: '继续完成排版',
+      narrative: '模型生成的会话工作摘要',
+      sections: [
+        { key: 'active_work', label: '正在处理', values: ['压缩早期历史'] },
+        { key: 'pending_tasks', label: '待处理', values: ['继续处理最近回合'] },
+      ],
+    })
+  })
+
+  it('leaves legacy or malformed summaries for the plain-text fallback', () => {
+    expect(parseCompactionSummary('较早对话和工具结果已整理为工作记忆。')).toBeNull()
+    expect(parseCompactionSummary('{"objective":')).toBeNull()
+  })
+})
+
 describe('assistant timeline visibility', () => {
+  it('keeps persisted context-compaction blocks in the execution timeline', () => {
+    const blocks = visibleAssistantTurnBlocks([{
+      id: 'context-compaction-1',
+      type: 'context_compaction',
+      state: 'done',
+      content: '',
+      tool: null,
+      context_compaction: {
+        summary: '已整理早期工具循环。',
+        original_tokens: 190_000,
+        used_tokens: 48_000,
+        summarized_cycles: 3,
+        digested_cycles: 3,
+        dropped_cycles: 0,
+        summary_tokens: 600,
+        durable_snapshot: true,
+      },
+    }])
+
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].context_compaction?.durable_snapshot).toBe(true)
+  })
+
   it('keeps task-plan tool calls in the visible execution timeline', () => {
     const blocks = visibleAssistantTurnBlocks([{
       id: 'task-plan',

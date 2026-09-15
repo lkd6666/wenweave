@@ -13,14 +13,14 @@ import TemplateLibraryPanel, { type ResourceTab } from '../components/TemplateLi
 import ImageLibraryPanel from '../components/ImageLibraryPanel'
 import { documentsApi } from '../api/documents'
 import { imageLibraryApi } from '../api/imageLibrary'
+import { complianceApi } from '../api/compliance'
 import { modelsApi } from '../api/models'
 import { aiProvidersApi } from '../api/aiProviders'
-import { complianceApi } from '../api/compliance'
 import { wechatAccountsApi } from '../api/wechatAccounts'
 import { cancelChatRun, chatApi, reaskDocumentConflictFromError, reaskSourceUnavailableFromError, startChatRun, streamChatRunEvents } from '../api/chat'
-import type { ReaskConflictResolution, ThinkingEffort, ThinkingMode } from '../api/chat'
+import type { AgentRunTimeline, ReaskConflictResolution, ThinkingEffort, ThinkingMode } from '../api/chat'
 import { ApiError } from '../api/client'
-import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, PreviewImageTarget, ReasoningTrace, SelectedElementContext, TemplateItem, ToolExecution, VisibilitySettings, WeChatAvailableAccount } from '../types'
+import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, PreviewImageTarget, ReasoningTrace, SelectedElementContext, TemplateItem, ToolActivity, ToolExecution, VisibilitySettings, WeChatAvailableAccount } from '../types'
 import { sanitizeSelectedElement, sanitizeSelectedElements } from '../utils/selectedElements'
 import { prepareWeChatBodyImage } from '../utils/wechatBodyImage'
 import { clearChatComposerDraft, clearChatComposerDraftForRequest, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
@@ -141,15 +141,40 @@ interface ChatRunOptions {
   thinkingEffort: ThinkingEffort
 }
 
-function getComplianceButtonStatus(
+export function getComplianceButtonStatus(
   report: ComplianceReport | null,
-  loading: boolean,
+  loading = false,
 ): ComplianceButtonStatus {
   if (loading) return 'checking'
   if (!report) return 'unknown'
-  if (report.hasError) return 'error'
-  if (report.hasWarning) return 'warning'
+  if (!report.engine.available || report.isValid === null) return 'warning'
+  if (report.isValid === false || report.violations.length > 0 || report.gzhStrict?.hasError) return 'error'
+  if (report.gzhStrict?.hasWarning) return 'warning'
   return 'success'
+}
+
+export function complianceReportFromToolActivity(
+  activity: ToolActivity | null | undefined,
+): ComplianceReport | null {
+  const report = activity?.compliance as unknown
+  if (!report || typeof report !== 'object' || Array.isArray(report)) return null
+  const candidate = report as Partial<ComplianceReport>
+  if (!candidate.engine || typeof candidate.engine !== 'object') return null
+  if (!Array.isArray(candidate.violations) || !Array.isArray(candidate.warnMsgs)) return null
+  if (candidate.isValid !== true && candidate.isValid !== false && candidate.isValid !== null) return null
+  return candidate as ComplianceReport
+}
+
+export function latestComplianceReportFromTools(
+  tools: ToolExecution[] | null | undefined,
+): ComplianceReport | null {
+  if (!Array.isArray(tools)) return null
+  for (const tool of [...tools].reverse()) {
+    if (tool.name !== 'check_compliance') continue
+    const report = complianceReportFromToolActivity(tool.activity)
+    if (report) return report
+  }
+  return null
 }
 
 function getComplianceButtonLabel(status: ComplianceButtonStatus): string {
@@ -157,13 +182,13 @@ function getComplianceButtonLabel(status: ComplianceButtonStatus): string {
     case 'checking':
       return '正在检测合规性'
     case 'success':
-      return '合规检测通过'
+      return '官方合规检测通过'
     case 'warning':
-      return '合规检测存在潜在警告'
+      return '官方合规检测未验证或存在警告'
     case 'error':
-      return '合规检测存在严重错误'
+      return '存在官方合规违规'
     default:
-      return '尚未完成合规检测'
+      return '尚未运行官方合规检测'
   }
 }
 
@@ -243,6 +268,53 @@ function appendStreamTextBlock(
       tool: null,
     },
   ]
+}
+
+function timelineContent(blocks: AssistantTurnBlock[]): string {
+  return blocks
+    .filter((block) => block.type === 'content')
+    .map((block) => block.content)
+    .join('')
+}
+
+export function mergeContextStats(current: ChatContextStats | null, incoming: ChatContextStats): ChatContextStats {
+  if (!current) return incoming
+  if (
+    current.runtime_context_source === 'provider_reported'
+    && incoming.runtime_context_source === 'server_recomputed_after_tool'
+  ) {
+    // A tool-result snapshot is an estimate of the next request. Once the
+    // provider has reported the input for the current model turn, keep that
+    // measured value as the primary meter until the next provider report.
+    // Otherwise the ring alternates between the estimate (often 100%) and the
+    // measured input (for example 84%) during one continuous run.
+    return {
+      ...incoming,
+      runtime_context_tokens: current.runtime_context_tokens,
+      runtime_context_breakdown: current.runtime_context_breakdown,
+      runtime_context_source: current.runtime_context_source,
+      runtime_context_is_estimate: current.runtime_context_is_estimate,
+      runtime_context_tool_call_id: current.runtime_context_tool_call_id,
+      runtime_context_tool_name: current.runtime_context_tool_name,
+    }
+  }
+  if (incoming.runtime_context_source) return incoming
+  const keepRuntimeContext = ['provider_reported', 'server_recomputed_after_tool'].includes(
+    current.runtime_context_source ?? '',
+  )
+    && ['streaming', 'tool_result_context', 'tool_outputs_stored', 'run_compacting', 'in_run_compacted', 'run_compaction_failed'].includes(
+      incoming.runtime_context_state ?? incoming.state,
+    )
+  if (!keepRuntimeContext) return incoming
+  return {
+    ...incoming,
+    runtime_context_tokens: current.runtime_context_tokens,
+    runtime_context_breakdown: current.runtime_context_breakdown,
+    runtime_context_source: current.runtime_context_source,
+    runtime_context_is_estimate: current.runtime_context_is_estimate,
+    runtime_context_tool_call_id: current.runtime_context_tool_call_id,
+    runtime_context_tool_name: current.runtime_context_tool_name,
+  }
 }
 
 function preserveRetriedToolPreviews(
@@ -474,7 +546,12 @@ export default function EditorPage() {
   const attachedEditorDocumentRef = useRef<number | null>(null)
   const activeRunRef = useRef<string | null>(null)
   const resumedRunRef = useRef<string | null>(null)
-  const resumeHandlerRef = useRef<((runId: string, sessionId?: number) => Promise<void>) | null>(null)
+  const resumeHandlerRef = useRef<((
+    runId: string,
+    sessionId?: number,
+    streamAfter?: number,
+    timeline?: AgentRunTimeline | null,
+  ) => Promise<void>) | null>(null)
   const questionAnswerRequestRef = useRef<{
     questionId: string
     answerKey: string
@@ -482,7 +559,6 @@ export default function EditorPage() {
   } | null>(null)
   const questionActivityRef = useRef<{ questionId: string; lastSentAt: number } | null>(null)
   const questionTimeoutRecoveryRef = useRef<string | null>(null)
-  const complianceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const columnsRef = useRef<HTMLDivElement>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
   const htmlRef = useRef('')
@@ -677,26 +753,30 @@ export default function EditorPage() {
     window.addEventListener('pointercancel', finish)
   }, [resourceCollapsed])
 
-  const runComplianceCheck = useCallback(async (content: string) => {
+  // Only a completed official checker result is authoritative. Any local edit
+  // invalidates that snapshot, but never starts an HTTP compliance check.
+  const invalidateCompliance = useCallback(() => {
+    setCompliance(null)
+  }, [])
+
+  const handleManualComplianceCheck = useCallback(async () => {
+    if (complianceLoading) return
+    const snapshot = draftHtmlRef.current
+    const sourceDocumentId = documentIdRef.current
     setComplianceLoading(true)
     try {
-      const report = await complianceApi.check(content)
+      const report = await complianceApi.check(snapshot)
+      if (draftHtmlRef.current !== snapshot || documentIdRef.current !== sourceDocumentId) {
+        message.info('内容已变化，本次检测结果已失效')
+        return
+      }
       setCompliance(report)
-    } catch {
-      // 合规检测失败不阻断编辑
+    } catch (error) {
+      message.error(error instanceof ApiError ? String(error.detail) : '合规检测失败，请稍后重试')
     } finally {
       setComplianceLoading(false)
     }
-  }, [])
-
-  const scheduleComplianceCheck = useCallback(
-    (content: string) => {
-      if (complianceTimerRef.current) clearTimeout(complianceTimerRef.current)
-      setCompliance(null)
-      complianceTimerRef.current = setTimeout(() => runComplianceCheck(content), 600)
-    },
-    [runComplianceCheck],
-  )
+  }, [complianceLoading])
 
   const loadDocument = useCallback(async () => {
     if (!docId || Number.isNaN(docId)) return
@@ -788,7 +868,7 @@ export default function EditorPage() {
       const restoredThinkingPreference = resolveThinkingPreference(currentUser?.id, selectedModel)
       setThinkingMode(restoredThinkingPreference.mode)
       setThinkingEffort(restoredThinkingPreference.effort)
-      scheduleComplianceCheck(doc.current_html)
+      invalidateCompliance()
       markLoadStepCompleted('editor')
     } catch (err) {
       message.error(err instanceof ApiError ? String(err.detail) : '加载文档失败')
@@ -796,7 +876,7 @@ export default function EditorPage() {
     } finally {
       setLoading(false)
     }
-  }, [applyExternalHtml, currentUser?.id, docId, navigate, resolveStoredComposerDraft, scheduleComplianceCheck])
+  }, [applyExternalHtml, currentUser?.id, docId, invalidateCompliance, navigate, resolveStoredComposerDraft])
 
   const openImageLibrary = useCallback((tab: 'library' | 'search' | 'generate' = 'library', editCurrentImage = false) => {
     setCenterView('preview')
@@ -859,7 +939,6 @@ export default function EditorPage() {
     return () => {
       if (attachedEditorDocumentRef.current === (docId ?? null)) attachedEditorDocumentRef.current = null
       detachChatRunConnection(chatRunConnectionRef.current)
-      if (complianceTimerRef.current) clearTimeout(complianceTimerRef.current)
       cancelAutoSave()
     }
   }, [cancelAutoSave, docId, loadDocument])
@@ -870,6 +949,16 @@ export default function EditorPage() {
       return
     }
     if (streaming) return
+    const hasPendingContextInputs = Boolean(
+      contextDraft.trim()
+      || selectedElements.length > 0
+      || chatImages.length > 0,
+    )
+    // Keep the last provider-reported run value visible after completion. A
+    // plain preview is the value for the next request and used to overwrite
+    // the just-finished run, making the meter jump back from 84/100% to 64%.
+    // Any new composer input intentionally falls through and refreshes it.
+    if (contextStats?.runtime_context_source && !hasPendingContextInputs) return
     let active = true
     const timer = window.setTimeout(() => {
       void chatApi.previewContext(
@@ -944,7 +1033,7 @@ export default function EditorPage() {
           if (draftHtmlRef.current === snapshot) {
             draftHtmlRef.current = savedHtml
             setDraftHtml(savedHtml)
-            runComplianceCheck(savedHtml)
+            invalidateCompliance()
           }
           setPreviewRevision((value) => value + 1)
           setVersionRefreshToken((value) => value + 1)
@@ -963,7 +1052,7 @@ export default function EditorPage() {
       if (saved === null) return null
       if (!saveLatest) return saved
     }
-  }, [cancelAutoSave, docId, runComplianceCheck])
+  }, [cancelAutoSave, docId, invalidateCompliance])
 
   const scheduleAutoSave = useCallback(() => {
     cancelAutoSave()
@@ -977,9 +1066,9 @@ export default function EditorPage() {
     if (streaming || localizingArticleImages || next === draftHtmlRef.current) return
     draftHtmlRef.current = next
     setDraftHtml(next)
-    scheduleComplianceCheck(next)
+    invalidateCompliance()
     scheduleAutoSave()
-  }, [localizingArticleImages, scheduleAutoSave, scheduleComplianceCheck, streaming])
+  }, [invalidateCompliance, localizingArticleImages, scheduleAutoSave, streaming])
 
   const handleAppendTemplate = useCallback(async (template: TemplateItem) => {
     if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
@@ -1041,7 +1130,7 @@ export default function EditorPage() {
       applyExternalHtml(result.html)
       setPreviewRevision((value) => value + 1)
       setVersionRefreshToken((value) => value + 1)
-      scheduleComplianceCheck(result.html)
+      invalidateCompliance()
       message.success({
         key: progressMessageKey,
         content: result.localized_count ? `已转存 ${result.localized_count} 张外链图片` : '未发现需要转存的外链图片',
@@ -1056,7 +1145,7 @@ export default function EditorPage() {
     } finally {
       setLocalizingArticleImages(false)
     }
-  }, [applyExternalHtml, docId, localizingArticleImages, materializingTemplateImages, persistDraftHtml, saving, scheduleComplianceCheck, streaming])
+  }, [applyExternalHtml, docId, invalidateCompliance, localizingArticleImages, materializingTemplateImages, persistDraftHtml, saving, streaming])
 
   const handleExternalImagesPasted = useCallback(() => {
     // Wait for the iframe's native paste/input event to update draftHtmlRef.
@@ -1115,6 +1204,9 @@ export default function EditorPage() {
   const applySessionResourceContext = useCallback((updated: ChatSessionItem) => {
     setChatSessions((items) => items.map((item) => item.id === updated.id ? updated : item))
     if (updated.id === activeChatSessionId) {
+      // Attached templates change the next-request preview. Invalidate the
+      // retained post-run meter so the context effect recomputes it once.
+      setContextStats(null)
       const nextTemplates = updated.attached_templates ?? []
       setAttachedTemplates(nextTemplates)
       setComposerTemplates((items) => {
@@ -1325,6 +1417,7 @@ export default function EditorPage() {
     streamAfter = 0,
     ignoredUserQuestionId?: string,
     runOptions?: ChatRunOptions,
+    resumeTimeline?: AgentRunTimeline | null,
   ) => {
     const sessionId = sessionIdOverride ?? activeChatSessionId
     const requestModelId = runOptions?.modelId ?? modelId
@@ -1433,11 +1526,21 @@ export default function EditorPage() {
     }
     setStreaming(true)
     setStopping(false)
+    const restoredTimeline = !isNewRun && resumeTimeline ? {
+      tools: Array.isArray(resumeTimeline.tool_calls) ? resumeTimeline.tool_calls : [],
+      blocks: Array.isArray(resumeTimeline.turn_blocks) ? resumeTimeline.turn_blocks : [],
+      reasoning: resumeTimeline.reasoning ?? { status: 'idle', content: '', detail: '' },
+    } : null
     if (isNewRun) {
       setStreamText('')
       setToolActivities([])
       setStreamBlocks([])
       setReasoningTrace({ status: 'idle', content: '', detail: '' })
+    } else if (restoredTimeline) {
+      setStreamText(timelineContent(restoredTimeline.blocks))
+      setToolActivities(restoredTimeline.tools)
+      setStreamBlocks(restoredTimeline.blocks)
+      setReasoningTrace(restoredTimeline.reasoning)
     }
     setStreamNotice(null)
     setConversationError(null)
@@ -1446,13 +1549,13 @@ export default function EditorPage() {
     // A resumed run starts its SSE subscription after the question event, so
     // retain the locally rendered prefix instead of waiting for events that
     // will never be replayed.
-    let accumulated = isNewRun ? '' : streamText
+    let accumulated = isNewRun ? '' : restoredTimeline ? timelineContent(restoredTimeline.blocks) : streamText
     let latestHtml = persistedHtml
-    let activeTools: ToolExecution[] = isNewRun ? [] : toolActivities
-    let activeBlocks: AssistantTurnBlock[] = isNewRun ? [] : streamBlocks
+    let activeTools: ToolExecution[] = isNewRun ? [] : restoredTimeline ? restoredTimeline.tools : toolActivities
+    let activeBlocks: AssistantTurnBlock[] = isNewRun ? [] : restoredTimeline ? restoredTimeline.blocks : streamBlocks
     let activeReasoning: ReasoningTrace = isNewRun
       ? { status: 'idle', content: '', detail: '' }
-      : reasoningTrace
+      : restoredTimeline ? restoredTimeline.reasoning : reasoningTrace
     let modelTurnCheckpoint: {
       turn: number
       accumulated: string
@@ -1615,7 +1718,7 @@ export default function EditorPage() {
         setPreviewRevision((value) => value + 1)
         setMessages(await chatApi.listMessages(docId, sessionId))
         setPendingReaskMessageId(null)
-        scheduleComplianceCheck(latestHtml)
+        invalidateCompliance()
       }
       runId = run.run_id
       activeRunRef.current = run.run_id
@@ -1636,7 +1739,7 @@ export default function EditorPage() {
           applyExternalHtml(freshDocument.current_html)
           setPreviewRevision((value) => value + 1)
           setMessages(freshMessages)
-          scheduleComplianceCheck(freshDocument.current_html)
+          invalidateCompliance()
         }
         completed = true
       }
@@ -1779,11 +1882,15 @@ export default function EditorPage() {
               : block,
           )
           flushStreamRender()
+          if (evt.data.name === 'check_compliance') {
+            const report = complianceReportFromToolActivity(evt.data.activity)
+            if (report) setCompliance(report)
+          }
           if (evt.data.html) {
             latestHtml = evt.data.html
             applyExternalHtml(latestHtml)
             setPreviewRevision((value) => value + 1)
-            scheduleComplianceCheck(latestHtml)
+            invalidateCompliance()
           }
         } else if (evt.event === 'user_question') {
           // A retry after an accepted answer can replay the original question
@@ -1899,8 +2006,31 @@ export default function EditorPage() {
             retryStartedAtMs: Date.now() - received.eventAgeMs,
           })
           setThinkingStatus(retryReason)
+        } else if (evt.event === 'context_compaction') {
+          activeBlocks = [
+            ...activeBlocks,
+            {
+              id: evt.data.id ?? `context-compaction-${activeBlocks.length + 1}`,
+              type: 'context_compaction',
+              state: 'done',
+              content: '',
+              duration_ms: null,
+              tool: null,
+              context_compaction: {
+                summary: evt.data.summary,
+                original_tokens: evt.data.original_tokens,
+                used_tokens: evt.data.used_tokens,
+                summarized_cycles: evt.data.summarized_cycles,
+                digested_cycles: evt.data.digested_cycles,
+                dropped_cycles: evt.data.dropped_cycles,
+                summary_tokens: evt.data.summary_tokens,
+                durable_snapshot: evt.data.durable_snapshot,
+              },
+            },
+          ]
+          flushStreamRender()
         } else if (evt.event === 'context_stats') {
-          setContextStats(evt.data)
+          setContextStats((current) => mergeContextStats(current, evt.data))
         } else if (evt.event === 'heartbeat') {
           if (evt.data.phase === 'model_turn_started' && typeof evt.data.turn === 'number') {
             modelTurnCheckpoint = {
@@ -1941,7 +2071,7 @@ export default function EditorPage() {
           if (evt.data.compliance) {
             setCompliance(evt.data.compliance as ComplianceReport)
           } else {
-            scheduleComplianceCheck(latestHtml)
+            invalidateCompliance()
           }
           if (activeReasoning.content) {
             activeReasoning = { ...activeReasoning, status: 'complete' }
@@ -1991,7 +2121,9 @@ export default function EditorPage() {
               ])
               applyExternalHtml(freshDocument.current_html)
               setPreviewRevision((value) => value + 1)
-              scheduleComplianceCheck(freshDocument.current_html)
+              const recoveredCompliance = latestComplianceReportFromTools(runState.timeline?.tool_calls)
+              if (recoveredCompliance) setCompliance(recoveredCompliance)
+              else invalidateCompliance()
               setMessages(freshMessages)
               if (runState.status === 'failed') {
                 restoreSubmittedDraft(true)
@@ -2268,7 +2400,7 @@ export default function EditorPage() {
     if (reaskConflict.kind === 'local_draft') {
       applyExternalHtml(htmlRef.current)
       setPreviewRevision((value) => value + 1)
-      scheduleComplianceCheck(htmlRef.current)
+      invalidateCompliance()
     }
     setReaskConflict(null)
     setResolvingReaskConflict(false)
@@ -2418,7 +2550,12 @@ export default function EditorPage() {
     }
   }
 
-  resumeHandlerRef.current = async (runId: string, sessionId?: number) => handleSendMessage('', [], runId, undefined, sessionId)
+  resumeHandlerRef.current = async (
+    runId: string,
+    sessionId?: number,
+    streamAfter = 0,
+    timeline?: AgentRunTimeline | null,
+  ) => handleSendMessage('', [], runId, undefined, sessionId, undefined, undefined, [], [], 'structure', undefined, streamAfter, undefined, undefined, timeline)
 
   const handleStopAgent = async () => {
     const runId = activeRunRef.current
@@ -2630,6 +2767,14 @@ export default function EditorPage() {
     try {
       const stats = await chatApi.compactContext(docId, modelId, activeChatSession.id, rebuild)
       setContextStats(stats)
+      const compactionNotice = stats.compaction_notice
+      if (compactionNotice) {
+        setMessages((current) => (
+          current.some((item) => item.id === compactionNotice.id)
+            ? current
+            : [...current, compactionNotice]
+        ))
+      }
       if (stats.thinking_capability_fallback) {
         handleThinkingCapabilityFallback(stats.thinking_capability_fallback)
       }
@@ -2681,7 +2826,12 @@ export default function EditorPage() {
           return
         }
         setThinkingStatus('正在恢复 Agent 输出…')
-        await resumeHandlerRef.current?.(activeRun.run_id, activeRun.session_id)
+        await resumeHandlerRef.current?.(
+          activeRun.run_id,
+          activeRun.session_id,
+          activeRun.event_sequence,
+          activeRun.timeline,
+        )
       } catch (err) {
         if (!disposed) setConversationError(err instanceof ApiError ? String(err.detail) : '恢复 Agent 输出失败')
       }
@@ -2700,7 +2850,7 @@ export default function EditorPage() {
     if (docId && activeChatSessionId) clearChatComposerDraft(docId, activeChatSessionId)
     setContextDraft('')
     setCenterView('preview')
-    scheduleComplianceCheck(document.current_html)
+    invalidateCompliance()
     setVersionRefreshToken((value) => value + 1)
   }
 
@@ -2710,6 +2860,62 @@ export default function EditorPage() {
         ...(chatPaneWidth === null ? {} : { '--chat-pane-width': `${chatPaneWidth}px` }),
         ...(resourcePaneWidth === null ? {} : { '--resource-pane-width': `${resourcePaneWidth}px` }),
       } as CSSProperties)
+
+  const handleSetLibraryCover = useCallback(async (assetId: string) => {
+    const saved = await persistDraftHtml(false, true)
+    if (saved === null) throw new Error('正文保存失败')
+    try {
+      await imageLibraryApi.setCover(assetId, docId)
+      setVersionRefreshToken((value) => value + 1)
+      message.success('已设为文章封面')
+    } catch (error) {
+      message.error(error instanceof ApiError ? String(error.detail) : '设置封面失败')
+      throw error
+    }
+  }, [docId, persistDraftHtml])
+  // Streaming deltas only change the chat; keep resource previews and controls
+  // outside that update cycle while retaining all resource-specific inputs.
+  const resourceLibrary = useMemo(() => (
+    <TemplateLibraryPanel
+      modelId={modelId}
+      models={models}
+      disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+      canInsertAtCaret={centerView === 'preview' && previewMode === 'edit' && hasPreviewCaret}
+      attachedTemplateIds={attachedTemplates.map((item) => item.id)}
+      themeContext={activeChatSession?.theme_context ?? null}
+      onAppend={handleAppendTemplate}
+      onInsertAtCaret={handleInsertTemplateAtCaret}
+      onToggleAttach={toggleAttachedTemplate}
+      onClearThemeContext={() => { void clearSessionThemeContext() }}
+      collection={templateCollection}
+      onCollectionHandled={handleTemplateCollection}
+      activeResourceTab={activeResourceTab}
+      onResourceTabChange={setActiveResourceTab}
+      imagePanel={<ImageLibraryPanel
+        documentId={docId}
+        sessionId={activeChatSessionId}
+        initialModelId={activeChatSession?.image_model_id}
+        disabled={streaming || saving || localizingArticleImages}
+        applicationTarget={imageApplicationTarget}
+        selectedImage={activeCanvasImage}
+        command={imageLibraryCommand}
+        onApply={(url, alt) => Boolean(previewFrameRef.current?.applyLibraryImage(url, alt))}
+        onSetCover={handleSetLibraryCover}
+      />}
+      onOpenThemeGallery={(themeKey) => {
+        setResourceDrawerOpen(false)
+        setThemeGalleryInitialKey(themeKey ?? null)
+        setThemeGalleryOpen(true)
+      }}
+    />
+  ), [
+    modelId, models, streaming, saving, materializingTemplateImages, localizingArticleImages,
+    centerView, previewMode, hasPreviewCaret, attachedTemplates, activeChatSession,
+    handleAppendTemplate, handleInsertTemplateAtCaret, toggleAttachedTemplate,
+    clearSessionThemeContext, templateCollection, handleTemplateCollection,
+    activeResourceTab, docId, activeChatSessionId, imageApplicationTarget,
+    activeCanvasImage, imageLibraryCommand, handleSetLibraryCover,
+  ])
 
   if (loading) {
     const completedLoadProgress = WORKSPACE_LOAD_STEPS.reduce((total, step) => {
@@ -2784,52 +2990,6 @@ export default function EditorPage() {
     }
     selectCenterView(workspace)
   }
-  const handleSetLibraryCover = async (assetId: string) => {
-    const saved = await persistDraftHtml(false, true)
-    if (saved === null) throw new Error('正文保存失败')
-    try {
-      await imageLibraryApi.setCover(assetId, docId)
-      setVersionRefreshToken((value) => value + 1)
-      message.success('已设为文章封面')
-    } catch (error) {
-      message.error(error instanceof ApiError ? String(error.detail) : '设置封面失败')
-      throw error
-    }
-  }
-  const resourceLibrary = (
-    <TemplateLibraryPanel
-      modelId={modelId}
-      models={models}
-      disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
-      canInsertAtCaret={centerView === 'preview' && previewMode === 'edit' && hasPreviewCaret}
-      attachedTemplateIds={attachedTemplates.map((item) => item.id)}
-      themeContext={activeChatSession?.theme_context ?? null}
-      onAppend={handleAppendTemplate}
-      onInsertAtCaret={handleInsertTemplateAtCaret}
-      onToggleAttach={toggleAttachedTemplate}
-      onClearThemeContext={() => { void clearSessionThemeContext() }}
-      collection={templateCollection}
-      onCollectionHandled={handleTemplateCollection}
-      activeResourceTab={activeResourceTab}
-      onResourceTabChange={setActiveResourceTab}
-      imagePanel={<ImageLibraryPanel
-        documentId={docId}
-        sessionId={activeChatSessionId}
-        initialModelId={activeChatSession?.image_model_id}
-        disabled={streaming || saving || localizingArticleImages}
-        applicationTarget={imageApplicationTarget}
-        selectedImage={activeCanvasImage}
-        command={imageLibraryCommand}
-        onApply={(url, alt) => Boolean(previewFrameRef.current?.applyLibraryImage(url, alt))}
-        onSetCover={handleSetLibraryCover}
-      />}
-      onOpenThemeGallery={(themeKey) => {
-        setResourceDrawerOpen(false)
-        setThemeGalleryInitialKey(themeKey ?? null)
-        setThemeGalleryOpen(true)
-      }}
-    />
-  )
 
   return (
     <div className="editor-workbench">
@@ -2875,7 +3035,7 @@ export default function EditorPage() {
                 aria-label="资源库"
                 className="editor-mobile-toolbar-action"
                 icon={<AppstoreOutlined />}
-                disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+                disabled={saving || materializingTemplateImages || localizingArticleImages}
                 onClick={() => setResourceDrawerOpen(true)}
               />
             </Tooltip>
@@ -2992,7 +3152,7 @@ export default function EditorPage() {
                 icon={<AppstoreOutlined />}
                 aria-label="资源库"
                 type={!resourceCollapsed ? 'primary' : 'default'}
-                disabled={streaming || saving}
+                disabled={saving}
                 onClick={() => setResourceCollapsed((value) => !value)}
               >
                 资源库
@@ -3041,7 +3201,6 @@ export default function EditorPage() {
                 aria-label={`打开合规检测：${complianceButtonLabel}`}
                 className={`compliance-status-trigger is-${complianceButtonStatus}`}
                 icon={<SafetyCertificateOutlined />}
-                disabled={streaming}
                 onClick={() => setComplianceDrawerOpen(true)}
               />
             </Tooltip>
@@ -3050,7 +3209,6 @@ export default function EditorPage() {
                 aria-label="打开版本历史"
                 icon={<HistoryOutlined />}
                 type={versionDrawerOpen ? 'primary' : 'default'}
-                disabled={streaming}
                 onClick={() => setVersionDrawerOpen(true)}
               />
             </Tooltip>
@@ -3058,7 +3216,7 @@ export default function EditorPage() {
               <Button
                 aria-label="分享只读预览"
                 icon={<LinkOutlined />}
-                disabled={streaming || saving}
+                disabled={saving}
                 onClick={() => setDocumentShareOpen(true)}
               />
             </Tooltip>
@@ -3067,7 +3225,6 @@ export default function EditorPage() {
                 <Button
                   aria-label="打开原文校审"
                   icon={<FileSearchOutlined />}
-                  disabled={streaming}
                   onClick={() => setSourcePreviewOpen(true)}
                 />
               </Tooltip>
@@ -3378,7 +3535,6 @@ export default function EditorPage() {
             <Button
               icon={<SafetyCertificateOutlined />}
               className={`compliance-status-trigger is-${complianceButtonStatus}`}
-              disabled={streaming}
               onClick={() => {
                 setMobileActionsDrawerOpen(false)
                 setComplianceDrawerOpen(true)
@@ -3388,7 +3544,6 @@ export default function EditorPage() {
             </Button>
             <Button
               icon={<HistoryOutlined />}
-              disabled={streaming}
               onClick={() => {
                 setMobileActionsDrawerOpen(false)
                 setVersionDrawerOpen(true)
@@ -3398,7 +3553,7 @@ export default function EditorPage() {
             </Button>
             <Button
               icon={<LinkOutlined />}
-              disabled={streaming || saving}
+              disabled={saving}
               onClick={() => {
                 setMobileActionsDrawerOpen(false)
                 setDocumentShareOpen(true)
@@ -3409,7 +3564,6 @@ export default function EditorPage() {
             {hasSourceFile && (
               <Button
                 icon={<FileSearchOutlined />}
-                disabled={streaming}
                 onClick={() => {
                   setMobileActionsDrawerOpen(false)
                   setSourcePreviewOpen(true)
@@ -3455,7 +3609,11 @@ export default function EditorPage() {
         open={complianceDrawerOpen}
         onClose={() => setComplianceDrawerOpen(false)}
       >
-        <CompliancePanel report={compliance} loading={complianceLoading} />
+        <CompliancePanel
+          report={compliance}
+          loading={complianceLoading}
+          onCheck={() => void handleManualComplianceCheck()}
+        />
       </Drawer>
       <VersionHistoryDrawer
         documentId={docId}
@@ -3515,7 +3673,7 @@ export default function EditorPage() {
               setTitle(document.title)
               setPreviewRevision((value) => value + 1)
               setVersionRefreshToken((value) => value + 1)
-              scheduleComplianceCheck(document.current_html)
+              invalidateCompliance()
             }}
           />
         </Suspense>

@@ -1,3 +1,5 @@
+import { ImageTransformError, normalizeImageRotationDegrees, transformImageBlob } from './imageTransform'
+
 export const CROP_RECT_SCALE = 100_000
 const JPEG_CROP_QUALITY = 0.92
 
@@ -176,17 +178,20 @@ async function cropWithHtmlImage(source: Blob, rect: CropRect): Promise<Blob> {
   }
 }
 
-export async function cropImageBlob(source: Blob, rect: CropRect): Promise<Blob> {
+export async function cropImageBlob(source: Blob, rect: CropRect, rotationDegrees = 0): Promise<Blob> {
   if (source.type.toLowerCase() === 'image/gif') throw new ImageCropError('暂不支持裁剪 GIF 动图')
+  const rotation = normalizeImageRotationDegrees(rotationDegrees)
   let result: Blob
   try {
+    const rotated = rotation ? await transformImageBlob(source, { rotationDegrees: rotation }) : source
     if (typeof createImageBitmap === 'function' && typeof OffscreenCanvas !== 'undefined') {
-      result = await cropWithImageBitmap(source, rect)
+      result = await cropWithImageBitmap(rotated, rect)
     } else {
-      result = await cropWithHtmlImage(source, rect)
+      result = await cropWithHtmlImage(rotated, rect)
     }
   } catch (error) {
     if (error instanceof ImageCropError) throw error
+    if (error instanceof ImageTransformError) throw new ImageCropError(error.message)
     throw new ImageCropError('无法解码原图或生成裁剪图片')
   }
   return result

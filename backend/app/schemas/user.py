@@ -13,6 +13,7 @@ class UserRead(BaseModel):
     display_name: str
     role: UserRole
     is_active: bool
+    password_change_required: bool = False
     created_at: datetime
 
 

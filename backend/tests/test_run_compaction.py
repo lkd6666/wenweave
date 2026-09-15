@@ -11,18 +11,23 @@ import json
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.services.chat_agent import (
     RUN_VERBATIM_CYCLE_COUNT,
     _digest_cycle,
+    _effective_run_input_budget,
+    _message_tokens,
+    _provider_message_tokens,
+    _should_publish_runtime_compaction,
     _split_run_cycles,
     build_compaction_model,
     compact_run_messages,
     compact_run_messages_with_model,
     RuntimeCompactionError,
+    _dynamic_tool_result_limit,
     thinking_capability_fallback_data,
 )
 from app.services.agent_context import (
@@ -224,10 +229,161 @@ class RunCompactionTests(unittest.TestCase):
         _assert_tool_pairing(self, compacted)
         self.assertIsInstance(compacted[1], SystemMessage)
 
+    def test_model_summary_is_reused_without_recompacting_the_same_prefix(self) -> None:
+        messages = _conversation(8)
+        head, cycles = _split_run_cycles(messages)
+        budget = _tokens([
+            *head,
+            *(message for cycle in cycles[-RUN_VERBATIM_CYCLE_COUNT:] for message in cycle),
+        ]) + 1_000
+        compactor = self._Compactor()
+        compactor.ainvoke = AsyncMock(wraps=compactor.ainvoke)
+
+        first_projection, _ = asyncio.run(
+            compact_run_messages_with_model(messages, budget, compactor)
+        )
+        next_projection, next_stats = asyncio.run(
+            compact_run_messages_with_model([*first_projection, *_cycle(99)], budget, compactor)
+        )
+
+        self.assertEqual(compactor.ainvoke.await_count, 1)
+        self.assertEqual(next_stats["fallback"], "existing_summary")
+        _assert_tool_pairing(self, next_projection)
+
+    def test_reused_summary_does_not_emit_a_second_compaction_card(self) -> None:
+        """A later structural trim must not look like another model summary."""
+        summary = '{"objective":"继续处理当前任务"}'
+        state = {"last_announced": summary}
+
+        self.assertFalse(
+            _should_publish_runtime_compaction(
+                {
+                    "compacted": True,
+                    "fallback": "existing_summary",
+                    "summary": summary,
+                    "summarized_cycles": 0,
+                    "digested_cycles": 4,
+                },
+                state,
+            )
+        )
+        self.assertEqual(state["last_announced"], summary)
+
+    def test_first_model_summary_emits_one_compaction_card(self) -> None:
+        state: dict[str, object] = {}
+        compaction = {
+            "compacted": True,
+            "summary": '{"objective":"继续处理当前任务"}',
+            "summarized_cycles": 5,
+        }
+
+        self.assertTrue(_should_publish_runtime_compaction(compaction, state))
+        self.assertFalse(_should_publish_runtime_compaction(compaction, state))
+
     def test_model_compaction_failure_never_uses_deterministic_fallback(self) -> None:
         messages = _conversation(8)
         with self.assertRaisesRegex(RuntimeCompactionError, "运行中上下文压缩失败"):
             asyncio.run(compact_run_messages_with_model(messages, _tokens(messages) // 2, self._FailingCompactor()))
+
+    def test_tool_schema_cost_triggers_compaction_before_the_provider_limit(self) -> None:
+        """Tool JSON Schema is request input even though it is not a message."""
+        messages = _conversation(2)
+        message_tokens = _tokens(messages)
+        provider_threshold = 176_000
+        legacy_budget = provider_threshold - 3_500
+        # Reproduces the production failure: message-only accounting fits the
+        # old budget while the request with tools already exceeds the provider.
+        tool_schema_tokens = provider_threshold - message_tokens + 1
+
+        self.assertLess(message_tokens, legacy_budget)
+        self.assertGreater(message_tokens + tool_schema_tokens, provider_threshold)
+        effective_budget = _effective_run_input_budget(legacy_budget, tool_schema_tokens)
+        self.assertLess(effective_budget, message_tokens)
+
+        _, stats = asyncio.run(
+            compact_run_messages_with_model(messages, effective_budget, self._Compactor())
+        )
+
+        self.assertTrue(stats["compacted"])
+
+    def test_tool_preview_budget_uses_compacted_runtime_projection(self) -> None:
+        """A compacted run must not keep charging dropped audit cycles."""
+        old_history = _conversation(8)
+        runtime_projection = [
+            SystemMessage(content="系统规则"),
+            HumanMessage(content="本轮请求"),
+            AIMessage(content="已定位目标"),
+        ]
+
+        limit = _dynamic_tool_result_limit(
+            runtime_projection,
+            old_history,
+            run_budget_tokens=5_000,
+            tool_count=1,
+            max_preview_tokens=4_096,
+        )
+
+        self.assertGreater(limit, 256)
+        self.assertEqual(
+            _dynamic_tool_result_limit(
+                None,
+                old_history,
+                run_budget_tokens=5_000,
+                tool_count=1,
+                max_preview_tokens=4_096,
+            ),
+            256,
+        )
+        self.assertEqual(
+            limit,
+            min(4_096, max(256, (5_000 - _tokens(runtime_projection)))),
+        )
+
+    def test_tool_preview_budget_uses_provider_priced_remainder_directly(self) -> None:
+        runtime_projection = [
+            SystemMessage(content="系统规则"),
+            HumanMessage(content="本轮请求"),
+        ]
+        limit = _dynamic_tool_result_limit(
+            runtime_projection,
+            [],
+            run_budget_tokens=_provider_message_tokens(runtime_projection[0], 1.6)
+            + _provider_message_tokens(runtime_projection[1], 1.6)
+            + 1_600,
+            tool_count=1,
+            max_preview_tokens=4_096,
+            token_estimate_multiplier=1.6,
+        )
+
+        provider_remainder = 1_600
+        self.assertEqual(limit, provider_remainder)
+
+    def test_runtime_message_tokens_include_multimodal_image_cost(self) -> None:
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": "请检查图片"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ]
+        )
+
+        self.assertEqual(
+            _message_tokens(message),
+            estimate_tokens("请检查图片") + 1_024,
+        )
+
+    def test_provider_token_safety_factor_triggers_compaction_before_provider_limit(self) -> None:
+        """Chinese HTML can cost more than the neutral cl100k estimate."""
+        messages = _conversation(2)
+        local_tokens = _tokens(messages)
+        budget = int(local_tokens * 1.3)
+
+        _, local_stats = compact_run_messages(messages, budget)
+        _, provider_stats = compact_run_messages(
+            messages, budget, token_estimate_multiplier=1.6
+        )
+
+        self.assertFalse(local_stats["compacted"])
+        self.assertTrue(provider_stats["compacted"])
 
     def test_under_budget_conversation_is_returned_unchanged(self) -> None:
         messages = _conversation(2)

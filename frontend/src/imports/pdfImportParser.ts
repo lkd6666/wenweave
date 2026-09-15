@@ -1,6 +1,13 @@
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 import type { ImportParseProgress, ParsedImport, ParsedImportAsset } from './types'
 import {
+  hasRasterImageTransform,
+  pdfImageDisplayAspectRatio,
+  pdfMatrixToImageTransform,
+  rasterImageTransformKey,
+  transformImageBlob,
+} from '../utils/imageTransform'
+import {
   buildPdfTextBlocks,
   createPdfImageBlock,
   orderPdfBlocks,
@@ -150,16 +157,32 @@ export async function parsePdfInBrowser(
         let transform = [1, 0, 0, 1, 0, 0]
         const imageAssets = new Map<string, string>()
         const appendImage = async (imageValue: unknown, imageTransform: number[], objectId: string, rect?: { x?: number; y?: number; width?: number; height?: number }) => {
-        let clientId = objectId ? imageAssets.get(objectId) : undefined
+        const rasterTransform = pdfMatrixToImageTransform(imageTransform)
+        const imageWidth = Math.max(0.01, rect?.width ?? 1)
+        const imageHeight = Math.max(0.01, rect?.height ?? 1)
+        const displayAspectRatio = pdfImageDisplayAspectRatio(imageTransform, imageWidth, imageHeight)
+        const transformKey = rasterImageTransformKey(rasterTransform)
+        const aspectKey = displayAspectRatio ? Math.round(displayAspectRatio * 1000) / 1000 : 'unknown'
+        const assetKey = objectId ? `${objectId}:${transformKey}:${aspectKey}` : ''
+        let clientId = assetKey ? imageAssets.get(assetKey) : undefined
         if (!clientId) {
-          const blob = await imageObjectToPng(imageValue)
+          let blob = await imageObjectToPng(imageValue)
           if (!blob) {
             skippedImages += 1
             return
           }
+          if (hasRasterImageTransform(rasterTransform)) {
+            try {
+              blob = await transformImageBlob(blob, rasterTransform, {
+                outputAspectRatio: displayAspectRatio,
+              })
+            } catch (error) {
+              console.warn('PDF image transform conversion failed; preserving the original pixels', error)
+            }
+          }
           pageImageCount += 1
           clientId = `pdf-p${pageNumber}-image-${pageImageCount}`
-          if (objectId) imageAssets.set(objectId, clientId)
+          if (assetKey) imageAssets.set(assetKey, clientId)
           assets.push({ clientId, filename: `${clientId}.png`, contentType: 'image/png', blob })
         }
           blocks.push(createPdfImageBlock(clientId, imageTransform, pageHeight, operatorList.fnArray.length + blocks.length, rect))

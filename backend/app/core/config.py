@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     CHAT_AGENT_TURN_FINALIZATION_TIMEOUT_SECONDS: float = 30.0
     CHAT_AGENT_MODEL_MESSAGE_CONVERSION_TIMEOUT_SECONDS: float = 30.0
     CHAT_AGENT_COMPLIANCE_CHECK_TIMEOUT_SECONDS: float = 30.0
+    # The official WeChat checker uses a single, lazy Playwright Chromium
+    # worker. This timeout includes waiting for an earlier check in that
+    # worker's queue; a timeout yields an explicit "unverified" report.
+    WECHAT_COMPLIANCE_CHECK_TIMEOUT_SECONDS: float = Field(default=20.0, gt=0)
+    # Leave empty to use Playwright's managed Chromium. Set this when a
+    # deployment installs Chromium through its operating-system package manager.
+    WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH: str = ""
     # Deprecated compatibility alias for deployments that already configured
     # the earlier single idle limit. New deployments use the two limits above.
     CHAT_AGENT_MODEL_STREAM_IDLE_TIMEOUT_SECONDS: float = 300.0
@@ -97,7 +104,10 @@ class Settings(BaseSettings):
     CHAT_TOOL_OUTPUT_RETENTION_DAYS: int = 7
     CHAT_TOOL_OUTPUT_MAX_BYTES: int = 50 * 1024 * 1024
     CHAT_TOOL_OUTPUT_CLEANUP_INTERVAL_SECONDS: int = 3600
-    CHAT_AGENT_RUN_LEASE_SECONDS: int = 30
+    # Provider argument streams and terminal persistence can legitimately
+    # exceed thirty seconds. The control watcher renews this lease while the
+    # local worker is active; keep enough margin for a slow database roundtrip.
+    CHAT_AGENT_RUN_LEASE_SECONDS: int = 120
     CHAT_AGENT_RUN_EVENT_RETENTION_SECONDS: int = 3600
     CHAT_AGENT_RUN_LOCAL_EVENT_LIMIT: int = 128
     # Token streams are batched before they reach MySQL. This preserves a
@@ -108,8 +118,8 @@ class Settings(BaseSettings):
     CHAT_AGENT_RUN_LOCAL_TTL_SECONDS: int = 300
     CHAT_AGENT_LEASE_RECOVERY_INTERVAL_SECONDS: int = 5
     CHAT_AGENT_CONTEXT_STATS_STREAM_INTERVAL_SECONDS: float = 2.0
-    CHAT_AGENT_MAX_CONCURRENT_RUNS: int = 8
-    CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER: int = 2
+    CHAT_AGENT_MAX_CONCURRENT_RUNS: int = 10
+    CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER: int = 3
     CHAT_AGENT_STARTS_PER_MINUTE: int = 12
     # A paused ask_user call does not consume an execution slot. It is
     # automatically answered with ``no_response`` after this much completely

@@ -544,8 +544,8 @@ export default function WeChatDraftModal({
           style={{ marginBottom: 16 }}
         />
         <div className="wechat-draft-meta-grid">
-          <Form.Item name="title" label="文章标题" extra="与系统文章标题同步，用于微信草稿" rules={[{ required: true, whitespace: true, message: '请输入文章标题' }, { max: 32, message: '微信标题不能超过 32 个字' }]}>
-            <Input maxLength={32} showCount placeholder="系统文章标题" />
+          <Form.Item name="title" label="文章标题" extra="与系统文章标题同步，用于微信草稿" rules={[{ required: true, whitespace: true, message: '请输入文章标题' }, { max: 64, message: '微信标题不能超过 64 个字' }]}>
+            <Input maxLength={64} showCount placeholder="系统文章标题" />
           </Form.Item>
           <Form.Item name="author" label="作者" rules={[{ max: 16, message: '作者不能超过 16 个字' }]}>
             <Input maxLength={16} showCount placeholder="可选" />

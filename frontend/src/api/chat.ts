@@ -1,5 +1,5 @@
 import { ApiError, authenticatedFetch } from './client'
-import type { AgentRunStatus, ChangeSummary, ChatContextStats, ChatHistoryArchive, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, LayoutReferenceImitationStrength, ReadRange, SelectedElementContext, ToolActivity, ToolExecution } from '../types'
+import type { AgentRunStatus, AssistantTurnBlock, ChangeSummary, ChatContextCompactResult, ChatContextStats, ChatHistoryArchive, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ContextCompaction, LayoutReferenceImitationStrength, ReadRange, ReasoningTrace, SelectedElementContext, ToolActivity, ToolExecution } from '../types'
 import { sanitizeSelectedElements } from '../utils/selectedElements'
 
 const API_BASE = '/api'
@@ -39,6 +39,7 @@ export type ChatStreamEvent =
       }
     }
   | { event: 'context_stats'; data: ChatContextStats }
+  | { event: 'context_compaction'; data: ContextCompaction & { id?: string } }
   | {
       event: 'final'
       data: {
@@ -54,6 +55,12 @@ export type ChatStreamEvent =
     }
   | { event: 'error'; data: { message: string } }
 
+export interface AgentRunTimeline {
+  tool_calls: ToolExecution[]
+  reasoning: ReasoningTrace
+  turn_blocks: AssistantTurnBlock[]
+}
+
 export interface AgentRunInfo {
   run_id: string
   session_id: number
@@ -61,6 +68,8 @@ export interface AgentRunInfo {
   user_message_id: number
   assistant_message_id: number | null
   error_message: string
+  event_sequence: number
+  timeline?: AgentRunTimeline | null
   reask_activation?: { archive_id: number; source_message_id: number; current_html: string } | null
   user_question?: ChatUserQuestion | null
 }
@@ -287,6 +296,10 @@ export async function* streamChatRunEvents(
       }
     }
   } finally {
+    // A question/final event can end consumption while the SSE response is
+    // still open. Releasing the lock alone keeps the network body buffering;
+    // explicitly cancel it on early exit and on local abort.
+    await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
 }
@@ -390,7 +403,7 @@ export const chatApi = {
       template_ids: templateIds.slice(0, 6),
     },
   ),
-  compactContext: (documentId: number, modelId: number, sessionId: number, rebuild = false) => apiPost<ChatContextStats>(
+  compactContext: (documentId: number, modelId: number, sessionId: number, rebuild = false) => apiPost<ChatContextCompactResult>(
     `/documents/${documentId}/chat-context/compact`,
     { model_id: modelId, session_id: sessionId, rebuild },
   ),
@@ -442,7 +455,7 @@ async function readWithInactivityTimeout(
     }
     const onAbort = () => finish(() => reject(signal?.reason ?? new DOMException('请求已取消', 'AbortError')))
     const timer = window.setTimeout(() => {
-      void reader.cancel()
+      void reader.cancel().catch(() => undefined)
       finish(() => reject(new StreamInactivityError('实时连接长时间没有数据，正在重新连接')))
     }, STREAM_INACTIVITY_TIMEOUT_MS)
 

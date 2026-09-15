@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Empty, Input, Modal, Pagination, Popconfirm, Segmented, Select, Spin, Tooltip, message } from 'antd'
 import {
   AppstoreAddOutlined,
@@ -118,7 +118,10 @@ function RichTemplateEditor({ html, onChange }: { html: string; onChange: (html:
   return <div className="template-rich-editor"><iframe ref={iframeRef} title="粘贴内容编辑" sandbox="allow-same-origin" srcDoc={sourceRef.current} onLoad={handleLoad} /></div>
 }
 
-function TemplatePreview({ html, title }: { html: string; title: string }) {
+const TemplatePreview = memo(function TemplatePreview({ html, title }: { html: string; title: string }) {
+  // Chat deltas rerender the resource panel; unchanged previews must not parse
+  // another browser Document on each update (including height updates).
+  const srcDoc = useMemo(() => previewDocument(html), [html])
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const cleanupRef = useRef<() => void>(() => undefined)
   const [height, setHeight] = useState(166)
@@ -148,10 +151,15 @@ function TemplatePreview({ html, title }: { html: string; title: string }) {
 
   return (
     <div className="template-library-preview" style={{ height }}>
-      <iframe ref={iframeRef} title={title} sandbox={SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW} scrolling="no" srcDoc={previewDocument(html)} onLoad={handleLoad} style={{ height }} />
+      <iframe ref={iframeRef} title={title} sandbox={SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW} scrolling="no" srcDoc={srcDoc} onLoad={handleLoad} style={{ height }} />
     </div>
   )
-}
+})
+
+const ResourcePreviewFrame = memo(function ResourcePreviewFrame({ html, title, theme = false }: { html: string; title: string; theme?: boolean }) {
+  const srcDoc = useMemo(() => theme ? frameThemeDocument(html) : previewDocument(html), [html, theme])
+  return <iframe title={title} sandbox={SANDBOX_ALLOW_NEW_WINDOW} srcDoc={srcDoc} />
+})
 
 function asErrorMessage(error: unknown, fallback: string): string {
   return error instanceof ApiError ? String(error.detail) : fallback
@@ -629,7 +637,7 @@ export default function TemplateLibraryPanel({
                 return (
                   <button type="button" className="theme-library-preview-card" key={theme.key} onClick={() => onOpenThemeGallery(theme.key)} disabled={disabled || !modelId}>
                     <span className="theme-library-preview-frame" style={{ borderTopColor: theme.accent_color }}>
-                      {preview ? <iframe title={`${theme.name} 预览`} sandbox={SANDBOX_ALLOW_NEW_WINDOW} srcDoc={frameThemeDocument(preview)} /> : <LoadingOutlined />}
+                      {preview ? <ResourcePreviewFrame title={`${theme.name} 预览`} html={preview} theme /> : <LoadingOutlined />}
                     </span>
                     <span className="theme-library-preview-meta"><strong>{theme.name}</strong><i style={{ background: theme.accent_color }} /></span>
                     <small>{theme.scenarios.slice(0, 3).join(' · ')}</small>
@@ -711,7 +719,7 @@ export default function TemplateLibraryPanel({
             </section>
             <section className="template-editor-preview">
               <span>沙箱预览</span>
-              <iframe title="模板实时预览" sandbox={SANDBOX_ALLOW_NEW_WINDOW} srcDoc={previewDocument(draft.mode === 'ai' ? generation?.output_html ?? '' : draft.html)} />
+              <ResourcePreviewFrame title="模板实时预览" html={draft.mode === 'ai' ? generation?.output_html ?? '' : draft.html} />
             </section>
           </div>
         )}

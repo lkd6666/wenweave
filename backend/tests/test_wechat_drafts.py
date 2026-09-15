@@ -682,6 +682,13 @@ class WeChatHttpClientTests(unittest.TestCase):
             f"<p>{'正文' * 10_001}</p>",
         )
 
+    def test_accepts_wechat_title_up_to_64_characters(self) -> None:
+        title = "标题" * 32
+        WeChatOfficialAccountClient.validate_draft_input(
+            WeChatArticleMetadata(title=title, cover_url="https://images.example.com/cover.png"),
+            "<p>正文</p>",
+        )
+
     def test_allows_browser_recoverable_p_section_nesting(self) -> None:
         WeChatOfficialAccountClient.validate_draft_input(
             WeChatArticleMetadata(title="标题", cover_url="https://images.example.com/cover.png"),

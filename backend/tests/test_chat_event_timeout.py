@@ -18,6 +18,7 @@ import app.bootstrap as bootstrap_module
 from app.db.base import Base
 from app.api.routes.chat import _agent_execution_error_message, _force_stuck_cancellation, _has_external_document_conflict, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _preserve_retried_tool_previews, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
 from app.models.agent_run import AgentRun, AgentRunStatus
+from app.models.agent_run_event import AgentRunEvent
 from app.models.chat_user_question import ChatUserQuestion, ChatUserQuestionStatus
 from app.models.chat_message import ChatMessage
 from app.models.document import Document
@@ -28,6 +29,62 @@ from app.services.chat_agent import ModelStreamCleanupError, ModelStreamTimeoutE
 
 
 class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    def test_live_run_timeline_returns_a_snapshot_at_the_durable_cursor(self) -> None:
+        engine = create_engine("sqlite://")
+        session_factory = sessionmaker(bind=engine)
+        Base.metadata.create_all(engine)
+        try:
+            with session_factory() as db:
+                run = AgentRun(
+                    id="run-live-snapshot",
+                    document_id=1,
+                    session_id=1,
+                    user_id=1,
+                    user_message_id=1,
+                    client_request_id="request-live-snapshot",
+                    status=AgentRunStatus.RUNNING,
+                    event_sequence=3,
+                )
+                db.add(run)
+                db.add_all([
+                    AgentRunEvent(
+                        run_id=run.id,
+                        sequence=1,
+                        event="reasoning_delta",
+                        payload_json='{"text":"先检查标题。"}',
+                    ),
+                    AgentRunEvent(
+                        run_id=run.id,
+                        sequence=2,
+                        event="tool_call",
+                        payload_json='{"id":"tool-1","name":"read_blocks","arguments":{}}',
+                    ),
+                    AgentRunEvent(
+                        run_id=run.id,
+                        sequence=3,
+                        event="text_delta",
+                        payload_json='{"text":"正在调整标题层级"}',
+                    ),
+                    AgentRunEvent(
+                        run_id=run.id,
+                        sequence=4,
+                        event="text_delta",
+                        payload_json='{"text":"不应进入快照"}',
+                    ),
+                ])
+                db.commit()
+
+                timeline = chat_module._live_run_timeline(db, run)
+                payload = chat_module._run_read(run, timeline=timeline)
+
+            self.assertIsNotNone(timeline)
+            assert timeline is not None
+            self.assertEqual(timeline.reasoning.content, "先检查标题。")
+            self.assertEqual(timeline.turn_blocks[-1].content, "正在调整标题层级")
+            self.assertEqual(payload.event_sequence, 3)
+        finally:
+            engine.dispose()
+
     def test_persisted_waiting_question_is_readable_after_session_closes(self) -> None:
         engine = create_engine("sqlite://")
         session_factory = sessionmaker(bind=engine)

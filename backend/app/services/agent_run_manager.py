@@ -352,7 +352,7 @@ class AgentRunManager:
                         if run.flush_task is None or run.flush_task.done():
                             run.flush_task = asyncio.create_task(self._flush_after_delay(run.run_id))
                         return
-            if event == "context_stats":
+            if event == "context_stats" and data.get("state") != "tool_result_context":
                 # Keep one snapshot but place its replacement at the tail: the
                 # state is observed now, not at the time of the superseded one.
                 prior_index: int | None = None

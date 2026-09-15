@@ -44,6 +44,8 @@ SUPPORTED_THEME_REFERENCE_TYPES = {"image/jpeg", "image/png", "image/webp", "ima
 THEME_GENERATION_TIMEOUT_SECONDS = max(60.0, float(get_settings().TEMPLATE_GENERATION_TIMEOUT_SECONDS))
 THEME_GENERATION_CLEANUP_GRACE_SECONDS = 10.0
 THEME_COMPONENT_BATCH_SIZE = 3
+THEME_MODEL_RECONNECT_ATTEMPTS = 2
+THEME_MODEL_RECONNECT_DELAY_SECONDS = 1.0
 _FORBIDDEN_PREVIEW = re.compile(
     r"<\s*/?\s*(?:script|style|iframe|object|embed|form|input|button|textarea|select|video|audio|canvas|svg)\b|@font-face|expression\s*\(",
     re.IGNORECASE,
@@ -478,7 +480,7 @@ def _prompt_for_blueprint(db: Session, generation: GzhThemeGeneration, *, repair
     scenario_text = "、".join(_json_list(generation.scenarios_json)) or "请自动推导至少 3 个适用场景"
     slots = [{"id": slot.id, "default_name": slot.name, "purpose": slot.purpose} for slot in THEME_COMPONENT_SLOTS]
     base_context = _base_theme_summary(db, generation)
-    repair = f"\n上一次蓝图校验失败，必须逐条修复：{repair_errors}\n" if repair_errors else ""
+    repair = _repair_feedback(repair_errors, "主题蓝图")
     return f"""你是微信公众号文章主题设计器。先生成主题蓝图，不生成 HTML 组件，不生成文章正文。
 
 用户风格描述：{generation.brief}
@@ -515,7 +517,7 @@ def _prompt_for_component_batch(
         "accent_color": blueprint["accent_color"],
         "design_tokens": blueprint["design_tokens"],
     }
-    repair = f"\n上一次当前批次校验失败，必须逐条修复：{repair_errors}\n" if repair_errors else ""
+    repair = _repair_feedback(repair_errors, "当前组件批次")
     return f"""你是微信公众号文章主题组件设计器。为已确认的主题蓝图生成当前 3 个以内的静态 HTML 组件。
 
 用户风格描述：{generation.brief}
@@ -527,8 +529,20 @@ def _prompt_for_component_batch(
 只返回当前组件编号，每个编号恰好一次，并按请求顺序排列。每个组件的 HTML 只生成静态公众号富文本：
 - 所有可见文字必须使用 <span leaf="">文字</span> 包裹。
 - 仅使用 section、p、span、strong、em、code、img、figure、figcaption、hr、br、table、thead、tbody、tr、th、td、a；所有样式写在元素自身的 style 中。
-- 禁止 HTML 文档壳、style/script、class/id、SVG、表单、交互、外部字体和复杂布局；table 仅能表达真实数据表格。
+- 根容器只能使用 <section>，绝不能使用 <div>；同时禁止 HTML 文档壳、style/script、class/id、SVG、表单、交互、外部字体和复杂布局；table 仅能表达真实数据表格。
 - 组件内容使用展示型占位文案，不得复制参考图中的文字、商标或图片素材；每个组件控制在约 200-500 个中文字符的简洁预览规模。"""
+
+
+def _repair_feedback(errors: str, subject: str) -> str:
+    if not errors.strip():
+        return ""
+    return f"""
+上一轮{subject}被服务端校验拒绝。以下是必须修复的硬性反馈，不是给用户的说明：
+<validation_feedback>
+{errors.strip()}
+</validation_feedback>
+请只返回修正后的完整结果，逐条消除上述问题；不要解释错误、不要沿用不兼容标签或属性。
+"""
 
 
 def _message_content(db: Session, generation: GzhThemeGeneration, assets: list[GzhThemeReferenceAsset], provider_type: str, prompt: str) -> str | list[dict[str, Any]]:
@@ -644,12 +658,78 @@ async def _generate_stage(
             message=message if attempt == 0 else f"正在修复：{message}",
         )
         try:
-            result = await request(repair_errors)
+            result = await _request_with_reconnect(
+                db,
+                generation,
+                stage=stage,
+                current=current,
+                message=message,
+                request=request,
+                repair_errors=repair_errors,
+            )
             _raise_if_cancelled(db, generation)
             return validate(result)
         except (GzhThemeGenerationError, GzhThemeError) as exc:
             repair_errors = str(exc)
     raise GzhThemeGenerationError(repair_errors or "主题生成阶段未通过校验")
+
+
+def _is_reconnectable_model_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 429} or status_code >= 500
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "connection error",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "connect timeout",
+        "network error",
+        "network is unreachable",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+    ))
+
+
+async def _request_with_reconnect(
+    db: Session,
+    generation: GzhThemeGeneration,
+    *,
+    stage: str,
+    current: int,
+    message: str,
+    request,
+    repair_errors: str,
+) -> Any:
+    for connection_attempt in range(1, THEME_MODEL_RECONNECT_ATTEMPTS + 1):
+        _raise_if_cancelled(db, generation)
+        try:
+            return await request(repair_errors)
+        except _GenerationCancelled:
+            raise
+        except Exception as exc:
+            if connection_attempt >= THEME_MODEL_RECONNECT_ATTEMPTS or not _is_reconnectable_model_error(exc):
+                raise
+            _set_progress(
+                db,
+                generation,
+                stage="reconnecting",
+                current=current,
+                total=THEME_GENERATION_PROGRESS_TOTAL,
+                message=(
+                    f"模型连接中断，正在重新连接（{connection_attempt + 1}/"
+                    f"{THEME_MODEL_RECONNECT_ATTEMPTS}）：{message}"
+                ),
+            )
+            await asyncio.sleep(THEME_MODEL_RECONNECT_DELAY_SECONDS)
+    raise GzhThemeGenerationError("模型连接重试耗尽")
 
 
 def _table_cell(value: str) -> str:

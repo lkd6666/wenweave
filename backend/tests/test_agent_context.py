@@ -7,9 +7,15 @@ from unittest.mock import patch
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from app.api.routes.chat import _merge_runtime_context_stats, _persist_runtime_compaction_snapshot
+from app.api.routes.chat import (
+    _context_compaction_event_data,
+    _context_compaction_notice_content,
+    _merge_runtime_context_stats,
+    _persist_context_compaction_notice,
+    _persist_runtime_compaction_snapshot,
+)
 from app.bootstrap import _legacy_snapshot_prefix_hash
 from app.models.ai_model import AIModel
 from app.models.chat_message import ChatMessage, MessageRole
@@ -19,6 +25,7 @@ from app.models.chat_context_snapshot import ChatContextSnapshot
 from app.models.chat_session import ChatSession, ChatSessionMemory
 from app.db.base import Base
 from app.services.agent_context import AgentContextBuilder, COMPACTION_TARGET_TOKENS, ContextRecord, context_prefix_hash
+from app.services.chat_agent import _runtime_context_stats_for_messages
 from app.services.html_workspace import HtmlWorkspace
 from app.schemas.ai_provider import ModelCreate
 
@@ -366,6 +373,8 @@ class AgentContextBuilderTests(unittest.TestCase):
         self.assertEqual(measured["state"], "ready")
         self.assertEqual(measured["runtime_input_tokens"], 4_000)
         self.assertEqual(measured["last_model_output_tokens"], 900)
+        self.assertEqual(measured["runtime_context_tokens"], 4_000)
+        self.assertEqual(measured["runtime_context_source"], "provider_reported")
         self.assertEqual(compacted["used_tokens"], 12_000)
         self.assertEqual(compacted["runtime_original_tokens"], 20_000)
         self.assertEqual(compacted["runtime_digested_cycles"], 4)
@@ -373,6 +382,93 @@ class AgentContextBuilderTests(unittest.TestCase):
         self.assertEqual(streaming["runtime_input_tokens"], 5_200)
         self.assertEqual(streaming["runtime_projected_tokens"], 640)
         self.assertEqual(streaming["runtime_tool_argument_tokens"], 140)
+
+        after_tool = _merge_runtime_context_stats(
+            prepared,
+            {
+                "state": "tool_result_context",
+                "used_tokens": 5_800,
+                "context_source": "server_recomputed_after_tool",
+                "context_is_estimate": True,
+                "tool_call_id": "call-7",
+                "tool_name": "read_blocks",
+                "breakdown": {"runtime_system": 1_000, "runtime_history": 2_000, "runtime_tools": 2_800},
+            },
+        )
+        self.assertEqual(after_tool["used_tokens"], 12_000)
+        self.assertEqual(after_tool["runtime_context_tokens"], 5_800)
+        self.assertEqual(after_tool["runtime_context_breakdown"]["runtime_tools"], 2_800)
+        self.assertEqual(after_tool["runtime_context_source"], "server_recomputed_after_tool")
+        self.assertEqual(after_tool["runtime_context_tool_call_id"], "call-7")
+
+    def test_runtime_context_stats_rebuild_the_next_turn_message_sequence(self) -> None:
+        stats = _runtime_context_stats_for_messages([
+            SystemMessage(content="系统规则"),
+            HumanMessage(content="请调整标题"),
+            AIMessage(content="", tool_calls=[{"id": "call-1", "name": "read_blocks", "args": {"block_ids": ["b1"]}}]),
+            ToolMessage(content='{"ok":true,"blocks":["标题"]}', tool_call_id="call-1", name="read_blocks"),
+        ])
+
+        self.assertEqual(stats["used_tokens"], sum(stats["breakdown"].values()))
+        self.assertGreater(stats["breakdown"]["runtime_system"], 0)
+        self.assertGreater(stats["breakdown"]["runtime_history"], 0)
+        self.assertGreater(stats["breakdown"]["runtime_tools"], 0)
+
+    def test_manual_compaction_notice_uses_actual_before_and_after_context_sizes(self) -> None:
+        content = _context_compaction_notice_content(
+            {"compiled_input_tokens": 20_000},
+            {"compiled_input_tokens": 5_000, "state": "compacted"},
+        )
+
+        self.assertEqual(content, "压缩上下文成功，节省 15,000 tokens，压缩率 75%（20,000 → 5,000 tokens）。")
+
+    def test_preflight_compaction_event_contains_saved_tokens(self) -> None:
+        event = _context_compaction_event_data(
+            {"compiled_input_tokens": 30_000, "state": "requires_compaction"},
+            {"compiled_input_tokens": 8_000, "state": "compacted"},
+        )
+
+        self.assertEqual(event["original_tokens"], 30_000)
+        self.assertEqual(event["used_tokens"], 8_000)
+        self.assertTrue(event["durable_snapshot"])
+
+    def test_manual_compaction_notice_does_not_claim_a_noop_was_compacted(self) -> None:
+        content = _context_compaction_notice_content(
+            {"used_tokens": 2_000},
+            {"used_tokens": 2_000, "state": "ready"},
+        )
+
+        self.assertEqual(content, "上下文检查完成，本次无需压缩（当前 2,000 tokens）。")
+
+    def test_manual_compaction_notice_is_not_replayed_to_the_model(self) -> None:
+        request = self.add_turn("继续调整正文", MessageRole.USER)
+        self.db.add(
+            ChatContextEvent(
+                document_id=1,
+                session_id=self.session.id,
+                message_id=request.id,
+                ordinal=0,
+                kind=ContextEventKind.USER,
+                payload_json=json.dumps({"content": request.content}, ensure_ascii=False),
+            )
+        )
+        notice = _persist_context_compaction_notice(
+            self.db,
+            document_id=1,
+            session_id=self.session.id,
+            before_stats={"used_tokens": 20_000},
+            after_stats={"used_tokens": 5_000, "state": "compacted"},
+        )
+        self.db.commit()
+
+        prepared = self.builder([request, notice]).snapshot()
+
+        self.assertEqual(notice.role, MessageRole.TOOL)
+        self.assertEqual(
+            self.db.query(ChatContextEvent).filter(ChatContextEvent.message_id == notice.id).count(),
+            0,
+        )
+        self.assertEqual(prepared["event_count"], 1)
 
     def test_model_budget_schema_rejects_impossible_window(self) -> None:
         with self.assertRaises(ValidationError):

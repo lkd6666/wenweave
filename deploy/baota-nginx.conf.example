@@ -4,8 +4,8 @@ server {
     listen [::]:80;
     server_name example.com;
 
-    # Let the application enforce its 30 MB import limit with multipart overhead.
-    client_max_body_size 35m;
+    # Let the application enforce its 50 MB import limit with multipart overhead.
+    client_max_body_size 55m;
 
     # Keep agent tokens unbuffered and prohibit cache/CDN storage for SSE.
     location ~ ^/api/documents/[0-9]+/(?:chat-runs/[A-Za-z0-9-]+/events|wechat-drafts/stream)$ {

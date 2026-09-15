@@ -2,14 +2,32 @@ import JSZip from 'jszip'
 import { DOMParser } from '@xmldom/xmldom'
 import type { CropRect } from '../utils/imageCrop'
 import { wordSourceRectToCropRect } from '../utils/imageCrop'
+import { hasRasterImageTransform, normalizeImageRotationDegrees, type RasterImageTransform } from '../utils/imageTransform'
 
 export interface WordImageOccurrence {
   cropRect: CropRect | null
   relationshipId: string | null
+  transform?: RasterImageTransform
   displaySize?: {
     widthPx: number
     heightPx: number
   }
+}
+
+function drawingTransform(drawing: Element): RasterImageTransform | undefined {
+  const shapeProperties = descendantElements(drawing, 'spPr')[0]
+  const transform = shapeProperties && descendantElements(shapeProperties, 'xfrm')[0]
+  if (!transform) return undefined
+  const rawRotation = Number(attribute(transform, 'rot'))
+  const rotationDegrees = Number.isFinite(rawRotation) ? normalizeImageRotationDegrees(rawRotation / 60_000) : 0
+  const flipHorizontal = ['1', 'true', 'on'].includes((attribute(transform, 'flipH') ?? '').toLowerCase())
+  const flipVertical = ['1', 'true', 'on'].includes((attribute(transform, 'flipV') ?? '').toLowerCase())
+  const result = {
+    ...(rotationDegrees ? { rotationDegrees } : {}),
+    ...(flipHorizontal ? { flipHorizontal } : {}),
+    ...(flipVertical ? { flipVertical } : {}),
+  }
+  return hasRasterImageTransform(result) ? result : undefined
 }
 
 const WORD_DOCUMENT_PATH = 'word/document.xml'
@@ -73,10 +91,12 @@ function displaySizeForDrawing(drawing: Element): WordImageOccurrence['displaySi
 
 function appendDrawingOccurrences(drawing: Element, occurrences: WordImageOccurrence[]) {
   const displaySize = displaySizeForDrawing(drawing)
+  const transform = drawingTransform(drawing)
   for (const blip of descendantElements(drawing, 'blip')) {
     occurrences.push({
       cropRect: cropForBlip(blip),
       relationshipId: attribute(blip, 'embed', RELATIONSHIPS_NAMESPACE) ?? attribute(blip, 'link', RELATIONSHIPS_NAMESPACE),
+      ...(transform ? { transform } : {}),
       ...(displaySize ? { displaySize } : {}),
     })
   }

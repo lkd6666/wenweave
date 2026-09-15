@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent } from 'react'
+import type { ChangeEvent, ClipboardEvent, DragEvent } from 'react'
 import { Alert, Button, Checkbox, Dropdown, Empty, Image, Input, InputNumber, Modal, Pagination, Popconfirm, Select, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd'
 import { DeleteOutlined, EditOutlined, EyeOutlined, MoreOutlined, PictureOutlined, ReloadOutlined, StopOutlined, UploadOutlined } from '@ant-design/icons'
 import { imageLibraryApi } from '../api/imageLibrary'
@@ -36,9 +36,9 @@ function ImagePreviewAction({ src, alt }: { src: string; alt: string }) {
     <Tooltip title="预览图片">
       <Button size="small" aria-label={`预览图片：${alt}`} icon={<EyeOutlined />} onClick={() => setOpen(true)} />
     </Tooltip>
-    <span className="image-library-preview-source" aria-hidden="true">
+    {open && <span className="image-library-preview-source" aria-hidden="true">
       <Image src={src} alt={alt} preview={{ visible: open, onVisibleChange: setOpen }} />
-    </span>
+    </span>}
   </>
 }
 
@@ -113,6 +113,8 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   const searchCacheRef = useRef(new Map<string, ImageSearchResult>())
   const generationRefreshRef = useRef<Promise<ImageGenerationItem> | null>(null)
   const uploadInputRef = useRef<HTMLInputElement>(null)
+  const dragDepthRef = useRef(0)
+  const [dragActive, setDragActive] = useState(false)
 
   useEffect(() => {
     if (!command) return
@@ -191,17 +193,66 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
     return true
   }
 
-  const uploadFiles = (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? [])
-    event.currentTarget.value = ''
-    if (!files.length || uploading) return
-    const batch = files.slice(0, 20)
-    if (files.length > 20) message.warning('每次最多上传 20 张图片')
+  const uploadFiles = useCallback((files: File[]) => {
+    if (!files.length || uploading || disabled) return
+    const imageFiles = files.filter((file) => file.type.startsWith('image/'))
+    if (imageFiles.length !== files.length) message.warning('仅支持上传图片文件')
+    if (!imageFiles.length) return
+    const batch = imageFiles.slice(0, 20)
+    if (imageFiles.length > 20) message.warning('每次最多上传 20 张图片')
     setUploading(true)
     void imageLibraryApi.upload(documentId, batch).then(() => {
       message.success(`已上传 ${batch.length} 张图片`)
       return loadLibrary(1)
     }).catch((error) => message.error(errorMessage(error, '上传图片失败'))).finally(() => setUploading(false))
+  }, [disabled, documentId, loadLibrary, uploading])
+
+  const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? [])
+    event.currentTarget.value = ''
+    uploadFiles(files)
+  }
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    if (disabled || uploading) return
+    dragDepthRef.current += 1
+    setDragActive(true)
+  }
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    if (!disabled && !uploading) event.dataTransfer.dropEffect = 'copy'
+  }
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    dragDepthRef.current -= 1
+    if (dragDepthRef.current <= 0) {
+      dragDepthRef.current = 0
+      setDragActive(false)
+    }
+  }
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    dragDepthRef.current = 0
+    setDragActive(false)
+    uploadFiles(Array.from(event.dataTransfer.files))
+  }
+
+  const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
+    if (disabled || uploading) return
+    const files = Array.from(event.clipboardData.items).flatMap((item, index) => {
+      if (item.kind !== 'file' || !item.type.startsWith('image/')) return []
+      const blob = item.getAsFile()
+      if (!blob) return []
+      const extension = item.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+      return [new File([blob], `pasted-image-${Date.now()}-${index}.${extension}`, { type: item.type })]
+    })
+    if (!files.length) return
+    event.preventDefault()
+    uploadFiles(files)
   }
 
   const rename = async () => {
@@ -316,19 +367,37 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
     }
   }
 
-  const libraryTab = <div className="image-library-content">
+  const libraryTab = <div
+    className={`image-library-content${dragActive ? ' is-dragging' : ''}`}
+    onDragEnter={handleDragEnter}
+    onDragOver={handleDragOver}
+    onDragLeave={handleDragLeave}
+    onDrop={handleDrop}
+    onPaste={handlePaste}
+  >
     <div className="image-library-toolbar">
       <Input.Search allowClear placeholder="搜索图片" value={query} onChange={(event) => setQuery(event.target.value)} />
       <Select aria-label="图片来源" value={source} onChange={setSource} options={[{ value: 'all', label: '全部来源' }, { value: 'upload', label: '上传' }, { value: 'ai', label: 'AI' }, { value: 'search', label: '搜图' }]} />
-      <input ref={uploadInputRef} type="file" hidden multiple accept="image/jpeg,image/png,image/gif,image/webp,image/avif,image/bmp" onChange={uploadFiles} />
+      <input ref={uploadInputRef} type="file" hidden multiple accept="image/jpeg,image/png,image/gif,image/webp,image/avif,image/bmp" onChange={handleFileInput} />
       <Button type="primary" icon={<UploadOutlined />} loading={uploading} disabled={disabled || uploading} aria-label="上传图片" onClick={() => uploadInputRef.current?.click()} />
       <Tooltip title="刷新"><Button icon={<ReloadOutlined />} aria-label="刷新图片库" onClick={() => void loadLibrary(page)} /></Tooltip>
+    </div>
+    <div
+      className={`image-library-upload-zone${dragActive ? ' is-dragging' : ''}${disabled ? ' is-disabled' : ''}`}
+      role="button"
+      tabIndex={disabled ? -1 : 0}
+      aria-label="拖拽或粘贴图片"
+      onClick={() => { if (!disabled && !uploading) uploadInputRef.current?.click() }}
+      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !disabled && !uploading) { event.preventDefault(); uploadInputRef.current?.click() } }}
+    >
+      <UploadOutlined />
+      <span>{dragActive ? '松开以上传图片' : '拖拽图片到这里，或在此处粘贴'}</span>
     </div>
     <div className="image-library-summary"><Text type="secondary">{mode === 'shared' ? '全员共享图库' : '个人图库'} · {total} 张</Text>{selectedIds.length > 0 && <Popconfirm title={`移出选中的 ${selectedIds.length} 张图片？`} onConfirm={() => void remove(selectedIds)}><Button danger size="small" icon={<DeleteOutlined />}>批量移出</Button></Popconfirm>}</div>
     {loading ? <div className="resource-library-loading"><Spin size="small" /></div> : assets.length ? <>
       <div className="image-library-grid">{assets.map((asset) => <article className="image-library-card" key={asset.id}>
         <button type="button" className="image-library-apply" disabled={disabled} title={applicationTarget === 'image' ? '替换当前图片' : '插入到画布所选位置'} onClick={() => apply(asset.url, asset.name)}>
-          <img src={asset.url} alt={asset.name} />
+          <img src={asset.url} alt={asset.name} loading="lazy" decoding="async" />
         </button>
         <Checkbox className="image-library-select" checked={selectedIds.includes(asset.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, asset.id] : ids.filter((id) => id !== asset.id))} />
         <div className="image-library-card-actions">
@@ -361,6 +430,10 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
     {models.length ? <>
       <Select value={modelId ?? undefined} onChange={setModelId} style={{ width: '100%' }} options={models.map((model) => ({ value: model.id, label: model.display_name }))} />
       {selectedImage && <Checkbox checked={editCurrentImage} onChange={(event) => setEditCurrentImage(event.target.checked)}>编辑画布中选中的图片</Checkbox>}
+      {editCurrentImage && selectedImage && <div className="image-library-edit-source">
+        <img src={selectedImage.sourceUrl} alt={selectedImage.alt || '当前选中的图片'} />
+        <span>当前选中图片</span>
+      </div>}
       <Input.TextArea rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={editCurrentImage ? '描述希望如何修改当前图片' : '描述画面主体、风格、色彩和构图'} />
       <Space wrap><Select value={aspectRatio} onChange={setAspectRatio} options={(selectedModel?.supported_aspect_ratios.length ? selectedModel.supported_aspect_ratios : ['landscape', 'portrait', 'square']).map((value) => ({ value, label: value === 'landscape' ? '横图' : value === 'portrait' ? '竖图' : '方图' }))} /><Select value={quality} onChange={setQuality} options={(selectedModel?.supported_qualities.length ? selectedModel.supported_qualities : ['auto']).map((value) => ({ value, label: `质量 ${value}` }))} /><InputNumber min={1} max={4} value={quantity} onChange={(value) => setQuantity(value ?? 1)} /><InputNumber aria-label="生成超时（秒）" min={30} max={1800} step={30} value={timeoutSeconds} onChange={(value) => setTimeoutSeconds(value ?? 180)} addonBefore="超时" addonAfter="秒" /></Space>
       <Space wrap><Button type="primary" loading={creating} disabled={Boolean(activeGeneration)} onClick={() => void createGeneration()}>{editCurrentImage ? '生成编辑结果' : '生成图片'}</Button>{activeGeneration && <Button icon={<ReloadOutlined />} loading={refreshingGeneration} onClick={() => void manualRefreshGeneration()}>刷新</Button>}{activeGeneration && <Button icon={<StopOutlined />} onClick={() => void imageGenerationsApi.cancel(documentId, activeGeneration.id).then((next) => setGenerations((items) => items.map((item) => item.id === next.id ? next : item)))}>取消</Button>}</Space>

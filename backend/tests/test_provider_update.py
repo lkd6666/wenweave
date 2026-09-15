@@ -26,6 +26,7 @@ from app.api.routes.ai_providers import (
 from app.bootstrap import migrate_anthropic_thinking_models, migrate_schema
 from app.api.routes.models import list_image_models, list_models
 from app.db.base import Base
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 from app.models.ai_image_model import AIImageModel
 from app.models.ai_model import AIModel
 from app.models.ai_provider import AIProvider, ProviderType
@@ -138,6 +139,55 @@ class ProviderUpdateTests(unittest.TestCase):
 
         updated = update_model(model.id, ModelUpdate(prompt_cache_enabled=False), self.db)
         self.assertFalse(updated.prompt_cache_enabled)
+
+    def test_schema_migration_upgrades_only_the_legacy_preview_default(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        db = Session(engine)
+        try:
+            provider = AIProvider(
+                name="迁移测试",
+                provider_type=ProviderType.OPENAI_COMPATIBLE,
+                base_url="https://example.test/v1",
+                api_key_encrypted="",
+            )
+            db.add(provider)
+            db.flush()
+            legacy = AIModel(
+                provider_id=provider.id,
+                model_name="legacy-default",
+                display_name="Legacy default",
+                context_window_tokens=32_768,
+                context_compaction_threshold_tokens=24_576,
+                max_output_tokens=8_192,
+                tool_result_max_tokens=8_192,
+            )
+            customized = AIModel(
+                provider_id=provider.id,
+                model_name="custom-preview",
+                display_name="Custom preview",
+                context_window_tokens=128_000,
+                context_compaction_threshold_tokens=119_808,
+                max_output_tokens=8_192,
+                tool_result_max_tokens=8_192,
+            )
+            db.add_all((legacy, customized))
+            db.commit()
+            legacy_id, customized_id = legacy.id, customized.id
+        finally:
+            db.close()
+
+        try:
+            with patch("app.bootstrap.engine", engine):
+                migrate_schema()
+            with Session(engine) as verify_db:
+                self.assertEqual(
+                    verify_db.get(AIModel, legacy_id).tool_result_max_tokens,
+                    DEFAULT_TOOL_RESULT_MAX_TOKENS,
+                )
+                self.assertEqual(verify_db.get(AIModel, customized_id).tool_result_max_tokens, 8_192)
+        finally:
+            engine.dispose()
 
     def test_prompt_cache_flag_rejects_anthropic_provider(self) -> None:
         update_provider(self.provider_id, ProviderUpdate(provider_type=ProviderType.ANTHROPIC), self.db)

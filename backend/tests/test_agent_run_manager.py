@@ -178,6 +178,29 @@ class AgentRunManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(json.loads(rows[0].payload_json)["count"], 9)
 
+    async def test_tool_result_context_stats_are_not_coalesced(self) -> None:
+        manager = AgentRunManager()
+        run_id = "run-tool-context-stats"
+        manager.create(run_id)
+        self._persist_run(manager, run_id)
+
+        with patch.object(manager_module, "SessionLocal", self.Session):
+            await manager.publish(
+                run_id,
+                "context_stats",
+                {"state": "tool_result_context", "tool_call_id": "call-1", "used_tokens": 100},
+            )
+            await manager.publish(
+                run_id,
+                "context_stats",
+                {"state": "tool_result_context", "tool_call_id": "call-2", "used_tokens": 200},
+            )
+            await manager.flush(run_id)
+            with self.Session() as db:
+                rows = db.query(AgentRunEvent).filter(AgentRunEvent.run_id == run_id).order_by(AgentRunEvent.sequence).all()
+
+        self.assertEqual([json.loads(row.payload_json)["tool_call_id"] for row in rows], ["call-1", "call-2"])
+
     async def test_repairs_stale_sequence_cursor_before_appending(self) -> None:
         manager = AgentRunManager()
         run_id = "run-stale-event-sequence"

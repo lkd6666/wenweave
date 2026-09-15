@@ -31,6 +31,7 @@ from app.services.chat_agent import (
     normalise_user_question,
     restore_resume_messages,
     run_agent_loop,
+    validate_gzh_theme_candidate,
 )
 from app.services.html_workspace import HtmlWorkspace
 from app.services.image_search import ImageSearchCandidate, decode_candidate_reference
@@ -107,6 +108,7 @@ def _run(
     attached_templates: Sequence[dict[str, Any]] | None = None,
     tool_output_store: ToolOutputStore | None = None,
     selected_elements: Sequence[dict[str, Any]] | None = None,
+    theme_application: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     async def go() -> list[dict[str, Any]]:
         return [
@@ -126,6 +128,7 @@ def _run(
                 budget,
                 attached_templates=attached_templates,
                 tool_output_store=tool_output_store,
+                theme_application=theme_application,
             )
         ]
 
@@ -133,7 +136,7 @@ def _run(
 
 
 class AgentLoopEndToEndTests(unittest.TestCase):
-    def test_invalid_replace_document_returns_structured_html_errors_to_model_and_ui(self) -> None:
+    def test_invalid_replace_document_is_preserved_and_returns_warning_to_model_and_ui(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
         model = ScriptedChatModel(
             script=[
@@ -154,22 +157,73 @@ class AgentLoopEndToEndTests(unittest.TestCase):
 
         events = _run(model, session)
 
-        failed = next(
+        warning = next(
             event["data"]
             for event in events
             if event["event"] == "tool_result" and event["data"]["name"] == "replace_document"
         )
-        validation = failed["activity"]["html_validation"]
+        validation = warning["activity"]["html_validation"]
         self.assertFalse(validation["valid"])
         self.assertEqual(validation["issues"][0]["code"], "missing_end_tag_before_close")
-        self.assertIn("请在 </section> 前补上 </strong>", failed["result"])
-        self.assertEqual(session.html, SOURCE_HTML)
+        self.assertIn("请根据上述 line、column、tag 和 message 对当前候选做局部修复", warning["result"])
+        self.assertTrue(warning["activity"]["validation_warning"])
+        self.assertEqual(session.html, "<section>\n  <strong>broken\n</section>")
 
         self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
         tool_payload = json.loads(str(model.seen_messages[1][-1].content))
         self.assertEqual(tool_payload["validation"]["issues"][0]["line"], 3)
         self.assertEqual(tool_payload["validation"]["issues"][0]["tag"], "section")
-        self.assertIn("不要只根据标签数量猜测", tool_payload["next_step"])
+        self.assertTrue(tool_payload["ok"])
+        self.assertEqual(tool_payload["warning"], validation)
+
+    def test_theme_strict_rejection_reaches_model_and_allows_retry(self) -> None:
+        source = '<section><p><span leaf="">原文</span></p></section>'
+        valid_html = '<section><p><span leaf="">修复后的正文</span></p></section>'
+        session = HtmlEditSession(source, candidate_validator=validate_gzh_theme_candidate)
+        revision = session.document_map()["revision"]
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "replace_document",
+                        {
+                            "revision": revision,
+                            "html": '<section style="float:left"><p>未包裹正文</p></section>',
+                        },
+                    )
+                },
+                {"tool": ("replace_document", {"revision": revision, "html": valid_html})},
+                {"text": "已修复严格校验问题并完成主题排版。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+
+        events = _run(
+            model,
+            session,
+            theme_application={"theme_name": "严格校验测试主题", "apply_mode": "full"},
+        )
+
+        failed = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result"
+            and event["data"]["name"] == "replace_document"
+            and event["data"]["activity"]["kind"] == "error"
+        )
+        strict = failed["activity"]["gzh_validation"]
+        self.assertTrue(strict["hasError"])
+        self.assertGreaterEqual(len(strict["errors"]), 2)
+        self.assertIn("float", " ".join(strict["errors"]).lower())
+
+        self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
+        tool_payload = json.loads(str(model.seen_messages[1][-1].content))
+        self.assertEqual(tool_payload["gzh_validation"]["errors"], strict["errors"])
+        self.assertIn("当前 revision", tool_payload["next_step"])
+        self.assertEqual(session.html, valid_html)
+        self.assertTrue(session.edited)
+        self.assertEqual(events[-1]["event"], "final")
 
     def test_session_history_result_reaches_model_and_timeline_with_call_id(self) -> None:
         """A tool that only returns ToolMessage must still settle the live UI."""
@@ -293,10 +347,12 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         _run(ordinary_model, HtmlEditSession(SOURCE_HTML))
 
         self.assertIn("check_compliance", ordinary_model.bound_tool_names)
+        self.assertIn("read_wechat_compliance_spec", ordinary_model.bound_tool_names)
         self.assertIn("search_article_images", ordinary_model.bound_tool_names)
         self.assertIn("view_article_images", ordinary_model.bound_tool_names)
         self.assertIn("import_searched_image", ordinary_model.bound_tool_names)
         self.assertIn("apply_searched_cover", ordinary_model.bound_tool_names)
+        self.assertIn("transform_document_image", ordinary_model.bound_tool_names)
         self.assertNotIn("apply_searched_image", ordinary_model.bound_tool_names)
         self.assertNotIn("validate_gzh_html", ordinary_model.bound_tool_names)
 
@@ -375,7 +431,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         with (
             patch("app.services.chat_agent.SessionLocal", factory),
             patch("app.services.tool_output_store.SessionLocal", factory),
-            patch("app.services.local_uploads.inspect_image", return_value=SimpleNamespace(content_type="image/png")),
+            patch("app.services.local_uploads.inspect_image", return_value=SimpleNamespace(content_type="image/png", width=640, height=360)),
         ):
             events = asyncio.run(go())
         try:
@@ -393,12 +449,309 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                 if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
             )
             self.assertEqual(result["activity"]["kind"], "image_view")
+            self.assertEqual(result["activity"]["details"]["items"][0]["width"], 640)
+            self.assertEqual(result["activity"]["details"]["items"][0]["height"], 360)
             persisted_context = [
                 event["data"].get("context_events", [])
                 for event in events
                 if isinstance(event.get("data"), dict) and event["event"] in {"final", "error"}
             ]
             self.assertNotIn(base64.b64encode(image_bytes).decode("ascii"), json.dumps(persisted_context, ensure_ascii=False))
+        finally:
+            engine.dispose()
+
+    def test_text_only_image_view_returns_actual_dimensions(self) -> None:
+        image_bytes = b"not-a-real-image-but-validated-by-the-test"
+        source = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        session = HtmlEditSession(f'<section><img src="{source}" alt="活动图片"></section>')
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "view_article_images",
+                        {"references": [{"kind": "article", "image_slot": 1, "revision": session.workspace().revision}]},
+                    )
+                },
+                {"text": "已读取图片尺寸。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="dimension-text-only-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "尺寸测试稿",
+                    session.html,
+                    "读取文章内图片尺寸",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=store,
+                    actor_user_id=7,
+                    model_is_multimodal=False,
+                    provider_type="openai_compatible",
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+            patch("app.services.local_uploads.inspect_image", return_value=SimpleNamespace(content_type="image/png", width=1200, height=628)),
+        ):
+            events = asyncio.run(go())
+        try:
+            result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
+            )
+            details = result["activity"]["details"]
+            self.assertFalse(details["vision_supported"])
+            self.assertEqual(details["viewed_count"], 0)
+            self.assertEqual(details["items"][0]["width"], 1200)
+            self.assertEqual(details["items"][0]["height"], 628)
+        finally:
+            engine.dispose()
+
+    def test_multimodal_image_view_can_return_dimensions_without_injecting_pixels(self) -> None:
+        image_bytes = b"dimensions-only-image"
+        source = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        session = HtmlEditSession(f'<section><img src="{source}" alt="活动图片"></section>')
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "view_article_images",
+                        {
+                            "references": [{"kind": "article", "image_slot": 1, "revision": session.workspace().revision}],
+                            "include_image": False,
+                        },
+                    )
+                },
+                {"text": "已读取图片尺寸。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="dimension-only-multimodal-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "尺寸测试稿",
+                    session.html,
+                    "读取文章内图片尺寸",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=store,
+                    actor_user_id=7,
+                    model_is_multimodal=True,
+                    provider_type="openai_compatible",
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+            patch("app.services.local_uploads.inspect_image", return_value=SimpleNamespace(content_type="image/png", width=1200, height=628)),
+        ):
+            events = asyncio.run(go())
+        try:
+            self.assertEqual(events[-1]["event"], "final")
+            self.assertFalse(
+                any(
+                    isinstance(message, HumanMessage) and getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+                    for message in model.seen_messages[1]
+                )
+            )
+            result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
+            )
+            details = result["activity"]["details"]
+            self.assertTrue(details["vision_supported"])
+            self.assertFalse(details["image_content_included"])
+            self.assertEqual(details["viewed_count"], 0)
+            self.assertEqual((details["items"][0]["width"], details["items"][0]["height"]), (1200, 628))
+        finally:
+            engine.dispose()
+
+    def test_stale_article_image_references_are_reconciled_after_unrelated_edit(self) -> None:
+        inserted_bytes = b"inserted-image-bytes"
+        first_bytes = b"first-image-bytes"
+        second_bytes = b"second-image-bytes"
+        inserted_source = f"data:image/png;base64,{base64.b64encode(inserted_bytes).decode('ascii')}"
+        first_source = f"data:image/png;base64,{base64.b64encode(first_bytes).decode('ascii')}"
+        second_source = f"data:image/png;base64,{base64.b64encode(second_bytes).decode('ascii')}"
+        original_html = (
+            f'<section><p>原始正文</p><img src="{first_source}" alt="第一张图">'
+            f'<p>补充说明</p><img src="{second_source}" alt="第二张图"></section>'
+        )
+        updated_html = original_html.replace(
+            f'<img src="{first_source}"',
+            f'<img src="{inserted_source}" alt="插入图片"><img src="{first_source}"',
+        ).replace("原始正文", "正文已调整")
+        session = HtmlEditSession(original_html)
+        initial_revision = session.workspace().revision
+        initial_images = session.workspace().image_inventory()["images"]
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("inspect_current_images", {})},
+                {"tool": ("replace_document", {"revision": initial_revision, "html": updated_html})},
+                {
+                    "tool": (
+                        "view_article_images",
+                        {
+                            "references": [
+                                {
+                                    "kind": "article",
+                                    "image_slot": 1,
+                                    "revision": initial_revision,
+                                    "source_fingerprint": initial_images[0]["source_fingerprint"],
+                                },
+                                {"kind": "article", "image_slot": 2, "revision": "older-unseen-revision"},
+                            ]
+                        },
+                    )
+                },
+                {"text": "已查看文章图片。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="stale-vision-reference-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "多模态测试稿",
+                    session.html,
+                    "请查看文章内图片",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=store,
+                    actor_user_id=7,
+                    model_is_multimodal=True,
+                    provider_type="openai_compatible",
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+            patch("app.services.local_uploads.inspect_image", return_value=SimpleNamespace(content_type="image/png", width=640, height=360)),
+        ):
+            events = asyncio.run(go())
+        try:
+            self.assertEqual(events[-1]["event"], "final")
+            result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
+            )
+            self.assertEqual(result["activity"]["kind"], "image_view")
+            self.assertEqual(result["activity"]["details"]["viewed_count"], 2)
+            self.assertEqual(
+                [item["label"].split(" · ", 1)[0] for item in result["activity"]["details"]["items"]],
+                ["文章图片 2", "文章图片 3"],
+            )
+            visual_message = next(
+                message
+                for message in model.seen_messages[3]
+                if isinstance(message, HumanMessage)
+                and getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+            )
+            self.assertEqual(
+                [block["type"] for block in visual_message.content if block["type"] == "image_url"],
+                ["image_url", "image_url"],
+            )
+        finally:
+            engine.dispose()
+
+    def test_unseen_stale_article_image_reference_is_rejected_without_image_injection(self) -> None:
+        image_bytes = b"unseen-stale-image"
+        source = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        session = HtmlEditSession(f'<section><img src="{source}" alt="未盘点图片"></section>')
+        model = ScriptedChatModel(
+            script=[
+                {
+                    "tool": (
+                        "view_article_images",
+                        {"references": [{"kind": "article", "image_slot": 1, "revision": "stale-revision"}]},
+                    )
+                },
+                {"text": "无法安全读取该图片。"},
+            ],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="unseen-stale-vision-reference-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "多模态测试稿",
+                    session.html,
+                    "请查看文章内图片",
+                    session.document_map(),
+                    None,
+                    [],
+                    session=session,
+                    tool_output_store=store,
+                    actor_user_id=7,
+                    model_is_multimodal=True,
+                    provider_type="openai_compatible",
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+        ):
+            events = asyncio.run(go())
+        try:
+            result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
+            )
+            self.assertEqual(result["activity"]["kind"], "error")
+            self.assertIn("缺少可恢复指纹", result["result"])
+            self.assertFalse(
+                any(
+                    isinstance(message, HumanMessage)
+                    and getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+                    for message in model.seen_messages[1]
+                )
+            )
         finally:
             engine.dispose()
 
@@ -521,6 +874,35 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertNotIn("error", kinds)
         self.assertIn("tool_call", kinds)
         self.assertIn("tool_result", kinds)
+        completed_tools = [
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"].get("id") != "automatic-final-compliance"
+        ]
+        automatic_compliance_results = [
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"].get("id") == "automatic-final-compliance"
+        ]
+        tool_contexts = [
+            event["data"]
+            for event in events
+            if event["event"] == "context_stats" and event["data"].get("state") == "tool_result_context"
+        ]
+        self.assertEqual(len(tool_contexts), len(completed_tools))
+        self.assertEqual(
+            [context["tool_call_id"] for context in tool_contexts],
+            [tool["id"] for tool in completed_tools],
+        )
+        self.assertEqual(len(automatic_compliance_results), 1)
+        self.assertEqual(automatic_compliance_results[0]["name"], "check_compliance")
+        self.assertIn("任务结束自动合规检测", automatic_compliance_results[0]["result"])
+        self.assertIsInstance(automatic_compliance_results[0]["activity"].get("compliance"), dict)
+        model_compliance_result = next(
+            tool for tool in completed_tools if tool["name"] == "check_compliance"
+        )
+        self.assertIsInstance(model_compliance_result["activity"].get("compliance"), dict)
+        self.assertTrue(all(context["used_tokens"] > 0 for context in tool_contexts))
         runtime_stats = [
             event["data"]
             for event in events
@@ -604,7 +986,14 @@ class AgentLoopEndToEndTests(unittest.TestCase):
 
         self.assertEqual(
             tool_names,
-            ["search_html", "read_blocks", "apply_html_patch", "apply_html_patch", "check_compliance"],
+            [
+                "search_html",
+                "read_blocks",
+                "apply_html_patch",
+                "apply_html_patch",
+                "check_compliance",
+                "check_compliance",
+            ],
         )
         self.assertNotIn("get_document_map", tool_names)
         self.assertGreater(first_edit_activity["continuity"]["preserved_block_count"], 0)
@@ -871,7 +1260,10 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             if event["event"] == "tool_result" and event["data"]["name"] == "inspect_current_images"
         )
 
-        self.assertEqual(tool_names, ["inspect_current_images", "read_blocks", "apply_html_patch", "check_compliance"])
+        self.assertEqual(
+            tool_names,
+            ["inspect_current_images", "read_blocks", "apply_html_patch", "check_compliance", "check_compliance"],
+        )
         inspect_call = next(
             event["data"]
             for event in events
@@ -1224,7 +1616,11 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         script[1]["hang_after_tool"] = True
         model = ScriptedChatModel(script=script, seen_message_counts=[], seen_messages=[])
 
-        events = _run(model, session, timeout=0.5)
+        # This case verifies that a complete write call is dispatched before a
+        # gateway's missing terminal frame. Browser-backed compliance is
+        # unrelated and would make the sub-second transport assertion flaky.
+        with patch.object(session, "check_compliance", return_value={"isValid": True, "violations": []}):
+            events = _run(model, session, timeout=0.5)
 
         self.assertEqual(events[-1]["event"], "final")
         self.assertNotIn("error", [event["event"] for event in events])
@@ -1420,7 +1816,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "error")
         self.assertIn("响应整理超过", events[-1]["data"]["message"])
 
-    def test_stalled_final_compliance_reports_an_error(self) -> None:
+    def test_stalled_final_compliance_returns_an_unverified_final_report(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
         model = ScriptedChatModel(
             script=[{"text": "正文已经输出。"}], seen_message_counts=[], seen_messages=[]
@@ -1436,12 +1832,17 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         ):
             events = _run(model, session)
 
-        self.assertEqual(events[-1]["event"], "error")
-        self.assertIn("合规检查超过", events[-1]["data"]["message"])
-        ledger = events[-1]["data"].get("context_events", [])
-        self.assertEqual(len(ledger), 1)
-        self.assertEqual(ledger[0]["kind"], "assistant")
-        self.assertIn("正文已经输出", ledger[0]["payload"]["content"])
+        self.assertEqual(events[-1]["event"], "final")
+        report = events[-1]["data"]["compliance"]
+        self.assertIsNone(report["isValid"])
+        self.assertFalse(report["engine"]["available"])
+        self.assertIn("未完成检测", report["engine"]["detail"])
+        automatic_result = next(
+            event["data"]
+            for event in events
+            if event["event"] == "tool_result" and event["data"].get("id") == "automatic-final-compliance"
+        )
+        self.assertEqual(automatic_result["result"], "任务结束自动合规检测未验证")
 
     def test_ask_user_pauses_then_resumes_with_the_original_tool_call_id(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)

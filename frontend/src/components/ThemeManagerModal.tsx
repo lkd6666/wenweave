@@ -74,6 +74,10 @@ function splitScenarios(value: string) {
   return value.split(/[，,\n]/).map((item) => item.trim()).filter(Boolean).slice(0, 12)
 }
 
+function isModelConnectionError(value: string) {
+  return /connection|connect|network|timeout|temporarily unavailable|service unavailable|bad gateway/i.test(value)
+}
+
 function versionLabel(version: GzhThemeVersion) {
   return `v${version.version}`
 }
@@ -198,7 +202,13 @@ export default function ThemeManagerModal({ open, modelId, models, onClose, onTh
       message.warning('请选择 AI 模型')
       return
     }
-    const brief = `${wizard.brief.trim()}${extraInstruction ? `\n\n补充调整：${extraInstruction.trim()}` : ''}`.trim()
+    const previousFailure = generation?.status === 'failed' ? generation.error_message.trim() : ''
+    const previousValidationFeedback = previousFailure && !isModelConnectionError(previousFailure) ? previousFailure : ''
+    const brief = [
+      wizard.brief.trim(),
+      previousValidationFeedback ? `上一轮服务端校验反馈（必须修复）：${previousValidationFeedback}` : '',
+      extraInstruction ? `补充调整：${extraInstruction.trim()}` : '',
+    ].filter(Boolean).join('\n\n')
     if (brief.length < 8) {
       message.warning('请先描述希望的模板风格')
       return
@@ -439,7 +449,13 @@ export default function ThemeManagerModal({ open, modelId, models, onClose, onTh
                 />
               </div>
             )}
-            {generation?.status === 'failed' && <AiImageGeneration status="error" title="主题生成未通过检查" detail={generation.error_message || '请调整风格描述后再次生成。'} />}
+            {generation?.status === 'failed' && (
+              <>
+                <AiImageGeneration status="error" title={isModelConnectionError(generation.error_message) ? '模型连接已中断' : '主题生成未通过检查'} detail={generation.error_message || '请调整风格描述后再次生成。'} />
+                {!isModelConnectionError(generation.error_message) && <Input.TextArea value={adjustment} onChange={(event) => setAdjustment(event.target.value)} autoSize={{ minRows: 2, maxRows: 4 }} maxLength={2000} placeholder="补充调整要求，例如：所有容器使用 section，不要使用 div" />}
+                <div className="theme-wizard-result-actions"><Button icon={<ReloadOutlined />} loading={generationBusy} onClick={() => void createGeneration(adjustment)}>{isModelConnectionError(generation.error_message) ? '重新连接模型' : '按检查结果修复'}</Button></div>
+              </>
+            )}
             {generation?.status === 'cancelled' && <AiImageGeneration status="cancelled" title="主题生成已停止" detail="可调整要求后重新生成。" />}
             {generation?.status === 'succeeded' && (
               <>

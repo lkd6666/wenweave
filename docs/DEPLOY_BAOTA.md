@@ -85,9 +85,22 @@ cd /www/wwwroot/yibanpaiban/backend
 python3 -m venv venv
 ./venv/bin/pip install --upgrade pip
 ./venv/bin/pip install -r requirements.txt
+./venv/bin/python -m playwright install-deps chromium
+install -d -m 0755 -o www -g www /home/www
+sudo -H -u www ./venv/bin/python -m playwright install chromium
 mkdir -p data/uploads
 chown -R www:www /www/wwwroot/yibanpaiban
 ```
+
+官方微信合规检测使用 Python Playwright Chromium，不需要 Node.js。`install-deps` 需要 root 权限；浏览器文件则必须使用实际运行 Uvicorn 的 `www` 用户安装。不要只用 root 执行 `playwright install`，否则文件会进入 `/root/.cache/ms-playwright`，而 `www` 进程仍会在 `/home/www/.cache/ms-playwright` 报浏览器不存在。若系统没有 `sudo`，等效命令为 `runuser -u www -- env HOME=/home/www ./venv/bin/python -m playwright install chromium`。
+
+每次升级或重装 `requirements.txt` 后都要重新执行上面的 Chromium 安装命令，确保浏览器 revision 与固定的 Python Playwright 版本一致，然后在宝塔面板重启 Python 项目。可在重启前以运行用户执行真实启动测试：
+
+```bash
+sudo -H -u www ./venv/bin/python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); print("Chromium OK:", p.chromium.executable_path); b.close(); p.stop()'
+```
+
+浏览器只在首次模型合规检测时启动并由进程复用；不可用时返回“未验证”，不会阻止编辑、保存或公众号草稿同步。若服务器已有系统 Chromium，可在 `backend/.env` 设置 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH=/实际/chromium路径`。
 
 在宝塔“Python 项目”中新增项目，项目路径选择 `backend`，运行用户选择 `www`，启动命令填写：
 

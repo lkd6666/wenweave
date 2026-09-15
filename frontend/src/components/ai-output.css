@@ -147,7 +147,16 @@
   word-break: break-word;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
-  animation: aicss-reasoning-in 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: aicss-reasoning-in 420ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.aicss-reasoning-text {
+  color: var(--aicss-muted);
+  font-size: 13px;
+  font-weight: 425;
+  line-height: 20px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .aicss-text-response,

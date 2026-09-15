@@ -76,6 +76,22 @@ export function AppThemeProvider({ children }: { children: ReactNode }) {
           token: {
             colorPrimary: '#1677ff',
             borderRadius: 6,
+            ...(resolvedTheme === 'dark'
+              ? {
+                  colorBgBase: '#141414',
+                  colorBgLayout: '#141414',
+                  colorBgContainer: '#1c1c1c',
+                  colorBgElevated: '#242424',
+                  colorBgSpotlight: '#2a2a2a',
+                  colorFillSecondary: '#222222',
+                  colorBorder: '#383838',
+                  colorBorderSecondary: '#2c2c2c',
+                  colorText: '#f1f1f1',
+                  colorTextSecondary: '#b8b8b8',
+                  colorTextTertiary: '#8a8a8a',
+                  boxShadowSecondary: '0 6px 16px rgba(0, 0, 0, 0.42)',
+                }
+              : {}),
           },
         }}
       >

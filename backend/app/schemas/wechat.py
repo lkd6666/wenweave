@@ -8,8 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class WeChatArticleMetadata(BaseModel):
-    # The article title is canonical. The push service applies WeChat's 32-character limit.
-    title: str = Field(default="", max_length=256)
+    # The article title is canonical and WeChat accepts at most 64 characters.
+    title: str = Field(default="", max_length=64)
     author: str = Field(default="", max_length=16)
     digest: str = Field(default="", max_length=120)
     content_source_url: str = Field(default="", max_length=1024)

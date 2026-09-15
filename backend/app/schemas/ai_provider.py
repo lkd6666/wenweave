@@ -3,6 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 from app.models.ai_provider import ProviderType
 
 
@@ -93,7 +94,7 @@ class ModelRead(AvailabilityTimeRanges):
     context_window_tokens: int = Field(default=32768, ge=8192, le=2_000_000)
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
-    tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
+    tool_result_max_tokens: int = Field(default=DEFAULT_TOOL_RESULT_MAX_TOKENS, ge=128, le=1_000_000)
     is_default: bool
     is_enabled: bool = True
     is_multimodal: bool = False
@@ -116,7 +117,7 @@ class ModelCreate(AvailabilityTimeRanges):
     context_window_tokens: int = Field(default=32768, ge=8192, le=2_000_000)
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
-    tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
+    tool_result_max_tokens: int = Field(default=DEFAULT_TOOL_RESULT_MAX_TOKENS, ge=128, le=1_000_000)
     is_default: bool = False
     is_enabled: bool = True
     is_multimodal: bool = False
@@ -242,7 +243,7 @@ class ModelPresetRead(BaseModel):
     context_window_tokens: int = 32768
     context_compaction_threshold_tokens: int = 24576
     max_output_tokens: int = 8192
-    tool_result_max_tokens: int = 8192
+    tool_result_max_tokens: int = DEFAULT_TOOL_RESULT_MAX_TOKENS
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True
     thinking_config: dict[str, Any] = Field(default_factory=dict)
@@ -281,7 +282,7 @@ class ModelBulkCreateItem(AvailabilityTimeRanges):
     context_window_tokens: int = Field(default=32768, ge=8192, le=2_000_000)
     context_compaction_threshold_tokens: int = Field(default=24576, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=8192, ge=128, le=1_000_000)
-    tool_result_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
+    tool_result_max_tokens: int = Field(default=DEFAULT_TOOL_RESULT_MAX_TOKENS, ge=128, le=1_000_000)
     is_enabled: bool = True
     is_multimodal: bool = False
     supports_disabled_thinking: bool = True

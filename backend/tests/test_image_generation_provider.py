@@ -144,6 +144,24 @@ class DashScopeImageAdapterTests(unittest.TestCase):
         self.assertEqual(len(result.images), 3)
         self.assertEqual(result.usage["images"], 3)
 
+    def test_provider_drops_repeated_image_urls_from_batch(self) -> None:
+        generation = _Generation()
+        generation.quantity = 3
+        repeated = image_generation.ProviderGenerationResult(
+            images=(
+                image_generation.ProviderImage(url="https://cdn.example/same.png?signature=one"),
+                image_generation.ProviderImage(url="https://cdn.example/same.png?signature=two"),
+            ),
+            usage={"images": 2},
+        )
+
+        async def run() -> image_generation.ProviderGenerationResult:
+            with patch.object(image_generation, "_call_provider_once", new=AsyncMock(return_value=repeated)):
+                return await image_generation._call_provider(object(), generation)  # type: ignore[arg-type]
+
+        result = asyncio.run(run())
+        self.assertEqual([item.url for item in result.images], ["https://cdn.example/same.png?signature=one"])
+
     def test_parses_native_dashscope_message_image(self) -> None:
         payload = {
             "output": {

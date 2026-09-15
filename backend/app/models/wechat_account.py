@@ -99,7 +99,7 @@ class WeChatDraft(Base):
         default=WeChatDraftSyncMode.CREATE,
     )
     media_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    article_title: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    article_title: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     error_code: Mapped[int | None] = mapped_column(nullable=True)
     error_message: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -27,6 +27,7 @@ from app.models.document import Document, DocumentSourceType
 from app.models.document_group import DocumentGroup
 from app.models.document_import import DocumentImport, DocumentImportAsset, DocumentImportStatus
 from app.models.document_version import DocumentVersion, DocumentVersionSource
+from app.models.image_generation import ImageLibrarySource
 from app.models.storage_config import StorageConfig
 from app.models.template_library import TemplateLibraryItem
 from app.models.document_visibility import VisibilityMode
@@ -86,13 +87,14 @@ from app.services.document_versions import (
     create_document_version,
     materialize_document_version,
 )
-from app.services.document_images import DocumentImageStorageError, store_document_image
+from app.services.document_images import DocumentImageStorageError, StoredDocumentImage, store_document_image
 from app.services.document_image_localization import (
     cleanup_document_localization,
     localize_document_html,
 )
 from app.services.external_fetch import PublicFetchError, fetch_public_image
 from app.services.image_localization import ImageLocalizationError, ImageLocalizationResult
+from app.services.image_library import create_library_asset
 from app.services.chat_images import ChatImageError, delete_document_attachments
 from app.services.document_shares import revoke_document_shares
 from app.services.web_article_import import (
@@ -119,7 +121,7 @@ from app.services.operation_logs import (
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
 
-MAX_IMPORT_FILE_SIZE = 30 * 1024 * 1024
+MAX_IMPORT_FILE_SIZE = 50 * 1024 * 1024
 MAX_REPLACEMENT_IMAGE_SIZE = 10 * 1024 * 1024
 REPLACEABLE_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "avif", "bmp"}
 SAFE_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/avif", "image/bmp"}
@@ -527,6 +529,42 @@ def _validate_import_asset_metadata(filename: str, content_type: str, size: int)
     return safe_name, normalized_content_type
 
 
+def _create_import_library_assets(
+    db: Session,
+    document: Document,
+    assets_by_id: dict[str, DocumentImportAsset],
+    referenced_asset_ids: set[str],
+    storage: StorageConfig | None,
+) -> None:
+    """Make imported article images reusable in the image library."""
+    for asset_id in referenced_asset_ids:
+        asset = assets_by_id[asset_id]
+        width = height = 0
+        if storage is None:
+            try:
+                image = local_uploads.validate_image(local_uploads.local_path(asset.object_key), asset.content_type)
+                width, height = image.width, image.height
+            except local_uploads.LocalUploadError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            image_url = _local_import_image_url(asset.id)
+            storage_mode = "local"
+        else:
+            image_url = oss_client.sign_read_url(storage, asset.object_key, oss_client.IMAGE_URL_EXPIRE_SECONDS)
+            storage_mode = "oss"
+        create_library_asset(
+            db,
+            owner_id=document.owner_id,
+            document_id=document.id,
+            name=_safe_filename(asset.filename, "图片"),
+            source=ImageLibrarySource.UPLOAD,
+            stored=StoredDocumentImage(url=image_url, object_key=asset.object_key, storage_mode=storage_mode),
+            content_type=asset.content_type,
+            size=asset.size,
+            width=width,
+            height=height,
+        )
+
+
 def _get_users(db: Session, user_ids: list[int]) -> list[User]:
     unique_ids = list(dict.fromkeys(user_ids))
     if not unique_ids:
@@ -619,7 +657,7 @@ def create_direct_import(
 ) -> DocumentImportCreateResult:
     source_type, extension, expected_content_type = _source_type_for_filename(payload.filename)
     if payload.size > MAX_IMPORT_FILE_SIZE:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="文件过大，请上传 30MB 以内的文件")
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="文件过大，请上传 50MB 以内的文件")
     normalized_content_type = payload.content_type.lower().split(";", 1)[0]
     accepted_content_types = {expected_content_type, "application/octet-stream"}
     if source_type == DocumentSourceType.MARKDOWN:
@@ -890,6 +928,7 @@ def complete_direct_import(
         DocumentVersionSource.INITIAL,
         "浏览器直传导入" if storage is not None else "服务器受限存储导入",
     )
+    _create_import_library_assets(db, document, assets_by_id, referenced_asset_ids, storage)
     if group:
         touch_group(group, current_user.id)
     import_session.status = DocumentImportStatus.COMPLETED
@@ -1598,8 +1637,8 @@ async def _push_wechat_draft(
         sync_mode = WeChatDraftSyncMode(payload.sync_mode)
 
     title = document.title.strip()
-    if not title or len(title) > 32:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="系统文章标题需为 1 到 32 个字，才能同步至微信")
+    if not title or len(title) > 64:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="系统文章标题需为 1 到 64 个字，才能同步至微信")
     metadata = WeChatArticleMetadata.model_validate({**document.wechat_metadata, "title": title})
     client = WeChatOfficialAccountClient()
     trusted_image_hosts = _trusted_oss_image_hosts(db)

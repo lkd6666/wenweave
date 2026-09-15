@@ -155,6 +155,35 @@ def replace_image_source(current_html: str, image_index: int, source_url: str, n
     return current_html[:tag_match.start()] + next_tag + current_html[tag_match.end():]
 
 
+_STALE_TRANSFORMED_IMAGE_ATTRIBUTES = re.compile(
+    r"\s+(?:srcset|sizes|data-crop-source|data-crop-rect|data-crop-rotation|data-preview-upload-id)"
+    r"\s*=\s*(?:['\"][^'\"]*['\"]|[^\s>]+)",
+    re.IGNORECASE,
+)
+
+
+def replace_transformed_image_source(current_html: str, image_index: int, source_url: str, next_url: str) -> str:
+    """Replace one image after baking new pixels and clear stale derivatives.
+
+    A crop/rotation changes every pixel variant, so retaining ``srcset`` would
+    let a browser choose the old uncropped asset. Crop provenance describes a
+    different source at this point as well. Presentation attributes such as
+    ``alt``, ``class``, dimensions and inline style intentionally remain.
+    """
+    tags = list(re.finditer(r"<img\b[^>]*>", current_html or "", flags=re.IGNORECASE))
+    if image_index < 0 or image_index >= len(tags):
+        raise ImageGenerationError("目标图片不存在，请重新选择")
+    tag_match = tags[image_index]
+    tag = tag_match.group(0)
+    src_match = re.search(r"(\bsrc\s*=\s*)(['\"])(.*?)\2", tag, flags=re.IGNORECASE | re.DOTALL)
+    if not src_match or unescape(src_match.group(3).strip()) != unescape(source_url.strip()):
+        raise ImageGenerationError("目标图片已发生变化，请重新选择")
+    replacement = f"{src_match.group(1)}{src_match.group(2)}{html_escape_url(next_url)}{src_match.group(2)}"
+    next_tag = tag[:src_match.start()] + replacement + tag[src_match.end():]
+    next_tag = _STALE_TRANSFORMED_IMAGE_ATTRIBUTES.sub("", next_tag)
+    return current_html[:tag_match.start()] + next_tag + current_html[tag_match.end():]
+
+
 def html_escape_url(value: str) -> str:
     return value.replace("&", "&amp;").replace('"', "&quot;").replace("'", "&#x27;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -501,6 +530,7 @@ async def _call_provider(model: AIImageModel, generation: ImageGeneration, sourc
     """
     requested = max(1, min(int(generation.quantity), 4))
     images: list[ProviderImage] = []
+    seen_images: set[str] = set()
     usage: dict[str, Any] = {}
     task_ids: list[str] = []
     last_error: ImageGenerationError | None = None
@@ -512,7 +542,28 @@ async def _call_provider(model: AIImageModel, generation: ImageGeneration, sourc
             if not images:
                 raise
             break
-        images.extend(result.images)
+        # A few gateways have been observed to repeat the same URL (or the
+        # same base64 payload) for every item in an ``n`` response. Persisting
+        # those entries would make a batch look like several different images
+        # while actually rendering one image repeatedly. Keep only unique
+        # provider results; the bounded retry loop still gives providers that
+        # return fewer images a chance to fill the requested quantity.
+        for image in result.images:
+            identity = ""
+            if image.url:
+                parsed_url = urlsplit(image.url.strip())
+                identity = (
+                    f"{parsed_url.scheme.lower()}://{parsed_url.netloc.lower()}{parsed_url.path}"
+                    if parsed_url.scheme and parsed_url.netloc
+                    else image.url.strip()
+                )
+            if not identity and image.data:
+                identity = hashlib.sha256(image.data).hexdigest()
+            if identity and identity in seen_images:
+                continue
+            if identity:
+                seen_images.add(identity)
+            images.append(image)
         _merge_usage(usage, result.usage)
         if result.provider_task_id:
             task_ids.append(result.provider_task_id)
@@ -572,6 +623,16 @@ async def materialize_source_image(source: str, *, storage: StorageConfig | None
     value = str(source or "").strip()
     if not value:
         raise ImageGenerationError("编辑任务缺少原图")
+    if value.lower().startswith("data:image/"):
+        try:
+            header, encoded = value.split(",", 1)
+            if ";base64" not in header.lower():
+                raise ValueError("图片不是 Base64 data URI")
+            data = base64.b64decode(encoded, validate=True)
+            info = local_uploads.inspect_image(data)
+            return data, info.content_type
+        except (ValueError, binascii.Error, local_uploads.LocalUploadError) as exc:
+            raise ImageGenerationError("文章内联图片无效") from exc
     if value.startswith("/api/documents/local-images/"):
         name = value.rsplit("/", 1)[-1].split("?", 1)[0]
         path = local_uploads.local_path(f"local/images/{name}")

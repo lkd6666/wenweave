@@ -38,7 +38,7 @@ export function deriveModelTokenBudget(inputKTokens: unknown, outputKTokens: unk
     tool_result_max_tokens: Math.min(
       contextCompactionThresholdTokens,
       contextCompactionThresholdTokens < 65_536
-        ? 8_192
+        ? 10_000
         : contextCompactionThresholdTokens <= 262_144
           ? 12_288
           : 16_384,

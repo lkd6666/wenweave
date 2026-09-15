@@ -12,8 +12,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
+
 CATALOG_SOURCE = "models.dev 开源模型目录（https://models.dev）"
 OFFICIAL_DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com/v1"
+SCNET_OPENAI_BASE_URL = "https://api.scnet.cn/api/llm/v1"
 
 # 模型发现协议与聊天协议并不完全相同。预设显式标记发现适配器，避免把所有厂商都假定为
 # Bearer + /models：Gemini 的原生列表接口使用 x-goog-api-key 且响应为 models[]，
@@ -34,6 +37,13 @@ VOLCENGINE_ARK_DISCOVERY = {
 # 各家的 Claude Code 兼容网关只实现 /v1/messages，不提供 /v1/models（阿里云文档明确
 # 写了这一点）。显式标记为不支持，避免发一次注定 404 的请求后把配置问题报成密钥问题。
 UNSUPPORTED_DISCOVERY = {"adapter": "unsupported", "reason": "该端点仅提供 /v1/messages，不支持模型列表查询"}
+# 方舟 Agent Plan / Coding Plan 的套餐网关支持与 OpenAI 兼容的 ``GET /models``；
+# 该接口会按套餐和当前账号返回实际可用的模型，不能用普通方舟的 ``/endpoints`` 代替。
+VOLCENGINE_ARK_PLAN_DISCOVERY = {
+    "adapter": "openai_compatible",
+    "path": "/models",
+    "response_key": "data",
+}
 
 # Anthropic 协议的凭证头在各网关之间不一致：官方与 DeepSeek 接受 x-api-key，而
 # 阿里云 / 智谱 / Kimi 的文档只给出 ANTHROPIC_AUTH_TOKEN（Claude Code 将其发为
@@ -46,7 +56,7 @@ def recommended_tool_preview_tokens(input_budget_tokens: int) -> int:
     """Match mainstream Agent preview sizes while keeping full results retrievable."""
     budget = max(1, int(input_budget_tokens))
     if budget < 65_536:
-        target = 8_192
+        target = DEFAULT_TOOL_RESULT_MAX_TOKENS
     elif budget <= 262_144:
         target = 12_288
     else:
@@ -173,11 +183,137 @@ def _coding_models(
     return entries
 
 
+def _volcengine_plan_reasoning_config() -> dict[str, Any]:
+    """Return the documented Responses reasoning-effort mapping for Ark plans."""
+    return {
+        "enabled": {"reasoning_effort": "medium"},
+        "disabled": {"reasoning_effort": "none"},
+        "efforts": {
+            "low": {"reasoning_effort": "low"},
+            "medium": {"reasoning_effort": "medium"},
+            "high": {"reasoning_effort": "high"},
+        },
+    }
+
+
+def _gemini_25_thinking_config() -> dict[str, Any]:
+    """Native Gemini 2.5 thinking budgets (``-1`` means dynamic)."""
+    return {
+        "enabled": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": -1}},
+        "disabled": {"thinkingConfig": {"includeThoughts": False, "thinkingBudget": 0}},
+        "efforts": {
+            "minimal": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": 512}},
+            "low": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": 1024}},
+            "medium": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": 4096}},
+            "high": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": 8192}},
+            "max": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": -1}},
+        },
+    }
+
+
+def _gemini_3_thinking_config() -> dict[str, Any]:
+    """Native Gemini 3 thinking levels; Gemini 3 cannot disable thinking."""
+    return {
+        "enabled": {"thinkingConfig": {"includeThoughts": True, "thinkingLevel": "high"}},
+        "efforts": {
+            "low": {"thinkingConfig": {"includeThoughts": True, "thinkingLevel": "low"}},
+            "high": {"thinkingConfig": {"includeThoughts": True, "thinkingLevel": "high"}},
+        },
+    }
+
+
+def _gemini_models(*items: tuple[str, str, dict[str, Any], bool]) -> list[dict[str, Any]]:
+    entries = _models(*[(name, display, config) for name, display, config, _ in items])
+    for entry, (_, _, _, multimodal) in zip(entries, items):
+        entry["context_window_tokens"] = 1_000_000
+        entry["context_compaction_threshold_tokens"] = 991_808
+        entry["max_output_tokens"] = 8_192
+        entry["tool_result_max_tokens"] = recommended_tool_preview_tokens(991_808)
+        entry["is_multimodal"] = multimodal
+        entry["supports_disabled_thinking"] = "disabled" in entry["thinking_config"]
+    return entries
+
+
+def _volcengine_plan_models(
+    *items: tuple[str, str, int, int, bool, bool, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    """Build Ark subscription-plan models from the official OpenCode limits.
+
+    The plan docs provide operational limits for the Responses and Chat API
+    configurations. They are lower than a few models' theoretical maximum
+    output, leaving a usable input budget for this application's Agent loop.
+    """
+    entries = _coding_models(
+        *(
+            (model_name, display_name, context_window, max_output, thinking_config)
+            for model_name, display_name, context_window, max_output, _, _, thinking_config in items
+        )
+    )
+    for entry, (_, _, _, _, is_multimodal, supports_disabled_thinking, _) in zip(entries, items):
+        entry["is_multimodal"] = is_multimodal
+        entry["supports_disabled_thinking"] = supports_disabled_thinking
+    return entries
+
+
 def _glm_thinking_config() -> dict[str, Any]:
     return {
         "enabled": {"thinking": {"type": "enabled"}},
         "disabled": {"thinking": {"type": "disabled"}},
     }
+
+
+def _scnet_reasoning_config() -> dict[str, Any]:
+    """Return a DeepSeek V4 mapping valid for SCNet Chat and Responses APIs.
+
+    SCNet documents ``reasoning_effort`` as ``high``/``max`` for Chat
+    Completions, while ``none`` is only documented by Responses.  Use the
+    cross-protocol ``enable_thinking`` switch for the disabled state so the
+    preset remains usable when the installer overrides the protocol.
+    """
+    return {
+        "enabled": {"reasoning_effort": "high"},
+        "disabled": {"enable_thinking": False},
+        "efforts": {
+            "high": {"reasoning_effort": "high"},
+            "max": {"reasoning_effort": "max"},
+        },
+    }
+
+
+def _scnet_models() -> list[dict[str, Any]]:
+    """Build the current SCNet model catalogue used by API and Token Plan keys.
+
+    SCNet keeps the same model IDs behind its regular and subscription keys;
+    the key determines billing and entitlement.  The list is intentionally
+    also used as a discovery fallback so a Token Plan can be configured before
+    its account-specific ``/models`` response is available.
+    """
+    entries = _models(
+        ("GLM-5.2", "GLM-5.2", None),
+        ("GLM-5", "GLM-5", None),
+        ("GLM-5.1", "GLM-5.1", None),
+        ("Kimi-K3", "Kimi K3", None),
+        ("Kimi-K2.7-Code", "Kimi K2.7 Code", None),
+        ("Kimi-K2.6", "Kimi K2.6", None),
+        ("Kimi-K2.5", "Kimi K2.5", None),
+        ("DeepSeek-V4-Flash", "DeepSeek V4 Flash", _scnet_reasoning_config()),
+        ("DeepSeek-V3.2", "DeepSeek V3.2", None),
+        ("MiniMax-M3", "MiniMax M3", None),
+        ("MiniMax-M2.7", "MiniMax M2.7", None),
+        ("MiniMax-M2.5", "MiniMax M2.5", None),
+        ("MiMo-V2.5-Pro", "MiMo V2.5 Pro", None),
+    )
+    for entry in entries:
+        entry["is_multimodal"] = entry["model_name"] in {"Kimi-K2.6", "Kimi-K2.5"}
+    return entries
+
+
+def _scnet_coding_models() -> list[dict[str, Any]]:
+    """Build SCNet Coding Plan's currently published model catalogue."""
+    return _models(
+        ("MiniMax-M2.5", "MiniMax M2.5", None),
+        ("Qwen3-235B-A22B", "Qwen3 235B A22B", _toggle_config()),
+    )
 
 
 # ``id`` 是稳定的产品内部标识，不依赖某个供应商模型名称。后续增加模型不影响已有配置。
@@ -252,6 +388,42 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         ),
     },
     {
+        "id": "scnet",
+        "name": "国家超算互联网（SCNet）",
+        "provider_type": "openai_compatible",
+        "base_url": SCNET_OPENAI_BASE_URL,
+        "api_key_hint": "sk-...",
+        "api_key_prefix": "sk-",
+        "model_discovery": OPENAI_COMPATIBLE_DISCOVERY,
+        "models": _scnet_models(),
+    },
+    {
+        # Token Plan uses the same gateway and model IDs as the regular API,
+        # but the subscription key (sk-tp-...) must be kept separate.  Responses
+        # is the native agent-friendly OpenAI protocol; installation can still
+        # override this to openai_compatible for /chat/completions tools.
+        "id": "scnet_token_plan",
+        "name": "国家超算互联网 · Token Plan（Responses API）",
+        "provider_type": "openai_responses",
+        "base_url": SCNET_OPENAI_BASE_URL,
+        "api_key_hint": "sk-tp-...（Token Plan 专属）",
+        "api_key_prefix": "sk-tp-",
+        "model_discovery": OPENAI_COMPATIBLE_DISCOVERY,
+        "models": _scnet_models(),
+    },
+    {
+        # Coding Plan uses a separate subscription key (sk-sp-...) and a
+        # smaller, coding-focused model catalogue than Token Plan.
+        "id": "scnet_coding_plan",
+        "name": "国家超算互联网 · Coding Plan（Responses API）",
+        "provider_type": "openai_responses",
+        "base_url": SCNET_OPENAI_BASE_URL,
+        "api_key_hint": "sk-sp-...（Coding Plan 专属）",
+        "api_key_prefix": "sk-sp-",
+        "model_discovery": OPENAI_COMPATIBLE_DISCOVERY,
+        "models": _scnet_coding_models(),
+    },
+    {
         "id": "volcengine_ark",
         "name": "火山引擎 / 方舟",
         "provider_type": "openai_compatible",
@@ -260,6 +432,106 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         # 方舟调用时的 model 是用户创建的推理 Endpoint ID（ep-...），不是公共模型名。
         "model_discovery": VOLCENGINE_ARK_DISCOVERY,
         "models": [],
+    },
+    {
+        # 方舟官方将此套餐命名为 Agent Plan；它是普通方舟 /api/v3 Endpoint
+        # 推理之外的专属套餐，不可混用 API Key 或 Base URL。
+        "id": "volcengine_ark_agent_plan",
+        "name": "火山方舟 · Agent Plan（Responses API）",
+        "provider_type": "openai_responses",
+        "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+        "api_key_hint": "套餐专属 API Key",
+        "model_discovery": VOLCENGINE_ARK_PLAN_DISCOVERY,
+        "models": _volcengine_plan_models(
+            (
+                "ark-code-latest", "Ark Code Latest", 256_000, 32_000, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "doubao-seed-2.1-turbo", "Doubao Seed 2.1 Turbo", 256_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "doubao-seed-evolving", "Doubao Seed Evolving", 1_024_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "glm-5.3", "GLM-5.3", 1_024_000, 65_536, False, False,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "glm-latest", "GLM Latest", 1_024_000, 65_536, False, False,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "deepseek-v4-flash", "DeepSeek V4 Flash", 1_024_000, 65_536, False, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "deepseek-v4-pro", "DeepSeek V4 Pro", 1_024_000, 65_536, False, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "doubao-seed-2.0-lite", "Doubao Seed 2.0 Lite", 256_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "doubao-seed-2.0-mini", "Doubao Seed 2.0 Mini", 256_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "minimax-m3", "MiniMax M3", 1_024_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            ("kimi-k2.7-code", "Kimi K2.7 Code", 256_000, 32_000, True, True, None),
+            (
+                "kimi-k3", "Kimi K3", 1_024_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+        ),
+    },
+    {
+        "id": "volcengine_ark_coding_plan",
+        "name": "火山方舟 · Coding Plan（Responses API）",
+        "provider_type": "openai_responses",
+        "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "api_key_hint": "套餐专属 API Key",
+        "model_discovery": VOLCENGINE_ARK_PLAN_DISCOVERY,
+        "models": _volcengine_plan_models(
+            (
+                "ark-code-latest", "Ark Code Latest", 256_000, 32_000, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "doubao-seed-2.1-turbo", "Doubao Seed 2.1 Turbo", 256_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "glm-5.3", "GLM-5.3", 1_024_000, 65_536, False, False,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "glm-latest", "GLM Latest", 1_024_000, 65_536, False, False,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "deepseek-v4-flash", "DeepSeek V4 Flash", 1_024_000, 65_536, False, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "deepseek-v4-pro", "DeepSeek V4 Pro", 1_024_000, 65_536, False, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "doubao-seed-2.0-lite", "Doubao Seed 2.0 Lite", 256_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            (
+                "minimax-m3", "MiniMax M3", 1_024_000, 65_536, True, True,
+                _volcengine_plan_reasoning_config(),
+            ),
+            ("kimi-k2.7-code", "Kimi K2.7 Code", 256_000, 32_000, True, True, None),
+        ),
     },
     {
         "id": "baidu_qianfan",
@@ -390,14 +662,16 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
     },
     {
         "id": "gemini",
-        "name": "Google Gemini（OpenAI 兼容）",
-        "provider_type": "openai_compatible",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "name": "Google Gemini（原生 API）",
+        "provider_type": "gemini_native",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "api_key_hint": "AIza...",
         "model_discovery": GEMINI_DISCOVERY,
-        "models": _models(
-            ("gemini-2.5-pro", "Gemini 2.5 Pro", _openai_reasoning_config()),
-            ("gemini-2.5-flash", "Gemini 2.5 Flash", _openai_reasoning_config()),
+        "models": _gemini_models(
+            ("gemini-2.5-pro", "Gemini 2.5 Pro", _gemini_25_thinking_config(), True),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash", _gemini_25_thinking_config(), True),
+            ("gemini-3-pro-preview", "Gemini 3 Pro Preview", _gemini_3_thinking_config(), True),
+            ("gemini-3-flash-preview", "Gemini 3 Flash Preview", _gemini_3_thinking_config(), True),
         ),
     },
     # ---------------------------------------------------------------------
@@ -559,24 +833,76 @@ def get_provider_preset(preset_id: str) -> dict[str, Any] | None:
     return None
 
 
-def find_provider_preset(base_url: str, provider_type: str) -> dict[str, Any] | None:
+def find_provider_preset(
+    base_url: str,
+    provider_type: str,
+    api_key: str | None = None,
+) -> dict[str, Any] | None:
+    """Find a preset, using the credential prefix when gateways are shared.
+
+    SCNet's regular API, Token Plan and Coding Plan intentionally share both
+    the gateway URL and (for two plans) the protocol.  The persisted provider
+    record has no preset ID, so a supplied API key is the only reliable way to
+    select the right fallback catalogue.
+    """
     normalized = base_url.rstrip("/").lower()
-    for preset in PROVIDER_PRESETS:
-        if preset["provider_type"] == provider_type and preset["base_url"].rstrip("/").lower() == normalized:
-            return deepcopy(preset)
+    base_matches = [
+        preset
+        for preset in PROVIDER_PRESETS
+        if preset["base_url"].rstrip("/").lower() == normalized
+    ]
+    if api_key:
+        specific_matches = [
+            preset
+            for preset in base_matches
+            if str(preset.get("api_key_prefix") or "") not in {"", "sk-"}
+            and api_key.startswith(str(preset["api_key_prefix"]))
+        ]
+        if specific_matches:
+            return deepcopy(specific_matches[0])
+        generic_matches = [
+            preset
+            for preset in base_matches
+            if str(preset.get("api_key_prefix") or "") == "sk-"
+            and api_key.startswith("sk-")
+        ]
+        if generic_matches:
+            return deepcopy(generic_matches[0])
+    matches = [preset for preset in base_matches if preset["provider_type"] == provider_type]
+    if api_key and len(matches) > 1:
+        for preset in matches:
+            prefix = str(preset.get("api_key_prefix") or "")
+            if prefix and api_key.startswith(prefix):
+                # The generic ``sk-`` prefix also matches plan keys; prefer
+                # the plan-specific prefixes when more than one is present.
+                if prefix != "sk-" or not any(
+                    str(candidate.get("api_key_prefix") or "") != "sk-"
+                    and api_key.startswith(str(candidate.get("api_key_prefix") or ""))
+                    for candidate in matches
+                ):
+                    return deepcopy(preset)
+    if matches:
+        return deepcopy(matches[0])
     return None
 
 
 def find_model_preset(model_name: str, provider_preset: dict[str, Any] | None = None) -> dict[str, Any] | None:
     candidates = [provider_preset] if provider_preset else PROVIDER_PRESETS
     normalized = model_name.lower()
+    capability = DISCOVERED_MODEL_CAPABILITIES.get(normalized)
     for preset in candidates:
         if not preset:
             continue
         for model in preset["models"]:
             if model["model_name"].lower() == normalized:
-                return deepcopy(model)
-    capability = DISCOVERED_MODEL_CAPABILITIES.get(normalized)
+                result = deepcopy(model)
+                # The global capability catalogue is authoritative for
+                # provider-agnostic discovery. Keep provider-specific preset
+                # values intact because a plan endpoint may document a
+                # different operational limit for the same model ID.
+                if capability is not None and provider_preset is None:
+                    result.update(deepcopy(capability))
+                return result
     return deepcopy(capability) if capability else None
 
 

@@ -1,9 +1,10 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import type { CSSProperties, UIEvent } from 'react'
+import type { CSSProperties, UIEvent, WheelEvent } from 'react'
 import { useStickToBottom } from 'use-stick-to-bottom'
 import { Alert, Button, Collapse, Drawer, Dropdown, Grid, Image, Input, Modal, Popover, Select, Tag, Tooltip, Typography, message } from 'antd'
 import {
   AppstoreOutlined,
+  ArrowRightOutlined,
   ArrowDownOutlined,
   ArrowUpOutlined,
   BulbOutlined,
@@ -20,6 +21,7 @@ import {
   FolderOpenOutlined,
   FormatPainterOutlined,
   HistoryOutlined,
+  InfoCircleFilled,
   LoadingOutlined,
   MoreOutlined,
   PaperClipOutlined,
@@ -68,7 +70,7 @@ import { aiDiffRows } from './aiOutputDiff'
 const { Text } = Typography
 
 export interface ChatRunNotice {
-  kind: 'retrying' | 'error' | 'success'
+  kind: 'retrying' | 'error' | 'success' | 'info'
   title: string
   detail: string
   attempt?: number
@@ -103,6 +105,7 @@ const TOOL_LABELS: Record<string, string> = {
   read_history_blocks: '读取历史源码',
   apply_html_patch: '应用排版补丁',
   replace_document: '整体重写',
+  read_wechat_compliance_spec: '读取微信合规规范',
   check_compliance: '合规检测',
   update_task_plan: '更新任务清单',
   apply_layout_reference: '应用参考排版',
@@ -133,6 +136,7 @@ const TOOL_LABELS: Record<string, string> = {
   apply_edited_image: '应用编辑图片',
   edit_article_cover: '编辑文章封面',
   apply_edited_cover: '应用编辑封面',
+  transform_document_image: '裁切或旋转图片',
 }
 
 const MemoMarkdownContent = memo(MarkdownContent)
@@ -146,7 +150,10 @@ const CONTEXT_BREAKDOWN_LABELS: Record<string, string> = {
   current_request: '当前请求',
   image_inputs: '图片输入',
   selected_context: '选中元素',
-  runtime_output: '本轮实时增量',
+  runtime_system: '系统提示',
+  runtime_history: '本轮消息',
+  runtime_tools: '工具结果',
+  runtime_images: '工具图片提示',
 }
 const CONTEXT_BREAKDOWN_COLORS: Record<string, string> = {
   system: '#a0a5af',
@@ -158,7 +165,10 @@ const CONTEXT_BREAKDOWN_COLORS: Record<string, string> = {
   current_request: '#e34d80',
   image_inputs: '#4b9f9f',
   selected_context: '#ba9aaf',
-  runtime_output: '#5d8c5a',
+  runtime_system: '#a0a5af',
+  runtime_history: '#f0b45f',
+  runtime_tools: '#5d8c5a',
+  runtime_images: '#4b9f9f',
 }
 const THINKING_EFFORT_LABELS: Record<string, string> = {
   minimal: '极简',
@@ -181,7 +191,7 @@ interface TaskPlan {
 // renderer. Keep that behavior so inline Markdown such as **bold** is never
 // shown as literal source while the Agent is still streaming.
 const StreamingMarkdownContent = memo(function StreamingMarkdownContent({ content }: { content: string }) {
-  return <MemoMarkdownContent content={content} />
+  return <MemoMarkdownContent content={content} streaming />
 })
 
 function formatTokenCount(value: number): string {
@@ -190,25 +200,140 @@ function formatTokenCount(value: number): string {
   return `${Math.round(value / 1_000)}K`
 }
 
-function estimateRuntimeTokens(streamText: string, reasoningTrace: ReasoningTrace, toolActivities: ToolExecution[]): number {
-  const content = [
-    streamText,
-    reasoningTrace.content,
-    ...toolActivities.map((tool) => tool.result ?? ''),
-  ].join('')
-  return content ? Math.ceil(content.length / 2) : 0
+interface CompactionSummarySection {
+  key: string
+  label: string
+  values: string[]
 }
 
-export function contextUsageValues(stats: ChatContextStats, runtimeTokens = 0) {
-  const runtimeProjectionTokens = Math.max(
-    0,
-    Math.round(runtimeTokens),
-    stats.runtime_projected_tokens ?? 0,
-  )
+interface CompactionSummary {
+  objective: string
+  narrative: string
+  sections: CompactionSummarySection[]
+}
+
+const COMPACTION_SUMMARY_FIELD_LABELS: Record<string, string> = {
+  important_details: '重要信息',
+  user_preferences: '用户偏好',
+  completed_intents: '已完成',
+  active_work: '正在处理',
+  pending_tasks: '待处理',
+  blocked: '阻塞项',
+  next_move: '下一步',
+  relevant_files: '相关文件',
+  constraints: '约束条件',
+  decisions: '已确认决策',
+  completed: '已完成',
+  blockers: '阻塞项',
+  next_steps: '下一步',
+  source_refs: '来源记录',
+}
+
+const COMPACTION_SUMMARY_FIELD_ORDER = [
+  'active_work',
+  'pending_tasks',
+  'next_steps',
+  'next_move',
+  'constraints',
+  'decisions',
+  'user_preferences',
+  'important_details',
+  'completed',
+  'completed_intents',
+  'blockers',
+  'blocked',
+  'relevant_files',
+  'source_refs',
+]
+
+function compactionSummaryValues(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : [value]
+  return values.flatMap((item) => {
+    if (typeof item === 'string') {
+      const text = item.trim()
+      return text ? [text] : []
+    }
+    if (typeof item === 'number' || typeof item === 'boolean') return [String(item)]
+    return []
+  })
+}
+
+function compactionSummaryFieldLabel(key: string): string {
+  return COMPACTION_SUMMARY_FIELD_LABELS[key] ?? key.replace(/_/g, ' ')
+}
+
+/** Parse the compactors' two persisted JSON schemas without changing legacy text summaries. */
+export function parseCompactionSummary(summary: string): CompactionSummary | null {
+  const trimmed = summary.trim()
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed)
+  const source = (fenced?.[1] ?? trimmed).trim()
+  if (!source) return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(source)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+
+  const record = parsed as Record<string, unknown>
+  const objective = compactionSummaryValues(record.objective).join('；')
+  const narrative = compactionSummaryValues(record.narrative).join('；')
+  const knownKeys = new Set(['objective', 'narrative', ...COMPACTION_SUMMARY_FIELD_ORDER])
+  const orderedKeys = [
+    ...COMPACTION_SUMMARY_FIELD_ORDER.filter((key) => key in record),
+    ...Object.keys(record).filter((key) => !knownKeys.has(key)),
+  ]
+  const sections = orderedKeys.flatMap((key) => {
+    const values = compactionSummaryValues(record[key])
+    return values.length ? [{ key, label: compactionSummaryFieldLabel(key), values }] : []
+  })
+
+  return objective || narrative || sections.length ? { objective, narrative, sections } : null
+}
+
+function wheelDeltaPixels(event: WheelEvent<HTMLElement>): number {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * 16
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) return event.deltaY * event.currentTarget.clientHeight
+  return event.deltaY
+}
+
+function scrollableWheelParent(element: HTMLElement, delta: number): HTMLElement | null {
+  let parent = element.parentElement
+  while (parent) {
+    const overflowY = window.getComputedStyle(parent).overflowY
+    const maximumScrollTop = parent.scrollHeight - parent.clientHeight
+    const canScroll = maximumScrollTop > 1 && /auto|scroll|overlay/.test(overflowY)
+    if (canScroll && (delta < 0 ? parent.scrollTop > 1 : parent.scrollTop < maximumScrollTop - 1)) return parent
+    parent = parent.parentElement
+  }
+  return null
+}
+
+/** Hand the wheel event to the nearest scrollable parent as soon as a detail panel hits its edge. */
+function forwardCompactionBoundaryWheel(event: WheelEvent<HTMLElement>) {
+  const delta = wheelDeltaPixels(event)
+  if (!delta) return
+  const element = event.currentTarget
+  const maximumScrollTop = element.scrollHeight - element.clientHeight
+  const atBoundary = maximumScrollTop <= 1
+    || (delta < 0 ? element.scrollTop <= 1 : element.scrollTop >= maximumScrollTop - 1)
+  if (!atBoundary) return
+
+  const parent = scrollableWheelParent(element, delta)
+  if (!parent) return
+  event.preventDefault()
+  event.stopPropagation()
+  parent.scrollTop = Math.max(0, Math.min(parent.scrollHeight - parent.clientHeight, parent.scrollTop + delta))
+}
+
+export function contextUsageValues(stats: ChatContextStats) {
+  const runtimeContextTokens = Math.max(0, Math.round(stats.runtime_context_tokens ?? 0))
   return {
-    compiledInputTokens: stats.compiled_input_tokens ?? stats.used_tokens,
+    compiledInputTokens: runtimeContextTokens || stats.compiled_input_tokens || stats.used_tokens,
     ledgerTokens: stats.ledger_tokens ?? stats.conversation_tokens ?? 0,
-    runtimeProjectionTokens,
+    runtimeContextTokens,
   }
 }
 
@@ -246,24 +371,48 @@ export function visibleTemplateReferenceIndexes(content: string, templateCount: 
   return indexes
 }
 
+export function contextCompactionNotice(content: string): ChatRunNotice {
+  const successPrefix = '压缩上下文成功，'
+  if (content.startsWith(successPrefix)) {
+    return {
+      kind: 'success',
+      title: '上下文已压缩',
+      detail: content.slice(successPrefix.length).trim(),
+    }
+  }
+
+  const noOpPrefix = '上下文检查完成，'
+  if (content.startsWith(noOpPrefix)) {
+    return {
+      kind: 'info',
+      title: '无需压缩',
+      detail: content.slice(noOpPrefix.length).trim(),
+    }
+  }
+
+  return {
+    kind: 'info',
+    title: '上下文状态',
+    detail: content,
+  }
+}
+
 function ContextUsage({
   stats,
-  runtimeTokens = 0,
   onCompactContext,
 }: {
   stats: ChatContextStats
-  runtimeTokens?: number
   onCompactContext: (rebuild: boolean) => void | Promise<void>
 }) {
   const [compacting, setCompacting] = useState(false)
-  // The prepared-context budget remains authoritative for the next request.
-  // While an Agent streams, add its visible output as a local projection so
-  // the meter advances without waiting for the turn to be persisted.
-  const { compiledInputTokens, ledgerTokens, runtimeProjectionTokens } = contextUsageValues(stats, runtimeTokens)
-  const isLiveProjection = runtimeProjectionTokens > 0
-  const stateLabel = isLiveProjection
-    ? '本轮执行中'
-    : stats.runtime_context_state === 'run_compacting' || stats.state === 'compacting'
+  const { compiledInputTokens, ledgerTokens, runtimeContextTokens } = contextUsageValues(stats)
+  const hasRuntimeContext = runtimeContextTokens > 0
+  const sourceLabel = stats.runtime_context_source === 'provider_reported'
+    ? '最近模型调用实报'
+    : stats.runtime_context_source === 'server_recomputed_after_tool'
+      ? '工具结果后重算'
+      : '已构建上下文'
+  const stateLabel = stats.runtime_context_state === 'run_compacting' || stats.state === 'compacting'
         ? '正在压缩'
       : stats.runtime_context_state === 'in_run_compacted'
         ? '运行中已压缩'
@@ -275,13 +424,13 @@ function ContextUsage({
           ? '发送时将压缩'
           : stats.state === 'context_overflow'
             ? '当前配置不足'
-            : '下次输入'
-  const usedTokens = compiledInputTokens + runtimeProjectionTokens
+            : sourceLabel
+  const usedTokens = compiledInputTokens
   const usagePercent = Math.min(100, Math.round(usedTokens / Math.max(1, stats.usable_tokens) * 100))
-  const breakdownItems = [
-    ...Object.entries(stats.breakdown).filter(([, value]) => value > 0),
-    ...(isLiveProjection ? [['runtime_output', runtimeProjectionTokens] as [string, number]] : []),
-  ]
+  const activeBreakdown = hasRuntimeContext && Object.keys(stats.runtime_context_breakdown ?? {}).length
+    ? stats.runtime_context_breakdown ?? {}
+    : stats.breakdown
+  const breakdownItems = Object.entries(activeBreakdown).filter(([, value]) => value > 0)
   const ringColor = usagePercent >= 85 ? '#e88b2d' : usagePercent >= 65 ? '#d6a33d' : '#3c84e8'
   const ringStyle = {
     background: `conic-gradient(${ringColor} ${usagePercent}%, var(--app-border) 0)`,
@@ -324,7 +473,7 @@ function ContextUsage({
       </div>
       <div className="chat-context-summary">
         <b>{usagePercent}% 已用</b>
-        <span>{isLiveProjection ? '本轮预估约' : '下次输入约'} {formatTokenCount(usedTokens)} / {formatTokenCount(stats.usable_tokens)} tokens</span>
+        <span>{hasRuntimeContext ? sourceLabel : '下次输入约'} {formatTokenCount(usedTokens)} / {formatTokenCount(stats.usable_tokens)} tokens</span>
       </div>
       <div className="chat-context-bar" aria-label={`上下文已使用 ${usagePercent}%`}>
         {breakdownItems.map(([key, value]) => (
@@ -344,9 +493,10 @@ function ContextUsage({
         {stats.snapshot_covered_event_count ? `；快照覆盖 ${stats.snapshot_covered_event_count} 条事件` : ''}
         <br />完整事件 {stats.event_count ?? 0} 条，当前回放 {stats.replayed_event_count ?? 0} 条，已节省约 {stats.tokens_saved.toLocaleString()} tokens
         {stats.compaction_strategy ? `；压缩方式：${stats.compaction_strategy === 'agentic' ? '模型摘要' : stats.compaction_strategy}` : ''}
-        {stats.is_estimate ? '，为估算值' : ''}
+        {hasRuntimeContext ? (stats.runtime_context_is_estimate ? '；服务端估算值' : '；提供方实报') : (stats.is_estimate ? '，为估算值' : '')}
+        {stats.runtime_context_source === 'server_recomputed_after_tool' && stats.runtime_context_tool_name ? `；工具 ${stats.runtime_context_tool_name} 已完成` : ''}
         {stats.runtime_input_tokens ? `；本轮最近调用约 ${formatTokenCount(stats.runtime_input_tokens)} tokens` : ''}
-        {isLiveProjection ? `；本轮实时增量约 ${formatTokenCount(runtimeProjectionTokens)} tokens，尚未持久化` : ''}
+        {stats.runtime_context_state === 'streaming' ? '；流式生成内容尚未进入下一次模型输入，工具完成后会重算' : ''}
         <br />输出上限 {stats.max_output_tokens.toLocaleString()}，单次工具预览上限 {stats.tool_result_max_tokens.toLocaleString()} tokens
         {stats.effective_tool_preview_tokens && stats.effective_tool_preview_tokens !== stats.tool_result_max_tokens
           ? `（本轮动态上限 ${formatTokenCount(stats.effective_tool_preview_tokens)}）`
@@ -745,7 +895,6 @@ export default function ChatPanel({
     : thinkingStatus?.includes('工具参数')
       ? thinkingStatus
       : streamingLabel(streamBlocks, streamText)
-  const runtimeTokens = streaming ? estimateRuntimeTokens(streamText, reasoningTrace, toolActivities) : 0
   const taskPlan = streaming
     ? latestTaskPlanFromBlocks(streamBlocks, toolActivities)
     : latestTaskPlanFromMessages(messages)
@@ -1301,7 +1450,7 @@ export default function ChatPanel({
             </div>
             <div className="chat-input-actions-submit">
               {chatSettingsTrigger}
-              {contextStats && <ContextUsage stats={contextStats} runtimeTokens={runtimeTokens} onCompactContext={onCompactContext} />}
+              {contextStats && <ContextUsage stats={contextStats} onCompactContext={onCompactContext} />}
               {streaming && (
                 <Tooltip title="停止生成">
                   <Button aria-label="停止生成" danger icon={<StopOutlined />} loading={stopping} disabled={stopping} onClick={onStop} />
@@ -1437,6 +1586,8 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
               resumeChatAutoFollow={resumeChatAutoFollow}
               archiveScrollAnchorEnabled={!editingDisabled}
             />
+          ) : messageItem.role === 'tool' ? (
+            <ContextCompactionNotice content={messageItem.content} />
           ) : (
             <div className="chat-turn-content">
               <UserMessageContent
@@ -1481,6 +1632,7 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
 })
 
 function messageAuthorLabel(messageItem: ChatMessageItem, currentUserId: number | undefined): string {
+  if (messageItem.role === 'tool') return '系统'
   if (messageItem.role !== 'user') return '排版助手'
   if (messageItem.created_by?.id === currentUserId) return '你'
   return messageItem.created_by?.display_name || messageItem.created_by?.username || '未知用户'
@@ -1638,7 +1790,13 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
 
   return (
     <div className={`chat-run-notice is-${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
-      {notice.kind === 'retrying' ? <SyncOutlined spin /> : notice.kind === 'success' ? <CheckCircleFilled /> : <ExclamationCircleFilled />}
+      {notice.kind === 'retrying'
+        ? <SyncOutlined spin />
+        : notice.kind === 'success'
+          ? <CheckCircleFilled />
+          : notice.kind === 'info'
+            ? <InfoCircleFilled />
+            : <ExclamationCircleFilled />}
       <div className="chat-run-notice-copy">
         <div className="chat-run-notice-title">
           <strong>{notice.title}</strong>
@@ -1658,6 +1816,68 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
             </Button>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
+
+interface ContextCompactionMetrics {
+  savedTokens: string
+  compressionRate: string
+  beforeTokens: string
+  afterTokens: string
+}
+
+function contextCompactionMetrics(detail: string): ContextCompactionMetrics | null {
+  const match = detail.match(/^节省\s+([\d,]+)\s+tokens，压缩率\s+([\d.]+)%（([\d,]+)\s*→\s*([\d,]+)\s+tokens）[。.]?$/)
+  if (!match) return null
+  return {
+    savedTokens: match[1],
+    compressionRate: match[2],
+    beforeTokens: match[3],
+    afterTokens: match[4],
+  }
+}
+
+function ContextCompactionNotice({ content }: { content: string }) {
+  const notice = contextCompactionNotice(content)
+  const metrics = notice.kind === 'success' ? contextCompactionMetrics(notice.detail) : null
+  const isSuccess = notice.kind === 'success'
+
+  return (
+    <div className={`context-compaction-notice is-${notice.kind}`} role="status">
+      <span className="context-compaction-notice-icon" aria-hidden="true">
+        {isSuccess ? <CheckCircleFilled /> : <InfoCircleFilled />}
+      </span>
+      <div className="context-compaction-notice-copy">
+        <div className="context-compaction-notice-heading">
+          <strong>{notice.title}</strong>
+          {isSuccess && <span className="context-compaction-notice-badge">已持久化</span>}
+        </div>
+        {metrics ? (
+          <div className="context-compaction-notice-metrics" aria-label={notice.detail}>
+            <div className="context-compaction-notice-token-flow">
+              <span className="context-compaction-notice-token-value">
+                <small>压缩前</small>
+                <b>{metrics.beforeTokens}</b>
+              </span>
+              <ArrowRightOutlined />
+              <span className="context-compaction-notice-token-value is-result">
+                <small>压缩后</small>
+                <b>{metrics.afterTokens}</b>
+              </span>
+              <em>tokens</em>
+            </div>
+            <div className="context-compaction-notice-savings">
+              <small>本次节省</small>
+              <b>{metrics.savedTokens}</b>
+              <em>tokens</em>
+              <span>压缩率 {metrics.compressionRate}%</span>
+            </div>
+          </div>
+        ) : (
+          <div className="context-compaction-notice-detail">{notice.detail}</div>
+        )}
       </div>
     </div>
   )
@@ -2124,6 +2344,75 @@ const AssistantTimelineBlock = memo(function AssistantTimelineBlock({
   resumeChatAutoFollow: (suspensionId: number | null) => void
   autoFollowSuspensionEnabled: boolean
 }) {
+  if (block.type === 'context_compaction' && block.context_compaction) {
+    const compaction = block.context_compaction
+    const summary = parseCompactionSummary(compaction.summary)
+    const sourceReferences = summary?.sections.find((section) => section.key === 'source_refs')
+    const summarySections = summary?.sections.filter((section) => section.key !== 'source_refs') ?? []
+    const savedTokens = Math.max(0, compaction.original_tokens - compaction.used_tokens)
+    const rate = compaction.original_tokens > 0
+      ? Math.round(savedTokens / compaction.original_tokens * 100)
+      : 0
+    return (
+      <div className={`assistant-process-entry assistant-action-entry assistant-process-compaction${connectsToNext ? ' has-next-process' : ''}${archived ? ' is-archived' : ''}`}>
+        <div className="assistant-process-rail" aria-hidden="true"><i className="assistant-process-dot" /></div>
+        <div className="assistant-process-main">
+          <div className="assistant-compaction-card">
+            <div className="assistant-compaction-title">压缩上下文成功</div>
+            <div className="assistant-compaction-stats">
+              {savedTokens > 0 ? `节省 ${savedTokens.toLocaleString()} tokens（${rate}%）` : '已整理运行上下文'}
+              {compaction.summarized_cycles > 0 ? ` · 摘要 ${compaction.summarized_cycles} 轮工具循环` : ''}
+              {compaction.durable_snapshot ? ' · 已持久化' : ''}
+            </div>
+            {compaction.summary && (
+              <details className="assistant-compaction-details">
+                <summary>查看压缩摘要</summary>
+                {summary ? (
+                  <div className="assistant-compaction-summary" onWheel={forwardCompactionBoundaryWheel}>
+                    {summary.objective && (
+                      <section className="assistant-compaction-summary-objective">
+                        <span>当前目标</span>
+                        <p>{summary.objective}</p>
+                      </section>
+                    )}
+                    {summary.narrative && (
+                      <section className="assistant-compaction-summary-narrative">
+                        <span>状态说明</span>
+                        <p>{summary.narrative}</p>
+                      </section>
+                    )}
+                    {summarySections.length > 0 && (
+                      <div className="assistant-compaction-summary-grid">
+                        {summarySections.map((section) => (
+                          <section className="assistant-compaction-summary-section" key={section.key}>
+                            <span>{section.label}</span>
+                            <ul>
+                              {section.values.map((value, index) => <li key={`${section.key}-${index}`}>{value}</li>)}
+                            </ul>
+                          </section>
+                        ))}
+                      </div>
+                    )}
+                    {sourceReferences && (
+                      <details className="assistant-compaction-source-refs">
+                        <summary>来源记录（{sourceReferences.values.length}）</summary>
+                        <ul className="assistant-compaction-source-list" onWheel={forwardCompactionBoundaryWheel}>
+                          {sourceReferences.values.map((value, index) => <li key={`source-ref-${index}`}><code>{value}</code></li>)}
+                        </ul>
+                      </details>
+                    )}
+                  </div>
+                ) : (
+                  <div className="assistant-compaction-summary-raw" onWheel={forwardCompactionBoundaryWheel}>{compaction.summary}</div>
+                )}
+              </details>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (block.type === 'thought') {
     const trace: ReasoningTrace = {
       status: block.state === 'active' ? 'thinking' : block.content ? 'complete' : 'unavailable',
@@ -2361,8 +2650,11 @@ function ToolTrace({
               </div>
             )}
             {generatedImages.length > 0 && <GeneratedImagePreviews images={generatedImages} />}
-            {htmlValidation?.valid === false && htmlValidation.errors?.length ? (
+            {htmlValidation?.valid === false && htmlValidation.errors?.length && !activity?.validation_warning ? (
               <div className="tool-trace-result">{htmlValidation.errors.join('；')}</div>
+            ) : null}
+            {activity?.validation_warning && htmlValidation?.errors?.length ? (
+              <div className="tool-trace-summary">HTML 结构警告（修改已保留）：{htmlValidation.errors.join('；')}</div>
             ) : null}
             {htmlValidation?.warnings?.length ? (
               <div className="tool-trace-summary">HTML5 兼容提示：{htmlValidation.warnings.join('；')}</div>
@@ -2482,6 +2774,7 @@ function toolDetailResult(tool: ToolExecution): string {
   const result = tool.result?.trim()
   if (!result) return ''
   if (tool.status === 'error') return toolHtmlValidation(tool)?.errors?.length ? '' : result
+  if (tool.activity?.validation_warning) return ''
   const summary = tool.activity?.summary?.trim()
   if (!summary) return result
 

@@ -7,34 +7,30 @@ class ComplianceCheckRequest(BaseModel):
     html: str
 
 
-class ComplianceDiagnosticRead(BaseModel):
-    code: str
-    severity: str
-    path: str
-    line: int
-    column: int
-    snippet: str
+class ComplianceEngineRead(BaseModel):
+    version: str
+    commit: str
+    repository: str
+    available: bool
+    detail: str
+
+
+class ComplianceViolationItemRead(BaseModel):
+    paragraphIndex: int | str | None = None
+    outerHTML: str
+    rules: str
+    measurements: dict[str, Any]
+
+
+class ComplianceViolationRead(BaseModel):
+    key: str
     message: str
-    consequence: str
-    suggestion: str
+    items: list[ComplianceViolationItemRead]
 
 
 class ComplianceReportRead(BaseModel):
-    removedClasses: list[str]
-    keptClasses: list[str]
-    removedIdAttributes: list[str]
-    riskStyleHints: list[str]
-    bannedTags: list[str]
-    consecutiveBrRuns: list[int]
-    svgIdAttributes: list[str]
-    imageIssues: list[str]
-    removedSvgBrs: int
-    hasSvg: bool
-    oversizedSvgBlocks: list[int]
-    maxNestingDepth: int
-    willFlattenNesting: bool
-    emptyNodeSuspects: list[str]
-    diagnostics: list[ComplianceDiagnosticRead]
-    hasError: bool
-    hasWarning: bool
+    engine: ComplianceEngineRead
+    isValid: bool | None
+    violations: list[ComplianceViolationRead]
+    warnMsgs: list[str]
     gzhStrict: dict[str, Any] | None = None

@@ -50,6 +50,8 @@ wechatediter/
 release-artifacts/
 artifacts/
 *.private.7z
+tmp/
+debug-artifacts/
 
 # Editor and operating system files
 .DS_Store

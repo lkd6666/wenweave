@@ -112,14 +112,18 @@ curl -fsS 'http://127.0.0.1:8088/search?q=test&categories=images&format=json' >/
 
 ```bash
 cd /opt/yibanpaiban/backend
-sudo -u yibanpaiban python3 -m venv venv
-sudo -u yibanpaiban ./venv/bin/pip install --upgrade pip
-sudo -u yibanpaiban ./venv/bin/pip install -r requirements.txt
-sudo -u yibanpaiban ./venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
-sudo -u yibanpaiban ./venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+sudo -H -u yibanpaiban python3 -m venv venv
+sudo -H -u yibanpaiban ./venv/bin/pip install --upgrade pip
+sudo -H -u yibanpaiban ./venv/bin/pip install -r requirements.txt
+sudo ./venv/bin/python -m playwright install-deps chromium
+sudo -H -u yibanpaiban ./venv/bin/python -m playwright install chromium
+sudo -H -u yibanpaiban ./venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
+sudo -H -u yibanpaiban ./venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 将最后两个命令的输出分别填入 `.env` 的 `SECRET_KEY` 与 `ENCRYPTION_KEY`，再继续创建 systemd 服务。
+
+官方微信合规检测由 Python Playwright 启动 Chromium，不需要 Node.js。浏览器必须使用运行 systemd 服务的同一用户安装；`sudo -H` 确保它进入该用户的缓存目录，而不是误装到 `/root/.cache/ms-playwright`。每次升级或重装 Python 依赖后都要重新执行 Chromium 安装命令并重启服务，以保持浏览器 revision 与 Playwright 版本一致。浏览器仅在首次模型合规检测时启动并由该应用进程复用；浏览器安装失败时文章会显示“未验证”，但编辑、保存和公众号草稿同步不会被阻断。若运维已通过系统包安装 Chromium，可在 `backend/.env` 设置 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium`（按实际路径替换），无需再下载 Playwright 管理的浏览器。
 
 创建 `/etc/systemd/system/yibanpaiban.service`：
 

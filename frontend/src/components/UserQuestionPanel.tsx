@@ -173,18 +173,28 @@ export default function UserQuestionPanel({
               const selected = selectedSet.has(option.id)
               return (
                 <div className={`user-question-option${selected ? ' is-selected' : ''}`} key={option.id}>
-                  <button
-                    type="button"
-                    className="user-question-option-main"
-                    disabled={interactionsDisabled}
-                    onClick={() => toggleOption(option.id)}
+                  <Tooltip
+                    placement="topLeft"
+                    title={(
+                      <div className="user-question-option-tooltip">
+                        <strong>{option.label}</strong>
+                        {option.description && <span>{option.description}</span>}
+                      </div>
+                    )}
                   >
-                    {question.allow_multiple ? <Checkbox checked={selected} /> : <Radio checked={selected} />}
-                    <span>
-                      <b>{option.label}</b>
-                      {option.description && <small>{option.description}</small>}
-                    </span>
-                  </button>
+                    <button
+                      type="button"
+                      className="user-question-option-main"
+                      disabled={interactionsDisabled}
+                      onClick={() => toggleOption(option.id)}
+                    >
+                      {question.allow_multiple ? <Checkbox checked={selected} /> : <Radio checked={selected} />}
+                      <span>
+                        <b>{option.label}</b>
+                        {option.description && <small>{option.description}</small>}
+                      </span>
+                    </button>
+                  </Tooltip>
                   {option.style_html && (
                     <Tooltip title="查看样式">
                       <Button

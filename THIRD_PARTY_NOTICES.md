@@ -1,5 +1,21 @@
 # Third-Party Notices
 
+## verify-article-structure-spec
+
+This product includes the WeChat official article-structure specification and
+browser verification bundle in `_third_party/verify-article-structure-spec`
+from <https://github.com/wechatjs/verify-article-structure-spec>.
+
+- Fixed upstream commit: `fa69e37341c86bfec4c8c533845910511e534c0c`
+- Browser checker package: `@tencent/verify-article-structure` v0.2.16
+- License: MIT; the upstream license is retained in the vendored directory.
+- The bundled `mp-darkmode` v1.2.3-alpha.1 dependency is MIT licensed; its
+  retained license notice is `MP_DARKMODE_LICENSE` in that directory.
+
+The application runs this fixed browser bundle through Python Playwright; it
+does not execute the upstream Node.js CLI in production. See the vendored
+`UPSTREAM.md` for the bundle hash and reproduction details.
+
 ## gzh-design-skill
 
 This product includes a vendored source snapshot at

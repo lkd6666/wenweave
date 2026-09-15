@@ -11,6 +11,7 @@ from app.core.config import get_settings
 
 ACCESS_TOKEN_TYPE = "access"
 REFRESH_TOKEN_TYPE = "refresh"
+FORCED_PASSWORD_CHANGE_VALUES = frozenset({"123456", "12345678"})
 
 
 def hash_password(plain_password: str) -> str:
@@ -22,6 +23,16 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
     except ValueError:
         return False
+
+
+def is_forced_password_change_value(username: str, password: str) -> bool:
+    """Return whether a new password is one of the explicitly unsafe values."""
+    return password in FORCED_PASSWORD_CHANGE_VALUES or password == username
+
+
+def password_hash_requires_change(username: str, password_hash: str) -> bool:
+    """Check a stored hash against the small set of passwords we prohibit."""
+    return any(verify_password(value, password_hash) for value in (*FORCED_PASSWORD_CHANGE_VALUES, username))
 
 
 def create_access_token(subject: str, extra_claims: Optional[Dict[str, Any]] = None) -> str:

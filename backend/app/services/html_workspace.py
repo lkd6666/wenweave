@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from typing import Callable, Iterable, Literal, Mapping
 
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 from app.services.token_budget import estimate_tokens
 from app.services.selected_elements import MAX_SELECTED_ELEMENT_TEXT_CHARS, redact_inline_data_for_identity
 
@@ -56,7 +57,6 @@ MAX_SEARCH_RESULTS = 12
 MAX_IMAGE_RESULTS = 12
 MAX_READ_BLOCKS = 16
 MAX_PATCH_OPERATIONS = 64
-DEFAULT_TOOL_RESULT_MAX_TOKENS = 8_192
 
 _SAFE_SEARCH_ATTRIBUTES = ("id", "class", "data-role", "role", "style", "alt", "title", "aria-label")
 _IMAGE_CONTEXT_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "figcaption", "td", "th"}

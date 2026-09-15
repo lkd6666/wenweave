@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import datetime, timezone
+from html.parser import HTMLParser
+from threading import Lock
+from time import monotonic
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -14,12 +19,34 @@ from app.models.image_generation import (
     ImageLibrarySource,
 )
 from app.models.storage_config import StorageConfig
+from app.models.document_import import DocumentImport, DocumentImportAsset, DocumentImportStatus
+from app.models.document import Document
 from app.models.user import User
 from app.services import oss_client
 from app.services.document_images import StoredDocumentImage
+from app.services.document_images import store_tracked_document_image
+from app.services import local_uploads
 
 
 IMAGE_LIBRARY_SETTINGS_ID = 1
+_OSS_IMPORT_PREFIX = "yibanpaiban/direct-imports/"
+_SIGNED_URL_CACHE_TTL_SECONDS = 5 * 60
+_SIGNED_URL_CACHE_MAX_ITEMS = 512
+_signed_read_url_cache: OrderedDict[tuple[int, str, str], tuple[float, str]] = OrderedDict()
+_signed_read_url_cache_lock = Lock()
+
+
+class _ImageSourceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        source = dict(attrs).get("src")
+        if source:
+            self.sources.append(source)
 
 
 def get_or_create_settings(db: Session) -> ImageLibrarySettings:
@@ -35,6 +62,31 @@ def library_mode(db: Session) -> ImageLibraryMode:
     return get_or_create_settings(db).mode
 
 
+def _cached_signed_read_url(storage: StorageConfig, object_key: str) -> str:
+    """Avoid generating a different private URL for every gallery refresh.
+
+    The underlying image URLs are intentionally long-lived, but a fresh
+    signature changes the query string and prevents the browser from reusing
+    its image cache. Keep the server-issued URL stable for a short interval;
+    storage edits invalidate the cache through ``updated_at``.
+    """
+    cache_key = (storage.id, storage.updated_at.isoformat() if storage.updated_at else "", object_key)
+    now = monotonic()
+    with _signed_read_url_cache_lock:
+        cached = _signed_read_url_cache.get(cache_key)
+        if cached and cached[0] > now:
+            _signed_read_url_cache.move_to_end(cache_key)
+            return cached[1]
+
+    url = oss_client.sign_read_url(storage, object_key, oss_client.IMAGE_URL_EXPIRE_SECONDS)
+    with _signed_read_url_cache_lock:
+        _signed_read_url_cache[cache_key] = (now + _SIGNED_URL_CACHE_TTL_SECONDS, url)
+        _signed_read_url_cache.move_to_end(cache_key)
+        while len(_signed_read_url_cache) > _SIGNED_URL_CACHE_MAX_ITEMS:
+            _signed_read_url_cache.popitem(last=False)
+    return url
+
+
 def refreshed_asset_url(db: Session, asset: ImageLibraryAsset) -> str:
     if asset.storage_mode != "oss":
         return asset.url
@@ -42,7 +94,7 @@ def refreshed_asset_url(db: Session, asset: ImageLibraryAsset) -> str:
     if storage is None:
         return asset.url
     try:
-        return oss_client.sign_read_url(storage, asset.object_key, oss_client.IMAGE_URL_EXPIRE_SECONDS)
+        return _cached_signed_read_url(storage, asset.object_key)
     except Exception:
         return asset.url
 
@@ -148,6 +200,80 @@ def soft_delete(asset: ImageLibraryAsset) -> None:
     asset.deleted_at = datetime.now(timezone.utc)
 
 
+def _is_temporary_import_key(object_key: str) -> bool:
+    return object_key.startswith(("local/direct-imports/", _OSS_IMPORT_PREFIX))
+
+
+def _replace_document_import_image(
+    db: Session,
+    document: Document | None,
+    old_key: str,
+    old_url: str,
+    stored: StoredDocumentImage,
+    storage: StorageConfig | None,
+) -> None:
+    if document is None or not document.current_html:
+        return
+    html = document.current_html
+    # Preserve crop/source attributes and any other references that use the
+    # exact URL persisted during import.
+    if old_url:
+        html = html.replace(old_url, stored.url)
+    if old_key.startswith("local/direct-imports/"):
+        import_asset = db.query(DocumentImportAsset).filter(DocumentImportAsset.object_key == old_key).first()
+        if import_asset is not None:
+            html = html.replace(f"/api/documents/import-assets/{import_asset.id}", stored.url)
+    elif storage is not None:
+        parser = _ImageSourceParser()
+        parser.feed(html)
+        parser.close()
+        for source in parser.sources:
+            if oss_client.storage_object_key_for_url(storage, source) == old_key:
+                html = html.replace(source, stored.url)
+    document.current_html = html
+
+
+def _promote_temporary_library_asset(
+    db: Session,
+    asset: ImageLibraryAsset,
+    document: Document | None,
+    storage: StorageConfig | None,
+) -> bool:
+    """Copy a direct-import object into durable image storage exactly once."""
+    if not _is_temporary_import_key(asset.object_key):
+        return False
+    if asset.storage_mode == "oss":
+        if storage is None:
+            return False
+        try:
+            data = oss_client.get_object_bytes(storage, asset.object_key)
+        except Exception:
+            return False
+    else:
+        try:
+            data = local_uploads.local_path(asset.object_key).read_bytes()
+        except (OSError, local_uploads.LocalUploadError):
+            return False
+    try:
+        image = local_uploads.inspect_image(data)
+        stored = store_tracked_document_image(db, data, asset.name or "image")
+    except (local_uploads.LocalUploadError, OSError, ValueError):
+        return False
+    old_key = asset.object_key
+    old_url = asset.url
+    asset.object_key = stored.object_key
+    asset.storage_mode = stored.storage_mode
+    asset.url = stored.url
+    asset.content_type = image.content_type
+    asset.size = len(data)
+    asset.width = image.width
+    asset.height = image.height
+    _replace_document_import_image(db, document, old_key, old_url, stored, storage)
+    # The caller commits the metadata update. The old direct-import object is
+    # intentionally left for the import cleanup path/lifecycle to remove.
+    return True
+
+
 def backfill_generated_assets(db: Session) -> int:
     rows = (
         db.query(GeneratedImageAsset, ImageGeneration)
@@ -161,3 +287,91 @@ def backfill_generated_assets(db: Session) -> int:
     if rows:
         db.commit()
     return len(rows)
+
+
+def backfill_imported_assets(db: Session) -> int:
+    """Register images from completed PDF/Word imports made before gallery sync."""
+    storage = db.query(StorageConfig).first()
+    promoted = 0
+    temporary_assets = (
+        db.query(ImageLibraryAsset)
+        .filter(
+            ImageLibraryAsset.deleted_at.is_(None),
+            ImageLibraryAsset.object_key.startswith("local/direct-imports/")
+            | ImageLibraryAsset.object_key.startswith(_OSS_IMPORT_PREFIX),
+        )
+        .all()
+    )
+    for asset in temporary_assets:
+        document = db.get(Document, asset.document_id) if asset.document_id else None
+        if _promote_temporary_library_asset(db, asset, document, storage):
+            promoted += 1
+
+    rows = (
+        db.query(DocumentImportAsset, DocumentImport, Document)
+        .join(DocumentImport, DocumentImport.id == DocumentImportAsset.import_id)
+        .join(Document, Document.id == DocumentImport.document_id)
+        .outerjoin(ImageLibraryAsset, ImageLibraryAsset.object_key == DocumentImportAsset.object_key)
+        .filter(
+            DocumentImport.status == DocumentImportStatus.COMPLETED,
+            DocumentImportAsset.id.is_not(None),
+            ImageLibraryAsset.id.is_(None),
+        )
+        .all()
+    )
+    if not rows:
+        return 0
+    created = 0
+    for asset, _import_session, document in rows:
+        # A completed Word import may retain parser-only crop/source assets;
+        # only promote images that survived into the article HTML.
+        if local_uploads.is_local_key(asset.object_key):
+            if f"/api/documents/import-assets/{asset.id}" not in (document.current_html or ""):
+                continue
+        elif storage is None:
+            continue
+        else:
+            parser = _ImageSourceParser()
+            parser.feed(document.current_html or "")
+            parser.close()
+            if not any(oss_client.storage_object_key_for_url(storage, source) == asset.object_key for source in parser.sources):
+                continue
+        width = height = 0
+        if local_uploads.is_local_key(asset.object_key):
+            try:
+                image = local_uploads.validate_image(local_uploads.local_path(asset.object_key), asset.content_type)
+                width, height = image.width, image.height
+            except (local_uploads.LocalUploadError, OSError):
+                continue
+            stored = StoredDocumentImage(
+                url=f"/api/documents/import-assets/{asset.id}",
+                object_key=asset.object_key,
+                storage_mode="local",
+            )
+        elif storage is not None:
+            try:
+                stored = StoredDocumentImage(
+                    url=oss_client.sign_read_url(storage, asset.object_key, oss_client.IMAGE_URL_EXPIRE_SECONDS),
+                    object_key=asset.object_key,
+                    storage_mode="oss",
+                )
+            except Exception:
+                continue
+        else:
+            continue
+        create_library_asset(
+            db,
+            owner_id=document.owner_id,
+            document_id=document.id,
+            name=asset.filename or "图片",
+            source=ImageLibrarySource.UPLOAD,
+            stored=stored,
+            content_type=asset.content_type,
+            size=asset.size,
+            width=width,
+            height=height,
+        )
+        created += 1
+    if created or promoted:
+        db.commit()
+    return created + promoted

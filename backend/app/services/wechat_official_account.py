@@ -1167,8 +1167,8 @@ class WeChatOfficialAccountClient:
 
     @staticmethod
     def _validate_article(metadata: WeChatArticleMetadata, content: str) -> None:
-        if not metadata.title or len(metadata.title) > 32:
-            raise WeChatApiError("请填写不超过 32 个字的微信标题")
+        if not metadata.title or len(metadata.title) > 64:
+            raise WeChatApiError("请填写不超过 64 个字的微信标题")
         if not metadata.cover_url:
             raise WeChatApiError("请先上传封面")
 

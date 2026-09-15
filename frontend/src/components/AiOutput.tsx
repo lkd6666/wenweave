@@ -1,5 +1,5 @@
 import { DownOutlined, RightOutlined, SearchOutlined } from '@ant-design/icons'
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import type { CSSProperties, ReactNode, UIEvent } from 'react'
 import type { AiDiffRow } from './aiOutputDiff'
 import './ai-output.css'
@@ -23,6 +23,18 @@ function reasoningSegments(value: string): string[] {
     return parts.length > 1 ? parts : [line]
   })
 }
+
+// Long reasoning can contain thousands of sentences. Keep the full transcript
+// scrollable without retaining thousands of animated rows.
+const ReasoningContent = memo(function ReasoningContent({ text }: { text: string }) {
+  const segments = text.length > 8_000 ? null : reasoningSegments(text)
+  if (!segments || segments.length > 80) {
+    return <div className="aicss-reasoning-text">{text}</div>
+  }
+  return <div className="aicss-thinking-reasoning-stream">
+    {segments.map((segment, index) => <p className="aicss-reasoning-sentence" key={index}>{segment}</p>)}
+  </div>
+})
 
 function CodeFileIcon() {
   return <svg className="aicss-code-block-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 6-6 6 6 6M16 6l6 6-6 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
@@ -92,7 +104,6 @@ export function AiThinkingReasoning({
 
   const hasDetail = Boolean(content || fallback)
   const summary = duration ? `思考了 ${duration}` : '思考过程'
-  const segments = reasoningSegments(content || fallback || '模型正在生成推理内容…')
   return (
     <section className={`aicss-thinking-reasoning${thinking ? ' is-thinking' : ''}`}>
       <button
@@ -112,9 +123,7 @@ export function AiThinkingReasoning({
             className={`aicss-thinking-reasoning-viewport${thinking ? ' is-live' : ''}`}
             onScroll={onScroll}
           >
-            <div className="aicss-thinking-reasoning-stream">
-              {segments.map((segment, index) => <p className="aicss-reasoning-sentence" key={index}>{segment}</p>)}
-            </div>
+            {open && <ReasoningContent text={content || fallback || '模型正在生成推理内容…'} />}
           </div>
         </div>
       </div>
@@ -186,7 +195,7 @@ export function AiToolCall({
       </Head>
       {children && (
         <div className={`aicss-tool-call-collapsible${onToggle && !expanded ? ' is-collapsed' : ''}`} aria-hidden={Boolean(onToggle && !expanded)}>
-          <div className="aicss-tool-call-body">{children}</div>
+          <div className="aicss-tool-call-body">{(!onToggle || expanded) && children}</div>
         </div>
       )}
     </div>

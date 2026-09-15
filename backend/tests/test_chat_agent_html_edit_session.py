@@ -6,6 +6,7 @@ from app.services.chat_agent import (
     _parse_gzh_theme_component_ids,
     _short,
     build_system_prompt,
+    validate_gzh_theme_candidate,
 )
 from app.services.html_workspace import WorkspaceError
 
@@ -286,32 +287,79 @@ class HtmlEditSessionSafetyTests(unittest.TestCase):
         self.assertEqual(raised.exception.details["reason"], "block_id_not_current")
         self.assertEqual(raised.exception.details["suggested_query"], "same")
 
-    def test_invalid_patch_does_not_change_document_or_checkpoint(self) -> None:
+    def test_invalid_patch_is_written_and_checkpointed_with_warning_diagnostics(self) -> None:
         checkpoints: list[str] = []
         session = HtmlEditSession("<p>old</p>", checkpoint_callback=checkpoints.append)
         operation = _patch_operations(session, ("old", "<strong>broken"))[0]
 
-        with self.assertRaisesRegex(WorkspaceError, "HTML 结构无效") as raised:
-            session.patch_blocks(session.document_map()["revision"], [operation])
+        session.patch_blocks(session.document_map()["revision"], [operation])
 
-        self.assertFalse(raised.exception.details["validation"]["valid"])
-        self.assertEqual(session.html, "<p>old</p>")
-        self.assertFalse(session.edited)
+        self.assertEqual(session.html, "<p><strong>broken</p>")
+        self.assertTrue(session.edited)
+        self.assertFalse(session.validate_html().valid)
         session.persist_checkpoint()
-        self.assertEqual(checkpoints, [])
+        self.assertEqual(checkpoints, [session.html])
 
-    def test_invalid_full_replacement_does_not_change_document_or_checkpoint(self) -> None:
+    def test_invalid_full_replacement_is_written_and_checkpointed_with_warning_diagnostics(self) -> None:
         checkpoints: list[str] = []
         session = HtmlEditSession("<p>old</p>", checkpoint_callback=checkpoints.append)
 
-        with self.assertRaisesRegex(WorkspaceError, "HTML 结构无效") as raised:
-            session.replace_document(session.document_map()["revision"], "<section><strong>broken</section>")
+        session.replace_document(session.document_map()["revision"], "<section><strong>broken</section>")
 
-        self.assertFalse(raised.exception.details["validation"]["valid"])
-        self.assertEqual(session.html, "<p>old</p>")
-        self.assertFalse(session.edited)
+        self.assertEqual(session.html, "<section><strong>broken</section>")
+        self.assertTrue(session.edited)
+        self.assertFalse(session.validate_html().valid)
         session.persist_checkpoint()
-        self.assertEqual(checkpoints, [])
+        self.assertEqual(checkpoints, [session.html])
+
+    def test_warning_candidate_can_be_repaired_with_current_revision_and_local_patch(self) -> None:
+        session = HtmlEditSession("<p>old</p>")
+        session.replace_document(session.document_map()["revision"], "<section><strong>broken</section>")
+
+        section = session.document_map()["blocks"][0]
+        summary = session.patch_blocks(
+            session.document_map()["revision"],
+            [{
+                "block_id": section["block_id"],
+                "expected_hash": section["expected_hash"],
+                "mode": "replace_inner",
+                "html": "<strong>fixed</strong>",
+            }],
+        )
+
+        self.assertTrue(session.validate_html().valid)
+        self.assertEqual(session.html, "<section><strong>fixed</strong></section>")
+        self.assertTrue(summary["revision"])
+
+    def test_strict_theme_candidate_is_rejected_before_document_mutation(self) -> None:
+        source = '<section><p><span leaf="">原文</span></p></section>'
+        session = HtmlEditSession(source, candidate_validator=validate_gzh_theme_candidate)
+
+        with self.assertRaisesRegex(WorkspaceError, "主题严格校验未通过") as raised:
+            session.replace_document(
+                session.document_map()["revision"],
+                '<section style="float:left"><p>新正文</p></section>',
+            )
+
+        strict = raised.exception.details["gzh_validation"]
+        self.assertTrue(strict["hasError"])
+        self.assertGreaterEqual(len(strict["errors"]), 2)
+        self.assertEqual(session.html, source)
+        self.assertFalse(session.edited)
+
+    def test_strict_theme_candidate_rejects_float_tag(self) -> None:
+        source = '<section><p><span leaf="">原文</span></p></section>'
+        session = HtmlEditSession(source, candidate_validator=validate_gzh_theme_candidate)
+
+        with self.assertRaisesRegex(WorkspaceError, "<float>") as raised:
+            session.replace_document(
+                session.document_map()["revision"],
+                '<section><float><span leaf="">正文</span></float></section>',
+            )
+
+        self.assertIn("<float>", " ".join(raised.exception.details["gzh_validation"]["errors"]))
+        self.assertEqual(session.html, source)
+        self.assertFalse(session.edited)
 
     def test_patch_is_atomic_when_one_operation_is_stale(self) -> None:
         source = "<p>first</p><p>second</p>"

@@ -1,15 +1,16 @@
 import { useState } from 'react'
-import { Form, Input, Modal, message } from 'antd'
+import { Alert, Form, Input, Modal, message } from 'antd'
 import { usersApi } from '../api/users'
 import { ApiError } from '../api/client'
 import { useAuthStore } from '../store/authStore'
 
 interface ChangePasswordModalProps {
   open: boolean
+  required?: boolean
   onClose: () => void
 }
 
-export default function ChangePasswordModal({ open, onClose }: ChangePasswordModalProps) {
+export default function ChangePasswordModal({ open, required = false, onClose }: ChangePasswordModalProps) {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const logout = useAuthStore((s) => s.logout)
@@ -35,14 +36,27 @@ export default function ChangePasswordModal({ open, onClose }: ChangePasswordMod
 
   return (
     <Modal
-      title="修改密码"
+      title={required ? '请先修改密码' : '修改密码'}
       open={open}
       className="change-password-modal"
-      onCancel={onClose}
+      closable={!required}
+      maskClosable={!required}
+      keyboard={!required}
+      onCancel={required ? undefined : onClose}
+      cancelButtonProps={required ? { style: { display: 'none' } } : undefined}
       onOk={handleOk}
       confirmLoading={loading}
       destroyOnHidden
     >
+      {required && (
+        <Alert
+          type="warning"
+          showIcon
+          message="当前密码过于简单"
+          description="为了保护工作区安全，请设置一个不同于账号且不易猜测的新密码。"
+          style={{ marginBottom: 16 }}
+        />
+      )}
       <Form form={form} layout="vertical">
         <Form.Item name="old_password" label="当前密码" rules={[{ required: true, message: '请输入当前密码' }]}>
           <Input.Password autoComplete="current-password" />

@@ -92,6 +92,12 @@ class ChatContextStatsRead(BaseModel):
     runtime_visible_output_tokens: int = 0
     runtime_reasoning_tokens: int = 0
     runtime_tool_argument_tokens: int = 0
+    runtime_context_tokens: int = 0
+    runtime_context_breakdown: dict[str, int] = Field(default_factory=dict)
+    runtime_context_source: str = ""
+    runtime_context_is_estimate: bool = True
+    runtime_context_tool_call_id: str = ""
+    runtime_context_tool_name: str = ""
     run_summarized_cycles: int = 0
     runtime_summary_tokens: int = 0
     input_budget_tokens: int = 0
@@ -122,13 +128,25 @@ class ReasoningTraceRead(BaseModel):
     detail: str = ""
 
 
+class ContextCompactionRead(BaseModel):
+    summary: str = ""
+    original_tokens: int = 0
+    used_tokens: int = 0
+    summarized_cycles: int = 0
+    digested_cycles: int = 0
+    dropped_cycles: int = 0
+    summary_tokens: int = 0
+    durable_snapshot: bool = False
+
+
 class AssistantTurnBlockRead(BaseModel):
     id: str
-    type: Literal["thought", "tool", "content"]
+    type: Literal["thought", "tool", "content", "context_compaction"]
     state: Literal["active", "done"] = "done"
     content: str = ""
     duration_ms: int | None = None
     tool: ToolExecutionRead | None = None
+    context_compaction: ContextCompactionRead | None = None
 
 
 class SelectedElementFingerprint(BaseModel):
@@ -189,6 +207,12 @@ class ChatMessageRead(BaseModel):
     template_refs: list[dict[str, Any]] = Field(default_factory=list)
     can_revert: bool = False
     created_at: datetime
+
+
+class ChatContextCompactResult(ChatContextStatsRead):
+    """Manual compaction stats plus the durable chat notice created for it."""
+
+    compaction_notice: ChatMessageRead | None = None
 
 
 class ChatHistoryArchiveRead(BaseModel):
@@ -399,5 +423,16 @@ class AgentRunRead(BaseModel):
     user_message_id: int
     assistant_message_id: int | None = None
     error_message: str = ""
+    # The durable cursor and reconstructed timeline let a refreshed browser
+    # render the current turn immediately, then subscribe only to newer SSE
+    # events instead of replaying the entire answer as a stream.
+    event_sequence: int = 0
+    timeline: "AgentRunTimelineRead | None" = None
     reask_activation: ChatReaskActivationRead | None = None
     user_question: ChatUserQuestionRead | None = None
+
+
+class AgentRunTimelineRead(BaseModel):
+    tool_calls: list[ToolExecutionRead] = Field(default_factory=list)
+    reasoning: ReasoningTraceRead = Field(default_factory=ReasoningTraceRead)
+    turn_blocks: list[AssistantTurnBlockRead] = Field(default_factory=list)

@@ -4,6 +4,12 @@ import './index.css'
 import App from './App.tsx'
 import { AppThemeProvider } from './theme/AppThemeProvider.tsx'
 import { AppBrandingProvider } from './brand/AppBrandingProvider.tsx'
+import { startReactPerformanceCleanup } from './utils/reactPerformanceCleanup'
+
+if (import.meta.env.DEV) {
+  const stopPerformanceCleanup = startReactPerformanceCleanup()
+  import.meta.hot?.dispose(stopPerformanceCleanup)
+}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

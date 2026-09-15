@@ -66,7 +66,7 @@ describe('AICSS output components', () => {
     expect(html).not.toContain('aicss-streaming-caret')
     expect(html).toContain('aicss-tool-call is-running')
     expect(html).toContain('aicss-tool-call-collapsible is-collapsed')
-    expect(html).toContain('工具详情')
+    expect(html).not.toContain('工具详情')
     expect(html).toContain('aicss-web-search is-running')
     expect(html).toContain('aicss-file-diff')
     expect(html).toContain('aicss-code-block')

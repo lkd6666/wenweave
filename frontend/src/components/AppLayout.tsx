@@ -10,6 +10,7 @@ import {
   LogoutOutlined,
   KeyOutlined,
   MenuOutlined,
+  LeftOutlined,
   SendOutlined,
   HistoryOutlined,
   DashboardOutlined,
@@ -65,6 +66,10 @@ export default function AppLayout() {
   useEffect(() => {
     if (isEditorPage) setSidebarCollapsed(true)
   }, [isEditorPage])
+
+  useEffect(() => {
+    if (user?.password_change_required) setChangePasswordOpen(true)
+  }, [user?.password_change_required])
 
   useEffect(() => {
     const group = adminMenuGroups.find(({ paths }) => paths.some((path) => location.pathname.startsWith(path)))
@@ -173,6 +178,14 @@ export default function AppLayout() {
           collapsible
           collapsed={sidebarCollapsed}
           onCollapse={setSidebarCollapsed}
+          trigger={
+            <span
+              className={`app-sider-trigger-icon${sidebarCollapsed ? ' is-collapsed' : ''}`}
+              aria-hidden="true"
+            >
+              <LeftOutlined />
+            </span>
+          }
           theme={resolvedTheme}
           className="app-sider"
         >
@@ -236,7 +249,7 @@ export default function AppLayout() {
           </div>
         </Header>
         <Content className="app-content">
-          <Outlet />
+          {user?.password_change_required ? <div aria-hidden="true" /> : <Outlet />}
         </Content>
       </Layout>
       <GlobalUserQuestionNotifications systemName={branding.system_name} iconUrl={logoUrl} />
@@ -252,7 +265,11 @@ export default function AppLayout() {
       >
         {navigationMenu}
       </Drawer>
-      <ChangePasswordModal open={changePasswordOpen} onClose={() => setChangePasswordOpen(false)} />
+      <ChangePasswordModal
+        open={changePasswordOpen}
+        required={user?.password_change_required === true}
+        onClose={() => setChangePasswordOpen(false)}
+      />
     </Layout>
   )
 }

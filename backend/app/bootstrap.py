@@ -1,6 +1,7 @@
 """首次启动初始化逻辑与轻量 SQLite schema migration。"""
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -9,10 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 from sqlalchemy import bindparam, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import DATA_DIR, get_settings
-from app.core.security import hash_password
+from app.core.security import hash_password, is_forced_password_change_value, password_hash_requires_change
+from app.core.token_budgets import DEFAULT_TOOL_RESULT_MAX_TOKENS
 from app.db.session import engine
 from app.models.document_version import DocumentVersion, DocumentVersionSource
 from app.models.ai_model import AIModel
@@ -40,13 +43,20 @@ from app.services.operation_logs import append_operation_log
 from app.services.agent_run_recovery import recover_interrupted_turn
 from app.services.model_presets import (
     anthropic_adaptive_thinking_config,
+    _gemini_25_thinking_config,
+    _gemini_3_thinking_config,
     is_official_deepseek_openai_endpoint,
     official_deepseek_thinking_config,
 )
 from app.services.wechat_compliance import run_compliance_check
 
 
-SCHEMA_REVISION = "20260815_layout_capture_sessions_v2"
+SCHEMA_REVISION = "20260816_password_change_policy_v1"
+TOOL_PREVIEW_BUDGET_MIGRATION = "20260816_tool_preview_10000"
+MYSQL_SCHEMA_LOCK_CONNECTION_TIMEOUT_SECONDS = 600
+
+
+logger = logging.getLogger(__name__)
 
 
 _MYSQL_IMAGE_MODEL_ACCESS_SPECS = (
@@ -73,10 +83,24 @@ def schema_migration_lock() -> Iterator[None]:
             ).scalar()
             if int(acquired or 0) != 1:
                 raise RuntimeError("等待数据库 schema 迁移锁超时")
+            # GET_LOCK belongs to this exact MySQL session.  Schema repair can
+            # take longer than a locally configured wait_timeout, during which
+            # the lock-owning connection is otherwise idle.  Keep it alive for
+            # the entire bootstrap, so another worker cannot enter mid-migration.
+            connection.execute(
+                text("SET SESSION wait_timeout = :timeout"),
+                {"timeout": MYSQL_SCHEMA_LOCK_CONNECTION_TIMEOUT_SECONDS},
+            )
             try:
                 yield
             finally:
-                connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                try:
+                    connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                except SQLAlchemyError:
+                    # MySQL automatically releases advisory locks when their
+                    # session closes.  A lost connection must not turn a fully
+                    # completed migration into a failed application startup.
+                    logger.warning("schema_migration_lock_release_failed", exc_info=True)
         return
 
     lock_path = engine.url.database
@@ -393,9 +417,13 @@ def migrate_schema() -> None:
     # Fresh application startup creates every table before this function. Keep
     # this explicit for standalone compatibility migrations and repair tools.
     ArticleTypographySettings.__table__.create(bind=engine, checkfirst=True)
-    inspector = inspect(engine)
     is_sqlite = engine.url.drivername.startswith("sqlite")
     with engine.begin() as connection:
+        # Bind the inspector to the active migration connection. On SQLite,
+        # an engine-bound inspector may borrow the same DB-API connection via
+        # the pool and roll back the migration transaction when its temporary
+        # connection is closed.
+        inspector = inspect(connection)
         # Both the run-admission gate and the SQLite fallback migration lock
         # need deterministic rows before application requests are accepted.
         lock_insert = "INSERT OR IGNORE" if is_sqlite else "INSERT IGNORE"
@@ -567,7 +595,7 @@ def migrate_schema() -> None:
                     connection.execute(text("ALTER TABLE ai_providers MODIFY COLUMN availability_time_ranges JSON NOT NULL"))
             if not is_sqlite:
                 provider_type_column = provider_columns.get("provider_type")
-                provider_enum_values = ("OPENAI_COMPATIBLE", "OPENAI_RESPONSES", "ANTHROPIC")
+                provider_enum_values = ("OPENAI_COMPATIBLE", "OPENAI_RESPONSES", "ANTHROPIC", "GEMINI_NATIVE")
                 existing_provider_values = set(
                     getattr(provider_type_column["type"], "enums", ()) if provider_type_column else ()
                 )
@@ -626,7 +654,20 @@ def migrate_schema() -> None:
                     connection.execute(
                         text(f"ALTER TABLE web_article_import_assets ADD COLUMN {column_name} INTEGER NOT NULL DEFAULT 0")
                     )
-        model_columns = {column["name"] for column in inspector.get_columns("ai_models")}
+        # Refresh after the provider-table DDL above. Some legacy-schema tests
+        # deliberately replace ai_models after the initial inspector snapshot.
+        # Use the active migration connection: SQLAlchemy Inspector can retain
+        # a stale table-info cache when a table was replaced on SQLite.
+        if is_sqlite:
+            model_columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql("PRAGMA table_info(ai_models)").fetchall()
+            }
+        else:
+            model_columns = {
+                str(row[0])
+                for row in connection.exec_driver_sql("SHOW COLUMNS FROM ai_models").fetchall()
+            }
         if "thinking_config" not in model_columns:
             if is_sqlite:
                 connection.execute(
@@ -654,7 +695,31 @@ def migrate_schema() -> None:
             )
         if "tool_result_max_tokens" not in model_columns:
             connection.execute(
-                text("ALTER TABLE ai_models ADD COLUMN tool_result_max_tokens INT NOT NULL DEFAULT 8192")
+                text(
+                    "ALTER TABLE ai_models ADD COLUMN tool_result_max_tokens INT NOT NULL "
+                    f"DEFAULT {DEFAULT_TOOL_RESULT_MAX_TOKENS}"
+                )
+            )
+        preview_budget_migrated = connection.execute(
+            text("SELECT version FROM schema_migrations WHERE version = :version"),
+            {"version": TOOL_PREVIEW_BUDGET_MIGRATION},
+        ).scalar()
+        if preview_budget_migrated is None:
+            # Only upgrade the complete old conservative tuple. A model with
+            # any adjusted budget remains an administrator-owned setting.
+            connection.execute(
+                text(
+                    "UPDATE ai_models SET tool_result_max_tokens = :new_limit "
+                    "WHERE context_window_tokens = 32768 "
+                    "AND context_compaction_threshold_tokens = 24576 "
+                    "AND max_output_tokens = 8192 "
+                    "AND tool_result_max_tokens = 8192"
+                ),
+                {"new_limit": DEFAULT_TOOL_RESULT_MAX_TOKENS},
+            )
+            connection.execute(
+                text(f"{lock_insert} INTO schema_migrations (version) VALUES (:version)"),
+                {"version": TOOL_PREVIEW_BUDGET_MIGRATION},
             )
         if "access_mode" not in model_columns:
             connection.execute(
@@ -751,11 +816,16 @@ def migrate_schema() -> None:
                 )
 
         if inspector.has_table("wechat_drafts"):
-            wechat_draft_columns = {column["name"] for column in inspector.get_columns("wechat_drafts")}
+            wechat_draft_columns = {column["name"]: column for column in inspector.get_columns("wechat_drafts")}
             if "sync_mode" not in wechat_draft_columns:
                 connection.execute(
                     text("ALTER TABLE wechat_drafts ADD COLUMN sync_mode VARCHAR(16) NOT NULL DEFAULT 'create'")
                 )
+            if not is_sqlite:
+                article_title_column = wechat_draft_columns.get("article_title")
+                current_length = getattr(article_title_column["type"], "length", None) if article_title_column else None
+                if current_length is not None and current_length < 64:
+                    connection.execute(text("ALTER TABLE wechat_drafts MODIFY COLUMN article_title VARCHAR(64) NOT NULL DEFAULT ''"))
 
         # Theme proposals used to snapshot only the raw Markdown library.  Add
         # the derived recipe/component selection so an approval remains
@@ -868,7 +938,7 @@ def migrate_schema() -> None:
         for column_name, definition in message_column_definitions.items():
             if column_name not in message_columns:
                 connection.execute(text(f"ALTER TABLE chat_messages ADD COLUMN {column_name} {definition}"))
-        message_indexes = {index["name"] for index in inspect(engine).get_indexes("chat_messages")}
+        message_indexes = {index["name"] for index in inspect(connection).get_indexes("chat_messages")}
         if "ix_chat_messages_history_archive_id" not in message_indexes:
             connection.execute(text("CREATE INDEX ix_chat_messages_history_archive_id ON chat_messages (history_archive_id)"))
         if "ix_chat_messages_created_by_id" not in message_indexes:
@@ -897,7 +967,7 @@ def migrate_schema() -> None:
             )
 
         if inspector.has_table("chat_context_snapshots"):
-            snapshot_columns = {column["name"] for column in inspect(engine).get_columns("chat_context_snapshots")}
+            snapshot_columns = {column["name"] for column in inspect(connection).get_columns("chat_context_snapshots")}
             if "invalidation_reason" not in snapshot_columns:
                 connection.execute(
                     text("ALTER TABLE chat_context_snapshots ADD COLUMN invalidation_reason VARCHAR(32) NOT NULL DEFAULT ''")
@@ -930,11 +1000,11 @@ def migrate_schema() -> None:
             session_rows = connection.execute(text("SELECT id, document_id FROM chat_sessions")).mappings().all()
             session_by_document = {int(row["document_id"]): int(row["id"]) for row in session_rows}
 
-        session_columns = {column["name"] for column in inspect(engine).get_columns("chat_sessions")}
+        session_columns = {column["name"] for column in inspect(connection).get_columns("chat_sessions")}
         if "context_generation" not in session_columns:
             connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN context_generation INTEGER NOT NULL DEFAULT 0"))
 
-        message_columns = {column["name"] for column in inspect(engine).get_columns("chat_messages")}
+        message_columns = {column["name"] for column in inspect(connection).get_columns("chat_messages")}
         if "session_id" not in message_columns:
             session_column = "INTEGER" if is_sqlite else "BIGINT UNSIGNED NULL"
             connection.execute(text(f"ALTER TABLE chat_messages ADD COLUMN session_id {session_column}"))
@@ -943,11 +1013,11 @@ def migrate_schema() -> None:
                 text("UPDATE chat_messages SET session_id = :session_id WHERE document_id = :document_id AND session_id IS NULL"),
                 {"session_id": session_id, "document_id": document_id},
             )
-        message_indexes = {index["name"] for index in inspect(engine).get_indexes("chat_messages")}
+        message_indexes = {index["name"] for index in inspect(connection).get_indexes("chat_messages")}
         if "ix_chat_messages_session_id" not in message_indexes:
             connection.execute(text("CREATE INDEX ix_chat_messages_session_id ON chat_messages (session_id)"))
 
-        memory_columns = {column["name"] for column in inspect(engine).get_columns("chat_session_memories")}
+        memory_columns = {column["name"] for column in inspect(connection).get_columns("chat_session_memories")}
         if "compacted_through_event_id" not in memory_columns:
             connection.execute(
                 text("ALTER TABLE chat_session_memories ADD COLUMN compacted_through_event_id INTEGER NOT NULL DEFAULT 0")
@@ -960,7 +1030,7 @@ def migrate_schema() -> None:
         # session-retained rows retain their existing expiry timestamp but are
         # converted to TTL rows so historical output cannot grow without end.
         if inspector.has_table("chat_tool_outputs"):
-            output_columns = {column["name"] for column in inspect(engine).get_columns("chat_tool_outputs")}
+            output_columns = {column["name"] for column in inspect(connection).get_columns("chat_tool_outputs")}
             if "retention_mode" not in output_columns:
                 definition = "VARCHAR(16) NOT NULL DEFAULT 'ttl'"
                 connection.execute(text(f"ALTER TABLE chat_tool_outputs ADD COLUMN retention_mode {definition}"))
@@ -1091,10 +1161,10 @@ def migrate_schema() -> None:
                 )
             connection.execute(text("UPDATE chat_context_snapshots SET active_slot = NULL WHERE is_active = 0"))
             connection.execute(text("UPDATE chat_context_snapshots SET active_slot = 1 WHERE is_active = 1"))
-            snapshot_indexes = {index["name"] for index in inspect(engine).get_indexes("chat_context_snapshots")}
+            snapshot_indexes = {index["name"] for index in inspect(connection).get_indexes("chat_context_snapshots")}
             snapshot_indexes.update(
                 constraint["name"]
-                for constraint in inspect(engine).get_unique_constraints("chat_context_snapshots")
+                for constraint in inspect(connection).get_unique_constraints("chat_context_snapshots")
                 if constraint.get("name")
             )
             if "uq_chat_context_snapshots_active_slot" not in snapshot_indexes:
@@ -1141,7 +1211,7 @@ def migrate_schema() -> None:
         # receive both timestamps atomically with the pause.
         if inspector.has_table("chat_user_questions"):
             question_columns = {
-                column["name"] for column in inspect(engine).get_columns("chat_user_questions")
+                column["name"] for column in inspect(connection).get_columns("chat_user_questions")
             }
             question_time_column = "DATETIME" if is_sqlite else "DATETIME(6) NULL"
             for column_name in ("last_activity_at", "timeout_at"):
@@ -1153,7 +1223,7 @@ def migrate_schema() -> None:
                         )
                     )
             question_indexes = {
-                index["name"] for index in inspect(engine).get_indexes("chat_user_questions")
+                index["name"] for index in inspect(connection).get_indexes("chat_user_questions")
             }
             if "ix_chat_user_questions_timeout_at" not in question_indexes:
                 connection.execute(
@@ -1279,12 +1349,12 @@ def migrate_schema() -> None:
                         },
                     )
 
-        run_columns = {column["name"] for column in inspect(engine).get_columns("agent_runs")}
+        run_columns = {column["name"] for column in inspect(connection).get_columns("agent_runs")}
         # SQLAlchemy stores enum member names in native MySQL ENUM columns.
         # Existing deployments need the new waiting state before a paused run
         # can be persisted.
         if not is_sqlite and "status" in run_columns:
-            status_column = {column["name"]: column for column in inspect(engine).get_columns("agent_runs")}.get("status")
+            status_column = {column["name"]: column for column in inspect(connection).get_columns("agent_runs")}.get("status")
             status_values = set(getattr(status_column["type"], "enums", ()) if status_column else ())
             required_status_values = {"PENDING", "RUNNING", "WAITING_FOR_INPUT", "CANCELLING", "COMPLETED", "CANCELLED", "FAILED"}
             if not required_status_values.issubset(status_values):
@@ -1363,7 +1433,7 @@ def migrate_schema() -> None:
                     text("UPDATE agent_runs SET session_id = :session_id WHERE id = :run_id"),
                     {"session_id": session_id, "run_id": run["id"]},
                 )
-        run_indexes = {index["name"] for index in inspect(engine).get_indexes("agent_runs")}
+        run_indexes = {index["name"] for index in inspect(connection).get_indexes("agent_runs")}
         if "ix_agent_runs_session_id" not in run_indexes:
             connection.execute(text("CREATE INDEX ix_agent_runs_session_id ON agent_runs (session_id)"))
         if "ix_agent_runs_lease_expires_at" not in run_indexes:
@@ -1371,7 +1441,7 @@ def migrate_schema() -> None:
 
         if inspector.has_table("model_call_records"):
             model_call_columns = {
-                column["name"]: column for column in inspect(engine).get_columns("model_call_records")
+                column["name"]: column for column in inspect(connection).get_columns("model_call_records")
             }
             if not is_sqlite:
                 status_column = model_call_columns.get("status")
@@ -1519,6 +1589,19 @@ def migrate_schema() -> None:
                 )
         if event_rows:
             connection.execute(ChatContextEvent.__table__.insert(), event_rows)
+
+        user_columns = {column["name"] for column in inspector.get_columns("users")}
+        if "password_change_required" not in user_columns:
+            connection.execute(
+                text("ALTER TABLE users ADD COLUMN password_change_required BOOLEAN NOT NULL DEFAULT 0")
+            )
+            rows = connection.execute(text("SELECT id, username, password_hash FROM users")).mappings().all()
+            for row in rows:
+                if password_hash_requires_change(str(row["username"]), str(row["password_hash"])):
+                    connection.execute(
+                        text("UPDATE users SET password_change_required = 1 WHERE id = :user_id"),
+                        {"user_id": row["id"]},
+                    )
 
         # This project still has a deliberately idempotent compatibility
         # migrator rather than Alembic.  Record the completed contract so
@@ -1672,7 +1755,10 @@ def migrate_schema() -> None:
 
         # Version rows from older releases contain a full HTML copy. Convert
         # them in place so future history reads use the shared object store.
-        migration_session = Session(bind=connection)
+        # Keep legacy-version repair isolated from the outer migration
+        # transaction. Closing a Session bound directly to ``connection``
+        # would otherwise roll back SQLite's pending DDL/DML.
+        migration_session = Session(bind=connection, join_transaction_mode="create_savepoint")
         try:
             migrate_legacy_document_versions(migration_session)
             migration_session.flush()
@@ -1707,6 +1793,9 @@ def seed_default_admin(db: Session) -> None:
         username=settings.DEFAULT_ADMIN_USERNAME,
         display_name=settings.DEFAULT_ADMIN_USERNAME,
         password_hash=hash_password(settings.DEFAULT_ADMIN_PASSWORD),
+        password_change_required=is_forced_password_change_value(
+            settings.DEFAULT_ADMIN_USERNAME, settings.DEFAULT_ADMIN_PASSWORD
+        ),
         role=UserRole.ADMIN,
         is_active=True,
     )
@@ -1764,6 +1853,35 @@ def migrate_anthropic_thinking_models(db: Session) -> int:
                 selected_efforts, str(default_effort or "")
             )
             if model.default_thinking_effort not in {"auto", "low", "medium", "high", "xhigh", "max"}:
+                model.default_thinking_effort = "auto"
+            changed += 1
+    if changed:
+        db.commit()
+    return changed
+
+
+def migrate_gemini_native_providers(db: Session) -> int:
+    """Move the bundled Google OpenAI-compatible preset to native Gemini API."""
+    legacy_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+    native_url = "https://generativelanguage.googleapis.com/v1beta"
+    changed = 0
+    providers = db.query(AIProvider).filter(AIProvider.base_url == legacy_url).all()
+    for provider in providers:
+        # Only the exact bundled URL is migrated. Third-party gateways may use
+        # the same path but do not necessarily implement GenerateContent.
+        provider.base_url = native_url
+        provider.provider_type = ProviderType.GEMINI_NATIVE
+        changed += 1
+        for model in provider.models:
+            is_gemini_3 = model.model_name.lower().startswith("gemini-3")
+            model.thinking_config = (
+                _gemini_3_thinking_config() if is_gemini_3 else _gemini_25_thinking_config()
+            )
+            if is_gemini_3:
+                model.supports_disabled_thinking = False
+                if model.default_thinking_effort not in {"auto", "low", "high"}:
+                    model.default_thinking_effort = "auto"
+            elif model.default_thinking_effort not in {"auto", "minimal", "low", "medium", "high", "max"}:
                 model.default_thinking_effort = "auto"
             changed += 1
     if changed:

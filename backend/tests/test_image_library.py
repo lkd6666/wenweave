@@ -35,6 +35,7 @@ from app.models.image_generation import (
     ImageLibrarySettings,
     ImageLibrarySource,
 )
+from app.models.storage_config import StorageConfig
 from app.models.user import User, UserRole
 from app.schemas.image_library import (
     ImageLibraryAssetRead,
@@ -266,6 +267,26 @@ class ImageLibraryTests(unittest.TestCase):
         validated = ImageLibraryAssetRead.model_validate(payload)
 
         self.assertEqual(validated.updated_at, validated.created_at)
+
+    def test_oss_asset_urls_are_reused_during_gallery_refreshes(self) -> None:
+        storage = StorageConfig(
+            endpoint="oss.example.test",
+            bucket="images",
+            access_key_id="key",
+            access_key_secret_encrypted="encrypted-secret",
+        )
+        asset = self._asset(self.owner, "OSS 图片")
+        asset.storage_mode = "oss"
+        asset.object_key = "yibanpaiban/gallery.png"
+        self.db.add(storage)
+        self.db.commit()
+
+        with patch("app.services.image_library.oss_client.sign_read_url", return_value="https://oss.example.test/gallery.png?signature=stable") as sign_url:
+            first = asset_payload(self.db, asset, self.owner)
+            second = asset_payload(self.db, asset, self.owner)
+
+        self.assertEqual(first["url"], second["url"])
+        sign_url.assert_called_once()
 
     def test_search_candidate_is_imported_only_when_route_is_applied(self) -> None:
         candidate = SimpleNamespace(id="candidate", title="搜索结果")

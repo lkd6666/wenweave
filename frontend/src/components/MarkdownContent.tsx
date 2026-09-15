@@ -9,6 +9,7 @@ import { AiDataTable, AiTextResponse } from './AiOutput'
 
 interface MarkdownContentProps {
   content: string
+  streaming?: boolean
 }
 
 const CODE_TOKEN_PATTERN = /```[\s\S]*?```|`[^`\n]*`/g
@@ -46,30 +47,35 @@ export function normalizeMathMarkdown(content: string): string {
   return normalized.replace(/@@YIBAN_CODE_(\d+)@@/g, (_match, index: string) => codeTokens[Number(index)] ?? '')
 }
 
+function markdownCode(highlight: boolean): NonNullable<Components['code']> {
+  return function MarkdownCode({ className, children, ...props }) {
+    const code = String(children).replace(/\n$/, '')
+    const language = /language-([\w+-]+)/.exec(className ?? '')?.[1]
+    const isBlock = Boolean(language) || code.includes('\n')
+    if (isBlock) {
+      return <CodeBlock code={code} language={language} showLineNumbers={code.includes('\n')} highlight={highlight} />
+    }
+    return <code className={className} {...props}>{children}</code>
+  }
+}
+
 const markdownComponents: Components = {
   pre: ({ children }) => <>{children}</>,
   table: ({ children, ...props }) => (
     <AiDataTable><table {...props}>{children}</table></AiDataTable>
   ),
-  code: ({ className, children, ...props }) => {
-    const code = String(children).replace(/\n$/, '')
-    const language = /language-([\w+-]+)/.exec(className ?? '')?.[1]
-    const isBlock = Boolean(language) || code.includes('\n')
-    if (isBlock) {
-      return <CodeBlock code={code} language={language} showLineNumbers={code.split('\n').length > 1} />
-    }
-    return <code className={className} {...props}>{children}</code>
-  },
+  code: markdownCode(true),
 }
+const streamingMarkdownComponents: Components = { ...markdownComponents, code: markdownCode(false) }
 
 /** AI 消息使用安全的 Markdown 子集渲染；不启用 raw HTML。 */
-export default function MarkdownContent({ content }: MarkdownContentProps) {
+export default function MarkdownContent({ content, streaming = false }: MarkdownContentProps) {
   return (
     <AiTextResponse><div className="markdown-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
-        components={markdownComponents}
+        components={streaming ? streamingMarkdownComponents : markdownComponents}
       >
         {normalizeMathMarkdown(content)}
       </ReactMarkdown>

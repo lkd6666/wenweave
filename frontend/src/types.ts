@@ -36,6 +36,7 @@ export interface User {
   display_name: string
   role: UserRole
   is_active: boolean
+  password_change_required?: boolean
   created_at: string
 }
 
@@ -58,9 +59,10 @@ export interface AppBranding {
 export interface TokenResponse {
   access_token: string
   token_type: string
+  password_change_required?: boolean
 }
 
-export type ProviderType = 'openai_compatible' | 'openai_responses' | 'anthropic'
+export type ProviderType = 'openai_compatible' | 'openai_responses' | 'anthropic' | 'gemini_native'
 
 export interface AvailabilityTimeRange {
   start: string
@@ -523,6 +525,9 @@ export interface HtmlValidationReport {
 export interface ToolActivity {
   kind: 'map' | 'search' | 'read' | 'edit' | 'check' | 'plan' | 'reference' | 'error' | string
   summary: string
+  // Native official report returned by check_compliance. It is present on
+  // both model-requested and terminal automatic check tool events.
+  compliance?: ComplianceReport
   query?: string
   revision?: string
   operation_count?: number
@@ -530,6 +535,7 @@ export interface ToolActivity {
   targets?: ToolActivityTarget[]
   details?: Record<string, unknown>
   html_validation?: HtmlValidationReport
+  validation_warning?: boolean
 }
 
 export interface ChatContextStats {
@@ -576,6 +582,12 @@ export interface ChatContextStats {
   runtime_visible_output_tokens?: number
   runtime_reasoning_tokens?: number
   runtime_tool_argument_tokens?: number
+  runtime_context_tokens?: number
+  runtime_context_breakdown?: Record<string, number>
+  runtime_context_source?: string
+  runtime_context_is_estimate?: boolean
+  runtime_context_tool_call_id?: string
+  runtime_context_tool_name?: string
   last_model_output_tokens?: number
   last_model_cached_input_tokens?: number
   ledger_tokens?: number
@@ -601,7 +613,22 @@ export interface ChatContextStats {
   } | null
 }
 
-export type AssistantTurnBlockType = 'thought' | 'tool' | 'content'
+export interface ChatContextCompactResult extends ChatContextStats {
+  compaction_notice?: ChatMessageItem | null
+}
+
+export type AssistantTurnBlockType = 'thought' | 'tool' | 'content' | 'context_compaction'
+
+export interface ContextCompaction {
+  summary: string
+  original_tokens: number
+  used_tokens: number
+  summarized_cycles: number
+  digested_cycles: number
+  dropped_cycles: number
+  summary_tokens: number
+  durable_snapshot: boolean
+}
 
 export interface AssistantTurnBlock {
   id: string
@@ -611,6 +638,7 @@ export interface AssistantTurnBlock {
   duration_ms?: number | null
   started_at_ms?: number
   tool: ToolExecution | null
+  context_compaction?: ContextCompaction | null
 }
 
 export interface ChatMessageItem {
@@ -816,24 +844,32 @@ export interface SelectedElementContext {
 }
 
 export interface ComplianceReport {
-  removedClasses: string[]
-  keptClasses: string[]
-  removedIdAttributes: string[]
-  riskStyleHints: string[]
-  bannedTags: string[]
-  consecutiveBrRuns: number[]
-  svgIdAttributes: string[]
-  imageIssues: string[]
-  removedSvgBrs: number
-  hasSvg: boolean
-  oversizedSvgBlocks: number[]
-  maxNestingDepth: number
-  willFlattenNesting: boolean
-  emptyNodeSuspects: string[]
-  diagnostics: ComplianceDiagnostic[]
-  hasError: boolean
-  hasWarning: boolean
+  engine: ComplianceEngineStatus
+  isValid: boolean | null
+  violations: ComplianceViolation[]
+  warnMsgs: string[]
   gzhStrict?: GzhStrictReport | null
+}
+
+export interface ComplianceEngineStatus {
+  version: string
+  commit: string
+  repository: string
+  available: boolean
+  detail: string
+}
+
+export interface ComplianceViolation {
+  key: string
+  message: string
+  items: ComplianceViolationItem[]
+}
+
+export interface ComplianceViolationItem {
+  paragraphIndex: number | string | null
+  outerHTML: string
+  rules: string
+  measurements: Record<string, unknown>
 }
 
 export interface GzhStrictReport {

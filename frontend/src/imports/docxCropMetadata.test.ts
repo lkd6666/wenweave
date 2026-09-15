@@ -25,4 +25,20 @@ describe('readWordImageOccurrences', () => {
       },
     ])
   })
+
+  it('reads DrawingML rotation and mirroring for each image occurrence', async () => {
+    const zip = new JSZip()
+    zip.file('word/document.xml', `
+      <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+        <w:body><w:p><w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="457200" /></wp:inline><pic:pic><pic:blipFill><a:blip r:embed="rId1" /></pic:blipFill><pic:spPr><a:xfrm rot="5400000" flipH="1" flipV="1" /></pic:spPr></pic:pic></w:drawing></w:r></w:p></w:body>
+      </w:document>
+    `)
+
+    const [occurrence] = await readWordImageOccurrences(await zip.generateAsync({ type: 'arraybuffer' }))
+
+    expect(occurrence).toMatchObject({
+      relationshipId: 'rId1',
+      transform: { rotationDegrees: 90, flipHorizontal: true, flipVertical: true },
+    })
+  })
 })

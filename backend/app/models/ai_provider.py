@@ -15,6 +15,7 @@ class ProviderType(str, enum.Enum):
     OPENAI_COMPATIBLE = "openai_compatible"
     OPENAI_RESPONSES = "openai_responses"
     ANTHROPIC = "anthropic"
+    GEMINI_NATIVE = "gemini_native"
 
 
 class AIProvider(Base):

@@ -25,6 +25,7 @@ from app.bootstrap import (
     backfill_official_deepseek_thinking_models,
     migrate_schema,
     migrate_anthropic_thinking_models,
+    migrate_gemini_native_providers,
     prepare_mysql_image_model_access_tables,
     recover_expired_agent_runs,
     recover_interrupted_agent_runs,
@@ -59,6 +60,7 @@ from app.services.operation_logs import (
     with_request_id,
 )
 from app.services.runtime_diagnostics import log_process_memory, read_process_memory
+from app.services.wechat_compliance import close_official_compliance_engine
 
 
 logger = logging.getLogger(__name__)
@@ -282,29 +284,35 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_last_attempt_at = None
     app.state.cleanup_last_success_at = None
     app.state.cleanup_last_error = ""
+    # TEMP (local port 8003): skip schema/bootstrap work, because another
+    # development instance currently owns the MySQL migration advisory lock.
+    # Restore the normal initialization block below once that instance stops.
+    pending_image_generation_ids: list[str] = []
     # Schema mutations and startup recovery must be performed by one worker.
     # Other workers wait on the advisory/file lock before accepting requests.
-    with schema_migration_lock():
-        if engine.url.drivername.startswith("mysql"):
-            # Legacy image-model IDs can differ from the current BIGINT UNSIGNED
-            # contract. Create every parent first, then create the two access
-            # tables with the actual parent ID types before static DDL sees them.
-            Base.metadata.create_all(bind=engine, tables=_schema_tables_before_image_model_access())
-            prepare_mysql_image_model_access_tables()
-        Base.metadata.create_all(bind=engine)
-        migrate_schema()
-        db = SessionLocal()
-        try:
-            recover_interrupted_agent_runs(db)
-            pending_image_generation_ids = recover_pending_generations()
-            backfill_official_deepseek_thinking_models(db)
-            migrate_anthropic_thinking_models(db)
-            from app.services.image_library import backfill_generated_assets
-
-            backfill_generated_assets(db)
-            seed_default_admin(db)
-        finally:
-            db.close()
+    # with schema_migration_lock():
+    #     if engine.url.drivername.startswith("mysql"):
+    #         # Legacy image-model IDs can differ from the current BIGINT UNSIGNED
+    #         # contract. Create every parent first, then create the two access
+    #         # tables with the actual parent ID types before static DDL sees them.
+    #         Base.metadata.create_all(bind=engine, tables=_schema_tables_before_image_model_access())
+    #         prepare_mysql_image_model_access_tables()
+    #     Base.metadata.create_all(bind=engine)
+    #     migrate_schema()
+    #     db = SessionLocal()
+    #     try:
+    #         recover_interrupted_agent_runs(db)
+    #         pending_image_generation_ids = recover_pending_generations()
+    #         backfill_official_deepseek_thinking_models(db)
+    #         migrate_anthropic_thinking_models(db)
+    #         migrate_gemini_native_providers(db)
+    #         from app.services.image_library import backfill_generated_assets, backfill_imported_assets
+    #
+    #         backfill_generated_assets(db)
+    #         backfill_imported_assets(db)
+    #         seed_default_admin(db)
+    #     finally:
+    #         db.close()
     # Waiting questions are durable but their lightweight local timers are
     # process-local. Recreate them after startup without consuming an Agent
     # execution slot.
@@ -338,6 +346,10 @@ async def lifespan(app: FastAPI):
         for task in (cleanup_task, recovery_task):
             with suppress(asyncio.CancelledError):
                 await task
+        # The checker is lazy, so this is a no-op when no model requested a
+        # verification. Closing it here releases its Chromium process before
+        # Uvicorn tears down the worker.
+        await asyncio.to_thread(close_official_compliance_engine)
 
 
 settings = get_settings()
@@ -345,7 +357,8 @@ settings.validate_runtime_security()
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
 MULTIPART_OVERHEAD_ALLOWANCE = 256 * 1024
-MAX_IMPORT_UPLOAD_BYTES = 30 * 1024 * 1024
+# Permit a 50 MiB file plus the enclosing multipart form data.
+MAX_IMPORT_UPLOAD_BYTES = 50 * 1024 * 1024 + MULTIPART_OVERHEAD_ALLOWANCE
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_BRANDING_ASSET_BYTES = 2 * 1024 * 1024
 MAX_LAYOUT_CAPTURE_UPLOAD_BYTES = MAX_RESPONSE_BYTES + MAX_REFERENCE_IMAGE_TOTAL_BYTES + MULTIPART_OVERHEAD_ALLOWANCE

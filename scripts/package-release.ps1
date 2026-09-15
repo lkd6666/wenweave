@@ -295,6 +295,21 @@ Set-Content -LiteralPath (Join-Path $releaseStage 'RELEASE_MANIFEST.txt') -Encod
     'database=mysql-schema-only',
     'private-runtime-data=excluded'
 )
+if ($LayoutCaptureAppOrigin.TrimEnd('/') -match '^https://(www\.)?example\.com$') {
+    Set-Content -LiteralPath (Join-Path $releaseStage 'DEPLOYER_ACTION_REQUIRED.txt') -Encoding utf8 -Value @"
+必须操作：替换排版采集扩展的占位来源
+
+此发行包中的排版采集扩展当前仅允许与 $($LayoutCaptureAppOrigin.TrimEnd('/')) 通信。这只是占位来源，不能用于真实部署。
+
+在将系统提供给实际用户之前，请在发行源代码目录使用真实的 HTTPS 站点来源重新执行打包：
+
+  .\scripts\package-release.ps1 -Version <新版本号> -LayoutCaptureAppOrigin 'https://你的实际域名' -SkipPrivateArchive
+
+真实来源必须只包含协议和域名（可含端口），不能包含路径、查询参数或片段。例如：https://editor.example.cn。
+
+仅修改 backend/.env 中的 CORS_ORIGINS、Nginx 配置或已解压文件，均不会修改已经编译并安装的浏览器扩展白名单；必须重新构建并让用户重新安装新扩展包。
+"@
+}
 Assert-PublicStageSafe -Stage $releaseStage
 New-PortableZip -SourceDirectory $releaseStage -DestinationFile $releaseZipCandidate
 Move-FileIntoPlace -Source $releaseZipCandidate -Destination $releaseZip

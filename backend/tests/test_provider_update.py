@@ -189,17 +189,16 @@ class ProviderUpdateTests(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_prompt_cache_flag_rejects_anthropic_provider(self) -> None:
+    def test_prompt_cache_flag_round_trips_for_anthropic_provider(self) -> None:
         update_provider(self.provider_id, ProviderUpdate(provider_type=ProviderType.ANTHROPIC), self.db)
-
-        with self.assertRaises(HTTPException) as raised:
-            create_model(
-                self.provider_id,
-                ModelCreate(model_name="claude", display_name="Claude", prompt_cache_enabled=True),
-                self.db,
-            )
-
-        self.assertEqual(raised.exception.status_code, 422)
+        model = create_model(
+            self.provider_id,
+            ModelCreate(model_name="claude", display_name="Claude", prompt_cache_enabled=True),
+            self.db,
+        )
+        self.assertTrue(model.prompt_cache_enabled)
+        updated = update_model(model.id, ModelUpdate(prompt_cache_enabled=False), self.db)
+        self.assertFalse(updated.prompt_cache_enabled)
 
     def test_anthropic_model_normalizes_openai_thinking_mapping(self) -> None:
         update_provider(self.provider_id, ProviderUpdate(provider_type=ProviderType.ANTHROPIC), self.db)

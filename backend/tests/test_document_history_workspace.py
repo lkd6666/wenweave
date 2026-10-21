@@ -22,6 +22,24 @@ from app.services.token_budget import estimate_tokens
 
 
 class DocumentHistoryWorkspaceTests(unittest.TestCase):
+    def test_source_files_authorize_document_and_do_not_build_dom_indexes(self) -> None:
+        from app.services.chat_agent import HtmlEditSession
+        from app.services.source_agent import create_source_workspace
+        from app.services.html_workspace import WorkspaceError
+        source = '<p>历史中文🙂</p>\r\n'
+        document = self.make_document(source)
+        version = self.commit_version(document, source, '源码')
+        foreign_document = self.make_document('<p>其他文章</p>')
+        foreign = self.commit_version(foreign_document, '<p>其他文章</p>', '隔离')
+        history = DocumentHistoryWorkspace(self.db, document.id, 4096)
+        workspace = create_source_workspace(HtmlEditSession('<p>当前</p>'), history=history)
+        with patch('app.services.document_history_workspace.HtmlWorkspace', side_effect=AssertionError('DOM index')):
+            file = workspace.get(f'/history/{version.id}.html')
+            self.assertEqual(file.content, source)
+            self.assertTrue(file.readonly)
+            with self.assertRaises(WorkspaceError):
+                workspace.get(f'/history/{foreign.id}.html')
+
     def setUp(self) -> None:
         self.engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(self.engine)
@@ -131,6 +149,27 @@ class DocumentHistoryWorkspaceTests(unittest.TestCase):
         self.assertNotIn("data:image", read["blocks"][0]["html"])
         self.assertTrue(read["read_only"])
         self.assertEqual(current_workspace.source_html, current)
+
+    def test_large_historical_block_can_be_read_with_fragment_cursor(self) -> None:
+        original = "<section><p>" + ("历史正文" * 400) + "</p></section>"
+        document = self.make_document(original)
+        version = create_document_version(self.db, document, self.user.id, DocumentVersionSource.INITIAL, "原文")
+        self.db.flush()
+        history = DocumentHistoryWorkspace(self.db, document.id, 512)
+        block_id = HtmlWorkspace(original).blocks[0].block_id
+
+        fragments: list[str] = []
+        cursor: int | str = 0
+        while True:
+            page = history.read_blocks(version.id, [block_id], cursor)
+            self.assertTrue(page["read_only"])
+            fragments.append(page["blocks"][0]["html_fragment"])
+            if page["next_cursor"] is None:
+                break
+            cursor = page["next_cursor"]
+
+        self.assertGreater(len(fragments), 1)
+        self.assertEqual("".join(fragments), original)
 
     def test_selected_version_image_search_and_inventory_are_complete_and_redacted(self) -> None:
         original = "".join(

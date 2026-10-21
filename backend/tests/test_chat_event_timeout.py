@@ -16,7 +16,7 @@ import app.models  # noqa: F401 - register referenced tables for the isolated da
 import app.api.routes.chat as chat_module
 import app.bootstrap as bootstrap_module
 from app.db.base import Base
-from app.api.routes.chat import _agent_execution_error_message, _force_stuck_cancellation, _has_external_document_conflict, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _preserve_retried_tool_previews, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
+from app.api.routes.chat import _agent_execution_error_message, _commit_waiting_user_question, _force_stuck_cancellation, _has_external_document_conflict, _is_context_limit_error, _is_retryable_db_disconnect, _iterate_agent_events_with_timeout, _preserve_retried_tool_previews, _restart_failure_events, _settle_terminal_timeline, _settle_user_question_timeline, _unresolved_edit_failure
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.agent_run_event import AgentRunEvent
 from app.models.chat_user_question import ChatUserQuestion, ChatUserQuestionStatus
@@ -114,6 +114,84 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(question.status, ChatUserQuestionStatus.WAITING)
             self.assertEqual(question.question["question"], "请选择")
+        finally:
+            engine.dispose()
+
+    def test_waiting_question_and_sse_event_commit_atomically_with_json_deadline(self) -> None:
+        engine = create_engine("sqlite://")
+        session_factory = sessionmaker(bind=engine)
+        Base.metadata.create_all(engine)
+        now = datetime(2026, 9, 22, 8, 0, tzinfo=timezone.utc)
+        try:
+            with session_factory() as db:
+                db.add(
+                    AgentRun(
+                        id="run-question-atomic",
+                        document_id=1,
+                        session_id=1,
+                        user_id=1,
+                        user_message_id=1,
+                        client_request_id="request-question-atomic",
+                        status=AgentRunStatus.RUNNING,
+                        owner_id="worker-1",
+                        event_sequence=2,
+                    )
+                )
+                db.add(
+                    AgentRunEvent(
+                        run_id="run-question-atomic",
+                        sequence=3,
+                        event="tool_call",
+                        payload_json='{"id":"call-1","name":"ask_user"}',
+                    )
+                )
+                db.commit()
+
+            question = ChatUserQuestion(
+                id="question-atomic",
+                run_id="run-question-atomic",
+                document_id=1,
+                session_id=1,
+                user_id=1,
+                model_id=1,
+                tool_call_id="call-1",
+                status=ChatUserQuestionStatus.WAITING,
+                question_json='{"question":"请选择","options":[]}',
+                resume_messages_json='[{"type":"ai"}]',
+                completed_context_events_json="[]",
+                execution_context_json="{}",
+                timeline_json="{}",
+                last_activity_at=now,
+                timeout_at=now + timedelta(minutes=2),
+            )
+            with session_factory() as db:
+                persisted, sequence, payload, occurred_at = _commit_waiting_user_question(
+                    db,
+                    "run-question-atomic",
+                    question,
+                    now=now,
+                )
+
+            with session_factory() as db:
+                run = db.get(AgentRun, "run-question-atomic")
+                event = (
+                    db.query(AgentRunEvent)
+                    .filter(AgentRunEvent.run_id == "run-question-atomic")
+                    .order_by(AgentRunEvent.sequence.desc())
+                    .first()
+                )
+
+            assert run is not None and event is not None
+            self.assertEqual(persisted.id, "question-atomic")
+            self.assertEqual(sequence, 4)
+            self.assertEqual(occurred_at, now)
+            self.assertEqual(run.status, AgentRunStatus.WAITING_FOR_INPUT)
+            self.assertEqual(run.event_sequence, 4)
+            self.assertEqual(run.owner_id, "")
+            self.assertEqual(event.event, "user_question")
+            self.assertEqual(json.loads(event.payload_json), payload)
+            self.assertIsInstance(payload["timeout_at"], str)
+            json.dumps(payload)
         finally:
             engine.dispose()
 
@@ -228,8 +306,32 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_settle_user_question_timeline(tool_calls, turn_blocks, "call-1"), "call-1")
         self.assertEqual(tool_calls[0]["status"], "success")
         self.assertEqual(turn_blocks[0]["tool"]["status"], "success")
+        self.assertEqual(tool_calls[0]["model_input"]["state"], "not_sent")
+        self.assertEqual(turn_blocks[0]["tool"]["model_input"]["state"], "not_sent")
         self.assertEqual(tool_calls[1]["status"], "waiting")
         self.assertEqual(turn_blocks[1]["tool"]["status"], "waiting")
+
+    def test_answering_question_records_the_exact_provider_visible_answer(self) -> None:
+        tool_calls = [{"id": "call-answer", "name": "ask_user", "status": "waiting", "preparing": False}]
+        turn_blocks = [{"type": "tool", "tool": {"id": "call-answer", "name": "ask_user", "status": "waiting"}}]
+        provider_content = '{"action":"selected","selected_options":[{"id":"option-1"}]}'
+
+        self.assertEqual(
+            _settle_user_question_timeline(
+                tool_calls,
+                turn_blocks,
+                "call-answer",
+                {"action": "selected"},
+                model_input_content=provider_content,
+            ),
+            "call-answer",
+        )
+        self.assertEqual(tool_calls[0]["model_input"], {
+            "state": "available",
+            "content": provider_content,
+            "truncated": False,
+        })
+        self.assertEqual(turn_blocks[0]["tool"]["model_input"], tool_calls[0]["model_input"])
 
     def test_model_retry_keeps_unexecuted_patch_visible_as_interrupted(self) -> None:
         checkpoint_tools = [{"id": "read-1", "name": "read_blocks", "status": "success"}]
@@ -565,20 +667,32 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         waiting_run = SimpleNamespace(status=AgentRunStatus.WAITING_FOR_INPUT)
 
         class FakeQuery:
+            calls = 0
+
+            def outerjoin(self, *_args):
+                return self
+
             def filter(self, *_args):
                 return self
 
+            def options(self, *_args):
+                return self
+
+            def order_by(self, *_args):
+                return self
+
+            def limit(self, *_args):
+                return self
+
             def all(self):
-                return [orphaned, valid]
+                FakeQuery.calls += 1
+                return [(orphaned, failed_run), (valid, waiting_run)] if FakeQuery.calls == 1 else []
 
         class FakeSession:
             committed = False
 
-            def query(self, _model):
+            def query(self, *_models):
                 return FakeQuery()
-
-            def get(self, _model, run_id):
-                return failed_run if run_id == "run-failed" else waiting_run
 
             def commit(self) -> None:
                 self.committed = True
@@ -712,9 +826,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_restart_failure_events_are_plain_payloads(self) -> None:
-        compliance = SimpleNamespace(to_dict=lambda: {"valid": True})
-        with patch.object(chat_module, "run_compliance_check", return_value=compliance):
-            events = _restart_failure_events("服务已重启", "<p>保留稿</p>")
+        events = _restart_failure_events("服务已重启", "<p>保留稿</p>")
 
         self.assertEqual([event["event"] for event in events], ["error", "final"])
         final = json.loads(events[1]["data"])
@@ -722,11 +834,10 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["html"], "<p>保留稿</p>")
         self.assertEqual(final["run_status"], "failed")
         self.assertEqual(final["partial_save_state"], "none")
+        self.assertIsNone(final["compliance"])
 
     def test_restart_failure_event_marks_a_preserved_candidate_as_changed(self) -> None:
-        compliance = SimpleNamespace(to_dict=lambda: {"valid": True})
-        with patch.object(chat_module, "run_compliance_check", return_value=compliance):
-            events = _restart_failure_events("服务已重启", "<p>保留稿</p>", "preserved")
+        events = _restart_failure_events("服务已重启", "<p>保留稿</p>", "preserved")
 
         final = json.loads(events[1]["data"])
         self.assertTrue(final["html_changed"])
@@ -962,12 +1073,14 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
-                        with_for_update=lambda: SimpleNamespace(first=lambda: result)
+                        with_for_update=lambda: SimpleNamespace(first=lambda: result),
+                        order_by=lambda *_args: SimpleNamespace(all=lambda: [])
                     )
                 )
 
             def add(self, message) -> None:
-                self.message = message
+                if isinstance(message, ChatMessage):
+                    self.message = message
 
             def flush(self) -> None:
                 self.message.id = 11
@@ -981,7 +1094,6 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession()
         manager = AgentRunManager()
         manager.create(run.id).status = AgentRunStatus.CANCELLING.value
-        compliance = SimpleNamespace(to_dict=lambda: {"valid": True})
 
         async def mark_terminal(run_id: str, status: str) -> None:
             manager.get(run_id).status = status
@@ -990,7 +1102,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat_module, "CANCEL_GRACE_SECONDS", 0),
             patch.object(chat_module, "SessionLocal", return_value=session),
             patch.object(chat_module, "agent_run_manager", manager),
-            patch.object(chat_module, "run_compliance_check", return_value=compliance),
+            patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
             patch.object(manager, "publish"),
             patch.object(manager, "mark_terminal", side_effect=mark_terminal),
         ):
@@ -1036,12 +1148,14 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
-                        with_for_update=lambda: SimpleNamespace(first=lambda: result)
+                        with_for_update=lambda: SimpleNamespace(first=lambda: result),
+                        order_by=lambda *_args: SimpleNamespace(all=lambda: [])
                     )
                 )
 
             def add(self, message) -> None:
-                self.message = message
+                if isinstance(message, ChatMessage):
+                    self.message = message
 
             def flush(self) -> None:
                 self.message.id = 11
@@ -1055,7 +1169,6 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession()
         manager = AgentRunManager()
         manager.create(run.id).status = AgentRunStatus.CANCELLING.value
-        compliance = SimpleNamespace(to_dict=lambda: {"valid": True})
 
         async def mark_terminal(run_id: str, status: str) -> None:
             manager.get(run_id).status = status
@@ -1064,7 +1177,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat_module, "CANCEL_GRACE_SECONDS", 0),
             patch.object(chat_module, "SessionLocal", return_value=session),
             patch.object(chat_module, "agent_run_manager", manager),
-            patch.object(chat_module, "run_compliance_check", return_value=compliance),
+            patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
             patch.object(chat_module, "touch_document"),
             patch.object(chat_module, "create_document_version"),
             patch.object(manager, "publish"),
@@ -1109,12 +1222,14 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
-                        with_for_update=lambda: SimpleNamespace(first=lambda: result)
+                        with_for_update=lambda: SimpleNamespace(first=lambda: result),
+                        order_by=lambda *_args: SimpleNamespace(all=lambda: [])
                     )
                 )
 
             def add(self, message) -> None:
-                self.message = message
+                if isinstance(message, ChatMessage):
+                    self.message = message
 
             def flush(self) -> None:
                 self.message.id = 11
@@ -1128,7 +1243,6 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession()
         manager = AgentRunManager()
         manager.create(run.id).status = AgentRunStatus.CANCELLING.value
-        compliance = SimpleNamespace(to_dict=lambda: {"valid": True})
 
         async def mark_terminal(run_id: str, status: str) -> None:
             manager.get(run_id).status = status
@@ -1137,7 +1251,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat_module, "CANCEL_GRACE_SECONDS", 0),
             patch.object(chat_module, "SessionLocal", return_value=session),
             patch.object(chat_module, "agent_run_manager", manager),
-            patch.object(chat_module, "run_compliance_check", return_value=compliance),
+            patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
             patch.object(chat_module, "create_document_version") as create_version,
             patch.object(manager, "publish"),
             patch.object(manager, "mark_terminal", side_effect=mark_terminal),
@@ -1201,7 +1315,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 self.committed = False
 
             def query(self, model):
-                return FakeQuery([run] if model is AgentRun else [document])
+                return FakeQuery([run] if model is AgentRun else [document] if model is Document else [])
 
             def get(self, model, _identifier):
                 return request_message if model is ChatMessage else None
@@ -1222,6 +1336,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bootstrap_module, "touch_document"),
             patch.object(bootstrap_module, "create_document_version"),
+            patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
         ):
             recovered = bootstrap_module.recover_interrupted_agent_runs(session)
 

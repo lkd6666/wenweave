@@ -7,12 +7,14 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from itertools import islice
 from typing import Any, Callable, Sequence
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.models.ai_model import AIModel
 from app.models.chat_image_attachment import ChatImageAttachment
@@ -22,12 +24,12 @@ from app.models.chat_history_archive import ChatHistoryArchive
 from app.models.chat_message import ChatMessage, MessageRole
 from app.models.chat_session import ChatSession, ChatSessionMemory
 from app.services.html_workspace import HtmlWorkspace
-from app.services.chat_images import CHAT_IMAGE_TOKEN_COST, attachment_text_suffix, image_content_blocks
+from app.services.chat_images import CHAT_IMAGE_TOKEN_COST, attachment_article_urls, attachment_reference_text, attachment_text_suffix, image_loading_plan, ordered_image_attachments
 from app.services.token_budget import estimate_tokens, truncate_to_tokens
 from app.services.tool_output_store import tool_output_stats
 from app.services.model_call_accounting import ModelCallTracker
+from app.services.openai_compatible_chat_model import CACHE_BOUNDARY_TEXT
 
-COMPACTION_TRIGGER_RATIO = 0.90
 COMPACTION_TARGET_TOKENS = 20_000
 DEFAULT_PRESERVE_RECENT_TOKENS = 20_000
 # Compaction is a small, single-purpose model turn. It uses an independent
@@ -40,14 +42,12 @@ COMPACTION_MODEL_TIMEOUT_SECONDS = 300
 COMPACTION_MODEL_REQUEST_TIMEOUT_SECONDS = 300
 COMPACTION_MODEL_MAX_RETRIES = 0
 COMPACTION_MODEL_MAX_OUTPUT_TOKENS = 12_000
-# The same tools are bound for every editor turn. This conservative schema
-# reserve keeps preflight below provider limits even when a provider adds JSON
-# envelope tokens that tiktoken cannot see.
+# Fallback only when the actual schema cannot be serialized. Normal requests
+# count the bound schema, including lazily loaded source-tool groups.
 AGENT_TOOL_SCHEMA_RESERVE_TOKENS = 3_500
-# Provider-reported usage for Chinese HTML is materially higher than the
-# provider-neutral cl100k estimate.  Apply the same conservative factor during
-# preflight and runtime compaction so the app compacts before the provider
-# limit, not after it has already been exceeded.
+# Provider tokenizers and message envelopes can differ from the shared o200k
+# text estimate. Keep the established conservative factor during preflight and
+# runtime compaction until matched provider requests justify recalibration.
 PROVIDER_TOKEN_ESTIMATE_SAFETY_MULTIPLIER = 1.60
 MEMORY_ITEM_LIMIT = 12
 MEMORY_ITEM_MAX_CHARS = 360
@@ -59,6 +59,7 @@ SOURCE_REF_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CURRENT_DOCUMENT_TOOL_NAMES = {
+    "list_files", "read_file", "search_files", "edit_file", "apply_patch", "write_file",
     "get_document_map",
     "search_html",
     "read_blocks",
@@ -227,6 +228,7 @@ class ContextRecord:
     document_revision: str = ""
     is_legacy: bool = False
     image_attachments: tuple[ChatImageAttachment, ...] = ()
+    created_at: datetime | None = None
 
     @property
     def content(self) -> str:
@@ -235,16 +237,54 @@ class ContextRecord:
     def _stale_tool_content(self, current_revision: str, result_limit_tokens: int) -> str:
         name = str(self.payload.get("name", "工具"))
         content = self.content
+        source_tools = {"list_files", "read_file", "search_files", "edit_file", "apply_patch", "write_file"}
+        def immutable_file(value: Any) -> bool:
+            return isinstance(value, dict) and value.get("readonly") is True and value.get("path") != "/article.html"
+        if name in {"read_file", "search_files", "list_files"}:
+            try:
+                parsed = json.loads(content)
+                if immutable_file(parsed) or (isinstance(parsed, dict) and parsed.get("files")
+                        and all(immutable_file(item) for item in parsed["files"])):
+                    return truncate_to_tokens(content, result_limit_tokens)
+            except (TypeError, ValueError):
+                pass
         if (
             current_revision
             and name in CURRENT_DOCUMENT_TOOL_NAMES
             and (self.is_legacy or (self.document_revision and self.document_revision != current_revision))
         ):
+            # Only locators and source HTML expire. Completed edits, readable
+            # text, image URLs and output handles remain useful on continuation.
+            def semantic(value: Any) -> Any:
+                if isinstance(value, dict):
+                    if name in source_tools and immutable_file(value):
+                        return value
+                    return {
+                        key: semantic(item) for key, item in value.items()
+                        if key not in {"revision", "current_revision", "block_id", "block_ids",
+                                       "expected_hash", "hash", "html", "new_html", "path", "locator"}
+                        and (name not in source_tools
+                             or key not in {"content", "start", "end", "start_line", "end_line", "line",
+                                           "before_start", "before_end",
+                                           "context_start", "context_end", "requested_start", "requested_end", "next_cursor"})
+                    }
+                if isinstance(value, list):
+                    return [semantic(item) for item in value]
+                return value
+
+            try:
+                historical = semantic(json.loads(content))
+            except (ValueError, TypeError):
+                historical = _short(content, 600)
             return json.dumps(
                 {
                     "stale": True,
                     "tool": name,
-                    "next_step": "历史定位已过期；请读取当前文档地图或重新搜索后再修改。",
+                    "historical_result": truncate_to_tokens(json.dumps(historical, ensure_ascii=False), max(64, result_limit_tokens - 160)),
+                    "source_ref": f"event:{self.id}",
+                    "next_step": ("历史源码位置已过期；按需 read_file/search_files 获取当前源码后修改。"
+                                  if name in source_tools
+                                  else "历史定位已过期；请读取当前文档地图或重新搜索后再修改。"),
                 },
                 ensure_ascii=False,
             )
@@ -254,21 +294,18 @@ class ContextRecord:
         self,
         current_revision: str,
         result_limit_tokens: int,
-        db: Session | None = None,
-        provider_type: str = "openai_compatible",
         include_images: bool = False,
+        article_urls: dict[str, str] | None = None,
+        preserve_tool_history: bool = False,
     ) -> BaseMessage:
         if self.kind == ContextEventKind.USER.value:
-            suffix = attachment_text_suffix(self.image_attachments, include_images)
-            if db is None or not self.image_attachments:
-                return HumanMessage(content=self.content + suffix)
-            blocks = image_content_blocks(
-                db, self.image_attachments, provider_type=provider_type, include_images=include_images
-            )
-            return HumanMessage(content=[{"type": "text", "text": self.content + suffix}, *blocks] if blocks else self.content + suffix)
+            suffix = attachment_text_suffix(self.image_attachments, include_images) + attachment_reference_text(self.image_attachments, article_urls=article_urls)
+            return HumanMessage(content=self.content + suffix)
         if self.kind == ContextEventKind.TOOL.value:
             return ToolMessage(
-                content=self._stale_tool_content(current_revision, result_limit_tokens),
+                content=(truncate_to_tokens(self.content, result_limit_tokens)
+                         if preserve_tool_history and not self.is_legacy
+                         else self._stale_tool_content(current_revision, result_limit_tokens)),
                 tool_call_id=str(self.payload.get("tool_call_id", "")),
                 name=str(self.payload.get("name", "")) or None,
                 status=str(self.payload.get("status", "success")),
@@ -284,12 +321,17 @@ class ContextRecord:
             for call in calls
             if isinstance(call, dict) and call.get("id")
         ]
-        return AIMessage(content=self.content, tool_calls=normalised_calls)
+        reasoning = self.payload.get("reasoning_content")
+        return AIMessage(content=self.content, tool_calls=normalised_calls,
+                         additional_kwargs={"reasoning_content": reasoning} if isinstance(reasoning, str) else {})
 
     def compact_line(self) -> str:
         event_ref = f"event:{self.id}"
         if self.kind == ContextEventKind.USER.value:
-            suffix = f"（含 {len(self.image_attachments)} 张图片）" if self.image_attachments else ""
+            suffix = (
+                f"（含 {len(self.image_attachments)} 张图片；可用 read_session_detail({event_ref}) 取回图片引用）"
+                if self.image_attachments else ""
+            )
             return f"[{event_ref}] 用户：{_short(self.content, 700)}{suffix}"
         if self.kind == ContextEventKind.ASSISTANT.value:
             calls = self.payload.get("tool_calls", [])
@@ -309,9 +351,13 @@ class ContextRecord:
 
 def context_prefix_hash(records: Sequence[ContextRecord], count: int | None = None) -> str:
     """Hash the canonical provider-visible prefix, never UI-only trace data."""
-    selected = records if count is None else records[: max(0, count)]
-    payload = [
-        {
+    selected = records if count is None else islice(records, max(0, count))
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, record in enumerate(selected):
+        if index:
+            digest.update(b",")
+        payload = {
             "id": record.id,
             "message_id": record.message_id,
             "kind": record.kind,
@@ -319,10 +365,9 @@ def context_prefix_hash(records: Sequence[ContextRecord], count: int | None = No
             "document_revision": record.document_revision,
             "legacy": record.is_legacy,
         }
-        for record in selected
-    ]
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+        digest.update(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    digest.update(b"]")
+    return "sha256:" + digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -331,6 +376,17 @@ class PreparedAgentContext:
     history: list[BaseMessage]
     workspace_map: dict[str, Any]
     stats: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RuntimePromptBudget:
+    build: Callable[[dict[str, Any]], tuple[str, str]]
+    system_state_combined: bool = False
+    request_suffix: str = ""
+    cache_boundaries_enabled: bool = False
+
+    def __call__(self, memory: dict[str, Any]) -> tuple[str, str]:
+        return self.build(memory)
 
 
 class ContextBudgetError(ValueError):
@@ -358,7 +414,11 @@ def compaction_failure_detail(exc: BaseException | None) -> str:
 
 
 class AgentContextBuilder:
-    """Build a Cline-style live transcript without replaying stale HTML state."""
+    """Build bounded event history; current state is supplied separately.
+
+    Opted-in providers retain original tool results as historical data. Writes
+    still require the current revision; legacy histories keep stale summaries.
+    """
 
     def __init__(
         self,
@@ -367,7 +427,7 @@ class AgentContextBuilder:
         session_id: int,
         model: AIModel,
         workspace: HtmlWorkspace,
-        history_rows: Sequence[ChatMessage],
+        history_rows: Sequence[ChatMessage] | None,
         base_prompt: str,
         current_request: str = "",
         additional_context: str = "",
@@ -376,24 +436,39 @@ class AgentContextBuilder:
         token_estimate_multiplier: float = PROVIDER_TOKEN_ESTIMATE_SAFETY_MULTIPLIER,
         exclude_message_id: int = 0,
         model_call_tracker_factory: Callable[[], ModelCallTracker] | None = None,
+        tool_schema_tokens: int = AGENT_TOOL_SCHEMA_RESERVE_TOKENS,
+        current_image_attachments: Sequence[ChatImageAttachment] = (),
+        runtime_context_factory: Callable[[dict[str, Any]], tuple[str, str]] | None = None,
     ):
         self.db = db
         self.document_id = document_id
         self.session_id = session_id
         self.model = model
+        provider_type = getattr(getattr(getattr(model, "provider", None), "provider_type", None), "value", "")
+        self.preserve_tool_history = bool(getattr(model, "prompt_cache_enabled", False)) and provider_type in {
+            "openai_compatible", "openai_responses", "anthropic"}
         self.workspace = workspace
         self.base_prompt = base_prompt
+        self.runtime_context_factory = runtime_context_factory
+        self._runtime_empty_state_tokens = 0
         self.current_request = current_request
         self.additional_context = additional_context
         self.current_image_count = max(0, int(current_image_count))
+        self.current_image_attachments = tuple(current_image_attachments)
+        if self.current_image_attachments:
+            self.current_image_count = len(self.current_image_attachments)
         self.exclude_message_id = exclude_message_id
         self.model_call_tracker_factory = model_call_tracker_factory
+        self.tool_schema_tokens = max(0, int(tool_schema_tokens))
         self.budget_multiplier = min(1.0, max(0.35, budget_multiplier))
         self.token_estimate_multiplier = min(3.0, max(1.0, token_estimate_multiplier))
         self.window = int(model.context_window_tokens)
         self.max_output_tokens = int(model.max_output_tokens)
-        self.usable_budget = int(model.context_compaction_threshold_tokens)
-        self.trigger_budget = max(1, int(self.usable_budget * COMPACTION_TRIGGER_RATIO * self.budget_multiplier))
+        self.input_limit = max(1, self.window - self.max_output_tokens)
+        self.usable_budget = min(int(model.context_compaction_threshold_tokens), self.input_limit)
+        # Normal requests trigger at the configured threshold. A lower
+        # multiplier is reserved for retrying an actual provider limit error.
+        self.trigger_budget = max(1, int(self.usable_budget * self.budget_multiplier))
         # Keep a short, information-dense hot context after compaction. Larger
         # model windows should increase the distance between compactions, not
         # make each compacted transcript needlessly large.
@@ -410,9 +485,23 @@ class AgentContextBuilder:
         )
         self.tool_result_max_tokens = int(model.tool_result_max_tokens)
         self.session = self.db.get(ChatSession, session_id)
+        # Request-scoped integer caches do not retain session content across
+        # users or requests. One preview used to re-tokenize each suffix for
+        # every candidate boundary, making long histories quadratic.
+        self._record_token_cache: dict[int, int] = {}
+        self._source_record_cache: list[ContextRecord] | None = None
+        self._storage_stats_cache: dict[str, Any] | None = None
+        self._fixed_token_cache: dict[str, int] | None = None
+        self._covered_snapshot_id: int | None = None
+        self._covered_event_ids: set[int] = set()
+        self.checkpoint_changed = False
         self.records = self._load_records(history_rows)
+        self.article_image_urls = attachment_article_urls(self.db, [
+            *self.current_image_attachments,
+            *(item for record in self.records for item in record.image_attachments),
+        ])
 
-    def _load_records(self, history_rows: Sequence[ChatMessage]) -> list[ContextRecord]:
+    def _load_records(self, history_rows: Sequence[ChatMessage] | None) -> list[ContextRecord]:
         query = (
             self.db.query(ChatContextEvent)
             # Every provider-visible event must have a concrete active message
@@ -432,9 +521,11 @@ class AgentContextBuilder:
             query = query.filter(ChatContextEvent.message_id > self.session.context_start_message_id)
         if self.exclude_message_id:
             query = query.filter(ChatContextEvent.message_id != self.exclude_message_id)
-        events = query.order_by(ChatContextEvent.id).all()
+        events = query.order_by(ChatContextEvent.message_id, ChatContextEvent.ordinal, ChatContextEvent.id).all()
         if events:
-            message_ids = [event.message_id for event in events if event.message_id]
+            message_ids = list(dict.fromkeys(
+                event.message_id for event in events if event.message_id and event.kind == ContextEventKind.USER
+            ))
             attachment_map: dict[int, tuple[ChatImageAttachment, ...]] = {}
             if message_ids:
                 attachments = (
@@ -456,13 +547,31 @@ class AgentContextBuilder:
                     payload=event.payload,
                     document_revision=event.document_revision,
                     is_legacy=event.is_legacy,
-                    image_attachments=attachment_map.get(event.message_id or 0, ()),
+                    image_attachments=tuple(ordered_image_attachments(
+                        attachment_map.get(event.message_id or 0, ()), event.payload.get("image_attachment_ids")
+                    )),
+                    created_at=event.created_at,
                 )
                 for event in events
             ]
 
         # Unit tests and an interrupted migration may have chat rows before
         # their backfill. This read-only fallback preserves old behavior.
+        if history_rows is None:
+            legacy = self.db.query(ChatMessage).options(
+                load_only(ChatMessage.id, ChatMessage.role, ChatMessage.content),
+                selectinload(ChatMessage.image_attachments),
+            ).filter(
+                ChatMessage.document_id == self.document_id,
+                ChatMessage.session_id == self.session_id,
+                ChatMessage.is_superseded.is_(False),
+                ChatMessage.role.in_([MessageRole.USER, MessageRole.ASSISTANT]),
+            )
+            if self.session and self.session.context_start_message_id:
+                legacy = legacy.filter(ChatMessage.id > self.session.context_start_message_id)
+            if self.exclude_message_id:
+                legacy = legacy.filter(ChatMessage.id != self.exclude_message_id)
+            history_rows = legacy.order_by(ChatMessage.id).all()
         records: list[ContextRecord] = []
         for row in history_rows:
             if not row.content.strip():
@@ -481,7 +590,46 @@ class AgentContextBuilder:
         return records
 
     def _source_records(self) -> list[ContextRecord]:
-        return self._valid_records(self.records)
+        if self._source_record_cache is None:
+            self._source_record_cache = self._valid_records(self.records)
+        return self._source_record_cache
+
+    def _snapshot_prefix(
+        self, checkpoint: ChatContextSnapshot, source_records: Sequence[ContextRecord]
+    ) -> tuple[list[ContextRecord], bool]:
+        count = int(checkpoint.source_event_count or 0)
+        max_event_id = int(checkpoint.source_max_event_id or 0)
+        if max_event_id:
+            candidates = (record for record in source_records if record.id <= max_event_id)
+        else:
+            prefix = list(source_records[:count])
+            if context_prefix_hash(prefix) == checkpoint.source_prefix_hash:
+                return prefix, len(prefix) == count
+            # Older snapshots have no high-water mark. Database timestamps let
+            # them survive recovery events appended to earlier messages later.
+            created_at = getattr(checkpoint, "created_at", None)
+            if created_at is None:
+                return prefix, False
+            boundary = created_at.replace(tzinfo=None)
+            candidates = (
+                record for record in source_records
+                if record.created_at is None or record.created_at.replace(tzinfo=None) <= boundary
+            )
+        result: list[ContextRecord] = []
+        for record in candidates:
+            result.append(record)
+            if len(result) == count:
+                break
+        return result, len(result) == count and context_prefix_hash(result) == checkpoint.source_prefix_hash
+
+    def _snapshot_covered_ids(
+        self, checkpoint: ChatContextSnapshot, source_records: Sequence[ContextRecord]
+    ) -> set[int]:
+        if self._covered_snapshot_id != checkpoint.id:
+            self._covered_snapshot_id = checkpoint.id
+            prefix, valid = self._snapshot_prefix(checkpoint, source_records)
+            self._covered_event_ids = {record.id for record in prefix} if valid else set()
+        return self._covered_event_ids
 
     def _checkpoint_is_valid(
         self, checkpoint: ChatContextSnapshot | ChatSessionMemory, source_records: Sequence[ContextRecord]
@@ -493,7 +641,11 @@ class AgentContextBuilder:
             if source_count and source_hash:
                 if not self.session or int(checkpoint.context_generation or 0) != int(self.session.context_generation or 0):
                     return False
-                return source_count <= len(source_records) and context_prefix_hash(source_records, source_count) == source_hash
+                prefix, valid = self._snapshot_prefix(checkpoint, source_records)
+                if valid:
+                    self._covered_snapshot_id = checkpoint.id
+                    self._covered_event_ids = {record.id for record in prefix}
+                return valid
 
         # Older rows predate source anchors. Keep their timestamp check only
         # until bootstrap can backfill or invalidate them.
@@ -540,27 +692,37 @@ class AgentContextBuilder:
             snapshot.active_slot = None
             snapshot.invalidation_reason = "source_diverged"
             self.db.flush()
+            self.checkpoint_changed = True
             return None
         if snapshot is None:
             # Older releases lazily invalidated snapshots using only a message
             # ID. Recover the newest such snapshot once when the timestamped
             # source check proves it is still valid. Explicit invalidations are
             # never revived.
-            recoverable = (
+            latest = (
                 self.db.query(ChatContextSnapshot)
-                .filter(
-                    ChatContextSnapshot.session_id == self.session_id,
-                    ChatContextSnapshot.is_active.is_(False),
-                    ChatContextSnapshot.invalidation_reason == "",
-                )
+                .filter(ChatContextSnapshot.session_id == self.session_id)
                 .order_by(ChatContextSnapshot.id.desc())
                 .first()
+            )
+            recoverable = (
+                latest
+                if latest and not latest.is_active and latest.invalidation_reason in {"", "source_diverged"}
+                else None
             )
             if recoverable and self._checkpoint_is_valid(recoverable, source_records):
                 recoverable.is_active = True
                 recoverable.active_slot = 1
+                recoverable.invalidation_reason = ""
+                if not recoverable.source_max_event_id and self._covered_event_ids:
+                    recoverable.source_max_event_id = max(self._covered_event_ids)
                 self.db.flush()
+                self.checkpoint_changed = True
                 return recoverable
+            if recoverable and recoverable.invalidation_reason == "source_diverged":
+                recoverable.invalidation_reason = "source_diverged_confirmed"
+                self.db.flush()
+                self.checkpoint_changed = True
         return snapshot
 
     def _load_memory(self, source_records: Sequence[ContextRecord]) -> ChatSessionMemory | None:
@@ -587,10 +749,14 @@ class AgentContextBuilder:
         self, source_records: Sequence[ContextRecord], checkpoint: ChatContextSnapshot | ChatSessionMemory | None
     ) -> list[ContextRecord]:
         if isinstance(checkpoint, ChatContextSnapshot) and checkpoint.source_event_count and checkpoint.source_prefix_hash:
-            return list(source_records[int(checkpoint.source_event_count) :])
+            covered_ids = self._snapshot_covered_ids(checkpoint, source_records)
+            return [record for record in source_records if record.id not in covered_ids]
         return [record for record in source_records if record.id > self._covered_id(checkpoint)]
 
     def _render_map(self) -> str:
+        payload = self.workspace.map_payload()
+        if payload.get("tool_protocol") == "v2":
+            return json.dumps({"revision": payload["revision"], "files": payload["files"]}, ensure_ascii=False)
         entries = []
         map_limit = max(18, int(72 * self.budget_multiplier))
         for block in self.workspace.map_payload(map_limit)["blocks"]:
@@ -602,15 +768,72 @@ class AgentContextBuilder:
         return "\n".join(entries)
 
     def _record_tokens(self, record: ContextRecord) -> int:
-        if record.kind == ContextEventKind.TOOL.value:
-            return self._provider_text_tokens(
-                record._stale_tool_content(self.workspace.revision, self.tool_result_max_tokens)
-            )
-        image_tokens = len(record.image_attachments) * CHAT_IMAGE_TOKEN_COST if self.model.is_multimodal else 0
-        return self._provider_text_tokens(json.dumps(record.payload, ensure_ascii=False)) + image_tokens
+        key = id(record)
+        if key not in self._record_token_cache:
+            self._record_token_cache[key] = self._uncached_record_tokens(record)
+        return self._record_token_cache[key]
+
+    def _uncached_record_tokens(self, record: ContextRecord) -> int:
+        # Count the replayed message, not ledger JSON (which also contains
+        # revisions, accounting fields and other data never sent to a model).
+        message = record.to_message(self.workspace.revision, self.tool_result_max_tokens,
+            include_images=self.model.is_multimodal, article_urls=self.article_image_urls,
+            preserve_tool_history=self.preserve_tool_history)
+        tokens = estimate_tokens(_content_text(message.content))
+        reasoning = message.additional_kwargs.get("reasoning_content")
+        if isinstance(reasoning, str):
+            tokens += estimate_tokens(reasoning)
+        tokens += sum(estimate_tokens(json.dumps(call.get("args", {}), ensure_ascii=False))
+                      for call in getattr(message, "tool_calls", []) or [])
+        priced = math.ceil(tokens * self.token_estimate_multiplier)
+        if (getattr(self.runtime_context_factory, "cache_boundaries_enabled", False)
+                and getattr(message, "tool_calls", None)):
+            # Count one checkpoint after all outputs for this assistant call,
+            # irrespective of parallel-tool count. Only complete cycles replay.
+            priced += self._provider_text_tokens(CACHE_BOUNDARY_TEXT)
+        return priced
 
     def _provider_text_tokens(self, value: str) -> int:
         return math.ceil(estimate_tokens(value) * self.token_estimate_multiplier)
+
+    def _request_text(self) -> str:
+        suffix = self.runtime_context_factory.request_suffix if isinstance(self.runtime_context_factory, RuntimePromptBudget) else ""
+        return (self.current_request + attachment_text_suffix(self.current_image_attachments, self.model.is_multimodal)
+                + attachment_reference_text(self.current_image_attachments, article_urls=self.article_image_urls) + suffix)
+
+    def _fixed_tokens(self) -> dict[str, int]:
+        if self._fixed_token_cache is None:
+            self._fixed_token_cache = {
+                "map": self._provider_text_tokens(self._render_map()),
+                "system": self._provider_text_tokens(self.base_prompt) if self.runtime_context_factory is None else 0,
+                "state": 0,
+                "request": self._provider_text_tokens(self._request_text()),
+                "additional": self._provider_text_tokens(self.additional_context),
+            }
+            if self.runtime_context_factory is not None:
+                fixed_prompt, state_prompt = self.runtime_context_factory({})
+                self._runtime_empty_state_tokens = self._provider_text_tokens(state_prompt)
+                self._fixed_token_cache["map"] = 0
+                self._fixed_token_cache["state"] = self._runtime_empty_state_tokens
+                self._fixed_token_cache["system"] = self._provider_text_tokens(fixed_prompt)
+                if getattr(self.runtime_context_factory, "system_state_combined", False):
+                    self._fixed_token_cache["system"] = max(0,
+                        self._provider_text_tokens(fixed_prompt + "\n" + state_prompt) - self._runtime_empty_state_tokens)
+                if isinstance(self.runtime_context_factory, RuntimePromptBudget):
+                    # v2 selections occur only in state. v1 adds a precise
+                    # selection descriptor to the user message as well.
+                    self._fixed_token_cache["additional"] = 0
+        return self._fixed_token_cache
+
+    def _memory_context_tokens(self, memory: dict[str, Any]) -> int:
+        if self.runtime_context_factory is None:
+            return self._provider_text_tokens(json.dumps(memory, ensure_ascii=False))
+        self._fixed_tokens()
+        fixed_prompt, state_prompt = self.runtime_context_factory(memory)
+        if getattr(self.runtime_context_factory, "system_state_combined", False):
+            fixed = self._fixed_tokens()
+            return max(0, self._provider_text_tokens(fixed_prompt + "\n" + state_prompt) - fixed["system"] - fixed["state"])
+        return max(0, self._provider_text_tokens(state_prompt) - self._runtime_empty_state_tokens)
 
     def _valid_records(self, records: Sequence[ContextRecord]) -> list[ContextRecord]:
         """Drop incomplete persisted tool cycles before any provider sees them."""
@@ -663,12 +886,9 @@ class AgentContextBuilder:
         # prompt and tool-schema overhead. Applying it to the whole request
         # would make a small-window model impossible to compact.
         fixed_overhead = (
-            self._provider_text_tokens(self.base_prompt)
-            + self._provider_text_tokens(self._render_map())
-            + self._provider_text_tokens(json.dumps(memory, ensure_ascii=False))
-            + self._provider_text_tokens(self.current_request)
-            + self._provider_text_tokens(self.additional_context)
-            + AGENT_TOOL_SCHEMA_RESERVE_TOKENS
+            sum(self._fixed_tokens().values())
+            + self._memory_context_tokens(memory)
+            + self.tool_schema_tokens
         )
         preserve = min(
             DEFAULT_PRESERVE_RECENT_TOKENS,
@@ -686,15 +906,16 @@ class AgentContextBuilder:
         # The 20K target is deliberately soft. First prefer the longest
         # complete suffix that fits it; if even the newest turn is larger,
         # retain that legal turn when the actual input budget permits it.
+        suffix_tokens = [0] * (len(records) + 1)
+        for index in range(len(records) - 1, -1, -1):
+            suffix_tokens[index] = suffix_tokens[index + 1] + self._record_tokens(records[index])
         for start in boundaries:
-            retained = records[start:]
-            if sum(self._record_tokens(record) for record in retained) <= preserve:
-                return list(records[:start]), list(retained)
-        maximum_preserve = max(1, self.usable_budget - fixed_overhead - self.memory_target_tokens)
+            if suffix_tokens[start] <= preserve:
+                return list(records[:start]), list(records[start:])
+        maximum_preserve = max(1, self.trigger_budget - fixed_overhead - self.memory_target_tokens)
         for start in reversed(boundaries):
-            retained = records[start:]
-            if sum(self._record_tokens(record) for record in retained) <= maximum_preserve:
-                return list(records[:start]), list(retained)
+            if suffix_tokens[start] <= maximum_preserve:
+                return list(records[:start]), list(records[start:])
         return list(records), []
 
     def _stats(
@@ -704,38 +925,74 @@ class AgentContextBuilder:
         state: str,
         checkpoint: ChatContextSnapshot | ChatSessionMemory | None,
     ) -> dict[str, Any]:
-        map_tokens = self._provider_text_tokens(self._render_map())
-        system_tokens = self._provider_text_tokens(self.base_prompt)
-        memory_tokens = self._provider_text_tokens(json.dumps(memory, ensure_ascii=False))
+        fixed = self._fixed_tokens()
+        map_tokens = fixed["map"]
+        system_tokens = fixed["system"]
+        state_tokens = fixed["state"]
+        memory_tokens = self._memory_context_tokens(memory)
         replay_tokens = sum(self._record_tokens(record) for record in replayed)
         tool_tokens = sum(self._record_tokens(record) for record in replayed if record.kind == ContextEventKind.TOOL.value)
-        current_image_tokens = self.current_image_count * CHAT_IMAGE_TOKEN_COST if self.model.is_multimodal else 0
-        current_request_tokens = self._provider_text_tokens(self.current_request) + current_image_tokens
-        additional_context_tokens = self._provider_text_tokens(self.additional_context)
-        schema_tokens = AGENT_TOOL_SCHEMA_RESERVE_TOKENS
-        used = system_tokens + map_tokens + memory_tokens + replay_tokens + current_request_tokens + additional_context_tokens + schema_tokens
+        additional_context_tokens = fixed["additional"]
+        schema_tokens = self.tool_schema_tokens
+        text_tokens = system_tokens + state_tokens + map_tokens + memory_tokens + replay_tokens + fixed["request"] + additional_context_tokens + schema_tokens
+        history_image_count = sum(len(record.image_attachments) for record in replayed)
+        image_count = self.current_image_count + history_image_count if self.model.is_multimodal else 0
+        direct_image_count = sum(bool(getattr(item, "is_direct_input", False)) for item in self.current_image_attachments) if self.model.is_multimodal else 0
+        plan = image_loading_plan(image_count, self.trigger_budget - text_tokens, direct_image_count=direct_image_count)
+        request_tokens = fixed["request"]
+        image_labels = [f"@图片{index} attachment_id={item.id} filename={json.dumps(item.filename, ensure_ascii=False)}"
+                        for index, item in enumerate(self.current_image_attachments, 1) if getattr(item, "is_direct_input", False)]
+        # Inline images also send textual identifiers. Reserve those before
+        # choosing a page, then count the actual request text once.
+        while plan["inline_count"]:
+            request_tokens = self._provider_text_tokens(self._request_text() + "".join(image_labels[:plan["inline_count"]]))
+            next_plan = image_loading_plan(image_count, self.trigger_budget - text_tokens - request_tokens + fixed["request"],
+                                           direct_image_count=min(direct_image_count, plan["inline_count"]))
+            if next_plan["inline_count"] == plan["inline_count"]:
+                plan = next_plan
+                break
+            plan = next_plan
+        if not plan["inline_count"]:
+            request_tokens = fixed["request"]
+        plan.update(current_inline_count=plan["inline_count"], history_inline_count=0)
+        current_image_tokens = plan["current_inline_count"] * CHAT_IMAGE_TOKEN_COST
+        current_request_tokens = request_tokens + current_image_tokens
+        used = system_tokens + state_tokens + map_tokens + memory_tokens + replay_tokens + current_request_tokens + additional_context_tokens + schema_tokens
         source_records = self._source_records()
         all_tokens = sum(self._record_tokens(record) for record in source_records) + current_request_tokens
         if isinstance(checkpoint, ChatContextSnapshot) and checkpoint.source_event_count and checkpoint.source_prefix_hash:
-            compacted = source_records[: int(checkpoint.source_event_count)]
+            covered_ids = self._snapshot_covered_ids(checkpoint, source_records)
+            compacted = [record for record in source_records if record.id in covered_ids]
         else:
             covered = self._covered_id(checkpoint)
             compacted = [record for record in source_records if record.id <= covered]
+        if self._storage_stats_cache is None:
+            self._storage_stats_cache = {
+                "archived_branch_count": self.db.query(ChatHistoryArchive.id).filter(
+                    ChatHistoryArchive.session_id == self.session_id
+                ).count(),
+                **tool_output_stats(self.db, self.session_id),
+            }
         return {
+            "model_id": int(self.model.id or 0),
+            "session_id": self.session_id,
             "used_tokens": used,
             "max_tokens": self.window,
             "usable_tokens": self.usable_budget,
-            "usage_percent": min(100, round(used / max(1, self.usable_budget) * 100)),
+            "input_limit_tokens": self.input_limit,
+            "usage_percent": min(100, round(used / max(1, self.trigger_budget) * 100)),
             "is_estimate": True,
             "state": state,
+            "image_loading": plan,
             "breakdown": {
                 "system": system_tokens,
+                "runtime_state": state_tokens,
                 "document_map": map_tokens,
                 "memory": memory_tokens,
                 "recent_history": replay_tokens - tool_tokens,
                 "tool_replay": tool_tokens,
                 "tool_schema": schema_tokens,
-                "current_request": current_request_tokens,
+                "current_request": request_tokens,
                 "image_inputs": current_image_tokens,
                 "selected_context": additional_context_tokens,
             },
@@ -766,10 +1023,7 @@ class AgentContextBuilder:
             "snapshot_covered_event_count": len(compacted),
             "cold_event_count": len(compacted),
             "hot_event_count": len(replayed),
-            "archived_branch_count": self.db.query(ChatHistoryArchive.id).filter(
-                ChatHistoryArchive.session_id == self.session_id
-            ).count(),
-            **tool_output_stats(self.db, self.session_id),
+            **self._storage_stats_cache,
         }
 
     def snapshot(self) -> dict:
@@ -835,57 +1089,77 @@ class AgentContextBuilder:
     async def _model_memory(
         self, chat_model: BaseChatModel, previous: dict[str, Any], older: Sequence[ContextRecord]
     ) -> dict[str, Any]:
-        transcript = "\n".join(record.compact_line() for record in older)
-        prompt = f"""将较早的排版 Agent 事件压缩为 JSON 工作记忆。当前 HTML、历史 block_id、revision、expected_hash 都不可靠，绝不能输出它们或源码。优先保留当前尚未完成的用户目标、不可违反的约束、已确认决策和下一步；与当前任务无关的旧主题、尝试过程和重复完成项应折叠或省略。
+        memory = previous
+        offset = 0
+        while offset < len(older):
+            prefix = f"""将较早的排版 Agent 事件压缩为 JSON 工作记忆。当前 HTML、历史 block_id、revision、expected_hash 都不可靠，绝不能输出它们或源码。优先保留当前尚未完成的用户目标、不可违反的约束、已确认决策和下一步；与当前任务无关的旧主题、尝试过程和重复完成项应折叠或省略。
 
 只返回一个 JSON 对象。字段固定为 objective、important_details、user_preferences、completed_intents、active_work、pending_tasks、blocked、next_move、relevant_files、source_refs、narrative。objective 必须描述当前待续接的实际任务，不能写“压缩历史”之类的元任务；narrative 为当前状态结论；其余字段为短字符串数组。摘要最多约 {self.memory_target_tokens} tokens。
 
 source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行中明确出现的 tool:toolout-<uuid>；禁止写工具名称、block_id、revision、猜测的 ID。没有精确引用时返回空数组。
+若当前未完成任务仍需查看早期用户附图，请把对应 event:<id> 保留在 source_refs；图片画面不在摘要中，后续可读取该事件取得附件引用。
 
 已有记忆：
-{json.dumps(previous, ensure_ascii=False)}
+{json.dumps(memory, ensure_ascii=False)}
 
 待压缩事件：
-{truncate_to_tokens(transcript, self.compaction_source_budget)}"""
-        last_error: Exception | None = None
-        for attempt in range(2):
-            tracker = self.model_call_tracker_factory() if self.model_call_tracker_factory else None
-            try:
-                response = await asyncio.wait_for(
-                    chat_model.ainvoke(
-                        [SystemMessage(content="你是安全的会话压缩器，只输出 JSON。"), HumanMessage(content=prompt)]
-                    ),
-                    timeout=COMPACTION_MODEL_TIMEOUT_SECONDS,
-                )
-                if tracker:
-                    tracker.complete(response)
-                text = _content_text(getattr(response, "content", ""))
-                match = re.search(r"\{[\s\S]*\}", text)
-                if not match:
-                    raise ValueError("压缩模型没有返回 JSON")
+"""
+            # Every covered event must reach the compactor. Carry the resulting
+            # memory through bounded batches instead of discarding the tail.
+            used_tokens = self._provider_text_tokens(prefix) + 64
+            lines: list[str] = []
+            while offset < len(older):
+                line = older[offset].compact_line()
+                line_tokens = self._provider_text_tokens(line + "\n")
+                if used_tokens + line_tokens > self.compaction_source_budget:
+                    break
+                lines.append(line)
+                used_tokens += line_tokens
+                offset += 1
+            if not lines:
+                raise ContextBudgetError("压缩模型的输入预算无法容纳工作记忆和一个完整事件；请使用更大上下文模型")
+            prompt = prefix + "\n".join(lines)
+            last_error: Exception | None = None
+            for attempt in range(2):
+                tracker = self.model_call_tracker_factory() if self.model_call_tracker_factory else None
                 try:
-                    value = json.loads(match.group(0))
-                except json.JSONDecodeError as exc:
-                    raise ValueError("压缩模型返回了无效 JSON") from exc
-                required = ("objective", "important_details", "user_preferences", "completed_intents", "active_work", "pending_tasks", "blocked", "next_move", "relevant_files", "source_refs", "narrative")
-                if (
-                    not isinstance(value, dict)
-                    or any(key not in value for key in required)
-                    or any(not isinstance(value[key], list) for key in required[1:-1])
-                    or not isinstance(value["objective"], str)
-                    or not isinstance(value["narrative"], str)
-                ):
-                    raise ValueError("压缩模型返回的记忆结构无效")
-                return _fit_memory_to_budget(value, self.memory_target_tokens)
-            except Exception as exc:  # Preserve the raw ledger and retry the model once.
-                if tracker:
-                    tracker.fail(exc)
-                last_error = exc
-                if attempt == 0:
-                    await asyncio.sleep(0.25)
-        # Do not manufacture a rule-based summary. The durable snapshot is
-        # written only after the model returned a valid structured result.
-        raise CompactionModelError(compaction_failure_detail(last_error)) from last_error
+                    response = await asyncio.wait_for(
+                        chat_model.ainvoke(
+                            [SystemMessage(content="你是安全的会话压缩器，只输出 JSON。"), HumanMessage(content=prompt)]
+                        ),
+                        timeout=COMPACTION_MODEL_TIMEOUT_SECONDS,
+                    )
+                    if tracker:
+                        tracker.complete(response)
+                    text = _content_text(getattr(response, "content", ""))
+                    match = re.search(r"\{[\s\S]*\}", text)
+                    if not match:
+                        raise ValueError("压缩模型没有返回 JSON")
+                    try:
+                        value = json.loads(match.group(0))
+                    except json.JSONDecodeError as exc:
+                        raise ValueError("压缩模型返回了无效 JSON") from exc
+                    required = ("objective", "important_details", "user_preferences", "completed_intents", "active_work", "pending_tasks", "blocked", "next_move", "relevant_files", "source_refs", "narrative")
+                    if (
+                        not isinstance(value, dict)
+                        or any(key not in value for key in required)
+                        or any(not isinstance(value[key], list) for key in required[1:-1])
+                        or not isinstance(value["objective"], str)
+                        or not isinstance(value["narrative"], str)
+                    ):
+                        raise ValueError("压缩模型返回的记忆结构无效")
+                    memory = _fit_memory_to_budget(value, self.memory_target_tokens)
+                    break
+                except Exception as exc:  # Preserve the raw ledger and retry the model once.
+                    if tracker:
+                        tracker.fail(exc)
+                    last_error = exc
+                    if attempt == 0:
+                        await asyncio.sleep(0.25)
+            else:
+                # No checkpoint is written until every batch succeeds.
+                raise CompactionModelError(compaction_failure_detail(last_error)) from last_error
+        return memory
 
     def _persist_snapshot(
         self,
@@ -944,12 +1218,15 @@ source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行
                     input_budget_tokens=self.usable_budget,
                     source_event_count=source_event_count,
                     source_prefix_hash=context_prefix_hash(source_records, source_event_count),
+                    source_max_event_id=max(record.id for record in source_records[:source_event_count]),
                     context_generation=int(self.session.context_generation or 0) if self.session else 0,
                     is_active=True,
                     active_slot=1,
                 )
                 self.db.add(snapshot)
                 self.db.commit()
+                self._covered_snapshot_id = snapshot.id
+                self._covered_event_ids = {record.id for record in source_records[:source_event_count]}
                 return snapshot
             except SQLAlchemyError:
                 self.db.rollback()
@@ -978,6 +1255,17 @@ source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行
         if force_compaction or stats["used_tokens"] >= self.trigger_budget:
             older, retained = self._partition_for_compaction(active, memory)
             if older:
+                if isinstance(checkpoint, ChatContextSnapshot) and checkpoint.source_event_count:
+                    covered_ids = self._snapshot_covered_ids(checkpoint, source_records)
+                    last_covered_index = max(
+                        (index for index, record in enumerate(source_records) if record.id in covered_ids),
+                        default=-1,
+                    )
+                    pre_boundary_active = sum(
+                        record.id not in covered_ids for record in source_records[:last_covered_index + 1]
+                    )
+                    if pre_boundary_active > len(older):
+                        older, retained = active[:pre_boundary_active], active[pre_boundary_active:]
                 if compaction_model is None:
                     raise ContextBudgetError("当前上下文需要模型压缩，但压缩模型不可用")
                 memory = await self._model_memory(compaction_model, memory, older)
@@ -1027,9 +1315,9 @@ source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行
                 record.to_message(
                     self.workspace.revision,
                     self.tool_result_max_tokens,
-                    self.db,
-                    self.model.provider.provider_type.value if self.model.provider is not None else "openai_compatible",
-                    self.model.is_multimodal,
+                    include_images=self.model.is_multimodal,
+                    article_urls=self.article_image_urls,
+                    preserve_tool_history=self.preserve_tool_history,
                 )
                 for record in active
             ],

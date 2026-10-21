@@ -55,7 +55,7 @@ FLUSH PRIVILEGES;
 mysql -u root -p yibanpaiban < /opt/yibanpaiban/deploy/mysql-schema.sql
 ```
 
-`deploy/mysql-schema.sql` 只含表、索引和约束，不包含用户、API Key、对象存储凭据、文档、日志或其他业务数据。MySQL 建议将 `max_allowed_packet` 设为至少 `64M`。
+`deploy/mysql-schema.sql` 只含表、索引和约束，不包含用户、API Key、对象存储凭据、文档、日志或其他业务数据。MySQL 建议将 `max_allowed_packet` 设为至少 `64M`。2 核 2 GiB 且 MySQL、应用、SearXNG 同机时，可从 [`deploy/mysql-2g.cnf.example`](../deploy/mysql-2g.cnf.example) 开始：buffer pool 为 256 MiB、最大连接 32；先确认该 MySQL 实例只承载本应用，再按实际数据量和峰值内存调整。
 
 ## 4. 配置生产环境
 
@@ -71,6 +71,10 @@ sudo chmod 600 /opt/yibanpaiban/backend/.env
 ```dotenv
 APP_ENV=production
 DATABASE_URL=mysql+pymysql://yibanpaiban:replace-with-a-long-password@127.0.0.1:3306/yibanpaiban?charset=utf8mb4
+DATABASE_POOL_SIZE=5
+DATABASE_MAX_OVERFLOW=0
+CHAT_AGENT_MAX_CONCURRENT_RUNS=10
+CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER=3
 DEFAULT_ADMIN_USERNAME=replace-admin-name
 DEFAULT_ADMIN_PASSWORD=replace-with-a-long-password
 CORS_ORIGINS=https://example.com
@@ -106,7 +110,7 @@ curl -fsS 'http://127.0.0.1:8088/search?q=test&categories=images&format=json' >/
 
 保持 `backend/.env` 中的 `SEARXNG_BASE_URL=http://127.0.0.1:8088`。如需改端口，同时修改 `deploy/searxng/.env` 的 `SEARXNG_HOST_PORT` 与此地址。默认国内来源为百度图片、搜狗图片和 `cn.bing.com` 图片；百度候选仅安全升级其 HTTP 来源页为 HTTPS，原图仍必须通过现有 HTTPS 校验。生产切换前按 `deploy/searxng/README.md` 在 `127.0.0.1:8089` 运行隔离验证，验证通过后执行 `./apply-domestic-profile.sh`；该脚本会保留搜图密钥并创建可回滚备份。应用层搜图总等待预算默认 4 秒，规范化结果缓存 300 秒，可分别用 `SEARXNG_TIMEOUT_SECONDS` 与 `SEARXNG_SEARCH_CACHE_SECONDS` 调整。该容器端口只绑定回环地址，不要通过防火墙或 Nginx 暴露。未启动或暂时故障时仅搜图返回错误，编辑、AI 生图和其他功能继续可用。
 
-默认以低配机模式运行：单 worker、单线程、320 MiB 内存上限、160 MiB 预留和 96 个 PID。可在 `deploy/searxng/.env` 覆盖 `SEARXNG_MEMORY_LIMIT`、`SEARXNG_UWSGI_WORKERS` 等参数。2C2G 仅适合低并发且数据库外置的场景；MySQL、主应用与搜图都在同机时建议至少 4G 内存。
+SearXNG 默认以低配机模式运行：单 worker、单线程、320 MiB 内存上限、160 MiB 预留和 96 个 PID。可在 `deploy/searxng/.env` 覆盖 `SEARXNG_MEMORY_LIMIT`、`SEARXNG_UWSGI_WORKERS` 等变量。2C2G 同机部署使用单 Uvicorn worker，并将上述 `.env` 示例中的 `CHAT_AGENT_MAX_CONCURRENT_RUNS` 改为 `2`、`CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER` 改为 `1`，保持 5 个数据库连接且无 overflow；这与应用默认的 10 / 3 并发不同。配置与复测方法见 [2 GiB 性能说明](PERFORMANCE_2G.md)。上线前必须用普通文章跑“双任务 + 搜图”整机复测。超大文档单独做容量测试，若出现持续 swap 或剩余内存不足，应降低并发或扩容。
 
 ## 5. 安装 Python 依赖并配置 systemd
 
@@ -116,14 +120,16 @@ sudo -H -u yibanpaiban python3 -m venv venv
 sudo -H -u yibanpaiban ./venv/bin/pip install --upgrade pip
 sudo -H -u yibanpaiban ./venv/bin/pip install -r requirements.txt
 sudo ./venv/bin/python -m playwright install-deps chromium
-sudo -H -u yibanpaiban ./venv/bin/python -m playwright install chromium
+sudo -H -u yibanpaiban ./venv/bin/python -m playwright install --only-shell chromium
 sudo -H -u yibanpaiban ./venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
 sudo -H -u yibanpaiban ./venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 将最后两个命令的输出分别填入 `.env` 的 `SECRET_KEY` 与 `ENCRYPTION_KEY`，再继续创建 systemd 服务。
 
-官方微信合规检测由 Python Playwright 启动 Chromium，不需要 Node.js。浏览器必须使用运行 systemd 服务的同一用户安装；`sudo -H` 确保它进入该用户的缓存目录，而不是误装到 `/root/.cache/ms-playwright`。每次升级或重装 Python 依赖后都要重新执行 Chromium 安装命令并重启服务，以保持浏览器 revision 与 Playwright 版本一致。浏览器仅在首次模型合规检测时启动并由该应用进程复用；浏览器安装失败时文章会显示“未验证”，但编辑、保存和公众号草稿同步不会被阻断。若运维已通过系统包安装 Chromium，可在 `backend/.env` 设置 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium`（按实际路径替换），无需再下载 Playwright 管理的浏览器。
+官方微信合规检测由 Python Playwright 启动 Chromium headless shell，不需要 Node.js。浏览器必须使用运行 systemd 服务的同一用户安装；`sudo -H` 确保它进入该用户的缓存目录，而不是误装到 `/root/.cache/ms-playwright`。每次升级或重装 Python 依赖后都要重新执行 shell 安装命令并重启服务，以保持浏览器 revision 与 Playwright 版本一致。不要把 Playwright 缓存中的 `chromium-*/chrome-linux64/chrome` 写入 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH`；若此前按旧说明写入过，请将该项留空。浏览器按需启动并复用，最后一次检测完成且队列为空 10 秒后释放 Chromium，较小的 Playwright 驱动保留至 120 秒；可分别用 `WECHAT_COMPLIANCE_BROWSER_IDLE_SECONDS` 和 `WECHAT_COMPLIANCE_DRIVER_IDLE_SECONDS` 调整。已有部署若在 `backend/.env` 中设置了浏览器空闲时间 `120`，需改为 `10` 才能降低检测后的常驻内存。浏览器安装失败时文章会显示“未验证”，但编辑、保存和公众号草稿同步不会被阻断。若运维已通过系统包安装 Chromium，可在 `backend/.env` 设置 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium`（按实际路径替换），无需再下载 Playwright 管理的浏览器。
+
+冷启动有独立的 `WECHAT_COMPLIANCE_BROWSER_STARTUP_TIMEOUT_SECONDS=40` 秒预算，启动成功后的规则执行仍按 `WECHAT_COMPLIANCE_CHECK_TIMEOUT_SECONDS=20` 秒限制。合规检测由模型主动调用或用户手动触发，任务完成、取消、失败和恢复时均不自动检测。
 
 创建 `/etc/systemd/system/yibanpaiban.service`：
 

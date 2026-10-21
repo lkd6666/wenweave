@@ -11,7 +11,7 @@ const preparedStats = {
 } as ChatContextStats
 
 describe('mergeContextStats', () => {
-  it('keeps a provider-reported input visible when a tool estimates the next input', () => {
+  it('shows the latest tool result budget even after a provider usage report', () => {
     const measured = {
       ...preparedStats,
       runtime_context_state: 'measured',
@@ -29,9 +29,9 @@ describe('mergeContextStats', () => {
 
     const merged = mergeContextStats(measured, afterTool)
 
-    expect(merged.runtime_context_tokens).toBe(21_000)
-    expect(merged.runtime_context_source).toBe('provider_reported')
-    expect(merged.runtime_context_is_estimate).toBe(false)
+    expect(merged.runtime_context_tokens).toBe(25_000)
+    expect(merged.runtime_context_source).toBe('server_recomputed_after_tool')
+    expect(merged.runtime_context_is_estimate).toBe(true)
   })
 
   it('keeps the latest measured input through following stream telemetry', () => {
@@ -52,6 +52,49 @@ describe('mergeContextStats', () => {
 
     expect(merged.runtime_context_tokens).toBe(21_000)
     expect(merged.runtime_context_source).toBe('provider_reported')
+  })
+
+  it('replaces runtime telemetry with the durable snapshot on completion or model change', () => {
+    const running = {
+      ...preparedStats,
+      runtime_context_tokens: 24_000,
+      runtime_context_source: 'server_request_budget',
+    }
+    const persisted = { ...preparedStats, state: 'ready', used_tokens: 18_000, compiled_input_tokens: 18_000 }
+    expect(mergeContextStats(running, persisted)).toEqual(persisted)
+  })
+
+  it('shows the smaller budget immediately after compaction', () => {
+    const running = { ...preparedStats, runtime_context_tokens: 24_000, runtime_context_source: 'server_request_budget' }
+    const compacted = {
+      ...preparedStats,
+      runtime_context_state: 'in_run_compacted',
+      runtime_context_tokens: 8_000,
+      runtime_context_source: 'server_request_budget',
+    }
+    expect(mergeContextStats(running, compacted).runtime_context_tokens).toBe(8_000)
+  })
+
+  it('retains the matching threshold and multiplier when keeping a live estimate', () => {
+    const running = {
+      ...preparedStats, model_id: 40, session_id: 3,
+      runtime_context_tokens: 30_000, runtime_context_source: 'server_request_budget',
+      used_tokens: 30_000, compiled_input_tokens: 30_000,
+      active_context_threshold_tokens: 50_000, token_estimate_multiplier: 1.6,
+    }
+    const persisted = { ...preparedStats, model_id: 40, session_id: 3, state: 'streaming', active_context_threshold_tokens: 80_000 }
+    const merged = mergeContextStats(running, persisted)
+    expect(merged.compiled_input_tokens).toBe(30_000)
+    expect(merged.active_context_threshold_tokens).toBe(50_000)
+    expect(merged.token_estimate_multiplier).toBe(1.6)
+  })
+
+  it('discards live estimates when a different model or session arrives', () => {
+    const running = { ...preparedStats, model_id: 40, session_id: 3, runtime_context_source: 'server_request_budget' }
+    for (const next of [{ model_id: 41, session_id: 3 }, { model_id: 40, session_id: 4 }]) {
+      const incoming = { ...preparedStats, ...next, state: 'streaming' }
+      expect(mergeContextStats(running, incoming)).toEqual(incoming)
+    }
   })
 })
 
@@ -123,5 +166,12 @@ describe('AI editing read-only actions', () => {
     expect(source).not.toContain('checkDisabled={streaming}')
     expect(source).toContain('restoreDisabled={streaming || saving || draftHtml !== html}')
     expect(source).toContain('disabled={streaming || saving || draftHtml === html}')
+  })
+
+  it('recovers a durable waiting question when its SSE frame is lost', () => {
+    const source = readFileSync(new URL('./EditorPage.tsx', import.meta.url), 'utf8')
+
+    expect(source).toContain("runState.status === 'waiting_for_input' && runState.user_question")
+    expect(source).toContain('setPendingUserQuestion(recoveredQuestion)')
   })
 })

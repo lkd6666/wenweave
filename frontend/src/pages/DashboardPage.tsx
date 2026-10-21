@@ -279,7 +279,11 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (!hasAiEditingDocument) return
+    let timer: number | null = null
+    let refreshInFlight = false
     const refreshAiEditingStatus = async () => {
+      if (refreshInFlight) return
+      refreshInFlight = true
       try {
         const { active_document_ids: activeDocumentIds } = await documentsApi.aiEditingStatus()
         const activeIds = new Set(activeDocumentIds)
@@ -303,11 +307,28 @@ export default function DashboardPage() {
         setSearchResults((page) => page && ({ ...page, items: page.items.map(setAiEditing) }))
       } catch {
         // The next polling cycle will retry without interrupting the workspace.
+      } finally {
+        refreshInFlight = false
       }
     }
-    void refreshAiEditingStatus()
-    const timer = window.setInterval(() => { void refreshAiEditingStatus() }, 3000)
-    return () => window.clearInterval(timer)
+    const stopPolling = () => {
+      if (timer !== null) {
+        window.clearInterval(timer)
+        timer = null
+      }
+    }
+    const syncPolling = () => {
+      stopPolling()
+      if (document.visibilityState !== 'visible') return
+      void refreshAiEditingStatus()
+      timer = window.setInterval(() => { void refreshAiEditingStatus() }, 3000)
+    }
+    syncPolling()
+    document.addEventListener('visibilitychange', syncPolling)
+    return () => {
+      document.removeEventListener('visibilitychange', syncPolling)
+      stopPolling()
+    }
   }, [hasAiEditingDocument])
 
   const handleCreateGroup = () => {

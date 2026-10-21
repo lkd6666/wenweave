@@ -970,6 +970,38 @@ class WeChatHttpClientTests(unittest.TestCase):
         self.assertIn("background-image: url('https://mmbiz.qpic.cn/avatar.png')", container.get("style") or "")
         client._upload_article_image.assert_awaited_once()
 
+    def test_replaces_svg_image_href_and_legacy_xlink_href(self) -> None:
+        primary = "https://images.example.com/graphic-primary.png"
+        fallback = "https://images.example.com/graphic-fallback.png"
+        client = WeChatOfficialAccountClient()
+        client._upload_article_image = AsyncMock(side_effect=[
+            "https://mmbiz.qpic.cn/graphic-primary.png",
+            "https://mmbiz.qpic.cn/graphic-fallback.png",
+        ])  # type: ignore[method-assign]
+
+        result = asyncio.run(
+            client._replace_body_images(
+                MagicMock(),
+                "token",
+                (
+                    '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">'
+                    f'<image href="{primary}"/><image xlink:href="{fallback}"/>'
+                    "</svg>"
+                ),
+                local_image_loader=lambda source: (source.encode("utf-8"), "image/png", source.rsplit("/", 1)[-1]),
+            )
+        )
+
+        self.assertEqual(
+            WeChatOfficialAccountClient.body_image_sources(result.html),
+            ["https://mmbiz.qpic.cn/graphic-primary.png", "https://mmbiz.qpic.cn/graphic-fallback.png"],
+        )
+        soup = BeautifulSoup(result.html, "html.parser")
+        images = soup.find_all("image")
+        self.assertEqual(images[0].get("href"), "https://mmbiz.qpic.cn/graphic-primary.png")
+        self.assertEqual(images[1].get("xlink:href"), "https://mmbiz.qpic.cn/graphic-fallback.png")
+        self.assertEqual(client._upload_article_image.await_count, 2)
+
     def test_replaces_srcset_and_background_shorthand_images(self) -> None:
         primary = "/api/documents/local-images/primary.png"
         alternate = "/api/documents/local-images/alternate.png"

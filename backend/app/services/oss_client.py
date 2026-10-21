@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from importlib import import_module
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
@@ -9,15 +10,18 @@ from typing import Any, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 import httpx
-import oss2
-import qiniu
-import tos
-from obs import ObsClient
-from qcloud_cos import CosConfig, CosS3Client
-from tos.enum import HttpMethodType
 
 from app.core.crypto import decrypt_secret
 from app.models.storage_config import StorageConfig
+
+
+def __getattr__(name: str) -> Any:
+    """Keep optional SDK module attributes compatible without eager imports."""
+    if name == "qiniu":
+        module = import_module("qiniu")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class OSSNotConfiguredError(Exception):
@@ -143,11 +147,15 @@ def _provider_error(config: StorageConfig, action: str, exc: Exception) -> Objec
     return ObjectStorageError(f"{provider_label(config)}{action}失败，请检查 Endpoint、区域、Bucket 与访问密钥")
 
 
-def _build_alibaba_bucket(config: StorageConfig) -> oss2.Bucket:
+def _build_alibaba_bucket(config: StorageConfig) -> Any:
+    import oss2
+
     return oss2.Bucket(oss2.Auth(config.access_key_id, _secret(config)), _normalize_endpoint(config.endpoint), config.bucket)
 
 
-def _build_cos_client(config: StorageConfig) -> CosS3Client:
+def _build_cos_client(config: StorageConfig) -> Any:
+    from qcloud_cos import CosConfig, CosS3Client
+
     return CosS3Client(
         CosConfig(
             Region=config.region_or_zone.strip(),
@@ -159,7 +167,9 @@ def _build_cos_client(config: StorageConfig) -> CosS3Client:
     )
 
 
-def _build_obs_client(config: StorageConfig) -> ObsClient:
+def _build_obs_client(config: StorageConfig) -> Any:
+    from obs import ObsClient
+
     return ObsClient(
         access_key_id=config.access_key_id,
         secret_access_key=_secret(config),
@@ -167,7 +177,9 @@ def _build_obs_client(config: StorageConfig) -> ObsClient:
     )
 
 
-def _build_tos_client(config: StorageConfig) -> tos.TosClientV2:
+def _build_tos_client(config: StorageConfig) -> Any:
+    import tos
+
     return tos.TosClientV2(
         ak=config.access_key_id,
         sk=_secret(config),
@@ -176,11 +188,15 @@ def _build_tos_client(config: StorageConfig) -> tos.TosClientV2:
     )
 
 
-def _build_qiniu_auth(config: StorageConfig) -> qiniu.Auth:
+def _build_qiniu_auth(config: StorageConfig) -> Any:
+    import qiniu
+
     return qiniu.Auth(config.access_key_id, _secret(config))
 
 
-def _qiniu_manager(config: StorageConfig) -> qiniu.BucketManager:
+def _qiniu_manager(config: StorageConfig) -> Any:
+    import qiniu
+
     return qiniu.BucketManager(_build_qiniu_auth(config))
 
 
@@ -241,6 +257,8 @@ def _put_bytes(config: StorageConfig, key: str, data: bytes, content_type: str |
         elif provider == VOLCENGINE_TOS:
             _build_tos_client(config).put_object(config.bucket, key, content=data, content_type=content_type)
         else:
+            import qiniu
+
             token = _build_qiniu_auth(config).upload_token(config.bucket, key, expires=DIRECT_UPLOAD_EXPIRE_SECONDS)
             _result, info = qiniu.put_data(token, key, data, mime_type=content_type or "application/octet-stream")
             if not 200 <= int(_value(info, "status_code", "status", default=0)) < 300:
@@ -316,6 +334,8 @@ def sign_direct_upload(
             )
             return _direct_target(_value(result, "signedUrl", "signed_url"), content_type, _value(result, "actualSignedRequestHeaders", default={}))
         if provider == VOLCENGINE_TOS:
+            from tos.enum import HttpMethodType
+
             result = _build_tos_client(config).pre_signed_url(
                 HttpMethodType.Http_Method_Put, config.bucket, key, expires=expires, header={"Content-Type": content_type}
             )
@@ -445,6 +465,8 @@ def sign_read_url(config: StorageConfig, object_key: str, expires: int = MANAGEM
             result = _build_obs_client(config).createSignedUrl("GET", config.bucket, key, expires=expires)
             return str(_value(result, "signedUrl", "signed_url"))
         if provider == VOLCENGINE_TOS:
+            from tos.enum import HttpMethodType
+
             result = _build_tos_client(config).pre_signed_url(HttpMethodType.Http_Method_Get, config.bucket, key, expires=expires)
             return str(_value(result, "signed_url"))
         return _build_qiniu_auth(config).private_download_url(build_public_url(config, key), expires=expires)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from datetime import datetime, timezone
+from html import escape
 from html.parser import HTMLParser
 from threading import Lock
 from time import monotonic
@@ -204,6 +205,12 @@ def _is_temporary_import_key(object_key: str) -> bool:
     return object_key.startswith(("local/direct-imports/", _OSS_IMPORT_PREFIX))
 
 
+def _replace_image_url_reference(html: str, old_url: str, new_url: str) -> str:
+    # HTMLParser decodes entities in src attributes. Match the encoded form
+    # too, or signed URLs containing &amp; keep re-registering old imports.
+    return html.replace(escape(old_url, quote=True), escape(new_url, quote=True)).replace(old_url, new_url)
+
+
 def _replace_document_import_image(
     db: Session,
     document: Document | None,
@@ -218,18 +225,18 @@ def _replace_document_import_image(
     # Preserve crop/source attributes and any other references that use the
     # exact URL persisted during import.
     if old_url:
-        html = html.replace(old_url, stored.url)
+        html = _replace_image_url_reference(html, old_url, stored.url)
     if old_key.startswith("local/direct-imports/"):
         import_asset = db.query(DocumentImportAsset).filter(DocumentImportAsset.object_key == old_key).first()
         if import_asset is not None:
-            html = html.replace(f"/api/documents/import-assets/{import_asset.id}", stored.url)
+            html = _replace_image_url_reference(html, f"/api/documents/import-assets/{import_asset.id}", stored.url)
     elif storage is not None:
         parser = _ImageSourceParser()
         parser.feed(html)
         parser.close()
         for source in parser.sources:
             if oss_client.storage_object_key_for_url(storage, source) == old_key:
-                html = html.replace(source, stored.url)
+                html = _replace_image_url_reference(html, source, stored.url)
     document.current_html = html
 
 
@@ -319,8 +326,8 @@ def backfill_imported_assets(db: Session) -> int:
         )
         .all()
     )
-    if not rows:
-        return 0
+    # Promotions must be committed even when every import is already in the
+    # library; otherwise the next startup downloads and copies them again.
     created = 0
     for asset, _import_session, document in rows:
         # A completed Word import may retain parser-only crop/source assets;
@@ -359,7 +366,7 @@ def backfill_imported_assets(db: Session) -> int:
                 continue
         else:
             continue
-        create_library_asset(
+        library_asset = create_library_asset(
             db,
             owner_id=document.owner_id,
             document_id=document.id,
@@ -371,6 +378,9 @@ def backfill_imported_assets(db: Session) -> int:
             width=width,
             height=height,
         )
+        # Finish newly registered imports in this pass as well. Failed copies
+        # keep their temporary key and remain eligible for the next startup.
+        _promote_temporary_library_asset(db, library_asset, document, storage)
         created += 1
     if created or promoted:
         db.commit()

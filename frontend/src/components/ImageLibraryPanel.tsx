@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ClipboardEvent, DragEvent } from 'react'
 import { Alert, Button, Checkbox, Dropdown, Empty, Image, Input, InputNumber, Modal, Pagination, Popconfirm, Select, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd'
-import { DeleteOutlined, EditOutlined, EyeOutlined, MoreOutlined, PictureOutlined, ReloadOutlined, StopOutlined, UploadOutlined } from '@ant-design/icons'
+import { DeleteOutlined, EditOutlined, EyeOutlined, MoreOutlined, PaperClipOutlined, PictureOutlined, ReloadOutlined, StopOutlined, UploadOutlined } from '@ant-design/icons'
 import { imageLibraryApi } from '../api/imageLibrary'
+import { MAX_CHAT_IMAGES_PER_MESSAGE } from '../api/chat'
 import { imageGenerationsApi } from '../api/imageGenerations'
 import { imageSearchesApi } from '../api/imageSearches'
 import { modelsApi } from '../api/models'
 import { ApiError } from '../api/client'
+import ImageUploadProgress from './ImageUploadProgress'
+import { runImageUploads } from '../utils/imageUpload'
+import useImageUploadProgress from '../hooks/useImageUploadProgress'
 import type { AIImageModelItem, ImageGenerationItem, ImageLibraryAsset, ImageLibrarySource, ImageSearchCandidate, ImageSearchOrientation, ImageSearchResult, PreviewImageTarget } from '../types'
 
 const { Text } = Typography
@@ -17,10 +21,13 @@ interface Props {
   sessionId: number | null
   initialModelId?: number | null
   disabled?: boolean
+  uploadDisabled?: boolean
   applicationTarget: 'image' | 'block' | 'caret' | null
   selectedImage: PreviewImageTarget | null
   onApply: (url: string, alt: string) => boolean
   onSetCover: (assetId: string) => Promise<void>
+  onReference: (assetIds: string[]) => Promise<boolean>
+  referenceDisabled?: boolean
   command?: { id: number; tab: 'library' | 'search' | 'generate'; editCurrentImage?: boolean } | null
 }
 
@@ -77,7 +84,7 @@ function MobileImageActions({ onRename, onRemove }: {
   </Dropdown>
 }
 
-export default function ImageLibraryPanel({ documentId, sessionId, initialModelId = null, disabled, applicationTarget, selectedImage, onApply, onSetCover, command = null }: Props) {
+export default function ImageLibraryPanel({ documentId, sessionId, initialModelId = null, disabled, uploadDisabled = false, applicationTarget, selectedImage, onApply, onSetCover, onReference, referenceDisabled, command = null }: Props) {
   const [tab, setTab] = useState<'library' | 'search' | 'generate'>('library')
   const [assets, setAssets] = useState<ImageLibraryAsset[]>([])
   const [total, setTotal] = useState(0)
@@ -87,11 +94,14 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   const [source, setSource] = useState<'all' | ImageLibrarySource>('all')
   const [loading, setLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useImageUploadProgress()
+  const uploadInProgressRef = useRef(false)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [renaming, setRenaming] = useState<ImageLibraryAsset | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [savingRename, setSavingRename] = useState(false)
   const [settingCoverId, setSettingCoverId] = useState('')
+  const [referencingId, setReferencingId] = useState('')
 
   const [searchQuery, setSearchQuery] = useState('')
   const [searchOrientation, setSearchOrientation] = useState<ImageSearchOrientation>('any')
@@ -129,7 +139,6 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
       setAssets(result.items)
       setTotal(result.total)
       setMode(result.mode)
-      setSelectedIds((ids) => ids.filter((id) => result.items.some((item) => item.id === id)))
     } catch (error) {
       message.error(errorMessage(error, '加载图片库失败'))
     } finally {
@@ -137,7 +146,27 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
     }
   }, [query, source])
 
-  useEffect(() => { void loadLibrary(1); setPage(1) }, [documentId, query, source, loadLibrary])
+  useEffect(() => { void loadLibrary(1); setPage(1); setSelectedIds([]) }, [documentId, query, source, loadLibrary])
+
+  const toggleSelection = (assetId: string, checked: boolean) => {
+    if (checked && selectedIds.length >= MAX_CHAT_IMAGES_PER_MESSAGE) {
+      message.warning(`最多选择 ${MAX_CHAT_IMAGES_PER_MESSAGE} 张图片`)
+      return
+    }
+    setSelectedIds((ids) => checked ? ids.includes(assetId) ? ids : [...ids, assetId].slice(0, MAX_CHAT_IMAGES_PER_MESSAGE) : ids.filter((id) => id !== assetId))
+  }
+
+  const selectedOnPage = assets.filter((asset) => selectedIds.includes(asset.id)).length
+  const togglePageSelection = (checked: boolean) => {
+    const pageIds = new Set(assets.map((asset) => asset.id))
+    if (!checked) {
+      setSelectedIds((ids) => ids.filter((id) => !pageIds.has(id)))
+      return
+    }
+    const nextIds = [...new Set([...selectedIds, ...pageIds])]
+    if (nextIds.length > MAX_CHAT_IMAGES_PER_MESSAGE) message.warning(`最多选择 ${MAX_CHAT_IMAGES_PER_MESSAGE} 张图片`)
+    setSelectedIds(nextIds.slice(0, MAX_CHAT_IMAGES_PER_MESSAGE))
+  }
 
   useEffect(() => {
     if (tab !== 'generate') return
@@ -194,18 +223,30 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   }
 
   const uploadFiles = useCallback((files: File[]) => {
-    if (!files.length || uploading || disabled) return
+    if (!files.length || uploadInProgressRef.current || uploadDisabled) return
     const imageFiles = files.filter((file) => file.type.startsWith('image/'))
     if (imageFiles.length !== files.length) message.warning('仅支持上传图片文件')
     if (!imageFiles.length) return
-    const batch = imageFiles.slice(0, 20)
-    if (imageFiles.length > 20) message.warning('每次最多上传 20 张图片')
+    const batch = imageFiles.slice(0, MAX_CHAT_IMAGES_PER_MESSAGE)
+    if (imageFiles.length > MAX_CHAT_IMAGES_PER_MESSAGE) message.warning(`每次最多上传 ${MAX_CHAT_IMAGES_PER_MESSAGE} 张图片`)
+    uploadInProgressRef.current = true
     setUploading(true)
-    void imageLibraryApi.upload(documentId, batch).then(() => {
-      message.success(`已上传 ${batch.length} 张图片`)
-      return loadLibrary(1)
-    }).catch((error) => message.error(errorMessage(error, '上传图片失败'))).finally(() => setUploading(false))
-  }, [disabled, documentId, loadLibrary, uploading])
+    void runImageUploads([{
+      size: batch.reduce((size, file) => size + file.size, 0), count: batch.length,
+      run: (onProgress) => imageLibraryApi.upload(documentId, batch, { onProgress }),
+    }], setUploadProgress).then(async ([result]) => {
+      if (result?.status === 'fulfilled') {
+        message.success(`已上传 ${batch.length} 张图片`)
+        setPage(1)
+        await loadLibrary(1)
+      } else if (result?.status === 'rejected') {
+        message.error(errorMessage(result.reason, '上传图片失败'))
+      }
+    }).finally(() => {
+      uploadInProgressRef.current = false
+      setUploading(false)
+    })
+  }, [uploadDisabled, documentId, loadLibrary, setUploadProgress])
 
   const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.currentTarget.files ?? [])
@@ -215,14 +256,14 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
 
   const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
-    if (disabled || uploading) return
+    if (uploadDisabled || uploading) return
     dragDepthRef.current += 1
     setDragActive(true)
   }
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
-    if (!disabled && !uploading) event.dataTransfer.dropEffect = 'copy'
+    if (!uploadDisabled && !uploading) event.dataTransfer.dropEffect = 'copy'
   }
 
   const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
@@ -242,7 +283,7 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   }
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
-    if (disabled || uploading) return
+    if (uploadDisabled || uploading) return
     const files = Array.from(event.clipboardData.items).flatMap((item, index) => {
       if (item.kind !== 'file' || !item.type.startsWith('image/')) return []
       const blob = item.getAsFile()
@@ -285,6 +326,20 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   const setCover = async (assetId: string) => {
     setSettingCoverId(assetId)
     try { await onSetCover(assetId) } finally { setSettingCoverId('') }
+  }
+
+  const reference = async (selection: string | string[]) => {
+    const assetIds = typeof selection === 'string' ? [selection] : selection
+    if (referencingId || referenceDisabled) return
+    setReferencingId(assetIds.length === 1 ? assetIds[0] : 'batch')
+    try {
+      if (await onReference(assetIds)) {
+        setSelectedIds([])
+        message.success('已引用到对话')
+      }
+    } finally {
+      setReferencingId('')
+    }
   }
 
   const searchImages = async (nextPage = 1) => {
@@ -379,30 +434,38 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
       <Input.Search allowClear placeholder="搜索图片" value={query} onChange={(event) => setQuery(event.target.value)} />
       <Select aria-label="图片来源" value={source} onChange={setSource} options={[{ value: 'all', label: '全部来源' }, { value: 'upload', label: '上传' }, { value: 'ai', label: 'AI' }, { value: 'search', label: '搜图' }]} />
       <input ref={uploadInputRef} type="file" hidden multiple accept="image/jpeg,image/png,image/gif,image/webp,image/avif,image/bmp" onChange={handleFileInput} />
-      <Button type="primary" icon={<UploadOutlined />} loading={uploading} disabled={disabled || uploading} aria-label="上传图片" onClick={() => uploadInputRef.current?.click()} />
+      <Button type="primary" icon={<UploadOutlined />} loading={uploading} disabled={uploadDisabled || uploading} aria-label="上传图片" onClick={() => uploadInputRef.current?.click()} />
       <Tooltip title="刷新"><Button icon={<ReloadOutlined />} aria-label="刷新图片库" onClick={() => void loadLibrary(page)} /></Tooltip>
     </div>
     <div
-      className={`image-library-upload-zone${dragActive ? ' is-dragging' : ''}${disabled ? ' is-disabled' : ''}`}
+      className={`image-library-upload-zone${dragActive ? ' is-dragging' : ''}${uploadDisabled ? ' is-disabled' : ''}`}
       role="button"
-      tabIndex={disabled ? -1 : 0}
+      tabIndex={uploadDisabled ? -1 : 0}
       aria-label="拖拽或粘贴图片"
-      onClick={() => { if (!disabled && !uploading) uploadInputRef.current?.click() }}
-      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !disabled && !uploading) { event.preventDefault(); uploadInputRef.current?.click() } }}
+      onClick={() => { if (!uploadDisabled && !uploading) uploadInputRef.current?.click() }}
+      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !uploadDisabled && !uploading) { event.preventDefault(); uploadInputRef.current?.click() } }}
     >
       <UploadOutlined />
       <span>{dragActive ? '松开以上传图片' : '拖拽图片到这里，或在此处粘贴'}</span>
     </div>
-    <div className="image-library-summary"><Text type="secondary">{mode === 'shared' ? '全员共享图库' : '个人图库'} · {total} 张</Text>{selectedIds.length > 0 && <Popconfirm title={`移出选中的 ${selectedIds.length} 张图片？`} onConfirm={() => void remove(selectedIds)}><Button danger size="small" icon={<DeleteOutlined />}>批量移出</Button></Popconfirm>}</div>
+    <div className="image-library-summary">
+      <Text type="secondary">{mode === 'shared' ? '全员共享图库' : '个人图库'} · {total} 张</Text>
+      {assets.length > 0 && <Checkbox checked={selectedOnPage === assets.length} indeterminate={selectedOnPage > 0 && selectedOnPage < assets.length} disabled={loading || Boolean(referencingId)} onChange={(event) => togglePageSelection(event.target.checked)}>本页全选</Checkbox>}
+      {selectedIds.length > 0 && <Space size={6} wrap>
+        <Button size="small" icon={<PaperClipOutlined />} loading={referencingId === 'batch'} disabled={referenceDisabled || Boolean(referencingId)} onClick={() => void reference(selectedIds)}>附到对话 ({selectedIds.length})</Button>
+        <Popconfirm title={`移出选中的 ${selectedIds.length} 张图片？`} onConfirm={() => void remove(selectedIds)}><Button danger size="small" icon={<DeleteOutlined />}>批量移出</Button></Popconfirm>
+      </Space>}
+    </div>
     {loading ? <div className="resource-library-loading"><Spin size="small" /></div> : assets.length ? <>
       <div className="image-library-grid">{assets.map((asset) => <article className="image-library-card" key={asset.id}>
         <button type="button" className="image-library-apply" disabled={disabled} title={applicationTarget === 'image' ? '替换当前图片' : '插入到画布所选位置'} onClick={() => apply(asset.url, asset.name)}>
           <img src={asset.url} alt={asset.name} loading="lazy" decoding="async" />
         </button>
-        <Checkbox className="image-library-select" checked={selectedIds.includes(asset.id)} onChange={(event) => setSelectedIds((ids) => event.target.checked ? [...ids, asset.id] : ids.filter((id) => id !== asset.id))} />
+        <Checkbox className="image-library-select" aria-label={`选择图片：${asset.name}`} checked={selectedIds.includes(asset.id)} disabled={Boolean(referencingId)} onChange={(event) => toggleSelection(asset.id, event.target.checked)} />
         <div className="image-library-card-actions">
+          <Tooltip title="引用到对话"><Button size="small" aria-label={`引用到对话：${asset.name}`} icon={<PaperClipOutlined />} loading={referencingId === asset.id} disabled={referenceDisabled || Boolean(referencingId)} onClick={() => void reference([asset.id])} /></Tooltip>
           <ImagePreviewAction src={asset.url} alt={asset.name} />
-          <Tooltip title="设为封面"><Button size="small" aria-label={`设为封面：${asset.name}`} icon={<PictureOutlined />} loading={settingCoverId === asset.id} onClick={() => void setCover(asset.id)} /></Tooltip>
+          <Tooltip title="设为封面"><Button size="small" aria-label={`设为封面：${asset.name}`} icon={<PictureOutlined />} loading={settingCoverId === asset.id} disabled={disabled || Boolean(settingCoverId)} onClick={() => void setCover(asset.id)} /></Tooltip>
           <span className="image-library-desktop-actions">
             {asset.can_manage && <Tooltip title="重命名"><Button size="small" icon={<EditOutlined />} onClick={() => { setRenaming(asset); setRenameValue(asset.name) }} /></Tooltip>}
             {asset.can_manage && <Popconfirm title="从图片库移出这张图片？" description="不会影响文章和历史版本中的图片。" onConfirm={() => void remove([asset.id])}><Button size="small" danger icon={<DeleteOutlined />} /></Popconfirm>}
@@ -440,12 +503,13 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
       {generations[0]?.status === 'failed' && <Alert type="error" showIcon message="最近一次生成失败" description={generations[0].error_message} />}
       {allGenerated.length ? <div className="image-library-grid">{allGenerated.map(({ asset, generation }) => {
         const imageUrl = asset.library_url || asset.url
-        return <article className="image-library-card" key={asset.id}><button type="button" className="image-library-apply" disabled={disabled} onClick={() => apply(imageUrl, generation.prompt)}><img src={imageUrl} alt={generation.prompt} /></button><div className="image-library-card-actions"><ImagePreviewAction src={imageUrl} alt={generation.prompt} /><Tooltip title={asset.library_asset_id ? '设为封面' : '正在保存到图库'}><Button size="small" aria-label={`设为封面：${generation.prompt}`} icon={<PictureOutlined />} loading={settingCoverId === asset.library_asset_id} disabled={!asset.library_asset_id} onClick={() => void setCover(asset.library_asset_id)} /></Tooltip></div><div className="image-library-card-meta"><ImageCardTitle text={generation.prompt} /><span><Tag bordered={false}>AI</Tag>{asset.width}×{asset.height}</span></div></article>
+        return <article className="image-library-card" key={asset.id}><button type="button" className="image-library-apply" disabled={disabled} onClick={() => apply(imageUrl, generation.prompt)}><img src={imageUrl} alt={generation.prompt} /></button><div className="image-library-card-actions"><Tooltip title="引用到对话"><Button size="small" aria-label={`引用到对话：${generation.prompt}`} icon={<PaperClipOutlined />} loading={referencingId === asset.library_asset_id} disabled={referenceDisabled || Boolean(referencingId) || !asset.library_asset_id} onClick={() => void reference(asset.library_asset_id)} /></Tooltip><ImagePreviewAction src={imageUrl} alt={generation.prompt} /><Tooltip title={asset.library_asset_id ? '设为封面' : '正在保存到图库'}><Button size="small" aria-label={`设为封面：${generation.prompt}`} icon={<PictureOutlined />} loading={settingCoverId === asset.library_asset_id} disabled={disabled || !asset.library_asset_id || Boolean(settingCoverId)} onClick={() => void setCover(asset.library_asset_id)} /></Tooltip></div><div className="image-library-card-meta"><ImageCardTitle text={generation.prompt} /><span><Tag bordered={false}>AI</Tag>{asset.width}×{asset.height}</span></div></article>
       })}</div> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={activeGeneration ? '正在生成图片' : '生成结果会自动保存到图库'} />}
     </> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可用图片模型" />}
   </Space>
 
   return <section className="image-library-panel">
+    {uploadProgress && <div className="image-library-upload-progress"><ImageUploadProgress progress={uploadProgress} /></div>}
     <div className={`image-library-target${applicationTarget ? ' has-target' : ''}`}><PictureOutlined /><span>{applicationTarget === 'image' ? '点击图片将替换当前画布图片' : applicationTarget ? '点击图片将插入所选区域之后' : '先在画布放置光标、选择块或点击图片'}</span></div>
     <Tabs size="small" activeKey={tab} onChange={(key) => setTab(key as typeof tab)} items={[{ key: 'library', label: '图库', children: libraryTab }, { key: 'search', label: '搜图', children: searchTab }, { key: 'generate', label: 'AI 生图', children: generateTab }]} />
     <Modal title="重命名图片" open={Boolean(renaming)} onCancel={() => setRenaming(null)} onOk={() => void rename()} confirmLoading={savingRename}><Input value={renameValue} maxLength={256} onChange={(event) => setRenameValue(event.target.value)} onPressEnter={() => void rename()} /></Modal>

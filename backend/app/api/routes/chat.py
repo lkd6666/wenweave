@@ -4,19 +4,20 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import AsyncIterator
+from typing import Annotated, AsyncIterator
 from uuid import uuid4
 
 import jwt
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import func, or_
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Load, Session
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import get_current_user
@@ -39,9 +40,18 @@ from app.models.chat_history_archive import ChatHistoryArchive
 from app.models.chat_session import ChatSession, ChatSessionMemory
 from app.models.chat_user_question import ChatUserQuestion, ChatUserQuestionStatus
 from app.models.document import Document
+from app.models.document_group import DocumentGroup
+from app.models.document_visibility import (
+    VisibilityMode,
+    document_group_visible_user_groups,
+    document_group_visible_users,
+    document_visible_user_groups,
+    document_visible_users,
+)
 from app.models.document_version import DocumentVersionSource
 from app.models.template_library import TemplateLibraryItem
-from app.models.user import User
+from app.models.user import User, UserRole
+from app.models.user_group import user_group_members
 from app.services.article_typography import get_or_create_typography_settings, typography_settings_payload
 from app.models.model_call_record import ModelCallRecord, ModelCallSource
 from app.models.operation_log import OperationLogStatus
@@ -69,7 +79,9 @@ from app.schemas.chat import (
 from app.schemas.chat_images import ChatImageAttachmentRead
 from app.services.agent_run_manager import TERMINAL_STATUSES, agent_run_manager
 from app.services.agent_run_recovery import recover_interrupted_turn, replay_agent_turn
-from app.services.agent_context import AGENT_TOOL_SCHEMA_RESERVE_TOKENS, AgentContextBuilder, ContextBudgetError, ContextRecord, context_prefix_hash
+from app.services.context_recovery import persist_recovered_context, recovered_context_events
+from app.services.token_budget import estimate_tokens
+from app.services.agent_context import AgentContextBuilder, ContextBudgetError, ContextRecord, context_prefix_hash
 from app.services.chat_agent import (
     HtmlEditSession,
     build_chat_model,
@@ -78,6 +90,8 @@ from app.services.chat_agent import (
     article_typography_prompt,
     claim_thinking_capability_fallback_data,
     context_budget_prompt,
+    runtime_context_budget_factory,
+    editor_tool_schema_tokens,
     restore_resume_messages,
     run_agent_loop,
     validate_gzh_theme_candidate,
@@ -94,9 +108,10 @@ from app.services.chat_session_context import (
     session_theme_proposal,
 )
 from app.services.document_activity import touch_document, touch_group
-from app.services.document_access import accessible_documents_query, can_access_document
+from app.services.document_access import can_access_document
 from app.services.document_versions import create_document_version
 from app.services.document_history_workspace import DocumentHistoryWorkspace
+from app.services.source_agent import create_source_workspace
 from app.services.layout_reference import (
     LayoutReferenceError,
     clear_session_layout_reference,
@@ -110,7 +125,6 @@ from app.services.layout_reference import (
 from app.services.model_access import can_access_image_model, can_access_model
 from app.services.model_call_accounting import ModelCallTracker
 from app.services.tool_output_store import ToolOutputStore
-from app.services.wechat_compliance import run_compliance_check
 from app.services.gzh_theme import (
     GzhThemeError,
     consume_approved_proposal,
@@ -219,6 +233,7 @@ from app.services.chat_images import (
     delete_attachment_object,
     duplicate_attachment,
     read_attachment_bytes,
+    ordered_image_attachments,
     user_message_content,
 )
 
@@ -290,6 +305,7 @@ def _attachment_read(attachment: ChatImageAttachment, user: User) -> dict:
     )
     return ChatImageAttachmentRead(
         id=attachment.id,
+        message_id=attachment.message_id,
         filename=attachment.filename,
         content_type=attachment.content_type,
         size=attachment.size,
@@ -404,6 +420,7 @@ def _persist_context_compaction_notice(
     session_id: int,
     before_stats: dict,
     after_stats: dict,
+    memory: dict | None = None,
 ) -> ChatMessage:
     """Store a display-only compaction result outside the provider event ledger."""
     notice = ChatMessage(
@@ -411,6 +428,10 @@ def _persist_context_compaction_notice(
         session_id=session_id,
         role=MessageRole.TOOL,
         content=_context_compaction_notice_content(before_stats, after_stats),
+        turn_blocks_json=json.dumps([{
+            "id": "context-compaction", "type": "context_compaction", "state": "done", "content": "",
+            "context_compaction": _context_compaction_event_data(before_stats, after_stats, memory),
+        }] if after_stats.get("state") == "compacted" else [], ensure_ascii=False),
     )
     db.add(notice)
     db.flush()
@@ -421,7 +442,7 @@ def _pending_attachments(
     db: Session, document_id: int, user_id: int, attachment_ids: list[str], *, require_unbound: bool = True
 ) -> list[ChatImageAttachment]:
     if len(attachment_ids) > MAX_CHAT_IMAGES_PER_MESSAGE or len(set(attachment_ids)) != len(attachment_ids):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="每条消息最多附加 5 张不同图片")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"每条消息最多附加 {MAX_CHAT_IMAGES_PER_MESSAGE} 张不同图片")
     if not attachment_ids:
         return []
     rows = db.query(ChatImageAttachment).filter(ChatImageAttachment.id.in_(attachment_ids)).all()
@@ -429,7 +450,7 @@ def _pending_attachments(
     if len(by_id) != len(attachment_ids):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="聊天图片不存在")
     ordered = [by_id[attachment_id] for attachment_id in attachment_ids]
-    if any(row.document_id != document_id or row.uploader_id != user_id for row in ordered):
+    if any(row.document_id != document_id or (row.uploader_id != user_id and (require_unbound or row.message_id is None)) for row in ordered):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="不能使用其他用户上传的聊天图片")
     if require_unbound and any(row.message_id is not None for row in ordered):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="聊天图片已发送")
@@ -462,41 +483,181 @@ def _question_read(
     )
 
 
+def _commit_waiting_user_question(
+    db: Session,
+    run_id: str,
+    question: ChatUserQuestion,
+    *,
+    now: datetime | None = None,
+) -> tuple[ChatUserQuestion, int, dict, datetime]:
+    """Publish the question row, replay event, and paused run atomically."""
+    committed_at = now or datetime.now(timezone.utc)
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().one_or_none()
+    if not run or run.status not in {AgentRunStatus.RUNNING, AgentRunStatus.PENDING}:
+        raise RuntimeError("Agent 运行已不再可等待用户回答")
+
+    db.add(question)
+    db.flush()
+    durable_sequence = (
+        db.query(AgentRunEvent.sequence)
+        .filter(AgentRunEvent.run_id == run_id)
+        .order_by(AgentRunEvent.sequence.desc())
+        .limit(1)
+        .scalar()
+    )
+    sequence = max(int(run.event_sequence or 0), int(durable_sequence or 0)) + 1
+    safe_question = _question_read(question, sequence)
+    if safe_question is None:
+        raise RuntimeError("待答问题保存失败")
+    # JSON mode converts ``timeout_at`` before the same payload enters the
+    # in-process SSE cache. Python mode leaves a datetime that json.dumps
+    # cannot encode, while the database copy only appears healthy on refresh.
+    event_payload = safe_question.model_dump(mode="json")
+    db.add(
+        AgentRunEvent(
+            run_id=run_id,
+            sequence=sequence,
+            event="user_question",
+            payload_json=json.dumps(event_payload, ensure_ascii=False, separators=(",", ":")),
+            created_at=committed_at,
+        )
+    )
+    run.event_sequence = sequence
+    run.status = AgentRunStatus.WAITING_FOR_INPUT
+    run.owner_id = ""
+    run.lease_expires_at = None
+    run.heartbeat_at = committed_at
+    run.last_phase = "user_question"
+    run.last_progress_at = committed_at
+    db.commit()
+    db.refresh(question)
+    db.expunge(question)
+    return question, sequence, event_payload, committed_at
+
+
 def _utc_datetime(value: datetime | None) -> datetime:
     resolved = value or datetime.now(timezone.utc)
     return resolved.replace(tzinfo=timezone.utc) if resolved.tzinfo is None else resolved.astimezone(timezone.utc)
 
 
-def _pending_user_question_snapshot(user_id: int) -> list[dict]:
-    """Return the durable, access-filtered question queue for one user."""
+def _pending_question_access_filter():
+    """Build a permission predicate correlated to each question's user.
+
+    Keeping the user ID in the SQL predicate lets one polling pass validate
+    every subscribed user without opening one database connection per user.
+    """
+    question_user_id = ChatUserQuestion.user_id
+    active_actor = exists(
+        select(User.id).where(User.id == question_user_id, User.is_active.is_(True))
+    )
+    actor_is_admin = exists(
+        select(User.id).where(User.id == question_user_id, User.role == UserRole.ADMIN)
+    )
+    document_is_directly_allowed = exists(
+        select(1).select_from(document_visible_users).where(
+            document_visible_users.c.document_id == Document.id,
+            document_visible_users.c.user_id == question_user_id,
+        )
+    )
+    document_is_group_allowed = exists(
+        select(1)
+        .select_from(
+            document_visible_user_groups.join(
+                user_group_members,
+                document_visible_user_groups.c.user_group_id == user_group_members.c.group_id,
+            )
+        )
+        .where(
+            document_visible_user_groups.c.document_id == Document.id,
+            user_group_members.c.user_id == question_user_id,
+        )
+    )
+    document_is_visible = or_(
+        Document.visibility_mode == VisibilityMode.ALL,
+        document_is_directly_allowed,
+        document_is_group_allowed,
+    )
+    parent_group_is_directly_allowed = exists(
+        select(1).select_from(document_group_visible_users).where(
+            document_group_visible_users.c.document_group_id == DocumentGroup.id,
+            document_group_visible_users.c.user_id == question_user_id,
+        ).correlate(DocumentGroup, ChatUserQuestion)
+    )
+    parent_group_is_group_allowed = exists(
+        select(1)
+        .select_from(
+            document_group_visible_user_groups.join(
+                user_group_members,
+                document_group_visible_user_groups.c.user_group_id == user_group_members.c.group_id,
+            )
+        )
+        .where(
+            document_group_visible_user_groups.c.document_group_id == DocumentGroup.id,
+            user_group_members.c.user_id == question_user_id,
+        )
+        .correlate(DocumentGroup, ChatUserQuestion)
+    )
+    parent_group_is_visible = or_(
+        Document.group_id.is_(None),
+        exists(
+            select(DocumentGroup.id).where(
+                DocumentGroup.id == Document.group_id,
+                or_(
+                    DocumentGroup.visibility_mode == VisibilityMode.ALL,
+                    parent_group_is_directly_allowed,
+                    parent_group_is_group_allowed,
+                ),
+            ).correlate(Document, ChatUserQuestion)
+        ),
+    )
+    return and_(active_actor, or_(actor_is_admin, and_(document_is_visible, parent_group_is_visible)))
+
+
+def _pending_user_question_snapshots(user_ids: list[int]) -> dict[int, list[dict]]:
+    """Return durable, access-filtered question queues in one database pass."""
+    requested_user_ids = sorted({int(user_id) for user_id in user_ids})
+    result: dict[int, list[dict]] = {user_id: [] for user_id in requested_user_ids}
+    if not requested_user_ids:
+        return result
     snapshot_db = SessionLocal()
     try:
-        actor = snapshot_db.get(User, user_id)
-        if actor is None or not actor.is_active:
-            return []
-        query = (
+        rows = (
             snapshot_db.query(ChatUserQuestion, AgentRun, Document)
             .join(AgentRun, AgentRun.id == ChatUserQuestion.run_id)
             .join(Document, Document.id == ChatUserQuestion.document_id)
             .filter(
-                ChatUserQuestion.user_id == user_id,
+                ChatUserQuestion.user_id.in_(requested_user_ids),
                 ChatUserQuestion.status == ChatUserQuestionStatus.WAITING,
-                AgentRun.user_id == user_id,
+                AgentRun.user_id == ChatUserQuestion.user_id,
                 AgentRun.status == AgentRunStatus.WAITING_FOR_INPUT,
                 AgentRun.document_id == ChatUserQuestion.document_id,
+                _pending_question_access_filter(),
             )
-        )
-        rows = (
-            accessible_documents_query(query, actor)
+            .options(
+                Load(ChatUserQuestion).load_only(
+                    ChatUserQuestion.id,
+                    ChatUserQuestion.run_id,
+                    ChatUserQuestion.document_id,
+                    ChatUserQuestion.session_id,
+                    ChatUserQuestion.user_id,
+                    ChatUserQuestion.status,
+                    ChatUserQuestion.question_json,
+                    ChatUserQuestion.timeline_json,
+                    ChatUserQuestion.last_activity_at,
+                    ChatUserQuestion.timeout_at,
+                    ChatUserQuestion.created_at,
+                ),
+                Load(AgentRun).load_only(AgentRun.id, AgentRun.event_sequence),
+                Load(Document).load_only(Document.id, Document.title),
+            )
             .order_by(ChatUserQuestion.created_at, ChatUserQuestion.id)
             .all()
         )
-        result: list[dict] = []
         for question, run, document in rows:
             question_payload = _question_read(question, int(run.event_sequence or 0))
             if question_payload is None:
                 continue
-            result.append(
+            result[question.user_id].append(
                 PendingChatUserQuestionRead(
                     document_id=document.id,
                     document_title=document.title,
@@ -510,15 +671,92 @@ def _pending_user_question_snapshot(user_id: int) -> list[dict]:
         snapshot_db.close()
 
 
+def _pending_user_question_snapshot(user_id: int) -> list[dict]:
+    return _pending_user_question_snapshots([user_id]).get(int(user_id), [])
+
+
+class _PendingQuestionBroker:
+    """Share one durable snapshot query among every local tab for a user."""
+
+    def __init__(self) -> None:
+        self._subscribers: dict[int, set[asyncio.Queue[str]]] = {}
+        self._snapshots: dict[int, str] = {}
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    def invalidate(self, user_id: int | None = None) -> None:
+        if user_id is not None:
+            self._snapshots.pop(int(user_id), None)
+        self._wake.set()
+
+    def _ensure_task(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    @staticmethod
+    def _offer(queue: asyncio.Queue[str], encoded: str) -> None:
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        queue.put_nowait(encoded)
+
+    async def subscribe(self, user_id: int) -> AsyncIterator[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+        subscribers = self._subscribers.setdefault(user_id, set())
+        subscribers.add(queue)
+        cached = self._snapshots.get(user_id)
+        if cached is not None:
+            self._offer(queue, cached)
+        self._ensure_task()
+        self._wake.set()
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            subscribers.discard(queue)
+            if not subscribers:
+                self._subscribers.pop(user_id, None)
+                self._snapshots.pop(user_id, None)
+            self._wake.set()
+
+    async def _run(self) -> None:
+        try:
+            while self._subscribers:
+                self._wake.clear()
+                user_ids = list(self._subscribers)
+                try:
+                    snapshots = await asyncio.to_thread(_pending_user_question_snapshots, user_ids)
+                except Exception:  # noqa: BLE001 - a later one-second pass retries a transient database failure.
+                    logger.warning("pending_question_snapshot_batch_failed", exc_info=True)
+                    snapshots = {}
+                for user_id in user_ids:
+                    if user_id not in self._subscribers or user_id not in snapshots:
+                        continue
+                    snapshot = snapshots[user_id]
+                    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    if self._snapshots.get(user_id) == encoded:
+                        continue
+                    self._snapshots[user_id] = encoded
+                    for queue in tuple(self._subscribers.get(user_id, ())):
+                        self._offer(queue, encoded)
+                if not self._subscribers:
+                    return
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=USER_QUESTION_SNAPSHOT_INTERVAL_SECONDS)
+                except TimeoutError:
+                    pass
+        finally:
+            self._task = None
+
+
+_pending_question_broker = _PendingQuestionBroker()
+
+
 async def _pending_user_question_event_stream(user_id: int) -> AsyncIterator[dict]:
-    previous_snapshot = ""
-    while True:
-        snapshot = await asyncio.to_thread(_pending_user_question_snapshot, user_id)
-        encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if encoded != previous_snapshot:
-            previous_snapshot = encoded
-            yield {"event": "pending_questions", "data": encoded}
-        await asyncio.sleep(USER_QUESTION_SNAPSHOT_INTERVAL_SECONDS)
+    async for encoded in _pending_question_broker.subscribe(user_id):
+        yield {"event": "pending_questions", "data": encoded}
 
 
 @user_question_router.get("/events")
@@ -637,92 +875,88 @@ def _run_lease_expired(run: AgentRun) -> bool:
     return lease_expires_at <= datetime.now(timezone.utc)
 
 
+def _agent_image_generation_context(db: Session, user_id: int, image_model_id: int | None) -> dict:
+    model = _agent_image_model(db, user_id, image_model_id)
+    return {"image_model_id": model.id if model else None,
+            "model_name": model.display_name if model else "管理员默认图片模型"}
+
+
 def _merge_runtime_context_stats(prepared_stats: dict, event_data: dict) -> dict:
-    """Attach per-turn telemetry without replacing the next-request budget."""
+    """Keep the meter on the current request budget, with usage as telemetry."""
     def metric(name: str) -> int:
         value = event_data.get(name)
-        return value if isinstance(value, int) else 0
+        return max(0, value) if isinstance(value, int) else 0
 
-    def breakdown(name: str) -> dict[str, int]:
-        value = event_data.get(name)
-        if not isinstance(value, dict):
-            return {}
-        return {
-            str(key): item
-            for key, item in value.items()
-            if isinstance(item, int) and item >= 0
-        }
-
-    runtime_state = str(event_data.get("state", ""))
-    merged = {
-        **prepared_stats,
-        "runtime_context_state": runtime_state,
-        **({"input_budget_tokens": metric("input_budget_tokens")} if metric("input_budget_tokens") else {}),
-        **({"compaction_location": str(event_data["location"])} if event_data.get("location") else {}),
-    }
-    if runtime_state == "measured":
-        return {
-            **merged,
-            "runtime_input_tokens": metric("used_tokens"),
-            "last_model_output_tokens": metric("last_turn_output_tokens"),
-            "last_model_cached_input_tokens": metric("cached_input_tokens"),
-            "runtime_context_tokens": metric("used_tokens"),
-            "runtime_context_source": "provider_reported",
-            "runtime_context_is_estimate": False,
-        }
-    if runtime_state == "tool_result_context":
-        return {
-            **merged,
-            "runtime_context_tokens": metric("used_tokens"),
-            "runtime_context_breakdown": breakdown("breakdown"),
-            "runtime_context_source": str(event_data.get("context_source") or "server_recomputed_after_tool"),
-            "runtime_context_is_estimate": bool(event_data.get("context_is_estimate", True)),
+    state = str(event_data.get("state", ""))
+    merged = {**prepared_stats, "runtime_context_state": state}
+    if event_data.get("location"):
+        merged["compaction_location"] = str(event_data["location"])
+    if metric("input_budget_tokens"):
+        merged["input_budget_tokens"] = metric("input_budget_tokens")
+        merged["active_context_threshold_tokens"] = metric("input_budget_tokens")
+    if state == "measured":
+        # Provider usage describes the call that just finished, not the next
+        # request containing its response and subsequent tool results.
+        return {**merged, "runtime_input_tokens": metric("used_tokens"),
+                "last_model_usage_reported": True,
+                "last_model_output_tokens": metric("last_turn_output_tokens"),
+                "last_model_cached_input_tokens": metric("cached_input_tokens")}
+    if state == "tool_outputs_stored":
+        return {**merged, **{key: metric(key) for key in (
+            "effective_tool_preview_tokens", "stored_tool_output_count", "stored_tool_output_bytes",
+            "stored_tool_output_tokens", "tool_output_retention_days",
+        )}}
+    if state in {"request_context", "model_response_context", "tool_result_context", "streaming",
+                 "run_compacting", "in_run_compacted", "run_compaction_failed"}:
+        schema = metric("tool_schema_tokens")
+        used = metric("used_tokens") + schema
+        streaming_tokens = 0
+        if state == "streaming":
+            multiplier = max(1.0, float(event_data.get("token_estimate_multiplier") or 1.0))
+            # Reasoning telemetry is not replayed into the next request.
+            streaming_tokens = math.ceil((metric("runtime_visible_output_tokens") + metric("runtime_tool_argument_tokens")) * multiplier)
+            used += streaming_tokens
+            merged.update({key: metric(key) for key in (
+                "runtime_projected_tokens", "runtime_visible_output_tokens", "runtime_reasoning_tokens",
+                "runtime_tool_argument_tokens",
+            )})
+        breakdown = event_data.get("breakdown")
+        breakdown = {str(key): value for key, value in breakdown.items() if isinstance(value, int) and value >= 0} if isinstance(breakdown, dict) else {"runtime_history": used - schema}
+        breakdown["tool_schema"] = schema
+        if streaming_tokens and isinstance(event_data.get("breakdown"), dict):
+            breakdown["runtime_streaming"] = streaming_tokens
+        merged.update({
+            "used_tokens": used, "compiled_input_tokens": used,
+            "runtime_context_tokens": used, "runtime_context_breakdown": breakdown,
+            "runtime_context_source": "server_recomputed_after_tool" if state == "tool_result_context" else "server_request_budget",
+            "runtime_context_is_estimate": True,
             "runtime_context_tool_call_id": str(event_data.get("tool_call_id") or ""),
             "runtime_context_tool_name": str(event_data.get("tool_name") or ""),
-        }
-    if runtime_state == "in_run_compacted":
-        return {
-            **merged,
-            "runtime_input_tokens": metric("used_tokens"),
-            "runtime_original_tokens": metric("run_original_tokens"),
-            "runtime_digested_cycles": metric("run_digested_cycles"),
-            "runtime_dropped_cycles": metric("run_dropped_cycles"),
-            "run_summarized_cycles": metric("run_summarized_cycles"),
-            "runtime_summary_tokens": metric("runtime_summary_tokens"),
-        }
-    if runtime_state == "streaming":
-        return {
-            **merged,
-            "runtime_input_tokens": metric("used_tokens"),
-            "runtime_projected_tokens": metric("runtime_projected_tokens"),
-            "runtime_visible_output_tokens": metric("runtime_visible_output_tokens"),
-            "runtime_reasoning_tokens": metric("runtime_reasoning_tokens"),
-            "runtime_tool_argument_tokens": metric("runtime_tool_argument_tokens"),
-        }
-    if runtime_state == "tool_outputs_stored":
-        return {
-            **merged,
-            "effective_tool_preview_tokens": metric("effective_tool_preview_tokens"),
-            "stored_tool_output_count": metric("stored_tool_output_count"),
-            "stored_tool_output_bytes": metric("stored_tool_output_bytes"),
-            "stored_tool_output_tokens": metric("stored_tool_output_tokens"),
-            "tool_output_retention_days": metric("tool_output_retention_days"),
-        }
+            "usage_percent": min(100, round(used / max(1, merged.get("active_context_threshold_tokens", 0)) * 100)),
+        })
+        if state == "in_run_compacted":
+            merged.update({
+                "runtime_original_tokens": metric("run_original_tokens") + schema,
+                "runtime_digested_cycles": metric("run_digested_cycles"),
+                "runtime_dropped_cycles": metric("run_dropped_cycles"),
+                "run_summarized_cycles": metric("run_summarized_cycles"),
+                "runtime_summary_tokens": metric("runtime_summary_tokens"),
+            })
     return merged
 
 
-def _context_compaction_event_data(before_stats: dict, after_stats: dict) -> dict:
+def _context_compaction_event_data(before_stats: dict, after_stats: dict, memory: dict | None = None) -> dict:
     """Build the compact, user-visible result for preflight context compaction."""
     before_tokens = max(0, int(before_stats.get("compiled_input_tokens") or before_stats.get("used_tokens") or 0))
     after_tokens = max(0, int(after_stats.get("compiled_input_tokens") or after_stats.get("used_tokens") or 0))
     return {
-        "summary": "较早对话和工具结果已整理为工作记忆。",
+        "summary": json.dumps(memory, ensure_ascii=False) if memory else "较早对话和工具结果已整理为工作记忆。",
         "original_tokens": before_tokens,
         "used_tokens": after_tokens,
         "summarized_cycles": 0,
         "digested_cycles": 0,
         "dropped_cycles": 0,
-        "summary_tokens": 0,
+        "summary_tokens": estimate_tokens(json.dumps(memory, ensure_ascii=False)) if memory else 0,
         "durable_snapshot": after_stats.get("state") == "compacted",
     }
 
@@ -782,8 +1016,8 @@ def _runtime_summary_memory(summary: str) -> dict | None:
         "pending_tasks": items("next_steps"),
         "blocked": items("blockers"),
         "next_move": items("next_steps"),
-        "relevant_files": [],
-        "source_refs": items("source_refs"),
+        "relevant_files": items("source_refs"),
+        "source_refs": re.findall(r"event:\d+|tool:toolout-[0-9a-fA-F-]{36}", str(value["source_refs"])),
         "narrative": str(value["completed"]).strip(),
     }
 
@@ -876,13 +1110,13 @@ def _persist_runtime_compaction_snapshot(
             ChatContextEvent.session_id == session_id,
             ChatMessage.is_superseded.is_(False),
         )
-        .order_by(ChatContextEvent.id)
+        .order_by(ChatContextEvent.message_id, ChatContextEvent.ordinal, ChatContextEvent.id)
         .all()
     )
     if session.context_start_message_id:
         source_events = [event for event in source_events if (event.message_id or 0) > session.context_start_message_id]
-    source_count = sum(1 for event in source_events if event.id <= cutoff_event_id)
-    if source_count <= 0:
+    covered_events = [event for event in source_events if event.id <= cutoff_event_id]
+    if not covered_events or not any(event.id == cutoff_event_id for event in covered_events):
         return
     source_records = [
         ContextRecord(
@@ -893,7 +1127,7 @@ def _persist_runtime_compaction_snapshot(
             document_revision=event.document_revision,
             is_legacy=event.is_legacy,
         )
-        for event in source_events
+        for event in covered_events
     ]
     db.query(ChatContextSnapshot).filter(
         ChatContextSnapshot.session_id == session_id,
@@ -914,8 +1148,9 @@ def _persist_runtime_compaction_snapshot(
             trigger="run_automatic",
             model_id=model_id,
             input_budget_tokens=max(0, int(input_budget_tokens)),
-            source_event_count=source_count,
-            source_prefix_hash=context_prefix_hash(source_records, source_count),
+            source_event_count=len(source_records),
+            source_prefix_hash=context_prefix_hash(source_records),
+            source_max_event_id=cutoff_event_id,
             context_generation=int(session.context_generation or 0),
             is_active=True,
             active_slot=1,
@@ -1103,6 +1338,11 @@ def _settle_terminal_timeline(tool_calls: list[dict], turn_blocks: list[dict]) -
                 else "本轮 Agent 已结束，未收到该工具的执行结果。"
             )
         tool["preparing"] = False
+        if isinstance(tool.get("model_input"), dict) and tool["model_input"].get("state") == "pending":
+            tool["model_input"] = {
+                "state": "not_sent",
+                "message": "本轮运行结束，工具结果没有进入模型后续调用。",
+            }
         changed = True
 
     for tool in tool_calls:
@@ -1154,6 +1394,7 @@ def _settle_user_question_timeline(
     turn_blocks: list[dict],
     tool_call_id: str,
     answer: dict | None = None,
+    model_input_content: str | None = None,
 ) -> str | None:
     """Mark a paused ask_user call as resolved and return its timeline ID.
 
@@ -1199,6 +1440,18 @@ def _settle_user_question_timeline(
         tool["preparing"] = False
         tool["result"] = result
         tool["activity"] = activity
+        tool["model_input"] = (
+            {
+                "state": "available",
+                "content": model_input_content,
+                "truncated": False,
+            }
+            if model_input_content is not None
+            else {
+                "state": "not_sent",
+                "message": "本轮未恢复模型调用，用户回答没有作为工具结果发送给模型。",
+            }
+        )
         changed = True
 
     for tool in tool_calls:
@@ -1383,6 +1636,7 @@ def _persist_restart_failure(db: Session, run: AgentRun, document: Document) -> 
     db.add(assistant_message)
     db.flush()
     run.assistant_message_id = assistant_message.id
+    persist_recovered_context(db, assistant_message, run.id)
     run.status = AgentRunStatus.FAILED
     run.error_message = content
     run.finished_at = run.finished_at or datetime.now(timezone.utc)
@@ -1565,7 +1819,7 @@ def _restart_failure_events(
                     "content": error_message,
                     "html": html,
                     "html_changed": partial_save_state == "preserved",
-                    "compliance": run_compliance_check(html).to_dict(),
+                    "compliance": None,
                     "partial": True,
                     "partial_save_state": partial_save_state,
                     "run_status": AgentRunStatus.FAILED.value,
@@ -1640,7 +1894,9 @@ def _has_external_document_conflict(
     """Keep own direct image writes distinct from an external document edit."""
     if stored_html == source_html or stored_html == candidate_html:
         return False
-    return not (candidate_html != source_html and stored_html in agent_checkpoint_htmls)
+    # A later tool can restore the original HTML after an image tool has
+    # already committed an intermediate snapshot. That is still our own write.
+    return stored_html not in agent_checkpoint_htmls
 
 
 def _persist_run_checkpoint(run_id: str, html: str) -> None:
@@ -1741,24 +1997,32 @@ async def _force_stuck_cancellation(run_id: str, document_id: int) -> None:
         )
         if not run.assistant_message_id:
             request_message = db.get(ChatMessage, run.user_message_id)
+            recovered = recover_interrupted_turn(
+                db.query(AgentRunEvent).filter(AgentRunEvent.run_id == run.id).order_by(AgentRunEvent.sequence).all(),
+                terminal_message,
+            )
             assistant_message = ChatMessage(
                 document_id=document.id,
                 session_id=run.session_id,
                 role=MessageRole.ASSISTANT,
-                content=terminal_message,
+                content=recovered.content,
+                tool_calls_json=json.dumps(recovered.tool_calls, ensure_ascii=False),
+                turn_blocks_json=json.dumps(recovered.turn_blocks, ensure_ascii=False),
+                reasoning_trace_json=json.dumps(recovered.reasoning_trace, ensure_ascii=False),
                 html_before=request_message.html_before if request_message else None,
                 html_after=report_html if html_changed else None,
             )
             db.add(assistant_message)
             db.flush()
             run.assistant_message_id = assistant_message.id
+            persist_recovered_context(db, assistant_message, run.id)
         db.commit()
 
         terminal_data = {
             "content": terminal_message,
             "html": report_html,
             "html_changed": html_changed,
-            "compliance": run_compliance_check(report_html).to_dict(),
+            "compliance": None,
             "cancelled": True,
             "partial": True,
             "partial_save_state": save_state,
@@ -1903,7 +2167,7 @@ def replace_chat_session_template_attachments(
     db: Session = Depends(get_db),
 ) -> dict:
     _get_accessible_document(db, document_id, current_user)
-    _require_idle_document(db, document_id)
+    # Active runs already captured their templates; this changes future requests.
     session = _get_chat_session(db, document_id, session_id, allow_archived=False)
     try:
         replace_session_attached_templates(db, session.id, payload.template_ids)
@@ -1924,7 +2188,6 @@ def remove_chat_session_template_attachment(
     db: Session = Depends(get_db),
 ) -> dict:
     _get_accessible_document(db, document_id, current_user)
-    _require_idle_document(db, document_id)
     session = _get_chat_session(db, document_id, session_id, allow_archived=False)
     current_ids = [item.id for item in session_attached_templates(db, session.id)]
     if template_id not in current_ids:
@@ -2031,6 +2294,8 @@ def list_messages(
     include_hidden: bool = False,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    limit: Annotated[int | None, Query(ge=1, le=100)] = None,
+    before_id: Annotated[int | None, Query(ge=1)] = None,
 ) -> list[dict]:
     document = _get_accessible_document(db, document_id, current_user)
     session = _get_chat_session(db, document_id, session_id) if session_id else _default_chat_session(db, document_id)
@@ -2079,10 +2344,26 @@ def list_messages(
         assistant_message.reasoning_trace_json = json.dumps(recovered_turn.reasoning_trace, ensure_ascii=False)
         assistant_message.turn_blocks_json = json.dumps(recovered_turn.turn_blocks, ensure_ascii=False)
         changed = True
-    messages = _session_message_query(db, session, include_hidden=include_hidden).order_by(ChatMessage.id).all()
+    query = _session_message_query(db, session, include_hidden=include_hidden)
+    if before_id is not None:
+        query = query.filter(ChatMessage.id < before_id)
+    if limit is None:
+        messages = query.order_by(ChatMessage.id).all()
+    else:
+        messages = list(reversed(query.order_by(ChatMessage.id.desc()).limit(limit).all()))
     for item in messages:
         if item.role == MessageRole.ASSISTANT:
             changed = _settle_persisted_assistant_message(item) or changed
+    # Older interrupted runs may already have a rich timeline but no model
+    # ledger. Repair those rows as well, including normal failures/cancellations.
+    interrupted_runs = db.query(AgentRun).filter(
+        AgentRun.session_id == session.id,
+        AgentRun.assistant_message_id.in_([item.id for item in messages]),
+        AgentRun.status.in_([AgentRunStatus.FAILED, AgentRunStatus.CANCELLED]),
+    ).all() if messages else []
+    messages_by_id = {item.id: item for item in messages}
+    for run in interrupted_runs:
+        changed = persist_recovered_context(db, messages_by_id[run.assistant_message_id], run.id) or changed
     if changed:
         db.commit()
     usage_by_message = _assistant_message_model_usage(db, messages)
@@ -2147,6 +2428,11 @@ def list_history_archive_messages(
     return [_message_read(item, current_user, usage_by_message.get(item.id)) for item in messages]
 
 
+def _agent_context_workspace(session: HtmlEditSession, tool_protocol: str | None = None):
+    protocol = tool_protocol or get_settings().CHAT_AGENT_TOOL_PROTOCOL
+    return create_source_workspace(session) if protocol == "v2" else session.workspace()
+
+
 @router.get("/{document_id}/chat-context", response_model=ChatContextStatsRead)
 def get_chat_context(
     document_id: int,
@@ -2164,29 +2450,43 @@ def get_chat_context(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="你没有使用该模型的权限")
     attached_templates = _session_attached_template_payload(db, session.id)
     theme_reference = _theme_reference_payload(session_theme_proposal(db, session.id))
-    history_rows = _session_message_query(db, session).order_by(ChatMessage.id).all()
+    history_rows = None  # The builder reads the ledger; legacy rows load only if needed.
     builder = AgentContextBuilder(
         db,
         document.id,
         session.id,
         model,
-        HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
+        _agent_context_workspace(HtmlEditSession(document.current_html, model.tool_result_max_tokens)),
         history_rows,
-        context_budget_prompt()
+        context_budget_prompt(prompt_cache_enabled=bool(model.prompt_cache_enabled), provider_type=model.provider.provider_type.value, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL)
         + "\n\n" + article_typography_prompt(typography_settings_payload(get_or_create_typography_settings(db)))
         + _layout_reference_context_prompt(
             session_layout_reference_agent_payload(get_session_layout_reference(db, session.id))
         )
         + _attached_template_prompt(attached_templates)
         + _theme_reference_prompt(theme_reference),
+        runtime_context_factory=runtime_context_budget_factory(
+            model, document.title, document.current_html,
+            history_available=True,
+            image_generation_context=_agent_image_generation_context(db, current_user.id, session.image_model_id),
+            layout_reference=session_layout_reference_agent_payload(get_session_layout_reference(db, session.id)),
+            attached_templates=attached_templates, theme_reference=theme_reference,
+            article_typography_settings=typography_settings_payload(get_or_create_typography_settings(db)), tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
         model_call_tracker_factory=lambda: ModelCallTracker(
             model_id=model.id,
             user_id=current_user.id,
             source=ModelCallSource.AGENT_CONTEXT_COMPACTION,
             source_id=f"session:{session.id}",
         ),
+        tool_schema_tokens=editor_tool_schema_tokens(
+            model.provider.provider_type.value,
+            get_session_layout_reference(db, session.id) is not None,
+            session_approved_theme_proposal(db, session.id) is not None, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
     )
-    return builder.snapshot()
+    stats = builder.snapshot()
+    if builder.checkpoint_changed:
+        db.commit()
+    return stats
 
 
 @router.post("/{document_id}/chat-context/preview", response_model=ChatContextStatsRead)
@@ -2204,7 +2504,7 @@ def preview_chat_context(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
     if not can_access_model(current_user, model):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="你没有使用该模型的权限")
-    preview_attachments = _pending_attachments(db, document.id, current_user.id, payload.image_attachment_ids)
+    preview_attachments = _pending_attachments(db, document.id, current_user.id, payload.image_attachment_ids, require_unbound=False)
     if preview_attachments and not model.is_multimodal:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前模型未启用图片交互，请切换多模态模型")
     attached_templates = (
@@ -2213,7 +2513,7 @@ def preview_chat_context(
         else _session_attached_template_payload(db, session.id)
     )
     theme_reference = _theme_reference_payload(session_theme_proposal(db, session.id))
-    history_rows = _session_message_query(db, session).order_by(ChatMessage.id).all()
+    history_rows = None  # The builder reads the ledger; legacy rows load only if needed.
     selection_context = (
         json.dumps([item.model_dump() for item in payload.selected_elements], ensure_ascii=False)
         if payload.selected_elements
@@ -2224,9 +2524,9 @@ def preview_chat_context(
         document.id,
         session.id,
         model,
-        HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
+        _agent_context_workspace(HtmlEditSession(document.current_html, model.tool_result_max_tokens)),
         history_rows,
-        context_budget_prompt()
+        context_budget_prompt(prompt_cache_enabled=bool(model.prompt_cache_enabled), provider_type=model.provider.provider_type.value, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL)
         + "\n\n" + article_typography_prompt(typography_settings_payload(get_or_create_typography_settings(db)))
         + _layout_reference_context_prompt(
             session_layout_reference_agent_payload(get_session_layout_reference(db, session.id))
@@ -2235,9 +2535,25 @@ def preview_chat_context(
         + _theme_reference_prompt(theme_reference),
         payload.message,
         selection_context,
+        runtime_context_factory=runtime_context_budget_factory(
+            model, document.title, document.current_html,
+            history_available=True,
+            image_generation_context=_agent_image_generation_context(db, current_user.id, session.image_model_id),
+            selected_elements=[item.model_dump() for item in payload.selected_elements],
+            layout_reference=session_layout_reference_agent_payload(get_session_layout_reference(db, session.id)),
+            attached_templates=attached_templates, theme_reference=theme_reference,
+            article_typography_settings=typography_settings_payload(get_or_create_typography_settings(db)), tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
         current_image_count=len(preview_attachments),
+        current_image_attachments=preview_attachments,
+        tool_schema_tokens=editor_tool_schema_tokens(
+            model.provider.provider_type.value,
+            get_session_layout_reference(db, session.id) is not None,
+            session_approved_theme_proposal(db, session.id) is not None, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
     )
-    return builder.snapshot()
+    stats = builder.snapshot()
+    if builder.checkpoint_changed:
+        db.commit()
+    return stats
 
 
 @router.post("/{document_id}/chat-context/compact", response_model=ChatContextCompactResult)
@@ -2258,27 +2574,38 @@ async def compact_chat_context(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="你没有使用该模型的权限")
     attached_templates = _session_attached_template_payload(db, session.id)
     theme_reference = _theme_reference_payload(session_theme_proposal(db, session.id))
-    history_rows = _session_message_query(db, session).order_by(ChatMessage.id).all()
+    history_rows = None  # The builder reads the ledger; legacy rows load only if needed.
     builder = AgentContextBuilder(
         db,
         document.id,
         session.id,
         model,
-        HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
+        _agent_context_workspace(HtmlEditSession(document.current_html, model.tool_result_max_tokens)),
         history_rows,
-        context_budget_prompt()
+        context_budget_prompt(prompt_cache_enabled=bool(model.prompt_cache_enabled), provider_type=model.provider.provider_type.value, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL)
         + "\n\n" + article_typography_prompt(typography_settings_payload(get_or_create_typography_settings(db)))
         + _layout_reference_context_prompt(
             session_layout_reference_agent_payload(get_session_layout_reference(db, session.id))
         )
         + _attached_template_prompt(attached_templates)
         + _theme_reference_prompt(theme_reference),
+        runtime_context_factory=runtime_context_budget_factory(
+            model, document.title, document.current_html,
+            history_available=True,
+            image_generation_context=_agent_image_generation_context(db, current_user.id, session.image_model_id),
+            layout_reference=session_layout_reference_agent_payload(get_session_layout_reference(db, session.id)),
+            attached_templates=attached_templates, theme_reference=theme_reference,
+            article_typography_settings=typography_settings_payload(get_or_create_typography_settings(db)), tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
         model_call_tracker_factory=lambda: ModelCallTracker(
             model_id=model.id,
             user_id=current_user.id,
             source=ModelCallSource.AGENT_CONTEXT_COMPACTION,
             source_id=f"session:{session.id}",
         ),
+        tool_schema_tokens=editor_tool_schema_tokens(
+            model.provider.provider_type.value,
+            get_session_layout_reference(db, session.id) is not None,
+            session_approved_theme_proposal(db, session.id) is not None, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
     )
     compaction_model = build_compaction_model(model.provider, model)
     before_stats = builder.snapshot()
@@ -2303,6 +2630,7 @@ async def compact_chat_context(
         session_id=session.id,
         before_stats=before_stats,
         after_stats=prepared.stats,
+        memory=prepared.memory,
     )
     db.commit()
     prepared.stats["compaction_notice"] = _message_read(notice, current_user)
@@ -2420,22 +2748,20 @@ async def start_chat_run(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
     if not can_access_model(current_user, model):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="你没有使用该模型的权限，请联系管理员")
-    attachments = _pending_attachments(db, document.id, current_user.id, payload.image_attachment_ids)
+    attachments = _pending_attachments(db, document.id, current_user.id, payload.image_attachment_ids, require_unbound=False)
+    if any(item.message_id is not None and (item.message is None or item.message.session_id != chat_session.id) for item in attachments):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="聊天图片属于其他对话")
     if attachments and not model.is_multimodal:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前模型未启用图片交互，请切换多模态模型")
     if not payload.message.strip() and not attachments:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="消息内容不能为空")
     effective_message = payload.message.strip() or "请分析所附图片，并继续处理当前推文。"
-    try:
-        attached_templates = (
-            _template_payload_from_models(
-                replace_session_attached_templates(db, chat_session.id, payload.template_ids)
-            )
-            if payload.template_ids is not None
-            else _session_attached_template_payload(db, chat_session.id)
-        )
-    except ChatSessionContextError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    # A queued request can carry older references without replacing the next draft's attachments.
+    attached_templates = (
+        _attached_template_payload(db, payload.template_ids)
+        if payload.template_ids is not None
+        else _session_attached_template_payload(db, chat_session.id)
+    )
     reask_activation: ReaskActivation | None = None
     inherited_theme_proposal_id: str | None = None
     if not payload.gzh_theme_proposal_id and payload.reask_from_message_id is not None:
@@ -2542,7 +2868,7 @@ async def start_chat_run(
         )
     selected_elements = [element.model_dump() for element in payload.selected_elements]
     article_typography_settings = typography_settings_payload(get_or_create_typography_settings(db))
-    reference_budget_prompt = context_budget_prompt() + _layout_reference_context_prompt(layout_reference)
+    reference_budget_prompt = context_budget_prompt(prompt_cache_enabled=bool(model.prompt_cache_enabled), provider_type=model.provider.provider_type.value, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL) + _layout_reference_context_prompt(layout_reference)
     reference_budget_prompt += "\n\n" + article_typography_prompt(article_typography_settings)
     reference_budget_prompt += _attached_template_prompt(attached_templates)
     if theme_application:
@@ -2553,18 +2879,27 @@ async def start_chat_run(
     else:
         reference_budget_prompt += _theme_reference_prompt(theme_reference)
     selection_budget_context = json.dumps(selected_elements, ensure_ascii=False) if selected_elements else ""
-    history_rows = _session_message_query(db, chat_session).order_by(ChatMessage.id).all()
+    history_rows = None  # Avoid loading HTML snapshots and UI traces for context accounting.
     preflight = AgentContextBuilder(
         db,
         document.id,
         chat_session.id,
         model,
-        HtmlEditSession(document.current_html, model.tool_result_max_tokens).workspace(),
+        _agent_context_workspace(HtmlEditSession(document.current_html, model.tool_result_max_tokens)),
         history_rows,
         reference_budget_prompt,
         payload.message,
         selection_budget_context,
+        runtime_context_factory=runtime_context_budget_factory(
+            model, document.title, document.current_html, selected_elements=selected_elements,
+            history_available=True,
+            image_generation_context=_agent_image_generation_context(db, current_user.id, chat_session.image_model_id),
+            layout_reference=layout_reference, theme_application=theme_application,
+            theme_reference=theme_reference, attached_templates=attached_templates,
+            article_typography_settings=article_typography_settings, tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
         current_image_count=len(attachments),
+        current_image_attachments=attachments,
+        tool_schema_tokens=editor_tool_schema_tokens(model.provider.provider_type.value, bool(layout_reference), bool(theme_application), tool_protocol=get_settings().CHAT_AGENT_TOOL_PROTOCOL),
     ).snapshot()
     if not preflight["can_fit_after_compaction"]:
         raise HTTPException(
@@ -2596,6 +2931,10 @@ async def start_chat_run(
     )
     db.add(user_message)
     db.flush()
+    attachments = [
+        duplicate_attachment(db, source=item, uploader_id=current_user.id) if item.message_id is not None else item
+        for item in attachments
+    ]
     for attachment in attachments:
         attachment.message_id = user_message.id
     if chat_session.title == "新对话":
@@ -2827,26 +3166,62 @@ async def restore_waiting_user_question_timeouts() -> None:
     def waiting_ids() -> list[str]:
         db = SessionLocal()
         try:
-            questions = (
-                db.query(ChatUserQuestion)
-                .filter(ChatUserQuestion.status == ChatUserQuestionStatus.WAITING)
-                .all()
-            )
             runnable_question_ids: list[str] = []
-            for question in questions:
-                run = db.get(AgentRun, question.run_id)
-                if run is not None and run.status == AgentRunStatus.WAITING_FOR_INPUT:
-                    runnable_question_ids.append(question.id)
-                else:
-                    _cancel_inconsistent_waiting_question(db, question, run)
-            if len(runnable_question_ids) != len(questions):
-                db.commit()
+            cursor = ""
+            while True:
+                rows = (
+                    db.query(ChatUserQuestion, AgentRun)
+                    .outerjoin(AgentRun, AgentRun.id == ChatUserQuestion.run_id)
+                    .filter(
+                        ChatUserQuestion.status == ChatUserQuestionStatus.WAITING,
+                        ChatUserQuestion.id > cursor,
+                    )
+                    .options(
+                        Load(ChatUserQuestion).load_only(
+                            ChatUserQuestion.id,
+                            ChatUserQuestion.run_id,
+                            ChatUserQuestion.status,
+                            ChatUserQuestion.answer_json,
+                            ChatUserQuestion.answered_at,
+                        ),
+                        Load(AgentRun).load_only(AgentRun.id, AgentRun.status),
+                    )
+                    .order_by(ChatUserQuestion.id)
+                    .limit(500)
+                    .all()
+                )
+                if not rows:
+                    break
+                changed = False
+                for question, run in rows:
+                    if run is not None and run.status == AgentRunStatus.WAITING_FOR_INPUT:
+                        runnable_question_ids.append(question.id)
+                    else:
+                        _cancel_inconsistent_waiting_question(db, question, run)
+                        changed = True
+                if changed:
+                    db.commit()
+                cursor = rows[-1][0].id
+                if len(rows) < 500:
+                    break
             return runnable_question_ids
         finally:
             db.close()
 
     for question_id in await asyncio.to_thread(waiting_ids):
         schedule_user_question_timeout(question_id)
+
+
+def _user_question_source_html(execution_context: dict, current_html: str) -> str:
+    """Verify the persisted pause snapshot while accepting legacy records."""
+    from app.services.html_workspace import HtmlWorkspace
+    source_html = str(execution_context.get("current_html") or "")
+    expected_revision = execution_context.get("source_revision")
+    if expected_revision and expected_revision != HtmlWorkspace.revision_for(source_html):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="恢复源码 revision 与暂停快照不一致")
+    if current_html != source_html:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="等待回答期间文档已变化，不能安全恢复本轮排版")
+    return source_html
 
 
 @router.post(
@@ -2933,9 +3308,7 @@ async def answer_chat_user_question(
         }
 
     execution_context = _json_dict(question.execution_context_json)
-    source_html = str(execution_context.get("current_html") or "")
-    if document.current_html != source_html:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="等待回答期间文档已变化，不能安全恢复本轮排版")
+    source_html = _user_question_source_html(execution_context, document.current_html)
     model = db.get(AIModel, question.model_id)
     if not model:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本轮使用的模型已被删除，无法继续")
@@ -2951,11 +3324,13 @@ async def answer_chat_user_question(
     timeline = _json_dict(question.timeline_json)
     timeline_tools = timeline.get("tool_calls") if isinstance(timeline.get("tool_calls"), list) else []
     timeline_blocks = timeline.get("turn_blocks") if isinstance(timeline.get("turn_blocks"), list) else []
+    canonical_answer_content = json.dumps(canonical_answer, ensure_ascii=False)
     if _settle_user_question_timeline(
         timeline_tools,
         timeline_blocks,
         question.tool_call_id,
         canonical_answer,
+        model_input_content=canonical_answer_content,
     ):
         timeline["tool_calls"] = timeline_tools
         timeline["turn_blocks"] = timeline_blocks
@@ -2979,7 +3354,7 @@ async def answer_chat_user_question(
     )
     compaction_model = build_compaction_model(model.provider, model)
     question.status = ChatUserQuestionStatus.ANSWERED
-    question.answer_json = json.dumps(canonical_answer, ensure_ascii=False)
+    question.answer_json = canonical_answer_content
     question.answer_client_request_id = payload.client_request_id
     question.answered_at = datetime.now(timezone.utc)
     run.status = AgentRunStatus.PENDING
@@ -3005,12 +3380,15 @@ async def answer_chat_user_question(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该回答已被并发处理，请刷新后继续") from exc
 
     cancel_user_question_timeout(question.id)
+    _pending_question_broker.invalidate(current_user.id)
 
     resume_state = {
+        "tool_protocol": execution_context.get("tool_protocol", "v1"),
+        "loaded_tool_groups": execution_context.get("loaded_tool_groups", []),
         "messages": resume_messages,
         "tool_result": {
             "tool_call_id": question.tool_call_id,
-            "content": json.dumps(canonical_answer, ensure_ascii=False),
+            "content": canonical_answer_content,
         },
         "completed_context_events": completed_context_events,
         "timeline": timeline,
@@ -3132,11 +3510,12 @@ async def cancel_chat_run(
         db.commit()
         if question:
             cancel_user_question_timeout(question.id)
+        _pending_question_broker.invalidate(run.user_id)
         terminal_data = {
             "content": terminal_message,
             "html": document.current_html,
             "html_changed": False,
-            "compliance": run_compliance_check(document.current_html).to_dict(),
+            "compliance": None,
             "cancelled": True,
             "partial": True,
             "partial_save_state": "none",
@@ -3315,6 +3694,8 @@ async def _execute_agent_run(
         document_id=document_id,
     )
     stream_db = SessionLocal()
+    tool_protocol = str(resume_state.get("tool_protocol", "v1")) if resume_state else get_settings().CHAT_AGENT_TOOL_PROTOCOL
+    loaded_tool_groups = list(resume_state.get("loaded_tool_groups") or []) if resume_state else []
     resume_timeline = resume_state.get("timeline", {}) if isinstance(resume_state, dict) else {}
     tool_trace: list[dict] = list(resume_timeline.get("tool_calls", [])) if isinstance(resume_timeline, dict) else []
     turn_blocks: list[dict] = list(resume_timeline.get("turn_blocks", [])) if isinstance(resume_timeline, dict) else []
@@ -3330,12 +3711,19 @@ async def _execute_agent_run(
     # not mistake that own write for an external document edit.
     agent_checkpoint_htmls: set[str] = set()
     terminal_context_events: list[dict] | None = None
+    terminal_runtime_compaction: dict | None = None
+    latest_context_stats: dict | None = None
     terminal_compliance: dict | None = None
     model_turn_checkpoint: dict[str, object] | None = None
 
     def finish_active_text_block() -> None:
         if turn_blocks and turn_blocks[-1].get("type") in {"thought", "content"}:
             block = turn_blocks[-1]
+            buffered_parts = block.pop("_content_parts", None)
+            if isinstance(buffered_parts, list) and buffered_parts:
+                block["content"] = str(block.get("content") or "") + "".join(
+                    str(part) for part in buffered_parts
+                )
             block["state"] = "done"
             if block.get("type") == "thought":
                 started_at = block.pop("_started_at", None)
@@ -3346,7 +3734,7 @@ async def _execute_agent_run(
         if not value:
             return
         if turn_blocks and turn_blocks[-1].get("type") == block_type and turn_blocks[-1].get("state") == "active":
-            turn_blocks[-1]["content"] += value
+            turn_blocks[-1].setdefault("_content_parts", []).append(value)
             return
         finish_active_text_block()
         block = {
@@ -3385,6 +3773,19 @@ async def _execute_agent_run(
         )
         await agent_run_manager.publish(run_id, "context_compaction", normalized)
 
+    async def publish_terminal_context() -> None:
+        """Send the same durable projection a reload or idle preview will use."""
+        def snapshot() -> dict:
+            with SessionLocal() as stats_db:
+                return get_chat_context(document_id, model_id, session_id, stats_db.get(User, user_id), stats_db)
+        try:
+            stats = await asyncio.to_thread(snapshot)
+            await agent_run_manager.publish(run_id, "context_stats", stats, force=True)
+        except Exception:
+            # Context telemetry cannot prevent terminal delivery after edits
+            # have been saved. The idle preview retries this same projection.
+            logger.warning("agent_terminal_context_unavailable run=%s", run_id, exc_info=True)
+
     def partial_content(default: str) -> str:
         text = "".join(
             str(block.get("content", "")) for block in turn_blocks if block.get("type") == "content"
@@ -3406,7 +3807,7 @@ async def _execute_agent_run(
             "content": content,
             "html": html,
             "html_changed": False,
-            "compliance": run_compliance_check(html).to_dict(),
+            "compliance": None,
             "cancelled": terminal_status == AgentRunStatus.CANCELLED,
             "partial": terminal_status != AgentRunStatus.COMPLETED,
             "partial_save_state": "unavailable" if candidate_exists else "none",
@@ -3497,7 +3898,7 @@ async def _execute_agent_run(
                         "content": content,
                         "html": html,
                         "html_changed": bool(previous_message and previous_message.html_after),
-                        "compliance": run_compliance_check(html).to_dict(),
+                        "compliance": None,
                         "cancelled": previous_run.status == AgentRunStatus.CANCELLED,
                         "partial": previous_run.status != AgentRunStatus.COMPLETED,
                         "partial_save_state": previous_save_state,
@@ -3516,7 +3917,7 @@ async def _execute_agent_run(
                         "content": previous_run.error_message if previous_run else content,
                         "html": html,
                         "html_changed": False,
-                        "compliance": run_compliance_check(html).to_dict(),
+                        "compliance": None,
                         "cancelled": bool(previous_run and previous_run.status == AgentRunStatus.CANCELLED),
                         "partial": True,
                         "partial_save_state": "none",
@@ -3552,10 +3953,11 @@ async def _execute_agent_run(
                 )
                 candidate_exists = latest_html != current_html
                 document_already_at_candidate = bool(document and document.current_html == latest_html)
+                document_write_needed = bool(document) and not document_conflict and not document_already_at_candidate
                 if document_conflict:
                     terminal_status = AgentRunStatus.FAILED
                     error_message = error_message or "运行期间文档已被手动或外部修改，Agent 结果未覆盖该修改"
-                    if candidate_exists and "部分修改未自动保存，原因是文档冲突" not in content:
+                    if (candidate_exists or agent_checkpoint_htmls) and "部分修改未自动保存，原因是文档冲突" not in content:
                         content = f"{content.rstrip()}\n\n部分修改未自动保存，原因是文档冲突。"
                 elif terminal_status != AgentRunStatus.COMPLETED and candidate_exists:
                     if "本轮排版部分完成，已保留修改" not in content:
@@ -3566,12 +3968,16 @@ async def _execute_agent_run(
                         content = f"{content.rstrip()}\n\n{failure_summary}"
 
                 html_changed = latest_html != current_html and not document_conflict
-                if document and html_changed and not document_already_at_candidate:
+                # The net change from the request baseline controls undo/UI
+                # metadata. The stored document can still need a write when
+                # the final candidate restores that baseline after an image
+                # tool committed an intermediate snapshot.
+                if document_write_needed:
                     document.current_html = latest_html
                     touch_document(document, user_id)
-                if document and html_changed:
-                    if document.group and not document_already_at_candidate:
+                    if document.group:
                         touch_group(document.group, user_id)
+                if document and html_changed:
                     # Agent HTML patches can reference generated candidate
                     # URLs directly. Mark matching
                     # assets as applied so the seven-day candidate sweep does
@@ -3608,23 +4014,25 @@ async def _execute_agent_run(
                     session_id=session_id,
                     message_id=assistant_message.id,
                     run_id=run_id,
-                    events=context_events,
+                    events=recovered_context_events(tool_trace, turn_blocks, content, context_events)
+                    if terminal_status != AgentRunStatus.COMPLETED else context_events,
                     fallback_content=content,
                 )
                 # The raw provider-visible events must be flushed first so a
                 # runtime summary can point at a precise contiguous prefix.
-                # Failed and cancelled runs never reach this promotion path.
                 terminal_db.flush()
-                if terminal_status == AgentRunStatus.COMPLETED:
+                # A validated summary remains usable when a later model call
+                # fails. Its exact canonical prefix must still be present.
+                if runtime_compaction and context_events:
                     _persist_runtime_compaction_snapshot(
                         terminal_db,
                         session_id=session_id,
                         assistant_message_id=assistant_message.id,
                         runtime_compaction=runtime_compaction,
                         model_id=model_id,
-                        input_budget_tokens=max(0, int(stream_model.context_compaction_threshold_tokens) - AGENT_TOOL_SCHEMA_RESERVE_TOKENS),
+                        input_budget_tokens=int(stream_model.context_compaction_threshold_tokens),
                     )
-                if document and html_changed and not document_already_at_candidate:
+                if document_write_needed:
                     label = (
                         f"主题排版：{theme_application['theme_name']}"
                         if theme_application and terminal_status == AgentRunStatus.COMPLETED
@@ -3687,7 +4095,7 @@ async def _execute_agent_run(
                     attempt + 1,
                 )
                 report_html = document.current_html if document_conflict and document else latest_html
-                save_state = "conflict" if document_conflict and latest_html != current_html else (
+                save_state = "conflict" if document_conflict else (
                     "preserved" if html_changed else "none"
                 )
                 logger.warning(
@@ -3708,7 +4116,7 @@ async def _execute_agent_run(
                     "content": content,
                     "html": report_html,
                     "html_changed": html_changed,
-                    "compliance": compliance if compliance and not document_conflict else run_compliance_check(report_html).to_dict(),
+                    "compliance": compliance if not document_conflict else None,
                     "cancelled": terminal_status == AgentRunStatus.CANCELLED,
                     "partial": terminal_status != AgentRunStatus.COMPLETED,
                     "partial_save_state": save_state,
@@ -3728,7 +4136,7 @@ async def _execute_agent_run(
             finally:
                 terminal_db.close()
 
-    def persist_waiting_question(data: dict) -> ChatUserQuestion:
+    def persist_waiting_question(data: dict) -> tuple[ChatUserQuestion, int, dict, datetime]:
         """Atomically publish a durable pause before ending the worker task."""
         finish_active_text_block()
         question_payload = data.get("question") if isinstance(data.get("question"), dict) else {}
@@ -3743,10 +4151,17 @@ async def _execute_agent_run(
                 item["preparing"] = False
                 item["result"] = "等待用户回答"
                 item["activity"] = {"kind": "question", "summary": "等待用户回答"}
+                item["model_input"] = {
+                    "state": "pending",
+                    "message": "正在等待用户回答，尚未向模型提供工具结果。",
+                }
                 break
         execution_context = {
+            "tool_protocol": data.get("tool_protocol", tool_protocol),
+            "loaded_tool_groups": data.get("loaded_tool_groups", loaded_tool_groups),
             "document_title": document_title,
-            "current_html": current_html,
+            "current_html": edit_session.html,
+            "source_revision": edit_session.source_file().revision,
             "selected_elements": selected_elements,
             "layout_reference": layout_reference,
             "theme_application": theme_application,
@@ -3790,21 +4205,12 @@ async def _execute_agent_run(
         )
         waiting_db = SessionLocal()
         try:
-            run = waiting_db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().one_or_none()
-            if not run or run.status not in {AgentRunStatus.RUNNING, AgentRunStatus.PENDING}:
-                raise RuntimeError("Agent 运行已不再可等待用户回答")
-            waiting_db.add(question)
-            run.status = AgentRunStatus.WAITING_FOR_INPUT
-            run.owner_id = ""
-            run.lease_expires_at = None
-            run.heartbeat_at = datetime.now(timezone.utc)
-            waiting_db.commit()
-            # ``commit`` expires ORM attributes by default. The worker must
-            # still publish this question after this short-lived session
-            # closes, so load and detach the complete durable record first.
-            waiting_db.refresh(question)
-            waiting_db.expunge(question)
-            return question
+            return _commit_waiting_user_question(
+                waiting_db,
+                run_id,
+                question,
+                now=now,
+            )
         except Exception:
             waiting_db.rollback()
             raise
@@ -3825,6 +4231,7 @@ async def _execute_agent_run(
             terminal_data = persist_terminal(
                 AgentRunStatus.CANCELLED, "已停止本轮操作，未执行任何修改。"
             )
+            await publish_terminal_context()
             await agent_run_manager.publish(run_id, "final", terminal_data)
             await agent_run_manager.mark_terminal(run_id, "cancelled")
             return
@@ -3837,22 +4244,9 @@ async def _execute_agent_run(
         stream_model = stream_db.get(AIModel, model_id)
         if not stream_model:
             raise RuntimeError("本轮使用的模型已被删除")
-        history_rows = (
-            stream_db.query(ChatMessage)
-            .filter(
-                ChatMessage.document_id == document_id,
-                ChatMessage.session_id == session_id,
-                ChatMessage.id != user_message_id,
-                ChatMessage.is_superseded.is_(False),
-            )
-            .order_by(ChatMessage.id)
-            .all()
-        )
         stream_session = _get_chat_session(stream_db, document_id, session_id, allow_archived=False)
-        if stream_session.context_start_message_id > 0:
-            history_rows = [
-                row for row in history_rows if row.id > stream_session.context_start_message_id
-            ]
+        history_rows = None
+
         def persist_agent_checkpoint(html: str) -> None:
             if html:
                 agent_checkpoint_htmls.add(html)
@@ -3876,23 +4270,39 @@ async def _execute_agent_run(
         if article_typography_settings is None:
             article_typography_settings = typography_settings_payload(get_or_create_typography_settings(stream_db))
         budget_prompt = (
-            context_budget_prompt()
+            context_budget_prompt(prompt_cache_enabled=bool(stream_model.prompt_cache_enabled), provider_type=stream_model.provider.provider_type.value, tool_protocol=tool_protocol)
             + "\n\n"
             + article_typography_prompt(article_typography_settings)
             + _layout_reference_context_prompt(layout_reference)
         )
         selection_budget_context = json.dumps(selected_elements, ensure_ascii=False) if selected_elements else ""
+        current_image_attachments = stream_db.query(ChatImageAttachment).filter(
+            ChatImageAttachment.id.in_(image_attachment_ids),
+            ChatImageAttachment.message_id == user_message_id,
+        ).order_by(ChatImageAttachment.created_at).all() if image_attachment_ids else []
+        current_image_attachments = ordered_image_attachments(current_image_attachments, image_attachment_ids)
+        image_generation_context = _agent_image_generation_context(stream_db, user_id, stream_session.image_model_id)
         context_builder = AgentContextBuilder(
             stream_db,
             document_id,
             session_id,
             stream_model,
-            edit_session.workspace(),
+            _agent_context_workspace(edit_session, tool_protocol),
             history_rows,
             budget_prompt,
             user_message,
             selection_budget_context,
+            runtime_context_factory=runtime_context_budget_factory(
+                stream_model, document_title, edit_session.html, selected_elements=selected_elements,
+                history_available=True,
+                image_generation_context=image_generation_context,
+                layout_reference=layout_reference, theme_application=theme_application,
+                theme_reference=theme_reference, attached_templates=attached_templates,
+                article_typography_settings=article_typography_settings, tool_protocol=tool_protocol,
+                loaded_tool_groups=loaded_tool_groups),
             current_image_count=len(image_attachment_ids),
+            current_image_attachments=current_image_attachments,
+            tool_schema_tokens=editor_tool_schema_tokens(stream_model.provider.provider_type.value, bool(layout_reference), bool(theme_application), tool_protocol=tool_protocol, loaded_tool_groups=tuple(loaded_tool_groups)),
             exclude_message_id=user_message_id,
             model_call_tracker_factory=lambda: ModelCallTracker(
                 model_id=model_id,
@@ -3915,7 +4325,7 @@ async def _execute_agent_run(
             )
         prepared_context = await context_builder.prepare(compaction_model)
         if preflight_stats.get("requires_compaction") and prepared_context.stats.get("state") == "compacted":
-            await publish_context_compaction(_context_compaction_event_data(preflight_stats, prepared_context.stats))
+            await publish_context_compaction(_context_compaction_event_data(preflight_stats, prepared_context.stats, prepared_context.memory))
         fallback_data = claim_thinking_capability_fallback_data(model_id, compaction_model)
         if fallback_data is not None:
             await agent_run_manager.publish(run_id, "thinking_capability_fallback", fallback_data)
@@ -3938,6 +4348,10 @@ async def _execute_agent_run(
                     "Agent 将按需读取模板源码，并保留当前文案和图片。"
                 ),
                 "html_changed": False,
+                "model_input": {
+                    "state": "not_sent",
+                    "message": "这是运行开始前的系统预设，不是作为工具结果发送给模型的消息。",
+                },
                 "activity": {
                     "kind": "reference",
                     "summary": (
@@ -3963,6 +4377,7 @@ async def _execute_agent_run(
                     "name": reference_tool["name"],
                     "result": reference_tool["result"],
                     "activity": reference_tool["activity"],
+                    "model_input": reference_tool["model_input"],
                 },
             )
         if theme_application and not resume_state:
@@ -3977,6 +4392,10 @@ async def _execute_agent_run(
                 "status": "success",
                 "result": "已确认主题排版，将在保留正文、链接和图片语义的前提下执行全文替换。",
                 "html_changed": False,
+                "model_input": {
+                    "state": "not_sent",
+                    "message": "这是运行开始前的系统预设，不是作为工具结果发送给模型的消息。",
+                },
                 "activity": {
                     "kind": "theme",
                     "summary": f"已确认主题「{theme_application['theme_name']}」",
@@ -4006,6 +4425,7 @@ async def _execute_agent_run(
                     "name": theme_tool["name"],
                     "result": theme_tool["result"],
                     "activity": theme_tool["activity"],
+                    "model_input": theme_tool["model_input"],
                 },
             )
         completed = False
@@ -4020,6 +4440,7 @@ async def _execute_agent_run(
                 turn_blocks,
                 resumed_question_call_id,
                 resumed_question_answer,
+                model_input_content=str((resume_tool_result or {}).get("content") or ""),
             )
             if timeline_question_tool_id:
                 question_result, question_activity = _user_question_resolution_presentation(resumed_question_answer)
@@ -4031,35 +4452,21 @@ async def _execute_agent_run(
                         "name": "ask_user",
                         "result": question_result,
                         "activity": question_activity,
+                        "model_input": {
+                            "state": "available",
+                            "content": str((resume_tool_result or {}).get("content") or ""),
+                            "truncated": False,
+                        },
                     },
                 )
-        current_image_attachments = (
-            stream_db.query(ChatImageAttachment)
-            .filter(
-                ChatImageAttachment.id.in_(image_attachment_ids),
-                ChatImageAttachment.message_id == user_message_id,
-            )
-            .order_by(ChatImageAttachment.created_at)
-            .all()
-            if image_attachment_ids
-            else []
-        )
         current_user_content = user_message_content(
             stream_db,
             user_message,
             current_image_attachments,
             provider_type=stream_model.provider.provider_type.value,
             include_images=stream_model.is_multimodal,
+            image_limit=prepared_context.stats["image_loading"]["current_inline_count"],
         )
-        selected_image_model = _agent_image_model(
-            stream_db,
-            user_id,
-            stream_session.image_model_id,
-        )
-        image_generation_context = {
-            "image_model_id": selected_image_model.id if selected_image_model else None,
-            "model_name": selected_image_model.display_name if selected_image_model else "管理员默认图片模型",
-        }
         # Attachment hydration starts a new read transaction after the
         # preflight commit.  ``run_agent_loop`` can run for minutes, so end it
         # before entering the graph; every later persistence path owns a
@@ -4082,7 +4489,7 @@ async def _execute_agent_run(
                     active_layout_reference,
                     edit_session,
                     history_workspace,
-                    max(1, int(stream_model.context_compaction_threshold_tokens) - AGENT_TOOL_SCHEMA_RESERVE_TOKENS),
+                    prepared_context.stats["active_context_threshold_tokens"],
                     run_id,
                     ToolOutputStore(document_id=document_id, session_id=session_id, run_id=run_id),
                     theme_application,
@@ -4099,6 +4506,10 @@ async def _execute_agent_run(
                     model_is_multimodal=stream_model.is_multimodal,
                     provider_type=stream_model.provider.provider_type.value,
                     article_typography_settings=article_typography_settings,
+                    prompt_cache_enabled=bool(stream_model.prompt_cache_enabled),
+                    prompt_cache_key=build_agent_prompt_cache_key(stream_model.provider, stream_model, user_id),
+                    tool_protocol=tool_protocol,
+                    loaded_tool_groups=loaded_tool_groups,
                 )
             ):
                 event = evt["event"]
@@ -4191,6 +4602,10 @@ async def _execute_agent_run(
                             "result": None,
                             "html_changed": False,
                             "activity": None,
+                            "model_input": {
+                                "state": "pending",
+                                "message": "工具正在执行，尚未向模型提供结果。",
+                            },
                         }
                         tool_trace.append(tool_entry)
                         log_process_memory(
@@ -4232,6 +4647,8 @@ async def _execute_agent_run(
                         matched_tool["preparing"] = False
                         matched_tool["html_changed"] = bool(data.get("html"))
                         matched_tool["activity"] = data.get("activity")
+                        if isinstance(data.get("model_input"), dict):
+                            matched_tool["model_input"] = data["model_input"]
                     log_process_memory(
                         logger,
                         stage="tool_done",
@@ -4247,28 +4664,27 @@ async def _execute_agent_run(
                         # persistence if the run is cancelled after an edit.
                         latest_html = edit_session.html
                 elif event == "user_question":
-                    question = persist_waiting_question(data)
-                    safe_question = _question_read(question)
-                    if safe_question is None:
-                        raise RuntimeError("待答问题保存失败")
-                    await agent_run_manager.publish(
+                    # Persist all earlier deltas before ownership moves to the
+                    # paused state; non-forced writes are fenced after that.
+                    await agent_run_manager.flush(run_id)
+                    question, question_sequence, question_payload, question_created_at = persist_waiting_question(data)
+                    await agent_run_manager.notify_persisted_event(
                         run_id,
+                        question_sequence,
                         "user_question",
-                        safe_question.model_dump(),
-                        force=True,
+                        question_payload,
+                        occurred_at=question_created_at,
                     )
                     await agent_run_manager.mark_waiting(run_id)
                     schedule_user_question_timeout(question.id)
+                    _pending_question_broker.invalidate(user_id)
                     completed = True
                     break
                 elif event == "context_stats":
                     # 保留初始构建的账本和预算字段；每次工具结果后的独立运行时
                     # 快照会驱动仪表盘，直到下一次模型调用给出提供方实报。
-                    await agent_run_manager.publish(
-                        run_id,
-                        "context_stats",
-                        _merge_runtime_context_stats(prepared_context.stats, data),
-                    )
+                    latest_context_stats = _merge_runtime_context_stats(latest_context_stats or prepared_context.stats, data)
+                    await agent_run_manager.publish(run_id, "context_stats", latest_context_stats)
                     continue
                 elif event == "context_compaction":
                     # Runtime compression is a user-visible process step. Keep
@@ -4283,6 +4699,8 @@ async def _execute_agent_run(
                     detail = str(data.get("message", "Agent 执行失败"))
                     if isinstance(data.get("context_events"), list):
                         terminal_context_events = data["context_events"]
+                    if isinstance(data.get("runtime_compaction"), dict):
+                        terminal_runtime_compaction = data["runtime_compaction"]
                     if data.get("rollback_html"):
                         # A theme candidate may already have emitted edit
                         # events. Strict validation is a terminal gate, so
@@ -4318,6 +4736,7 @@ async def _execute_agent_run(
                         runtime_compaction=data.get("runtime_compaction") if isinstance(data.get("runtime_compaction"), dict) else None,
                     )
                     logger.warning("agent_trace run=%s final_publish_start", run_id)
+                    await publish_terminal_context()
                     await agent_run_manager.publish(run_id, "final", terminal_data)
                     await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
                     logger.warning("agent_trace run=%s terminal_marked status=%s", run_id, terminal_data["run_status"])
@@ -4329,7 +4748,7 @@ async def _execute_agent_run(
             if context_error:
                 retried_for_context = True
                 retry_budget_prompt = (
-                    context_budget_prompt()
+                    context_budget_prompt(prompt_cache_enabled=bool(stream_model.prompt_cache_enabled), provider_type=stream_model.provider.provider_type.value, tool_protocol=tool_protocol)
                     + "\n\n"
                     + article_typography_prompt(article_typography_settings)
                     + _layout_reference_context_prompt(layout_reference)
@@ -4339,12 +4758,22 @@ async def _execute_agent_run(
                     document_id,
                     session_id,
                     stream_model,
-                    edit_session.workspace(),
+                    _agent_context_workspace(edit_session, tool_protocol),
                     history_rows,
                     retry_budget_prompt,
                     user_message,
                     selection_budget_context,
+                    runtime_context_factory=runtime_context_budget_factory(
+                        stream_model, document_title, edit_session.html, selected_elements=selected_elements,
+                        history_available=True,
+                        layout_reference=active_layout_reference, theme_application=theme_application,
+                        theme_reference=theme_reference, attached_templates=attached_templates,
+                        image_generation_context=image_generation_context,
+                        article_typography_settings=article_typography_settings, tool_protocol=tool_protocol,
+                        loaded_tool_groups=loaded_tool_groups),
                     current_image_count=len(image_attachment_ids),
+                    current_image_attachments=current_image_attachments,
+                    tool_schema_tokens=editor_tool_schema_tokens(stream_model.provider.provider_type.value, bool(layout_reference), bool(theme_application), tool_protocol=tool_protocol, loaded_tool_groups=tuple(loaded_tool_groups)),
                     budget_multiplier=0.5,
                     exclude_message_id=user_message_id,
                     model_call_tracker_factory=lambda: ModelCallTracker(
@@ -4361,8 +4790,14 @@ async def _execute_agent_run(
                 )
                 retry_preflight_stats = retry_builder.snapshot()
                 prepared_context = await retry_builder.prepare(compaction_model)
+                current_user_content = user_message_content(
+                    stream_db, user_message, current_image_attachments,
+                    provider_type=stream_model.provider.provider_type.value,
+                    include_images=stream_model.is_multimodal,
+                    image_limit=prepared_context.stats["image_loading"]["current_inline_count"],
+                )
                 if retry_preflight_stats.get("requires_compaction") and prepared_context.stats.get("state") == "compacted":
-                    await publish_context_compaction(_context_compaction_event_data(retry_preflight_stats, prepared_context.stats))
+                    await publish_context_compaction(_context_compaction_event_data(retry_preflight_stats, prepared_context.stats, prepared_context.memory))
                 fallback_data = claim_thinking_capability_fallback_data(model_id, compaction_model)
                 if fallback_data is not None:
                     await agent_run_manager.publish(run_id, "thinking_capability_fallback", fallback_data)
@@ -4382,6 +4817,7 @@ async def _execute_agent_run(
                 AgentRunStatus.CANCELLED,
                 partial_content("已停止本轮操作。"),
                 context_events=terminal_context_events,
+                runtime_compaction=terminal_runtime_compaction,
             )
         except Exception as persist_exc:  # noqa: BLE001 - SSE still needs a terminal event.
             logger.exception("agent_trace run=%s cancellation_persist_failed detail=%s", run_id, persist_exc)
@@ -4390,6 +4826,7 @@ async def _execute_agent_run(
                 partial_content("已停止本轮操作，终态保存暂时不可用，未能确认修改是否已保存。"),
                 str(persist_exc),
             )
+        await publish_terminal_context()
         await agent_run_manager.publish(run_id, "final", terminal_data)
         await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
     except Exception as exc:  # noqa: BLE001
@@ -4403,6 +4840,7 @@ async def _execute_agent_run(
                 error_message=message,
                 compliance=terminal_compliance,
                 context_events=terminal_context_events,
+                runtime_compaction=terminal_runtime_compaction,
             )
         except Exception as persist_exc:  # noqa: BLE001 - never leave the browser in running state.
             logger.exception("agent_trace run=%s failure_persist_failed detail=%s", run_id, persist_exc)
@@ -4412,6 +4850,7 @@ async def _execute_agent_run(
                 f"{message}; 终态保存失败: {persist_exc}",
             )
         await agent_run_manager.publish(run_id, "error", {"message": public_message})
+        await publish_terminal_context()
         await agent_run_manager.publish(run_id, "final", terminal_data)
         await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
         logger.warning("agent_trace run=%s failure_terminal_marked status=%s", run_id, terminal_data["run_status"])

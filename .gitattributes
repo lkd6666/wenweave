@@ -1,3 +1,6 @@
 # Local Vue reference files are retained in source control but excluded from release archives.
 /AiChat.vue export-ignore
 /AssistantTurnTimeline.vue export-ignore
+
+# Preserve checksum-verified tokenizer bytes and omit generated table diffs.
+backend/app/assets/tokenizers/*.tiktoken -text -diff

@@ -52,6 +52,7 @@ BLOCK_TAGS = {
     "ul",
 }
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+IMAGE_NODE_TAGS = {"img", "image"}
 MAX_MAP_BLOCKS = 72
 MAX_SEARCH_RESULTS = 12
 MAX_IMAGE_RESULTS = 12
@@ -391,7 +392,7 @@ class HtmlWorkspace:
                     heading_path=tuple(heading_stack),
                     text=text,
                     attributes=attributes,
-                    has_image="<img" in safe.lower(),
+                    has_image=("<img" in safe.lower() or "<image" in safe.lower()),
                     has_table="<table" in safe.lower(),
                     expected_hash=expected_hash,
                     searchable=" ".join((node.tag, path, attributes, " ".join(heading_stack), text)).lower(),
@@ -634,10 +635,20 @@ class HtmlWorkspace:
             ancestor = ancestor.parent
         return ""
 
+    @staticmethod
+    def _image_source(node: HtmlNode) -> tuple[str, str]:
+        if node.tag == "img":
+            return "src", node.attrs.get("src", "").strip()
+        for attribute in ("href", "xlink:href"):
+            value = node.attrs.get(attribute, "").strip()
+            if value:
+                return attribute, value
+        return "href", ""
+
     def _image_neighbours(self, block: HtmlBlock | None, image_starts: list[int] | None = None) -> tuple[str, str]:
         if block is None:
             return "", ""
-        image_starts = image_starts or [node.start for node in self._nodes if node.tag == "img"]
+        image_starts = image_starts or [node.start for node in self._nodes if node.tag in IMAGE_NODE_TAGS]
         image_index = image_starts.index(block.start) if block.start in image_starts else -1
         previous_image_start = image_starts[image_index - 1] if image_index > 0 else -1
         next_image_start = image_starts[image_index + 1] if image_index >= 0 and image_index + 1 < len(image_starts) else len(self.source_html)
@@ -747,12 +758,12 @@ class HtmlWorkspace:
             raise WorkspaceError("图片搜索数量无效", {"limit": limit})
 
         blocks_by_start = {block.start: block for block in self.blocks}
-        image_starts = [node.start for node in self._nodes if node.tag == "img"]
+        image_starts = [node.start for node in self._nodes if node.tag in IMAGE_NODE_TAGS]
         images: list[dict] = []
         for node in self._nodes:
-            if node.tag != "img":
+            if node.tag not in IMAGE_NODE_TAGS:
                 continue
-            source = node.attrs.get("src", "").strip()
+            source_attribute, source = self._image_source(node)
             if not source:
                 source_kind = "missing"
                 fingerprint = ""
@@ -769,6 +780,8 @@ class HtmlWorkspace:
             before_text, after_text = self._image_neighbours(block, image_starts)
             item = {
                 "slot": len(images) + 1,
+                "kind": "html-image" if node.tag == "img" else "svg-image",
+                "source_attribute": source_attribute,
                 "source_kind": source_kind,
                 "source_fingerprint": fingerprint,
                 "url_host": host,
@@ -827,7 +840,7 @@ class HtmlWorkspace:
         stable: dict[str, str] = {}
         for raw_key, raw_value in attrs.items():
             key = raw_key.lower().strip()
-            if key not in {"id", "src", "srcset", "href", "name"} and not key.startswith("data-"):
+            if key not in {"id", "src", "srcset", "href", "xlink:href", "name"} and not key.startswith("data-"):
                 continue
             value = redact_inline_data_for_identity(str(raw_value)).strip()
             if value:
@@ -983,7 +996,7 @@ class HtmlWorkspace:
     def read(
         self,
         block_ids: list[str],
-        cursor: int = 0,
+        cursor: int | str = 0,
         tool_result_max_tokens: int | None = None,
     ) -> dict:
         if not block_ids:
@@ -997,14 +1010,33 @@ class HtmlWorkspace:
                     "suggestion": "请把 block_id 分成多次 read_blocks 调用。",
                 },
             )
-        if not isinstance(cursor, int) or cursor < 0 or cursor >= len(block_ids):
+        request_hash = hashlib.sha256(json.dumps(block_ids, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+        start_index = cursor
+        fragment_offset = 0
+        if isinstance(cursor, str):
+            parts = cursor.split(":", 4)
+            if len(parts) == 5 and parts[0] == "v1" and parts[2].isdigit() and parts[3].isdigit():
+                _, revision, index_text, offset_text, cursor_request_hash = parts
+                start_index = int(index_text)
+                fragment_offset = int(offset_text)
+                if (
+                    revision != self.revision
+                    or not 0 <= start_index < len(block_ids)
+                    or request_hash != cursor_request_hash
+                    or fragment_offset <= 0
+                ):
+                    raise WorkspaceError("读取游标已失效，请从当前文档重新读取排版块", {"cursor": cursor})
+            else:
+                raise WorkspaceError("读取游标无效", {"cursor": cursor})
+        if type(start_index) is not int or not 0 <= start_index < len(block_ids):
             raise WorkspaceError(
                 "读取游标无效",
                 {"cursor": cursor, "requested_block_count": len(block_ids)},
             )
 
-        def payload(items: list[dict], next_cursor: int | None) -> dict:
-            remaining = len(block_ids) - (next_cursor if next_cursor is not None else len(block_ids))
+        def payload(items: list[dict], next_cursor: int | str | None) -> dict:
+            next_index = int(next_cursor.split(":", 4)[2]) if isinstance(next_cursor, str) else next_cursor
+            remaining = len(block_ids) - (next_index if next_index is not None else len(block_ids))
             result = {
                 "revision": self.revision,
                 "requested_block_count": len(block_ids),
@@ -1017,14 +1049,61 @@ class HtmlWorkspace:
                 result.update(
                     {
                         "truncated": True,
-                        "next_step": "请使用相同 block_ids 和 next_cursor 继续读取剩余完整排版块。",
+                        "next_step": (
+                            "请使用相同 block_ids 和 next_cursor 继续读取源码片段；片段不是完整 HTML，需按位置拼接。"
+                            if isinstance(next_cursor, str)
+                            else "请使用相同 block_ids 和 next_cursor 继续读取剩余排版块。"
+                        ),
                     }
                 )
             return result
 
         budget = self._result_token_limit(tool_result_max_tokens)
+
+        def fragment_page(index: int, block: HtmlBlock, source: str, offset: int) -> dict:
+            if offset >= len(source):
+                raise WorkspaceError("读取游标超出排版块源码范围", {"cursor": cursor, "block_id": block.block_id})
+
+            def candidate(length: int) -> dict:
+                end = offset + length
+                next_cursor = (
+                    f"v1:{self.revision}:{index}:{end}:{request_hash}"
+                    if end < len(source)
+                    else index + 1 if index + 1 < len(block_ids) else None
+                )
+                item = {
+                    "block_id": block.block_id,
+                    "tag": block.tag,
+                    "path": block.path,
+                    "text": block.text[:80],
+                    "expected_hash": block.expected_hash,
+                    "html_fragment": source[offset:end],
+                    "fragment_start": offset,
+                    "fragment_end": end,
+                    "fragment_total_chars": len(source),
+                    "complete_block": False,
+                }
+                return payload([item], next_cursor)
+
+            low, high = 1, len(source) - offset
+            best: dict | None = None
+            while low <= high:
+                middle = (low + high) // 2
+                page = candidate(middle)
+                if estimate_tokens(json.dumps(page, ensure_ascii=False, separators=(",", ":"))) <= budget:
+                    best = page
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is None:
+                raise WorkspaceError(
+                    "工具预览预算不足以返回排版块源码片段",
+                    {"tool_result_max_tokens": budget, "block_id": block.block_id},
+                )
+            return best
+
         blocks: list[dict] = []
-        for index, block_id in enumerate(block_ids[cursor:], start=cursor):
+        for index, block_id in enumerate(block_ids[start_index:], start=start_index):
             block = self._blocks_by_id.get(block_id)
             if not block:
                 details: dict[str, str] = {
@@ -1036,6 +1115,8 @@ class HtmlWorkspace:
                     details["suggested_query"] = hint
                 raise WorkspaceError("排版块已变化，请按目标正文关键词调用 search_html 重新定位", details)
             source = self._redact(self.source_html[block.start : block.end])
+            if fragment_offset:
+                return fragment_page(index, block, source, fragment_offset)
             candidate = {**block.map_item(), "html": source}
             next_cursor = index + 1 if index + 1 < len(block_ids) else None
             candidate_payload = payload([*blocks, candidate], next_cursor)
@@ -1044,15 +1125,7 @@ class HtmlWorkspace:
                 continue
             if blocks:
                 return payload(blocks, index)
-            raise WorkspaceError(
-                "单个排版块源码超过当前工具预览预算，未返回不完整 HTML",
-                {
-                    "estimated_tokens": estimate_tokens(json.dumps(candidate_payload, ensure_ascii=False, separators=(",", ":"))),
-                    "tool_result_max_tokens": budget,
-                    "block_id": block_id,
-                    "suggestion": "请搜索更细粒度的子块后再读取；系统不会返回不完整 HTML。",
-                },
-            )
+            return fragment_page(index, block, source, 0)
         return payload(blocks, None)
 
     def apply_patch(self, revision: str, operations: list[dict], restore: Callable[[str], str]) -> tuple[str, dict]:

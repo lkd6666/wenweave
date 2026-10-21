@@ -86,7 +86,7 @@ for (const [index, entry] of entries.entries()) {
 
 const packageJson = JSON.parse(await readFile(resolve(frontendRoot, 'package.json'), 'utf8'))
 const extensionVersion = process.env.LAYOUT_CAPTURE_EXTENSION_VERSION
-  || (packageJson.version === '0.0.0' ? '1.1.0' : packageJson.version)
+  || (packageJson.version === '0.0.0' ? '1.1.3' : packageJson.version)
 const versionParts = extensionVersion.split('.')
 if (versionParts.length < 1
   || versionParts.length > 4
@@ -119,6 +119,14 @@ const manifest = {
 await writeFile(resolve(outputDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
 await cp(resolve(extensionRoot, 'popup.html'), resolve(outputDir, 'popup.html'))
 await cp(resolve(extensionRoot, 'popup.css'), resolve(outputDir, 'popup.css'))
+const dependencyNotices = []
+for (const dependency of ['specificity', 'css-tree', 'mdn-data', 'source-map-js']) {
+  const dependencyRoot = resolve(frontendRoot, 'node_modules', dependency)
+  const dependencyPackage = JSON.parse(await readFile(resolve(dependencyRoot, 'package.json'), 'utf8'))
+  const license = await readFile(resolve(dependencyRoot, 'LICENSE'), 'utf8')
+  dependencyNotices.push(`${dependency} ${dependencyPackage.version}\n${license}`)
+}
+await writeFile(resolve(outputDir, 'THIRD_PARTY_LICENSES.txt'), dependencyNotices.join('\n\n'), 'utf8')
 
 const zip = new JSZip()
 for (const absolutePath of await collectFiles(outputDir)) {

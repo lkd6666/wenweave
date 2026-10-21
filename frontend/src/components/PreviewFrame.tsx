@@ -1,6 +1,6 @@
-import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
-import { Button, ColorPicker, Drawer, InputNumber, Popover, Segmented, Select, Tooltip, message } from 'antd'
+import { Button, ColorPicker, Drawer, Image, InputNumber, Modal, Popover, Segmented, Select, Spin, Tooltip, message } from 'antd'
 import BarsOutlined from '@ant-design/icons/BarsOutlined'
 import {
   AlignCenterOutlined,
@@ -23,6 +23,7 @@ import {
   StarOutlined,
   UndoOutlined,
   UnderlineOutlined,
+  ZoomInOutlined,
 } from '@ant-design/icons'
 import type { PreviewImageTarget, SelectedElementContext } from '../types'
 import {
@@ -38,8 +39,11 @@ import {
   stripBlockEditingMarkup,
 } from '../utils/blockEditing'
 import { sanitizeSelectedElement } from '../utils/selectedElements'
+import { collectSvgImageLayers } from '../utils/svgImageLayers'
+import type { SvgImageLayer } from '../utils/svgImageLayers'
 import { frameDocumentWithNewWindowLinks, markLinksToOpenInNewWindow, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 import { ARTICLE_RENDER_CSS, ARTICLE_RENDER_ROOT_CLASS, ARTICLE_RENDER_VIEWPORT } from '../utils/articleFrame'
+import { buildDarkModePreviewDocument, DARK_MODE_PREVIEW_SANDBOX, isDarkModePreviewHeightMessage } from '../utils/darkModePreview'
 import { documentsApi } from '../api/documents'
 import ImageCropModal from './ImageCropModal'
 import type { CropRect } from '../utils/imageCrop'
@@ -70,6 +74,7 @@ interface PreviewFrameProps {
   active: boolean
   mode: PreviewMode
   brightness: number
+  darkMode: boolean
   compact: boolean
   selectedElements: SelectedElementContext[]
   onHtmlChange: (html: string) => void
@@ -93,6 +98,9 @@ const BLOCK_SELECTOR = TEXT_BLOCK_SELECTOR
 const SYSTEM_FONT_FAMILY = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif"
 const MIXED_VALUE = '__mixed__'
 const TEXT_TOOLBAR_GAP = 10
+const DARK_MODE_PREVIEW_TRANSITION_MS = 180
+const PREVIEW_LOADING_DELAY_MS = 120
+const PREVIEW_LOADING_TIMEOUT_MS = 12_000
 // Give the pointer enough time to travel from the content to the drag handle.
 // The handle sits just outside the iframe content, so a short timeout makes it
 // disappear before the user can reach it.
@@ -105,6 +113,15 @@ const FONT_OPTIONS = [
   { value: 'Arial', label: 'Arial' },
 ]
 const LINE_HEIGHT_OPTIONS = ['1', '1.2', '1.4', '1.5', '1.6', '1.8', '2', '2.4']
+
+function createDarkModePreviewToken(): string {
+  const values = new Uint32Array(4)
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(values)
+    return Array.from(values, (value) => value.toString(36)).join('')
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`
+}
 
 function isTransferablePastedImageSource(value: string): boolean {
   const source = value.trim().toLowerCase()
@@ -262,6 +279,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   active,
   mode,
   brightness,
+  darkMode,
   compact,
   selectedElements,
   onHtmlChange,
@@ -278,11 +296,21 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   onExternalImagesPasted,
 }, ref) {
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  const darkModeIframeRef = useRef<HTMLIFrameElement>(null)
   const shellRef = useRef<HTMLDivElement>(null)
   const textToolbarRef = useRef<HTMLDivElement>(null)
   const blockToolbarRef = useRef<HTMLDivElement>(null)
   const resizeObserverRef = useRef<ResizeObserver | null>(null)
-  const selectedNodesRef = useRef<HTMLElement[]>([])
+  const heightFrameRef = useRef<number | null>(null)
+  const heightMeasurementPendingRef = useRef(false)
+  const previewLoadGenerationRef = useRef(0)
+  const previewLoadingDelayRef = useRef<number | null>(null)
+  const previewLoadingTimeoutRef = useRef<number | null>(null)
+  const previewLoadingFrameRef = useRef<number | null>(null)
+  const previewResourceCleanupRef = useRef<(() => void) | null>(null)
+  const activeRef = useRef(active)
+  const selectedNodesRef = useRef<Element[]>([])
+  const svgPickerCleanupRef = useRef<(() => void) | null>(null)
   const selectedBlocksRef = useRef<HTMLElement[]>([])
   const activeBlockRef = useRef<HTMLElement | null>(null)
   const activeCaretBlockRef = useRef<HTMLElement | null>(null)
@@ -338,9 +366,14 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const pendingExternalImagePasteRef = useRef(false)
   const inputTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [contentHeight, setContentHeight] = useState(240)
+  const [darkModeContentHeight, setDarkModeContentHeight] = useState(240)
+  const [previewLoading, setPreviewLoading] = useState(true)
   const [textToolbarPosition, setTextToolbarPosition] = useState<{ top: number; left: number } | null>(null)
   const [blockToolbarPosition, setBlockToolbarPosition] = useState<{ top: number; left: number } | null>(null)
   const [blockSelectionCount, setBlockSelectionCount] = useState(0)
+  const [blockSvgImageCount, setBlockSvgImageCount] = useState(0)
+  const [svgImageLayers, setSvgImageLayers] = useState<SvgImageLayer[]>([])
+  const [zoomedSvgImage, setZoomedSvgImage] = useState<{ layer: SvgImageLayer; index: number } | null>(null)
   const [blockStyle, setBlockStyle] = useState<BlockStyleValues>(EMPTY_BLOCK_STYLE)
   const [textToolbarColor, setTextToolbarColor] = useState<string | null>('#1f1f1f')
   const [textToolbarFontFamily, setTextToolbarFontFamily] = useState(SYSTEM_FONT_FAMILY)
@@ -361,6 +394,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const [mobileEditorPanel, setMobileEditorPanel] = useState<MobileEditorPanel>(null)
 
   modeRef.current = mode
+  activeRef.current = active
   compactRef.current = compact
   mobileEditTargetRef.current = mobileEditTarget
   mobileBlockMultiSelectRef.current = mobileBlockMultiSelect
@@ -379,12 +413,66 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   onAiImageActionRef.current = onAiImageAction
   onExternalImagesPastedRef.current = onExternalImagesPasted
 
+  const activeDarkModePreviewDocument = useMemo(() => {
+    if (!darkMode) return null
+    const token = createDarkModePreviewToken()
+    return {
+      token,
+      srcDoc: buildDarkModePreviewDocument({ html: html || EMPTY_PREVIEW_HTML, token }),
+    }
+  }, [darkMode, html])
+  const [retainedDarkModePreviewDocument, setRetainedDarkModePreviewDocument] = useState<{
+    token: string
+    srcDoc: string
+  } | null>(null)
+  const [darkModeReadyToken, setDarkModeReadyToken] = useState<string | null>(null)
+  const darkModePreviewDocument = activeDarkModePreviewDocument ?? retainedDarkModePreviewDocument
+  const darkModePreviewVisible = Boolean(
+    darkMode
+    && activeDarkModePreviewDocument
+    && darkModeReadyToken === activeDarkModePreviewDocument.token,
+  )
+  const displayedPreviewHeight = darkModePreviewVisible ? darkModeContentHeight : contentHeight
+
+  useLayoutEffect(() => {
+    if (activeDarkModePreviewDocument) setRetainedDarkModePreviewDocument(activeDarkModePreviewDocument)
+  }, [activeDarkModePreviewDocument])
+
+  useEffect(() => {
+    if (darkMode || !retainedDarkModePreviewDocument) return
+    const timer = window.setTimeout(() => setRetainedDarkModePreviewDocument(null), DARK_MODE_PREVIEW_TRANSITION_MS)
+    return () => window.clearTimeout(timer)
+  }, [darkMode, retainedDarkModePreviewDocument])
+
+  // Register before the browser gets a chance to deliver the srcDoc frame's
+  // initial postMessage; a regular effect can miss that first height report.
+  useLayoutEffect(() => {
+    if (!darkMode || !activeDarkModePreviewDocument) return
+    setDarkModeContentHeight(contentHeight)
+    const expectedToken = activeDarkModePreviewDocument.token
+    const receiveHeight = (event: MessageEvent<unknown>) => {
+      if (event.source !== darkModeIframeRef.current?.contentWindow) return
+      if (!isDarkModePreviewHeightMessage(event.data) || event.data.token !== expectedToken) return
+      const nextHeight = Math.ceil(event.data.height)
+      if (nextHeight < 160 || nextHeight > 100_000) return
+      setDarkModeContentHeight((current) => current === nextHeight ? current : nextHeight)
+      setDarkModeReadyToken(expectedToken)
+    }
+    window.addEventListener('message', receiveHeight)
+    return () => window.removeEventListener('message', receiveHeight)
+  }, [activeDarkModePreviewDocument, contentHeight, darkMode])
+
   useEffect(
     () => () => {
       resizeObserverRef.current?.disconnect()
       if (inputTimerRef.current) clearTimeout(inputTimerRef.current)
       if (textToolbarTimerRef.current) clearTimeout(textToolbarTimerRef.current)
       if (blockHandleTimerRef.current) clearTimeout(blockHandleTimerRef.current)
+      if (previewLoadingDelayRef.current) clearTimeout(previewLoadingDelayRef.current)
+      if (previewLoadingTimeoutRef.current) clearTimeout(previewLoadingTimeoutRef.current)
+      if (previewLoadingFrameRef.current !== null) window.cancelAnimationFrame(previewLoadingFrameRef.current)
+      previewResourceCleanupRef.current?.()
+      svgPickerCleanupRef.current?.()
       imageActionRef.current?.remove()
       blockHandleRef.current?.remove()
       blockDropIndicatorRef.current?.remove()
@@ -452,6 +540,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
   useEffect(() => {
     updateEditingState()
+    closeSvgImagePicker()
     if (mode !== 'edit') {
       pendingExternalImagePasteRef.current = false
       onCaretAvailabilityChangeRef.current(false)
@@ -598,27 +687,136 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   }
 
   const syncHeight = () => {
-    const document = iframeRef.current?.contentDocument
-    if (!document) return
-    const body = document.body
-    const view = document.defaultView
-    const bodyTop = body.getBoundingClientRect().top
-    const bodyPaddingBottom = Number.parseFloat(view?.getComputedStyle(body).paddingBottom ?? '0') || 0
-    let contentBottom = 0
+    heightMeasurementPendingRef.current = true
+    if (!activeRef.current || document.visibilityState !== 'visible' || heightFrameRef.current !== null) return
+    heightFrameRef.current = window.requestAnimationFrame(() => {
+      heightFrameRef.current = null
+      if (!activeRef.current || document.visibilityState !== 'visible') return
+      heightMeasurementPendingRef.current = false
+      const frameDocument = iframeRef.current?.contentDocument
+      if (!frameDocument) return
+      const body = frameDocument.body
+      const view = frameDocument.defaultView
+      const bodyTop = body.getBoundingClientRect().top
+      const bodyPaddingBottom = Number.parseFloat(view?.getComputedStyle(body).paddingBottom ?? '0') || 0
+      let contentBottom = 0
 
-    // scrollHeight is never smaller than an iframe's viewport. After a full
-    // rewrite replaces a long article with a short one, using it would retain
-    // the old iframe height and leave a large blank area at the bottom.
-    for (const element of body.querySelectorAll<HTMLElement>('*')) {
-      if (element.dataset.previewImageAction || view?.getComputedStyle(element).position === 'fixed') continue
-      const bounds = element.getBoundingClientRect()
-      if (bounds.width || bounds.height) contentBottom = Math.max(contentBottom, bounds.bottom - bodyTop)
-    }
-    const height = Math.max(160, contentBottom + bodyPaddingBottom)
-    // Keep the iframe a few pixels taller than its measured document so the
-    // browser never creates a second scrollbar because of rounding.
-    setContentHeight(Math.ceil(height) + 2)
+      // scrollHeight is never smaller than an iframe's viewport. After a full
+      // rewrite replaces a long article with a short one, using it would retain
+      // the old iframe height and leave a large blank area at the bottom.
+      for (const element of body.querySelectorAll<HTMLElement>('*')) {
+        if (element.dataset.previewImageAction || view?.getComputedStyle(element).position === 'fixed') continue
+        const bounds = element.getBoundingClientRect()
+        if (bounds.width || bounds.height) contentBottom = Math.max(contentBottom, bounds.bottom - bodyTop)
+      }
+      const height = Math.max(160, contentBottom + bodyPaddingBottom)
+      const nextHeight = Math.ceil(height) + 2
+      // Keep the iframe a few pixels taller than its measured document so the
+      // browser never creates a second scrollbar because of rounding.
+      setContentHeight((current) => current === nextHeight ? current : nextHeight)
+    })
   }
+
+  const clearPreviewLoadTracking = () => {
+    if (previewLoadingDelayRef.current) {
+      window.clearTimeout(previewLoadingDelayRef.current)
+      previewLoadingDelayRef.current = null
+    }
+    if (previewLoadingTimeoutRef.current) {
+      window.clearTimeout(previewLoadingTimeoutRef.current)
+      previewLoadingTimeoutRef.current = null
+    }
+    if (previewLoadingFrameRef.current !== null) {
+      window.cancelAnimationFrame(previewLoadingFrameRef.current)
+      previewLoadingFrameRef.current = null
+    }
+    previewResourceCleanupRef.current?.()
+    previewResourceCleanupRef.current = null
+  }
+
+  const finishPreviewLoading = (generation: number) => {
+    if (generation !== previewLoadGenerationRef.current) return
+    clearPreviewLoadTracking()
+    previewLoadingFrameRef.current = window.requestAnimationFrame(() => {
+      previewLoadingFrameRef.current = null
+      if (generation === previewLoadGenerationRef.current) setPreviewLoading(false)
+    })
+  }
+
+  const trackPreviewResources = (generation: number) => {
+    const frameDocument = iframeRef.current?.contentDocument
+    const body = frameDocument?.body
+    if (!frameDocument || !body) {
+      finishPreviewLoading(generation)
+      return
+    }
+
+    let remaining = 1
+    const listeners: Array<() => void> = []
+    const settle = () => {
+      remaining -= 1
+      if (remaining === 0) finishPreviewLoading(generation)
+    }
+    const settleResource = () => {
+      syncHeight()
+      settle()
+    }
+
+    for (const image of body.querySelectorAll<HTMLImageElement>('img')) {
+      if (image.complete) continue
+      remaining += 1
+      const onSettled = () => settleResource()
+      image.addEventListener('load', onSettled, { once: true })
+      image.addEventListener('error', onSettled, { once: true })
+      listeners.push(() => {
+        image.removeEventListener('load', onSettled)
+        image.removeEventListener('error', onSettled)
+      })
+    }
+
+    const fonts = frameDocument.fonts
+    if (fonts?.ready) {
+      remaining += 1
+      void fonts.ready.then(settleResource, settleResource)
+    }
+
+    previewResourceCleanupRef.current = () => listeners.forEach((remove) => remove())
+    syncHeight()
+    window.requestAnimationFrame(settle)
+  }
+
+  const startPreviewLoading = (immediate: boolean) => {
+    previewLoadGenerationRef.current += 1
+    const generation = previewLoadGenerationRef.current
+    clearPreviewLoadTracking()
+    if (immediate) {
+      setPreviewLoading(true)
+    } else {
+      previewLoadingDelayRef.current = window.setTimeout(() => {
+        if (generation === previewLoadGenerationRef.current) setPreviewLoading(true)
+      }, PREVIEW_LOADING_DELAY_MS)
+    }
+    previewLoadingTimeoutRef.current = window.setTimeout(
+      () => finishPreviewLoading(generation),
+      PREVIEW_LOADING_TIMEOUT_MS,
+    )
+    return generation
+  }
+
+  useEffect(() => {
+    const resumeMeasurement = () => {
+      if (document.visibilityState === 'visible' && heightMeasurementPendingRef.current) syncHeight()
+    }
+    document.addEventListener('visibilitychange', resumeMeasurement)
+    if (active) syncHeight()
+    return () => {
+      document.removeEventListener('visibilitychange', resumeMeasurement)
+      if (heightFrameRef.current !== null) {
+        window.cancelAnimationFrame(heightFrameRef.current)
+        heightFrameRef.current = null
+      }
+    }
+  }, [active])
 
   const resetMobileEditingUi = () => {
     mobileEditTargetRef.current = 'text'
@@ -632,6 +830,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const replacePreviewBody = (nextHtml: string) => {
     const body = iframeRef.current?.contentDocument?.body
     if (!body) return false
+    closeSvgImagePicker()
     const previousScrollTop = shellRef.current?.scrollTop ?? 0
     clearDomSelection()
     clearBlockSelection()
@@ -647,10 +846,11 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     onActiveImageChangeRef.current(null)
     activeCaretBlockRef.current = null
     resetMobileEditingUi()
+    const previewLoadGeneration = startPreviewLoading(false)
     body.innerHTML = nextHtml || EMPTY_PREVIEW_HTML
     markLinksToOpenInNewWindow(body)
     renderedHtmlRef.current = nextHtml
-    syncHeight()
+    trackPreviewResources(previewLoadGeneration)
     window.requestAnimationFrame(() => {
       const shell = shellRef.current
       if (shell) shell.scrollTop = previousScrollTop
@@ -672,7 +872,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     replacePreviewBody(html)
   }, [active, html])
 
-  const cleanClone = (element: HTMLElement) => {
+  const cleanClone = (element: Element) => {
     const clone = element.cloneNode(true) as HTMLElement
     clone.classList.remove('ai-element-selected')
     clone.querySelectorAll('.ai-element-selected').forEach((node) => node.classList.remove('ai-element-selected'))
@@ -791,9 +991,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return true
   }
 
-  const makeSelector = (element: HTMLElement, body: HTMLElement) => {
+  const makeSelector = (element: Element, body: HTMLElement) => {
     const segments: string[] = []
-    let current: HTMLElement | null = element
+    let current: Element | null = element
     while (current && current !== body) {
       const tag = current.tagName.toLowerCase()
       const siblings = Array.from(current.parentElement?.children ?? []).filter((node) => node.tagName === current?.tagName)
@@ -803,18 +1003,18 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return segments.join(' > ')
   }
 
-  const selectionStableAttributes = (element: HTMLElement) => {
+  const selectionStableAttributes = (element: Element) => {
     const attributes: Record<string, string> = {}
     element.getAttributeNames().forEach((name) => {
       const key = name.toLowerCase()
-      if (!/^(id|src|srcset|href|name|data-[a-z0-9_-]+)$/.test(key)) return
+      if (!/^(id|src|srcset|href|xlink:href|name|data-[a-z0-9_-]+)$/.test(key)) return
       const value = element.getAttribute(name)
       if (value) attributes[key] = value
     })
     return attributes
   }
 
-  const selectionFingerprintText = (clone: HTMLElement) => {
+  const selectionFingerprintText = (clone: Element) => {
     // Match the source-side parser's text normalisation. `textContent` alone
     // joins adjacent inline nodes, while replacing tags with whitespace keeps
     // a span/a selection stable across browser and source parsing.
@@ -823,41 +1023,50 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     return (container.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 1000)
   }
 
-  const selectionSiblingIndex = (element: HTMLElement) => {
+  const selectionSiblingIndex = (element: Element) => {
     const siblings = Array.from(element.parentElement?.children ?? [])
       .filter((node) => node.tagName === element.tagName)
     const index = siblings.indexOf(element)
     return index >= 0 ? index + 1 : 0
   }
 
-  const selectionTarget = (element: HTMLElement, body: HTMLElement): HTMLElement | null => {
+  const selectionTarget = (element: Element, body: HTMLElement): Element | null => {
     const svg = element.closest('svg')
-    if (!svg || !body.contains(svg)) return element
+    if (svg && body.contains(svg)) return svg
 
-    // SVG 的 rect/path/g 往往只是绘制层，编辑意图通常属于外层卡片或段落。
-    const container = svg.closest('section, article, figure, li, blockquote')
-    if (container && container !== body) return container as HTMLElement
-    const parent = svg.parentElement
-    return parent && parent !== body ? parent : null
+    const image = element.closest('img, image')
+    if (image && body.contains(image)) return image
+    return element
   }
 
-  const selectionContext = (element: HTMLElement, body: HTMLElement): SelectedElementContext => {
+  const selectionContext = (element: Element, body: HTMLElement): SelectedElementContext => {
     const clone = cleanClone(element)
     const selector = makeSelector(element, body)
     const parent = element.parentElement && element.parentElement !== body ? element.parentElement : null
     const text = (clone.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 2000)
     const fingerprintText = selectionFingerprintText(clone)
+    const tagName = element.tagName.toLowerCase()
+    const isImage = tagName === 'img' || tagName === 'image'
+    const sourceAttribute = tagName === 'img'
+      ? 'src'
+      : element.getAttribute('href')?.trim()
+        ? 'href'
+        : element.getAttribute('xlink:href')?.trim()
+          ? 'xlink:href'
+          : undefined
     return sanitizeSelectedElement({
       selector,
-      tag_name: element.tagName.toLowerCase(),
+      tag_name: tagName,
       html: clone.outerHTML,
       text,
+      kind: isImage ? 'image' : 'element',
+      source_attribute: sourceAttribute,
       locator: {
         path: selector,
         parent_path: parent ? makeSelector(parent, body) : '',
         sibling_index: selectionSiblingIndex(element),
         fingerprint: {
-          tag_name: element.tagName.toLowerCase(),
+          tag_name: tagName,
           stable_attributes: selectionStableAttributes(element),
           text: fingerprintText,
         },
@@ -865,7 +1074,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     })
   }
 
-  const toggleSelection = (element: HTMLElement, body: HTMLElement) => {
+  const toggleSelection = (element: Element, body: HTMLElement) => {
     const context = selectionContext(element, body)
     const index = selectedNodesRef.current.indexOf(element)
     if (index >= 0) {
@@ -883,6 +1092,66 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   const selectedBlocks = (body: HTMLElement) => sortBlocksInDocumentOrder(
     selectedBlocksRef.current.filter((block) => body.contains(block)),
   )
+
+  const closeSvgImagePicker = () => {
+    svgPickerCleanupRef.current?.()
+    svgPickerCleanupRef.current = null
+    setSvgImageLayers([])
+    setZoomedSvgImage(null)
+  }
+
+  const openSvgImagePicker = () => {
+    const document = iframeRef.current?.contentDocument
+    const body = document?.body
+    if (!document || !body) return
+    const roots: Element[] = modeRef.current === 'edit'
+      ? selectedBlocks(body)
+      : selectedNodesRef.current.filter((element) => body.contains(element))
+    const layers = collectSvgImageLayers(roots)
+    if (!layers.length) return
+
+    closeSvgImagePicker()
+    const style = document.createElement('style')
+    style.textContent = '.preview-svg-layer-picking, .preview-svg-layer-picking * { animation-play-state: paused !important; transition-duration: 0s !important; }'
+    document.head.appendChild(style)
+    document.documentElement.classList.add('preview-svg-layer-picking')
+    const pausedSvgs: SVGSVGElement[] = []
+    for (const svg of new Set(layers.map((layer) => layer.element.closest('svg')))) {
+      if (!svg || typeof svg.pauseAnimations !== 'function' || typeof svg.animationsPaused !== 'function') continue
+      try {
+        if (!svg.animationsPaused()) {
+          svg.pauseAnimations()
+          pausedSvgs.push(svg)
+        }
+      } catch {
+        continue
+      }
+    }
+    svgPickerCleanupRef.current = () => {
+      pausedSvgs.forEach((svg) => svg.unpauseAnimations())
+      document.documentElement.classList.remove('preview-svg-layer-picking')
+      style.remove()
+    }
+    setSvgImageLayers(layers)
+  }
+
+  const selectSvgImageLayer = (layer: SvgImageLayer) => {
+    const body = iframeRef.current?.contentDocument?.body
+    if (!body?.contains(layer.element)) {
+      closeSvgImagePicker()
+      message.warning('预览已更新，请重新展开选图')
+      return
+    }
+    const context = selectionContext(layer.element, body)
+    const alreadyAttached = selectedElements.some((selected) => selected.selector === context.selector && selected.html === context.html)
+    if (!alreadyAttached && selectedElements.length >= 12) {
+      message.warning('最多引用 12 个元素，请先移除其他引用')
+      return
+    }
+    onAttachSelectedBlocksRef.current([context])
+    closeSvgImagePicker()
+    message.success('已加入这张 SVG 图片，之前的引用已保留')
+  }
 
   const updateBlockToolbarPosition = () => {
     const iframe = iframeRef.current
@@ -961,6 +1230,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     selectedBlocksRef.current = ordered
     activeBlockRef.current = activeBlock && ordered.includes(activeBlock) ? activeBlock : ordered.at(-1) ?? null
     setBlockSelectionCount(ordered.length)
+    setBlockSvgImageCount(collectSvgImageLayers(ordered).length)
     onImageApplicationTargetChangeRef.current(ordered.length ? 'block' : activeCaretBlockRef.current?.isConnected ? 'caret' : null)
     if (ordered.length === 0) {
       setBlockToolbarPosition(null)
@@ -976,6 +1246,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     selectedBlocksRef.current = []
     activeBlockRef.current = null
     setBlockSelectionCount(0)
+    setBlockSvgImageCount(0)
     setBlockToolbarPosition(null)
     setBlockStyle(EMPTY_BLOCK_STYLE)
     onImageApplicationTargetChangeRef.current(activeCaretBlockRef.current?.isConnected ? 'caret' : null)
@@ -2235,13 +2506,17 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   }
 
   const handleLoad = () => {
+    closeSvgImagePicker()
     resizeObserverRef.current?.disconnect()
     const document = iframeRef.current?.contentDocument
     const body = document?.body
     if (!body) return
     previewReadyRef.current = true
+    const previewLoadGeneration = startPreviewLoading(true)
     if (renderedHtmlRef.current !== htmlRef.current) {
       replacePreviewBody(htmlRef.current)
+    } else {
+      trackPreviewResources(previewLoadGeneration)
     }
     updateEditingState()
     let textSelectionPressTimer: ReturnType<typeof setTimeout> | null = null
@@ -2753,25 +3028,54 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
   )
 
   return (
-    <div className={`preview-shell preview-mode-${mode}${compact ? ' preview-shell-compact' : ''}`} ref={shellRef}>
+    <div
+      className={`preview-shell preview-mode-${mode}${compact ? ' preview-shell-compact' : ''}`}
+      ref={shellRef}
+      aria-busy={previewLoading}
+    >
       <div
-        className="preview-device"
+        className={`preview-device${darkMode ? ' preview-device-dark-mode' : ''}`}
+        style={{ height: displayedPreviewHeight }}
         onPointerLeave={() => {
           if (modeRef.current === 'edit' && !compactRef.current) removeBlockHandle()
         }}
       >
-        {mode === 'select' && selectedElements.length > 0 && <div className="preview-selection-count">已选 {selectedElements.length}</div>}
+        {mode === 'select' && selectedElements.length > 0 && (
+          <div className="preview-selection-count">
+            已选 {selectedElements.length}
+            {collectSvgImageLayers(selectedNodesRef.current).length > 0 && (
+              <Button size="small" onClick={openSvgImagePicker}>展开选图</Button>
+            )}
+          </div>
+        )}
         <iframe
           ref={iframeRef}
           title="排版预览"
-          className="preview-iframe"
+          className={`preview-iframe preview-light-iframe${darkModePreviewVisible ? ' preview-iframe-faded' : ''}`}
           sandbox={SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW}
           scrolling="no"
           srcDoc={srcDocRef.current}
           style={{ height: contentHeight, filter: `brightness(${brightness / 100})` }}
           onLoad={handleLoad}
         />
+        {darkModePreviewDocument && (
+          <iframe
+            ref={darkModeIframeRef}
+            title="排版预览（微信 Dark Mode）"
+            className={`preview-iframe preview-dark-mode-iframe${darkModePreviewVisible ? ' preview-dark-mode-iframe-visible' : ''}`}
+            sandbox={DARK_MODE_PREVIEW_SANDBOX}
+            scrolling="no"
+            srcDoc={darkModePreviewDocument.srcDoc}
+            style={{ height: darkModeContentHeight, filter: `brightness(${brightness / 100})` }}
+          />
+        )}
       </div>
+      {previewLoading && (
+        <div className="preview-loading-overlay" role="status" aria-live="polite">
+          <Spin size="large" />
+          <span>正在加载文章预览</span>
+        </div>
+      )}
       {!compact && blockToolbarPosition && blockSelectionCount > 0 && (
         <div
           ref={blockToolbarRef}
@@ -2780,6 +3084,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
         >
           <span className="preview-block-toolbar-count">{blockSelectionCount} 块</span>
           <div className="preview-block-toolbar-actions">
+            {blockSvgImageCount > 0 && <Button aria-label="展开选图" type="primary" size="small" icon={<PictureOutlined />} onClick={openSvgImagePicker}>展开选图</Button>}
             <Tooltip title="上移"><Button aria-label="上移块" type="text" size="small" icon={<ArrowUpOutlined />} disabled={!canReorderSelectedBlocks} onClick={() => moveSelectedBlocks('up')} /></Tooltip>
             <Tooltip title="下移"><Button aria-label="下移块" type="text" size="small" icon={<ArrowDownOutlined />} disabled={!canReorderSelectedBlocks} onClick={() => moveSelectedBlocks('down')} /></Tooltip>
             <Tooltip title="复制"><Button aria-label="复制块" type="text" size="small" icon={<CopyOutlined />} onClick={duplicateSelectedBlocks} /></Tooltip>
@@ -2850,6 +3155,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
                   <Tooltip title="复制"><Button aria-label="复制块" type="text" icon={<CopyOutlined />} onClick={duplicateSelectedBlocks} /></Tooltip>
                   <Tooltip title="删除"><Button aria-label="删除块" danger type="text" icon={<DeleteOutlined />} onClick={deleteSelectedBlocks} /></Tooltip>
                   <Tooltip title="块样式"><Button aria-label="编辑块样式" type="text" icon={<BgColorsOutlined />} onClick={() => openMobileEditorPanel('block-style')} /></Tooltip>
+                  {blockSvgImageCount > 0 && <Button aria-label="展开选图" icon={<PictureOutlined />} onClick={openSvgImagePicker}>展开选图</Button>}
                   <Tooltip title="更多块操作"><Button aria-label="更多块操作" type="text" icon={<MoreOutlined />} onClick={() => openMobileEditorPanel('block-actions')} /></Tooltip>
                 </>
               )}
@@ -2908,6 +3214,61 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
           )}
         </Drawer>
       )}
+      <Drawer
+        className="preview-svg-image-drawer"
+        title="选择 SVG 中的图片"
+        placement={compact ? 'bottom' : 'right'}
+        size={compact ? 'min(70dvh, 560px)' : 400}
+        open={svgImageLayers.length > 0}
+        onClose={closeSvgImagePicker}
+      >
+        <p className="preview-svg-image-hint">动画已暂停。选择图片会追加到 AI 引用，不会清空之前选中的图片。</p>
+        <div className="preview-svg-image-list">
+          {svgImageLayers.map((layer, index) => (
+            <div className="preview-svg-image-item" key={index}>
+              <button
+                type="button"
+                className="preview-svg-image-select"
+                onClick={() => selectSvgImageLayer(layer)}
+                aria-label={`选择 SVG 图片 ${index + 1}${layer.label ? `：${layer.label}` : ''}`}
+              >
+                <span className="preview-svg-image-thumb">
+                  {layer.source ? <img src={layer.source} alt="" /> : <PictureOutlined />}
+                </span>
+                <span className="preview-svg-image-info">
+                  <strong>{layer.label || `图片 ${index + 1}`}</strong>
+                  <small>SVG 图片 {index + 1}</small>
+                </span>
+              </button>
+              <Button
+                aria-label={`放大预览 SVG 图片 ${index + 1}`}
+                type="link"
+                size="small"
+                icon={<ZoomInOutlined />}
+                disabled={!layer.source}
+                onClick={() => setZoomedSvgImage({ layer, index })}
+              >放大</Button>
+            </div>
+          ))}
+        </div>
+      </Drawer>
+      <Modal
+        title={zoomedSvgImage ? `预览 SVG 图片 ${zoomedSvgImage.index + 1}` : '预览图片'}
+        open={Boolean(zoomedSvgImage)}
+        onCancel={() => setZoomedSvgImage(null)}
+        footer={null}
+        width="min(92vw, 960px)"
+      >
+        {zoomedSvgImage && (
+          <div className="preview-svg-image-zoom">
+            <Image
+              src={zoomedSvgImage.layer.source}
+              alt={zoomedSvgImage.layer.label || `SVG 图片 ${zoomedSvgImage.index + 1}`}
+              style={{ maxWidth: '100%', maxHeight: '70vh', objectFit: 'contain' }}
+            />
+          </div>
+        )}
+      </Modal>
       {imageCropSession && (
         <ImageCropModal
           open

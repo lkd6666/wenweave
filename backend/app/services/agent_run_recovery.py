@@ -126,6 +126,7 @@ def replay_agent_turn(
                 tool["preparing"] = False
                 tool["html_changed"] = bool(data.get("html"))
                 tool["activity"] = data.get("activity") if isinstance(data.get("activity"), dict) else None
+                tool["model_input"] = data.get("model_input") if isinstance(data.get("model_input"), dict) else None
                 tool["read_range"] = data.get("read_range") if isinstance(data.get("read_range"), dict) else None
                 tool["change_summary"] = data.get("change_summary") if isinstance(data.get("change_summary"), dict) else None
             continue

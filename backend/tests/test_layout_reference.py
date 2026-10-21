@@ -15,6 +15,7 @@ from app.db.base import Base
 from app.api.routes import layout_references as layout_reference_routes
 from app.models.layout_capture_session import LayoutCaptureSession
 from app.schemas.layout_reference import LayoutCaptureSessionRead
+from app.services.browser_capture import MAX_CAPTURE_ASSETS
 
 from app.services.layout_reference import (
     MAX_REFERENCE_IMAGE_BYTES,
@@ -132,8 +133,8 @@ class LayoutReferenceExtractionTests(unittest.TestCase):
         with self.assertRaises(LayoutReferenceError):
             extract_layout_reference("<html><body><script>only_script()</script></body></html>", "https://example.com/empty")
 
-    def test_rejects_more_than_fifty_image_slots_even_when_the_url_repeats(self) -> None:
-        source = "<article>" + ('<img src="https://example.com/repeated.png">' * 51) + "</article>"
+    def test_rejects_image_slots_above_the_capture_limit_even_when_the_url_repeats(self) -> None:
+        source = "<article>" + ('<img src="https://example.com/repeated.png">' * (MAX_CAPTURE_ASSETS + 1)) + "</article>"
 
         with self.assertRaises(LayoutReferenceError):
             _extract_layout_reference_with_assets(source, "https://example.com/article")
@@ -368,6 +369,37 @@ class LayoutReferenceCacheTests(unittest.TestCase):
         with self.assertRaises(LayoutReferenceExpiredError):
             cache.get_preview_asset("preview", asset.asset_id, "not-the-preview-capability")
 
+    def test_cache_evicts_least_recently_used_entry(self) -> None:
+        cache = _ReferenceCache(max_entries=2, max_bytes=8 * 1024 * 1024)
+        expires_at = time.monotonic() + 60
+        cache.put(self._item("first", 10, expires_at))
+        cache.put(self._item("second", 10, expires_at))
+        cache.get("first", 10)
+        cache.put(self._item("third", 10, expires_at))
+
+        self.assertEqual(cache.get("first", 10).reference_id, "first")
+        self.assertEqual(cache.get("third", 10).reference_id, "third")
+        with self.assertRaises(LayoutReferenceExpiredError):
+            cache.get("second", 10)
+
+    def test_cache_enforces_total_asset_byte_limit(self) -> None:
+        cache = _ReferenceCache(max_entries=16, max_bytes=1024 * 1024)
+        expires_at = time.monotonic() + 60
+        first = self._item("first-large", 10, expires_at)
+        first.assets.append(
+            LayoutReferenceAsset("a" * 32, "first.png", "image/png", "png", data=b"a" * 700_000)
+        )
+        second = self._item("second-large", 10, expires_at)
+        second.assets.append(
+            LayoutReferenceAsset("b" * 32, "second.png", "image/png", "png", data=b"b" * 700_000)
+        )
+        cache.put(first)
+        cache.put(second)
+
+        self.assertEqual(cache.get("second-large", 10).reference_id, "second-large")
+        with self.assertRaises(LayoutReferenceExpiredError):
+            cache.get("first-large", 10)
+
     def test_preview_payload_never_contains_the_reference_image_source(self) -> None:
         item = self._item("preview", 10, time.monotonic() + 60)
         asset = LayoutReferenceAsset("b" * 32, "local/layout-references/preview/b.png", "image/png", "png")
@@ -440,6 +472,8 @@ class LayoutReferencePersistenceTests(unittest.TestCase):
             )
 
         self.assertEqual(recovered.html_template, reference.html_template)
+        self.assertEqual(recovered.preview_token, reference.preview_token)
+        self.assertIn(reference.preview_token, recovered.preview_payload()["assets"][0]["preview_url"])
         self.assertEqual(recovered.assets[0].data, b"shared-reference-image")
         self.assertEqual(preview.data, b"shared-reference-image")
 
@@ -520,6 +554,85 @@ class LayoutCaptureSessionTests(unittest.TestCase):
         self.assertIn("2 个图片素材未能", reference.warning or "")
         self.assertEqual(capture_session.status, "completed")
         self.assertIsNotNone(capture_session.consumed_at)
+
+    def test_capture_preserves_safe_static_svg_structure(self) -> None:
+        capture_session, token = self._start()
+        source = (
+            '<div id="js_content"><p>浏览器正文</p>'
+            '<svg viewBox="0 0 10 10"><defs><filter id="blur"><feGaussianBlur stdDeviation="1"/></filter></defs>'
+            '<path d="M0 0 L10 10" stroke="#222" filter="url(#blur)" onclick="alert(1)"/>'
+            '<script>alert(2)</script><foreignObject>危险内容</foreignObject></svg></div>'
+        )
+
+        reference = complete_layout_capture_session(
+            self.db,
+            capture_session.id,
+            token,
+            capture_session.canonical_url,
+            source,
+            "矢量参考",
+            {},
+        )
+
+        html = reference.html_template.lower()
+        self.assertIn("<svg", html)
+        self.assertIn("<path", html)
+        self.assertIn("<filter", html)
+        self.assertNotIn("onclick", html)
+        self.assertNotIn("<script", html)
+        self.assertNotIn("foreignobject", html)
+
+    def test_capture_keeps_author_styles_and_repeated_uses_of_one_asset(self) -> None:
+        capture_session, token = self._start()
+        asset_id = "a" * 32
+        long_value = "x" * 5000
+        source = (
+            '<div id="js_content" style="--Accent:#123456;--Copy:\'first;last\';--Long:' + long_value + '">'
+            '<section style="height:2px;background:red"></section>'
+            '<p style="color:var(--Accent);display:none">隐藏的作者内容</p>'
+            + f'<img src="layout-capture://{asset_id}">' * 201
+            + '</div>'
+        )
+        reference = complete_layout_capture_session(
+            self.db, capture_session.id, token, capture_session.canonical_url,
+            source, "作者声明", {asset_id: (PNG, ImageInfo("image/png", "png", 1, 1))},
+        )
+        self.assertEqual(len(reference.assets), 1)
+        self.assertEqual(reference.image_slots, 201)
+        reference_asset_id = reference.assets[0].asset_id
+        rendered = reference.materialized_template({reference_asset_id: "https://example.com/picture.png"}, [reference_asset_id])
+        self.assertIn("--Accent:#123456", rendered)
+        self.assertIn("--Copy:&#x27;first;last&#x27;", rendered)
+        self.assertIn("--Long:" + long_value, rendered)
+        self.assertIn("display:none", rendered)
+        self.assertIn('<section style="height:2px;background:red"></section>', rendered)
+        self.assertEqual(rendered.count('<img'), 201)
+
+    def test_capture_preserves_complete_source_and_generic_css_and_svg_images(self) -> None:
+        capture_session, token = self._start()
+        asset_id = "a" * 32
+        source = (
+            '<div id="js_content" style="--accent:#123456;display:flex;gap:2%">'
+            '<section style="width:32%;mask-image:url(layout-capture://' + asset_id + ')">'
+            '<svg viewBox="0 0 10 10"><image href="layout-capture://' + asset_id + '" width="10" height="10"/></svg>'
+            '</section>' + '<p>正文结构</p>' * 6000 + '<p>文章末尾</p></div>'
+        )
+        reference = complete_layout_capture_session(
+            self.db, capture_session.id, token, capture_session.canonical_url,
+            source, "原始 HTML", {asset_id: (PNG, ImageInfo("image/png", "png", 1, 1))},
+        )
+        self.assertIn("文章末尾", reference.html_template)
+        self.assertIn("width:32%", reference.html_template)
+        self.assertIn("--accent:#123456", reference.html_template)
+        self.assertIn('href="layout-reference://', reference.html_template)
+        self.assertIn("mask-image:url", reference.html_template)
+        self.assertIsNone(reference.warning)
+        reference_asset_id = reference.assets[0].asset_id
+        rendered = reference.materialized_template({reference_asset_id: "https://example.com/picture.png"}, [reference_asset_id])
+        self.assertTrue('href="https://example.com/picture.png"' in rendered)
+        without_picture = reference.materialized_template({}, [])
+        self.assertNotIn("<image", without_picture)
+        self.assertNotIn("layout-reference://", without_picture)
 
         with self.assertRaisesRegex(LayoutReferenceExpiredError, "已使用"):
             complete_layout_capture_session(

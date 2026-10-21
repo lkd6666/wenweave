@@ -9,6 +9,7 @@ import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -37,6 +38,7 @@ from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.services.agent_run_manager import WORKER_ID, cleanup_expired_agent_run_events
 from app.services.tool_output_store import cleanup_expired_tool_outputs
+from app.services.token_budget import preload_tokenizer
 from app.services.chat_images import cleanup_expired_drafts
 from app.services.gzh_theme_generation import cleanup_expired_reference_assets
 from app.services.layout_reference import (
@@ -266,7 +268,17 @@ def _schema_tables_before_image_model_access():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    startup_started = stage_started = perf_counter()
+
+    def record_startup_stage(stage: str) -> None:
+        nonlocal stage_started
+        now = perf_counter()
+        logger.warning("startup_stage_complete stage=%s elapsed_seconds=%.3f", stage, now - stage_started)
+        stage_started = now
+
     _install_asyncio_exception_reporting()
+    await asyncio.to_thread(preload_tokenizer)
+    record_startup_stage("tokenizer")
     memory = read_process_memory()
     logger.warning(
         "agent_worker_started pid=%s worker_id=%s rss_kib=%s swap_kib=%s",
@@ -284,35 +296,41 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_last_attempt_at = None
     app.state.cleanup_last_success_at = None
     app.state.cleanup_last_error = ""
-    # TEMP (local port 8003): skip schema/bootstrap work, because another
-    # development instance currently owns the MySQL migration advisory lock.
-    # Restore the normal initialization block below once that instance stops.
     pending_image_generation_ids: list[str] = []
     # Schema mutations and startup recovery must be performed by one worker.
     # Other workers wait on the advisory/file lock before accepting requests.
-    # with schema_migration_lock():
-    #     if engine.url.drivername.startswith("mysql"):
-    #         # Legacy image-model IDs can differ from the current BIGINT UNSIGNED
-    #         # contract. Create every parent first, then create the two access
-    #         # tables with the actual parent ID types before static DDL sees them.
-    #         Base.metadata.create_all(bind=engine, tables=_schema_tables_before_image_model_access())
-    #         prepare_mysql_image_model_access_tables()
-    #     Base.metadata.create_all(bind=engine)
-    #     migrate_schema()
-    #     db = SessionLocal()
-    #     try:
-    #         recover_interrupted_agent_runs(db)
-    #         pending_image_generation_ids = recover_pending_generations()
-    #         backfill_official_deepseek_thinking_models(db)
-    #         migrate_anthropic_thinking_models(db)
-    #         migrate_gemini_native_providers(db)
-    #         from app.services.image_library import backfill_generated_assets, backfill_imported_assets
-    #
-    #         backfill_generated_assets(db)
-    #         backfill_imported_assets(db)
-    #         seed_default_admin(db)
-    #     finally:
-    #         db.close()
+    with schema_migration_lock():
+        record_startup_stage("migration_lock")
+        if engine.url.drivername.startswith("mysql"):
+            # Legacy image-model IDs can differ from the current BIGINT UNSIGNED
+            # contract. Create every parent first, then create the two access
+            # tables with the actual parent ID types before static DDL sees them.
+            Base.metadata.create_all(bind=engine, tables=_schema_tables_before_image_model_access())
+            prepare_mysql_image_model_access_tables()
+        Base.metadata.create_all(bind=engine)
+        record_startup_stage("create_tables")
+        migrate_schema()
+        record_startup_stage("migrate_schema")
+        db = SessionLocal()
+        try:
+            recover_interrupted_agent_runs(db)
+            pending_image_generation_ids = recover_pending_generations()
+            record_startup_stage("recover_jobs")
+            backfill_official_deepseek_thinking_models(db)
+            migrate_anthropic_thinking_models(db)
+            migrate_gemini_native_providers(db)
+            record_startup_stage("migrate_models")
+            from app.services.image_library import backfill_generated_assets, backfill_imported_assets
+
+            backfill_generated_assets(db)
+            record_startup_stage("backfill_generated_assets")
+            imported_assets = backfill_imported_assets(db)
+            record_startup_stage("backfill_imported_assets")
+            if imported_assets:
+                logger.warning("startup_imported_assets_migrated count=%s", imported_assets)
+            seed_default_admin(db)
+        finally:
+            db.close()
     # Waiting questions are durable but their lightweight local timers are
     # process-local. Recreate them after startup without consuming an Agent
     # execution slot.
@@ -336,6 +354,8 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(_recover_expired_agent_runs)
 
     await asyncio.to_thread(_run_cleanup_cycle, app)
+    record_startup_stage("restore_timers_and_cleanup")
+    logger.warning("startup_complete elapsed_seconds=%.3f", perf_counter() - startup_started)
     cleanup_task = asyncio.create_task(cleanup_loop())
     recovery_task = asyncio.create_task(lease_recovery_loop())
     try:

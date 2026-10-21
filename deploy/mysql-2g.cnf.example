@@ -1,0 +1,18 @@
+# MySQL starting point for a dedicated Yibanpaiban database on a 2 GiB host.
+# Install under /etc/mysql/conf.d/ (or the distribution equivalent), restart
+# MySQL, then verify total RSS and swap during two Agent runs plus image search.
+[mysqld]
+innodb_buffer_pool_size=256M
+innodb_buffer_pool_instances=1
+max_connections=32
+thread_cache_size=8
+table_open_cache=400
+table_definition_cache=400
+tmp_table_size=16M
+max_heap_table_size=16M
+sort_buffer_size=512K
+join_buffer_size=512K
+read_buffer_size=256K
+read_rnd_buffer_size=512K
+max_allowed_packet=64M
+skip_name_resolve=ON

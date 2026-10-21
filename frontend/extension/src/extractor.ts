@@ -4,12 +4,14 @@ import {
   type CaptureDraftRead,
   type FinalizedCaptureDraft,
   type CapturePurpose,
-  isAllowedWechatAssetUrl,
+  isAllowedCaptureAssetUrl,
 } from './shared'
+import { originalArticleDocument } from './articleSource'
+import { inlineAuthoredStyles } from './authoredStyles'
 
 interface AssetRecord extends CaptureAssetDescriptor {
   imageElements: Set<Element>
-  backgroundElements: Set<HTMLElement>
+  styleElements: Map<HTMLElement | SVGElement, Set<string>>
   isCover: boolean
 }
 
@@ -24,7 +26,6 @@ interface CaptureDraftState {
 const drafts = new Map<string, CaptureDraftState>()
 const CSS_URL_PATTERN = /url\(\s*(['"]?)(.*?)\1\s*\)/gi
 const IMAGE_SOURCE_ATTRIBUTES = ['data-src', 'data-original', 'data-actualsrc', 'src'] as const
-
 function captureId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
@@ -33,14 +34,14 @@ function captureId(): string {
 function resolveAssetUrl(rawUrl: string, currentUrl: string): string | null {
   try {
     const resolved = new URL(rawUrl.trim(), currentUrl).toString()
-    return isAllowedWechatAssetUrl(resolved) ? resolved : null
+    return isAllowedCaptureAssetUrl(resolved) ? resolved : null
   } catch {
     return null
   }
 }
 
 function imageSource(element: Element): string {
-  for (const attribute of IMAGE_SOURCE_ATTRIBUTES) {
+  for (const attribute of [...IMAGE_SOURCE_ATTRIBUTES, 'href', 'xlink:href']) {
     const value = element.getAttribute(attribute)?.trim()
     if (value && !value.startsWith('data:image/svg')) return value
   }
@@ -48,39 +49,25 @@ function imageSource(element: Element): string {
 }
 
 function removeImageSourceAttributes(element: Element): void {
-  for (const attribute of IMAGE_SOURCE_ATTRIBUTES) element.removeAttribute(attribute)
+  for (const attribute of [...IMAGE_SOURCE_ATTRIBUTES, 'href', 'xlink:href']) element.removeAttribute(attribute)
   element.removeAttribute('srcset')
   element.removeAttribute('data-srcset')
 }
 
 function removeAssets(state: CaptureDraftState, initiallyFailed: Set<string>): Set<string> {
   const failed = new Set(initiallyFailed)
-  let expanded = true
-  while (expanded) {
-    expanded = false
-    for (const record of state.assets) {
-      if (!failed.has(record.assetId)) continue
-      for (const element of record.backgroundElements) {
-        for (const related of state.assets) {
-          if (related.backgroundElements.has(element) && !failed.has(related.assetId)) {
-            failed.add(related.assetId)
-            expanded = true
-          }
-        }
-      }
-    }
-  }
-
   for (const record of state.assets) {
     if (!failed.has(record.assetId)) continue
     for (const element of record.imageElements) element.remove()
+    for (const [element, properties] of record.styleElements) {
+      for (const property of properties) element.style.removeProperty(property)
+    }
   }
-  const failedBackgrounds = new Set<HTMLElement>()
+  // A failed URL invalidates its CSS declaration, but other uses of the same
+  // image elsewhere in the article remain intact.
   for (const record of state.assets) {
-    if (!failed.has(record.assetId)) continue
-    for (const element of record.backgroundElements) failedBackgrounds.add(element)
+    if (!record.isCover && !isRecordStillReferenced(record)) failed.add(record.assetId)
   }
-  for (const element of failedBackgrounds) element.style.removeProperty('background-image')
   return failed
 }
 
@@ -88,8 +75,10 @@ function isRecordStillReferenced(record: AssetRecord): boolean {
   for (const element of record.imageElements) {
     if (element.parentNode) return true
   }
-  for (const element of record.backgroundElements) {
-    if (element.style.backgroundImage.includes(`layout-capture://${record.assetId}`)) return true
+  for (const [element, properties] of record.styleElements) {
+    for (const property of properties) {
+      if (element.style.getPropertyValue(property).includes(`layout-capture://${record.assetId}`)) return true
+    }
   }
   return false
 }
@@ -134,16 +123,21 @@ export function createCaptureDraft(
   doc: Document,
   currentUrl: string,
   purpose: CapturePurpose = 'layout_reference',
+  sheetSource: Document = doc,
 ): CaptureDraftRead {
+  doc = originalArticleDocument(doc)
   const sourceRoot = doc.querySelector<HTMLElement>('#js_content')
   if (!sourceRoot) throw new Error('当前页面尚未显示微信文章正文，请先完成验证并等待文章加载')
+  inlineAuthoredStyles(doc, sourceRoot, sheetSource)
+  // The platform initially hides the article until its scripts finish loading.
+  // This loading gate is not an author style.
+  if (['hidden', 'collapse'].includes(sourceRoot.style.visibility)) sourceRoot.style.removeProperty('visibility')
+  if (sourceRoot.style.opacity && Number(sourceRoot.style.opacity) === 0) sourceRoot.style.removeProperty('opacity')
+  if (sourceRoot.style.display === 'none') sourceRoot.style.removeProperty('display')
   const root = sourceRoot.cloneNode(true) as HTMLElement
   const sourceToAsset = new Map<string, AssetRecord>()
   const assets: AssetRecord[] = []
   const unsupportedSources = new Set<string>()
-  const sourceElements = [sourceRoot, ...Array.from(sourceRoot.querySelectorAll<HTMLElement>('*'))]
-  const clonedElements = [root, ...Array.from(root.querySelectorAll<HTMLElement>('*'))]
-
   const register = (url: string): AssetRecord => {
     const existing = sourceToAsset.get(url)
     if (existing) return existing
@@ -151,7 +145,7 @@ export function createCaptureDraft(
       assetId: captureId(),
       url,
       imageElements: new Set(),
-      backgroundElements: new Set(),
+      styleElements: new Map(),
       isCover: false,
     }
     sourceToAsset.set(url, record)
@@ -169,8 +163,8 @@ export function createCaptureDraft(
     }
   }
 
-  const sourceImages = Array.from(sourceRoot.querySelectorAll('img'))
-  const clonedImages = Array.from(root.querySelectorAll('img'))
+  const sourceImages = Array.from(sourceRoot.querySelectorAll('img, svg image'))
+  const clonedImages = Array.from(root.querySelectorAll('img, svg image'))
   sourceImages.forEach((sourceImage, index) => {
     const clonedImage = clonedImages[index]
     if (!clonedImage) return
@@ -184,29 +178,39 @@ export function createCaptureDraft(
     const asset = register(resolved)
     asset.imageElements.add(clonedImage)
     removeImageSourceAttributes(clonedImage)
-    clonedImage.setAttribute('src', `layout-capture://${asset.assetId}`)
+    clonedImage.setAttribute(clonedImage.localName === 'image' ? 'href' : 'src', `layout-capture://${asset.assetId}`)
   })
 
-  sourceElements.forEach((sourceElement, index) => {
-    const clonedElement = clonedElements[index]
-    if (!clonedElement) return
-    const backgroundImage = sourceElement.style.backgroundImage
-    if (!backgroundImage || !backgroundImage.toLowerCase().includes('url(')) return
-    const matches = Array.from(backgroundImage.matchAll(CSS_URL_PATTERN))
-    const resolved = matches.map((match) => resolveAssetUrl(match[2] || '', currentUrl))
-    if (!matches.length || resolved.some((url) => !url)) {
-      for (const [matchIndex, match] of matches.entries()) {
-        if (!resolved[matchIndex]) unsupportedSources.add(match[2] || `invalid-background-${index}-${matchIndex}`)
+  const styledElements = [root, ...Array.from(root.querySelectorAll<HTMLElement | SVGElement>('*'))]
+  styledElements.forEach((element, index) => {
+    if (!element.style) return
+    for (const property of Array.from(element.style)) {
+      const value = element.style.getPropertyValue(property)
+      const matches = Array.from(value.matchAll(CSS_URL_PATTERN))
+      if (!matches.length) continue
+      const urls = matches.map((match) => {
+        const raw = match[2]?.trim() || ''
+        return raw.startsWith('#') ? raw : resolveAssetUrl(raw, currentUrl)
+      })
+      if (urls.some((url) => !url)) {
+        matches.forEach((match, urlIndex) => {
+          if (!urls[urlIndex]) unsupportedSources.add(match[2] || `invalid-style-${index}-${property}-${urlIndex}`)
+        })
+        element.style.removeProperty(property)
+        continue
       }
-      clonedElement.style.removeProperty('background-image')
-      return
+      let urlIndex = 0
+      const rewritten = value.replace(CSS_URL_PATTERN, (match) => {
+        const url = urls[urlIndex++]!
+        if (url.startsWith('#')) return match
+        const asset = register(url)
+        const properties = asset.styleElements.get(element) || new Set<string>()
+        properties.add(property)
+        asset.styleElements.set(element, properties)
+        return `url("layout-capture://${asset.assetId}")`
+      })
+      element.style.setProperty(property, rewritten, element.style.getPropertyPriority(property))
     }
-    let assetIndex = 0
-    clonedElement.style.backgroundImage = backgroundImage.replace(CSS_URL_PATTERN, () => {
-      const asset = register(resolved[assetIndex++] as string)
-      asset.backgroundElements.add(clonedElement)
-      return `url("layout-capture://${asset.assetId}")`
-    })
   })
 
   const state: CaptureDraftState = {
@@ -247,7 +251,7 @@ export function finalizeCaptureDraft(draftId: string, failedAssetIds: string[]):
   ))
   const omittedBodyAssets = Array.from(removed).filter((assetId) => {
     const asset = state.assets.find((candidate) => candidate.assetId === assetId)
-    return Boolean(asset && (asset.imageElements.size > 0 || asset.backgroundElements.size > 0))
+    return Boolean(asset && (asset.imageElements.size > 0 || asset.styleElements.size > 0))
   }).length
   drafts.delete(draftId)
   return {

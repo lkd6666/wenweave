@@ -10,7 +10,8 @@ import {
   captureCompletionPath,
   captureUrlsMatch,
   extensionErrorMessage,
-  isAllowedWechatAssetUrl,
+  isAllowedCaptureAssetUrl,
+  isWechatArticleUrl,
   isCaptureSessionUsable,
   isRecord,
   type CaptureAssetDescriptor,
@@ -29,6 +30,31 @@ interface DownloadedAsset {
 
 const EXPIRY_ALARM_PREFIX = 'layoutCaptureExpiry:'
 let runningSessionId: string | null = null
+
+async function readArticleStylesheet(url: string): Promise<Record<string, unknown>> {
+  const source = new URL(url)
+  if (source.protocol !== 'https:' || !['mp.weixin.qq.com', 'res.wx.qq.com'].includes(source.hostname)) return { ok: false }
+  const response = await fetch(url, { credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(8000) })
+  if (!response.ok || !response.headers.get('content-type')?.toLowerCase().includes('text/css') || !response.body) return { ok: false }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > 512 * 1024) return { ok: false }
+      chunks.push(value)
+    }
+  } finally {
+    await reader.cancel()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return { ok: true, css: new TextDecoder().decode(bytes) }
+}
 
 async function readStoredSession(): Promise<StoredCaptureSession | null> {
   const result = await chrome.storage.session.get(SESSION_STORAGE_KEY)
@@ -220,7 +246,7 @@ async function readResponseBytes(response: Response): Promise<Uint8Array> {
 }
 
 async function downloadAsset(asset: CaptureAssetDescriptor): Promise<DownloadedAsset> {
-  if (!isAllowedWechatAssetUrl(asset.url)) throw new Error('图片地址不在微信素材域名范围内')
+  if (!isAllowedCaptureAssetUrl(asset.url)) throw new Error('图片地址不在微信素材域名范围内')
   const response = await fetch(asset.url, {
     method: 'GET',
     credentials: 'omit',
@@ -228,7 +254,7 @@ async function downloadAsset(asset: CaptureAssetDescriptor): Promise<DownloadedA
     redirect: 'follow',
     referrerPolicy: 'no-referrer',
   })
-  if (!response.ok || !isAllowedWechatAssetUrl(response.url)) throw new Error('图片下载失败')
+  if (!response.ok || !isAllowedCaptureAssetUrl(response.url)) throw new Error('图片下载失败')
   const data = await readResponseBytes(response)
   const image = sniffImage(data)
   if (!image) throw new Error('图片格式不受支持')
@@ -427,6 +453,14 @@ async function performCapture(stored: StoredCaptureSession): Promise<void> {
 
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
   if (!isRecord(message) || typeof message.type !== 'string') return false
+  if (message.type === 'layoutCapture:readStylesheet'
+    && typeof message.url === 'string'
+    && sender.tab?.id !== undefined
+    && typeof sender.url === 'string'
+    && isWechatArticleUrl(sender.url)) {
+    void readArticleStylesheet(message.url).then(sendResponse).catch(() => sendResponse({ ok: false }))
+    return true
+  }
   if (message.type === 'layoutCapture:register') {
     void registerSession(message, sender).then(sendResponse)
     return true

@@ -34,6 +34,8 @@ HEARTBEAT_INTERVAL_SECONDS = 10
 EVENT_POLL_INTERVAL_SECONDS = 0.5
 EVENT_PAGE_SIZE = 256
 EVENT_SEQUENCE_RETRY_ATTEMPTS = 3
+LOCAL_DURABLE_CACHE_MAX_BYTES = 1024 * 1024
+LOCAL_DURABLE_EVENT_MAX_BYTES = 256 * 1024
 
 
 def _build_worker_id(instance_id: str) -> str:
@@ -67,9 +69,7 @@ class RunEvent:
     sequence: int
     event: str
     data: dict[str, Any]
-    # Local-only sequence for immediate, non-durable token delivery. It is
-    # deliberately not sent as an SSE event ID because MySQL later stores a
-    # compressed replacement event with a different durable sequence.
+    # Last local fragment covered by this event, never sent as an SSE ID.
     local_id: int = 0
     occurred_at: datetime = field(default_factory=_utcnow)
 
@@ -79,6 +79,7 @@ class PendingRunEvent:
     event: str
     data: dict[str, Any]
     payload_bytes: int
+    local_id: int = 0
 
 
 class AgentRunEventBacklogError(RuntimeError):
@@ -90,6 +91,10 @@ class LiveAgentRun:
     run_id: str
     status: str = "pending"
     events: list[RunEvent] = field(default_factory=list)
+    durable_events: list[RunEvent] = field(default_factory=list)
+    durable_event_bytes: int = 0
+    durable_sequence: int = 0
+    committed_local_id: int = 0
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     task: asyncio.Task[None] | None = None
     cancel_watch_task: asyncio.Task[None] | None = None
@@ -99,6 +104,7 @@ class LiveAgentRun:
     pending_bytes: int = 0
     pending_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    publication_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     flush_error: BaseException | None = None
     next_local_event_id: int = 1
     started: bool = False
@@ -116,6 +122,10 @@ class AgentRunManager:
         self.flush_max_bytes = max(256, int(settings.CHAT_AGENT_EVENT_FLUSH_MAX_BYTES))
         self.pending_max_bytes = max(self.flush_max_bytes, int(settings.CHAT_AGENT_EVENT_PENDING_MAX_BYTES))
         self.local_ttl_seconds = max(1, int(settings.CHAT_AGENT_RUN_LOCAL_TTL_SECONDS))
+        self.lease_renew_interval_seconds = min(
+            max(1.0, float(settings.CHAT_AGENT_RUN_LEASE_RENEW_INTERVAL_SECONDS)),
+            max(1.0, self.lease_seconds / 2),
+        )
 
     def create(self, run_id: str) -> LiveAgentRun:
         run = self._runs.get(run_id)
@@ -175,26 +185,45 @@ class AgentRunManager:
             run.cancel_watch_task = asyncio.create_task(self._watch_control(run_id))
         return bool(cancelled)
 
-    def _read_control(self, run_id: str) -> tuple[bool, bool] | None:
+    def _read_control(self, run_id: str, *, renew_lease: bool = False) -> tuple[bool, bool] | None:
+        """Read the small control plane without materializing large run fields."""
         now = _utcnow()
         with SessionLocal() as db:
-            run = db.get(AgentRun, run_id)
-            if run is None:
+            row = (
+                db.query(AgentRun.status, AgentRun.owner_id, AgentRun.cancel_requested_at)
+                .filter(AgentRun.id == run_id)
+                .one_or_none()
+            )
+            if row is None:
                 return None
-            status = _status_value(run.status)
+            status = _status_value(row.status)
             if status in TERMINAL_STATUSES | WAITING_STATUSES:
                 return True, False
-            if run.owner_id == self.worker_id:
-                run.heartbeat_at = now
-                run.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+            if renew_lease and row.owner_id == self.worker_id:
+                (
+                    db.query(AgentRun)
+                    .filter(AgentRun.id == run_id, AgentRun.owner_id == self.worker_id)
+                    .update(
+                        {
+                            AgentRun.heartbeat_at: now,
+                            AgentRun.lease_expires_at: now + timedelta(seconds=self.lease_seconds),
+                        },
+                        synchronize_session=False,
+                    )
+                )
                 db.commit()
-            return False, status == "cancelling" or run.cancel_requested_at is not None
+            return False, status == "cancelling" or row.cancel_requested_at is not None
 
     async def _watch_control(self, run_id: str) -> None:
         try:
+            last_lease_renewal = monotonic()
             while True:
                 await asyncio.sleep(EVENT_POLL_INTERVAL_SECONDS)
-                control = await asyncio.to_thread(self._read_control, run_id)
+                now = monotonic()
+                renew_lease = now - last_lease_renewal >= self.lease_renew_interval_seconds
+                control = await asyncio.to_thread(self._read_control, run_id, renew_lease=renew_lease)
+                if renew_lease:
+                    last_lease_renewal = now
                 if control is None:
                     return
                 terminal, cancelled = control
@@ -278,7 +307,7 @@ class AgentRunManager:
                         created_at=now,
                     )
                 )
-                persisted.append(RunEvent(sequence=sequence, event=item.event, data=item.data, occurred_at=now))
+                persisted.append(RunEvent(sequence=sequence, event=item.event, data=item.data, local_id=item.local_id, occurred_at=now))
             run.event_sequence = sequence
             last_event = pending[-1]
             phase = last_event.event
@@ -332,7 +361,7 @@ class AgentRunManager:
             payload_bytes=AgentRunManager._payload_bytes(merged_data),
         )
 
-    async def _queue_coalesced_event(self, run: LiveAgentRun, event: str, data: dict[str, Any]) -> None:
+    async def _queue_coalesced_event(self, run: LiveAgentRun, event: str, data: dict[str, Any], local_id: int = 0) -> None:
         payload_bytes = self._payload_bytes(data)
         async with run.pending_lock:
             if run.flush_error is not None:
@@ -341,6 +370,7 @@ class AgentRunManager:
                 previous = run.pending_events[-1]
                 if previous.event == event and "text" in previous.data and "text" in data:
                     candidate = self._merge_text_event(previous, data)
+                    candidate.local_id = local_id
                     if candidate.payload_bytes <= self.flush_max_bytes:
                         projected_bytes = run.pending_bytes - previous.payload_bytes + candidate.payload_bytes
                         if projected_bytes > self.pending_max_bytes:
@@ -368,7 +398,7 @@ class AgentRunManager:
                     )
                 if prior_index is not None:
                     run.pending_events.pop(prior_index)
-                run.pending_events.append(PendingRunEvent(event=event, data=data, payload_bytes=payload_bytes))
+                run.pending_events.append(PendingRunEvent(event=event, data=data, payload_bytes=payload_bytes, local_id=local_id))
                 run.pending_bytes = projected_bytes
                 if run.flush_task is None or run.flush_task.done():
                     run.flush_task = asyncio.create_task(self._flush_after_delay(run.run_id))
@@ -378,7 +408,7 @@ class AgentRunManager:
                 raise AgentRunEventBacklogError(
                     f"Agent 事件待写缓冲超过 {self.pending_max_bytes} 字节，已停止本轮执行"
                 )
-            run.pending_events.append(PendingRunEvent(event=event, data=data, payload_bytes=payload_bytes))
+            run.pending_events.append(PendingRunEvent(event=event, data=data, payload_bytes=payload_bytes, local_id=local_id))
             run.pending_bytes = projected_bytes
             if run.flush_task is None or run.flush_task.done():
                 run.flush_task = asyncio.create_task(self._flush_after_delay(run.run_id))
@@ -408,7 +438,24 @@ class AgentRunManager:
                 run.pending_events = []
                 run.pending_bytes = 0
             try:
-                persisted = await asyncio.to_thread(self._persist_events, run_id, pending, force=False)
+                async def commit_batch():
+                    events = await asyncio.to_thread(self._persist_events, run_id, pending, force=False)
+                    if events is not None:
+                        await self._cache_durable_events(run, events)
+                    return events
+
+                write_task = asyncio.create_task(commit_batch())
+                cancelled = False
+                while True:
+                    try:
+                        persisted = await asyncio.shield(write_task)
+                        break
+                    except asyncio.CancelledError:
+                        if write_task.cancelled():
+                            raise
+                        # A DB write in a thread cannot be cancelled. Keep its
+                        # ordering lock until commit and cache notification.
+                        cancelled = True
             except Exception as exc:
                 async with run.pending_lock:
                     run.pending_events = [*pending, *run.pending_events]
@@ -417,13 +464,16 @@ class AgentRunManager:
                 raise
             if persisted is None:
                 logger.warning("agent_run_event_batch_rejected run=%s count=%s", run_id, len(pending))
+                if cancelled:
+                    raise asyncio.CancelledError
                 return
             async with run.pending_lock:
                 # A transient database failure can recover before the next
                 # critical boundary. Do not poison that retry with its old
                 # exception once this batch has committed successfully.
                 run.flush_error = None
-            await self._wake_streams(run)
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def flush(self, run_id: str) -> None:
         """Synchronously persist queued deltas before an ordering boundary."""
@@ -432,14 +482,17 @@ class AgentRunManager:
             return
         task = run.flush_task
         if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            if run.flush_lock.locked():
+                await asyncio.shield(task)
+            else:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         await self._flush_pending(run_id)
         if run.flush_error is not None:
             raise AgentRunEventBacklogError("Agent 事件持久化失败") from run.flush_error
 
-    async def _notify_realtime(self, run: LiveAgentRun, event: str, data: dict[str, Any]) -> None:
+    async def _notify_realtime(self, run: LiveAgentRun, event: str, data: dict[str, Any]) -> int:
         """Send token fragments to local SSE clients before MySQL batching."""
         async with run.condition:
             run.events.append(
@@ -455,10 +508,38 @@ class AgentRunManager:
                 del run.events[: len(run.events) - self.local_event_limit]
             run.last_event_at = monotonic()
             run.condition.notify_all()
+            return run.next_local_event_id - 1
 
     async def _wake_streams(self, run: LiveAgentRun) -> None:
         """Wake local SSE polls after a durable batch becomes replayable."""
         async with run.condition:
+            run.last_event_at = monotonic()
+            run.condition.notify_all()
+
+    async def _cache_durable_events(self, run: LiveAgentRun, events: Iterable[RunEvent]) -> None:
+        """Share freshly committed events across local SSE subscribers."""
+        items = list(events)
+        if not items:
+            return
+        async with run.condition:
+            run.durable_sequence = max(run.durable_sequence, *(item.sequence for item in items))
+            run.committed_local_id = max(run.committed_local_id, *(item.local_id for item in items))
+            known = {item.sequence for item in run.durable_events}
+            for item in items:
+                if item.sequence in known:
+                    continue
+                payload_bytes = self._payload_bytes(item.data)
+                if payload_bytes > LOCAL_DURABLE_EVENT_MAX_BYTES:
+                    continue
+                run.durable_events.append(item)
+                run.durable_event_bytes += payload_bytes
+            run.durable_events.sort(key=lambda item: item.sequence)
+            while run.durable_events and (
+                len(run.durable_events) > EVENT_PAGE_SIZE
+                or run.durable_event_bytes > LOCAL_DURABLE_CACHE_MAX_BYTES
+            ):
+                removed = run.durable_events.pop(0)
+                run.durable_event_bytes = max(0, run.durable_event_bytes - self._payload_bytes(removed.data))
             run.last_event_at = monotonic()
             run.condition.notify_all()
 
@@ -467,8 +548,9 @@ class AgentRunManager:
         if run is None and not force:
             return
         if run is not None and not force and event in COALESCIBLE_EVENTS:
-            await self._notify_realtime(run, event, data)
-            await self._queue_coalesced_event(run, event, data)
+            async with run.publication_lock:
+                local_id = await self._notify_realtime(run, event, data)
+                await self._queue_coalesced_event(run, event, data, local_id)
             return
         if run is not None:
             await self.flush(run_id)
@@ -484,7 +566,39 @@ class AgentRunManager:
             return
         if run is None:
             return
-        await self._wake_streams(run)
+        await self._cache_durable_events(run, persisted)
+
+    async def notify_persisted_event(
+        self,
+        run_id: str,
+        sequence: int,
+        event: str,
+        data: dict[str, Any],
+        *,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        """Wake local streams for an event committed by a wider transaction.
+
+        A pending user question must become visible atomically with the run's
+        ``waiting_for_input`` state. That transaction is owned by the chat
+        route because it also inserts the question row. Once it commits, this
+        method shares the already durable event with in-process subscribers
+        without inserting a duplicate event.
+        """
+        run = self._runs.get(run_id)
+        if run is None:
+            return
+        await self._cache_durable_events(
+            run,
+            [
+                RunEvent(
+                    sequence=max(1, int(sequence)),
+                    event=event,
+                    data=data,
+                    occurred_at=occurred_at or _utcnow(),
+                )
+            ],
+        )
 
     def _release_owner(self, run_id: str) -> None:
         with SessionLocal() as db:
@@ -519,6 +633,8 @@ class AgentRunManager:
                 logger.exception("agent_run_terminal_flush_failed run=%s", run_id)
             async with run.condition:
                 run.status = status
+                run.task = None
+                run.events.clear()
                 run.condition.notify_all()
             if run.cancel_watch_task and not run.cancel_watch_task.done():
                 run.cancel_watch_task.cancel()
@@ -558,7 +674,11 @@ class AgentRunManager:
         # for the owner's 500 ms watcher tick.
         try:
             with SessionLocal() as db:
-                persisted = db.get(AgentRun, run_id)
+                persisted = (
+                    db.query(AgentRun.status, AgentRun.cancel_requested_at)
+                    .filter(AgentRun.id == run_id)
+                    .one_or_none()
+                )
                 if persisted is None:
                     return False
                 return (
@@ -571,8 +691,8 @@ class AgentRunManager:
 
     def _load_events(self, run_id: str, after: int) -> tuple[list[RunEvent], str | None]:
         with SessionLocal() as db:
-            run = db.get(AgentRun, run_id)
-            if run is None:
+            status_value = db.query(AgentRun.status).filter(AgentRun.id == run_id).scalar()
+            if status_value is None:
                 return [], None
             rows = (
                 db.query(AgentRunEvent)
@@ -595,7 +715,19 @@ class AgentRunManager:
                         occurred_at=_as_utc(row.created_at) or _utcnow(),
                     )
                 )
-            return events, _status_value(run.status)
+            return events, _status_value(status_value)
+
+    async def _local_durable_events_after(self, run: LiveAgentRun, after: int) -> tuple[list[RunEvent], bool]:
+        """Return cached committed events and whether the cache has a cursor gap."""
+        async with run.condition:
+            events = [item for item in run.durable_events if item.sequence > after]
+            durable_sequence = run.durable_sequence
+        has_gap = durable_sequence > after and (
+            not events
+            or events[0].sequence > after + 1
+            or events[-1].sequence < durable_sequence
+        )
+        return events, has_gap
 
     async def _local_events_after(
         self,
@@ -614,29 +746,66 @@ class AgentRunManager:
         last_heartbeat = monotonic()
         initial_run = self._runs.get(run_id)
         local_cursor = 0
+        needs_durable_read = True
         if initial_run is not None:
-            # Events emitted before the subscription are replayed from MySQL.
-            # Only fragments produced after it connects use the transient path.
-            async with initial_run.condition:
-                local_cursor = initial_run.next_local_event_id - 1
+            # Flush the pre-subscription prefix before allowing newer fragments
+            # to coalesce with it. Publishers cannot split notification/queueing
+            # across this boundary.
+            async with initial_run.publication_lock:
+                await self.flush(run_id)
+                async with initial_run.condition:
+                    local_cursor = initial_run.next_local_event_id - 1
         while True:
             run = self._runs.get(run_id)
+            pending: list[RunEvent] = []
+            status: str | None = run.status if run is not None else None
+            if run is not None and not needs_durable_read:
+                pending, has_gap = await self._local_durable_events_after(run, cursor)
+                needs_durable_read = has_gap
+            if run is None or needs_durable_read:
+                try:
+                    pending, status = await asyncio.to_thread(self._load_events, run_id, cursor)
+                    needs_durable_read = False
+                except Exception:  # noqa: BLE001 - retry polling instead of dropping an active stream on a transient DB error.
+                    logger.exception("agent_run_event_poll_failed run=%s", run_id)
+                    pending, status = [], None
+            for item in pending:
+                cursor = item.sequence
+                local_cursor = max(local_cursor, item.local_id)
+                yield item
+            if pending:
+                # A terminal run may have more than one database page. Drain
+                # the ledger before closing or waiting for new live output.
+                needs_durable_read = (
+                    len(pending) >= EVENT_PAGE_SIZE
+                    or status in TERMINAL_STATUSES | WAITING_STATUSES
+                )
+                continue
+            if status in TERMINAL_STATUSES | WAITING_STATUSES:
+                return
             if run is not None:
-                realtime, local_cursor = await self._local_events_after(run, local_cursor)
+                # A DB replay can observe a batch just before its cache update.
+                # Wait for that update before choosing the remaining fragments.
+                async with run.flush_lock:
+                    async with run.condition:
+                        if run.durable_sequence > cursor:
+                            continue
+                        local_cursor = max(local_cursor, run.committed_local_id)
+                realtime, next_local_cursor = await self._local_events_after(run, local_cursor)
+                if realtime and realtime[0].local_id > local_cursor + 1:
+                    # A slow subscriber lost fragments from the bounded cache.
+                    # Recover the full prefix from durable storage in order.
+                    async with run.publication_lock:
+                        await self.flush(run_id)
+                        async with run.condition:
+                            local_cursor = run.next_local_event_id - 1
+                    needs_durable_read = True
+                    continue
+                local_cursor = next_local_cursor
                 for item in realtime:
                     yield item
                 if realtime:
                     continue
-            try:
-                pending, status = await asyncio.to_thread(self._load_events, run_id, cursor)
-            except Exception:  # noqa: BLE001 - retry polling instead of dropping an active stream on a transient DB error.
-                logger.exception("agent_run_event_poll_failed run=%s", run_id)
-                pending, status = [], None
-            for item in pending:
-                cursor = item.sequence
-                yield item
-            if status in TERMINAL_STATUSES | WAITING_STATUSES:
-                return
             now = monotonic()
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                 yield RunEvent(sequence=0, event="heartbeat", data={"status": status or "unknown", "idle_seconds": 0})
@@ -664,16 +833,28 @@ def cleanup_expired_agent_run_events(db, *, now: datetime | None = None) -> int:
     """Remove replay records only after their terminal run has aged out."""
     retention_seconds = max(60, int(settings.CHAT_AGENT_RUN_EVENT_RETENTION_SECONDS))
     cutoff = (now or _utcnow()) - timedelta(seconds=retention_seconds)
-    terminal_run_ids = db.query(AgentRun.id).filter(
-        AgentRun.status.in_(
-            [AgentRunStatus.COMPLETED, AgentRunStatus.CANCELLED, AgentRunStatus.FAILED]
-        ),
-        AgentRun.finished_at.is_not(None),
-        AgentRun.finished_at <= cutoff,
-    )
+    expired_event_ids = [
+        event_id
+        for (event_id,) in (
+            db.query(AgentRunEvent.id)
+            .join(AgentRun, AgentRun.id == AgentRunEvent.run_id)
+            .filter(
+                AgentRun.status.in_(
+                    [AgentRunStatus.COMPLETED, AgentRunStatus.CANCELLED, AgentRunStatus.FAILED]
+                ),
+                AgentRun.finished_at.is_not(None),
+                AgentRun.finished_at <= cutoff,
+            )
+            .order_by(AgentRunEvent.id)
+            .limit(500)
+            .all()
+        )
+    ]
+    if not expired_event_ids:
+        return 0
     deleted = (
         db.query(AgentRunEvent)
-        .filter(AgentRunEvent.run_id.in_(terminal_run_ids))
+        .filter(AgentRunEvent.id.in_(expired_event_ids))
         .delete(synchronize_session=False)
     )
     db.commit()

@@ -425,6 +425,13 @@ class HtmlEditSessionSafetyTests(unittest.TestCase):
         self.assertIn("并行", prompt)
         self.assertIn("只读工具", prompt)
 
+    def test_prompt_reuses_gallery_article_urls_without_repeated_imports(self) -> None:
+        prompt = build_system_prompt("测试", "<p>正文</p>")
+
+        self.assertIn("若清单提供 article_url，直接复用该地址，不要再保存或导入", prompt)
+        self.assertIn("只有没有 article_url 的附件才调用 import_chat_image", prompt)
+        self.assertNotIn("用户要求用附图替换或插入正文图片时，调用 import_chat_image", prompt)
+
     def test_prompt_maps_attached_template_tokens_to_their_ordered_templates(self) -> None:
         prompt = build_system_prompt(
             "测试",

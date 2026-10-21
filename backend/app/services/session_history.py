@@ -6,12 +6,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models.chat_context_event import ChatContextEvent
+from app.models.chat_context_event import ChatContextEvent, ContextEventKind
+from app.models.chat_image_attachment import ChatImageAttachment
 from app.models.chat_session import ChatSession
 from app.models.chat_message import ChatMessage
 from app.models.chat_tool_output import ChatToolOutput
 from app.models.agent_run import AgentRun
-from app.services.token_budget import estimate_tokens, truncate_to_tokens
+from app.services.chat_images import attachment_article_urls, chat_attachment_url, ordered_image_attachments
+from app.services.token_budget import truncate_to_tokens
+from app.services.tool_output_store import _take_prefix
 
 
 class SessionHistoryError(ValueError):
@@ -54,6 +57,28 @@ class SessionHistoryReader:
         if start:
             query = query.filter(ChatContextEvent.message_id > start)
         return query.order_by(ChatContextEvent.id).all()
+
+    def _image_references(self, db: Session, message_id: int | None) -> list[dict[str, str]]:
+        if not message_id:
+            return []
+        attachments = (
+            db.query(ChatImageAttachment)
+            .filter(
+                ChatImageAttachment.document_id == self.document_id,
+                ChatImageAttachment.message_id == message_id,
+            )
+            .order_by(ChatImageAttachment.created_at, ChatImageAttachment.id)
+            .all()
+        )
+        event = db.query(ChatContextEvent).filter(
+            ChatContextEvent.message_id == message_id,
+            ChatContextEvent.session_id == self.session_id,
+            ChatContextEvent.kind == ContextEventKind.USER,
+        ).order_by(ChatContextEvent.ordinal, ChatContextEvent.id).first()
+        attachments = ordered_image_attachments(attachments, event.payload.get("image_attachment_ids") if event else None)
+        article_urls = attachment_article_urls(db, attachments)
+        return [{"attachment_id": item.id, "filename": item.filename, "url": chat_attachment_url(item),
+                 **({"article_url": article_urls[item.id]} if article_urls.get(item.id) else {})} for item in attachments]
 
     def search(self, db: Session, query: str, *, cursor: int = 0, limit: int = 8) -> dict[str, Any]:
         phrase = " ".join(str(query).lower().split())
@@ -101,6 +126,9 @@ class SessionHistoryReader:
                 }
             )
         page = matches[offset : offset + limit]
+        for item in page:
+            if item["kind"] == "user":
+                item["images"] = self._image_references(db, item["message_id"])
         return {
             "ok": True,
             "query": query,
@@ -120,13 +148,17 @@ class SessionHistoryReader:
             event = next((item for item in self._events(db) if item.id == event_id), None)
             if event is None:
                 raise SessionHistoryError("会话事件不存在或已从当前上下文中截断")
-            content = _event_text(event)
+            content = _event_text(event)[offset:]
+            page = _take_prefix(content, max_tokens)
+            next_offset = offset + len(page)
             return {
                 "ok": True,
                 "reference": reference,
                 "kind": event.kind.value,
-                "content": truncate_to_tokens(content, max_tokens),
-                "truncated": estimate_tokens(content) > max_tokens,
+                "content": page,
+                "next_cursor": next_offset if len(page) < len(content) else None,
+                "truncated": len(page) < len(content),
+                **({"images": self._image_references(db, event.message_id)} if event.kind.value == "user" else {}),
             }
         if reference.startswith("tool:"):
             output_id = reference.split(":", 1)[1]
@@ -151,7 +183,7 @@ class SessionHistoryReader:
             # Character offsets are used only as a continuation cursor; token limiting
             # keeps the provider-visible page inside the current turn budget.
             content = output.content[offset:]
-            page = truncate_to_tokens(content, max_tokens)
+            page = _take_prefix(content, max_tokens)
             next_offset = offset + len(page)
             return {
                 "ok": True,

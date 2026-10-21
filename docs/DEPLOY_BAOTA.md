@@ -39,6 +39,10 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 ```dotenv
 APP_ENV=production
 DATABASE_URL=mysql+pymysql://yibanpaiban:replace-with-a-long-password@127.0.0.1:3306/yibanpaiban?charset=utf8mb4
+DATABASE_POOL_SIZE=5
+DATABASE_MAX_OVERFLOW=0
+CHAT_AGENT_MAX_CONCURRENT_RUNS=10
+CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER=3
 DEFAULT_ADMIN_USERNAME=replace-admin-name
 DEFAULT_ADMIN_PASSWORD=replace-with-a-long-password
 CORS_ORIGINS=https://example.com
@@ -74,7 +78,7 @@ curl -fsS 'http://127.0.0.1:8088/search?q=test&categories=images&format=json' >/
 
 保持 `SEARXNG_BASE_URL=http://127.0.0.1:8088`。如需改端口，同时修改 `deploy/searxng/.env` 的 `SEARXNG_HOST_PORT` 与此地址。默认国内来源为百度图片、搜狗图片和 `cn.bing.com` 图片；百度候选仅安全升级其 HTTP 来源页为 HTTPS，原图仍必须通过现有 HTTPS 校验。生产切换前按 `deploy/searxng/README.md` 在 `127.0.0.1:8089` 运行隔离验证，验证通过后执行 `./apply-domestic-profile.sh`；该脚本会保留搜图密钥并创建可回滚备份。应用层搜图总等待预算默认 4 秒，规范化结果缓存 300 秒，可分别用 `SEARXNG_TIMEOUT_SECONDS` 与 `SEARXNG_SEARCH_CACHE_SECONDS` 调整。不要在宝塔安全组、Nginx 或公网防火墙开放该端口。搜图服务停机不会阻止主应用启动。
 
-Compose 默认使用单 worker、单线程和 320 MiB 内存上限（160 MiB 预留、96 PID），可通过 `deploy/searxng/.env` 的 `SEARXNG_MEMORY_LIMIT`、`SEARXNG_UWSGI_WORKERS` 等变量调整。2C2G 仅适合低并发且数据库外置的场景；宝塔、MySQL、主应用和搜图同机部署建议至少 4G 内存。
+Compose 默认使用单 worker、单线程和 320 MiB 内存上限（160 MiB 预留、96 PID），可通过 `deploy/searxng/.env` 的 `SEARXNG_MEMORY_LIMIT`、`SEARXNG_UWSGI_WORKERS` 等变量调整。2C2G 同机部署使用单 Uvicorn worker，并将上述 `.env` 示例中的 `CHAT_AGENT_MAX_CONCURRENT_RUNS` 改为 `2`、`CHAT_AGENT_MAX_CONCURRENT_RUNS_PER_USER` 改为 `1`，保持 5 个数据库连接且无 overflow；这与应用默认的 10 / 3 并发不同。MySQL 可从 `deploy/mysql-2g.cnf.example` 的 256 MiB buffer pool、32 个最大连接开始。配置与复测方法见 [2 GiB 性能说明](PERFORMANCE_2G.md)。上线前必须跑“双任务 + 搜图”整机复测；超大文档单独测试，持续 swap 时降低并发或扩容。
 
 ## 4. 安装 Python 依赖并启动
 
@@ -87,20 +91,22 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ./venv/bin/python -m playwright install-deps chromium
 install -d -m 0755 -o www -g www /home/www
-sudo -H -u www ./venv/bin/python -m playwright install chromium
+sudo -H -u www ./venv/bin/python -m playwright install --only-shell chromium
 mkdir -p data/uploads
 chown -R www:www /www/wwwroot/yibanpaiban
 ```
 
-官方微信合规检测使用 Python Playwright Chromium，不需要 Node.js。`install-deps` 需要 root 权限；浏览器文件则必须使用实际运行 Uvicorn 的 `www` 用户安装。不要只用 root 执行 `playwright install`，否则文件会进入 `/root/.cache/ms-playwright`，而 `www` 进程仍会在 `/home/www/.cache/ms-playwright` 报浏览器不存在。若系统没有 `sudo`，等效命令为 `runuser -u www -- env HOME=/home/www ./venv/bin/python -m playwright install chromium`。
+官方微信合规检测使用 Python Playwright Chromium headless shell，不需要 Node.js。`install-deps` 需要 root 权限；浏览器文件则必须使用实际运行 Uvicorn 的 `www` 用户安装。不要只用 root 执行 `playwright install`，否则文件会进入 `/root/.cache/ms-playwright`，而 `www` 进程仍会报浏览器不存在。若系统没有 `sudo`，等效命令为 `runuser -u www -- env HOME=/home/www ./venv/bin/python -m playwright install --only-shell chromium`。
 
-每次升级或重装 `requirements.txt` 后都要重新执行上面的 Chromium 安装命令，确保浏览器 revision 与固定的 Python Playwright 版本一致，然后在宝塔面板重启 Python 项目。可在重启前以运行用户执行真实启动测试：
+每次升级或重装 `requirements.txt` 后都要重新执行上面的安装命令，确保 headless shell 与当前虚拟环境的 Playwright 版本匹配，然后在宝塔面板重启 Python 项目。不要把 Playwright 缓存中的 `chromium-*/chrome-linux64/chrome` 写入 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH`；若此前按旧说明写入过，请将该项留空。`p.chromium.executable_path` 指向完整 Chromium，不能证明默认无头启动所需的 shell 已安装。重启前以运行用户执行真实启动测试：
 
 ```bash
-sudo -H -u www ./venv/bin/python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); print("Chromium OK:", p.chromium.executable_path); b.close(); p.stop()'
+sudo -H -u www ./venv/bin/python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); page=b.new_page(); page.set_content("<p>ok</p>"); print("Chromium headless shell OK:", page.text_content("p")); b.close(); p.stop()'
 ```
 
-浏览器只在首次模型合规检测时启动并由进程复用；不可用时返回“未验证”，不会阻止编辑、保存或公众号草稿同步。若服务器已有系统 Chromium，可在 `backend/.env` 设置 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH=/实际/chromium路径`。
+浏览器按需启动并由进程复用，最后一次检测完成且队列为空 10 秒后释放 Chromium；较小的 Playwright 驱动保留至 120 秒，以便短间隔检测重用。可分别用 `WECHAT_COMPLIANCE_BROWSER_IDLE_SECONDS` 和 `WECHAT_COMPLIANCE_DRIVER_IDLE_SECONDS` 调整。已有部署若在 `backend/.env` 中设置了浏览器空闲时间 `120`，需改为 `10` 才能降低检测后的常驻内存。不可用时返回“未验证”，不会阻止编辑、保存或公众号草稿同步。若服务器已有系统 Chromium，可在 `backend/.env` 设置 `WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH=/实际/chromium路径`。
+
+冷启动有独立的 `WECHAT_COMPLIANCE_BROWSER_STARTUP_TIMEOUT_SECONDS=40` 秒预算，启动成功后的规则执行仍按 `WECHAT_COMPLIANCE_CHECK_TIMEOUT_SECONDS=20` 秒限制。合规检测由模型主动调用或用户手动触发，任务完成、取消、失败和恢复时均不自动检测。
 
 在宝塔“Python 项目”中新增项目，项目路径选择 `backend`，运行用户选择 `www`，启动命令填写：
 

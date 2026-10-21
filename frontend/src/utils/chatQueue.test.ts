@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { moveQueuedChatItem, updateQueuedChatContent } from './chatQueue'
+import { canAdvanceQueuedChat, moveQueuedChatItem, updateQueuedChatContent } from './chatQueue'
 
 describe('chat queue helpers', () => {
   const items = [
@@ -7,6 +7,13 @@ describe('chat queue helpers', () => {
     { id: 'second', content: '第二项', imageIds: [] },
     { id: 'third', content: '第三项', imageIds: [] },
   ]
+
+  it('advances only after a confirmed successful run', () => {
+    expect(canAdvanceQueuedChat('completed')).toBe(true)
+    expect(canAdvanceQueuedChat('failed')).toBe(false)
+    expect(canAdvanceQueuedChat('cancelled')).toBe(false)
+    expect(canAdvanceQueuedChat(undefined)).toBe(false)
+  })
 
   it('updates only the queued instruction content', () => {
     const next = updateQueuedChatContent(items, 'first', '更新后的第一项')

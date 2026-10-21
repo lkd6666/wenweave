@@ -16,7 +16,7 @@ this exact source with `npm run build:browser` in the upstream `cli` directory.
 Its SHA-256 is:
 
 ```text
-00d3e65b57ddbac6879a151595c8bb2bdcc94b3bdc0e0c24cf23619c707ec210
+91b47add05f526a3eedd35d25b4ae2f89df0ebc80e0e1e6100f00f686875f9f
 ```
 
 Production code loads only the checked-in browser bundle through Python

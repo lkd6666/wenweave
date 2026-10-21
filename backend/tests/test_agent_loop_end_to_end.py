@@ -22,9 +22,13 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Huma
 from langchain_core.outputs import ChatGenerationChunk
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401 - register storage tables for the isolated graph test.
 from app.db.base import Base
+from app.models.chat_image_attachment import ChatImageAttachment
+from app.models.chat_message import ChatMessage, MessageRole
+from app.models.chat_session import ChatSession
 from app.models.chat_tool_output import ChatToolOutput
 from app.services.chat_agent import (
     HtmlEditSession,
@@ -71,8 +75,8 @@ class ScriptedChatModel(BaseChatModel):
             yield ChatGenerationChunk(message=AIMessageChunk(content=step["text"]))
         if step.get("disconnect_after_text"):
             raise RuntimeError("connection reset by peer")
-        if step.get("tool"):
-            name, args = step["tool"]
+        tool_steps = step.get("tools") or ([step["tool"]] if step.get("tool") else [])
+        for tool_index, (name, args) in enumerate(tool_steps):
             serialized_args = json.dumps(args, ensure_ascii=False)
             fragments = step.get("tool_argument_fragments") or [serialized_args]
             for index, fragment in enumerate(fragments):
@@ -81,9 +85,9 @@ class ScriptedChatModel(BaseChatModel):
                         content="",
                         tool_call_chunks=[
                             {
-                                **({"name": name, "id": f"call-{len(self.seen_message_counts)}"} if index == 0 else {}),
+                                **({"name": name, "id": None if step.get("omit_tool_ids") else f"call-{len(self.seen_message_counts)}" + (f"-{tool_index}" if len(tool_steps) > 1 else "")} if index == 0 else {}),
                                 "args": fragment,
-                                "index": 0,
+                                "index": None if step.get("omit_tool_indexes") else step.get("tool_indexes", range(len(tool_steps)))[tool_index],
                                 "type": "tool_call_chunk",
                             }
                         ],
@@ -128,7 +132,7 @@ def _run(
                 budget,
                 attached_templates=attached_templates,
                 tool_output_store=tool_output_store,
-                theme_application=theme_application,
+                theme_application=theme_application, tool_protocol="v1"
             )
         ]
 
@@ -136,6 +140,161 @@ def _run(
 
 
 class AgentLoopEndToEndTests(unittest.TestCase):
+    def test_missing_search_query_has_actionable_errors_and_recovers(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_html", {})},
+                {"tool": ("search_html", {})},
+                {"tool": ("search_html", {"query": "旧标题"})},
+                {"text": "已定位标题。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        with patch.object(session, "search", wraps=session.search) as search:
+            events = _run(model, session)
+        self.assertEqual(search.call_count, 1)
+        results = [event["data"] for event in events if event["event"] == "tool_result"]
+        self.assertEqual(len(results), 3)
+        for index, result in enumerate(results[:2]):
+            self.assertIn("缺少必填参数：query", result["result"])
+            self.assertNotIn("ToolInvocationError", result["result"])
+            self.assertEqual(result["activity"]["details"]["attempt"], index + 1)
+            message = model.seen_messages[index + 1][-1]
+            self.assertEqual(message.tool_call_id, result["id"])
+            payload = json.loads(str(message.content))
+            self.assertEqual(payload["missing_fields"], ["query"])
+            self.assertFalse(payload["retry_same_arguments"])
+            self.assertEqual(result["model_input"]["content"], str(message.content))
+        self.assertIn("get_document_map", results[1]["activity"]["details"]["next_step"])
+        self.assertEqual(results[2]["activity"]["kind"], "search")
+        self.assertEqual(events[-1]["event"], "final")
+
+    def test_provider_cumulative_search_arguments_use_the_complete_buffer(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_html", {"query": "旧标题"}), "tool_argument_fragments": ['{"query":', '{"query":"旧', '{"query":"旧标题"}']},
+                {"text": "已定位标题。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        with patch.object(session, "search", wraps=session.search) as search:
+            events = _run(model, session)
+        search.assert_called_once_with("旧标题", 8, 0)
+        result = next(event["data"] for event in events if event["event"] == "tool_result")
+        self.assertEqual(result["activity"]["kind"], "search")
+        self.assertEqual(model.seen_messages[1][-2].tool_calls[0]["args"], {"query": "旧标题"})
+
+    def test_search_accepts_encoded_wrappers_alias_and_optional_null(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_html", {"arguments": '{"keyword":"旧标题","limit":null}'})},
+                {"text": "已定位标题。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        with patch.object(session, "search", wraps=session.search) as search:
+            events = _run(model, session)
+        search.assert_called_once_with("旧标题", 8, 0)
+        result = next(event["data"] for event in events if event["event"] == "tool_result")
+        self.assertEqual(result["activity"]["kind"], "search")
+
+    def test_truncated_write_arguments_are_not_executed_as_partial_json(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        arguments = {"revision": session.document_map()["revision"], "html": "<p>不得写入</p>"}
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("replace_document", arguments), "tool_argument_fragments": [json.dumps(arguments)[:-1]]},
+                {"text": "参数不完整，需要重新提交。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        with patch.object(session, "replace_document", wraps=session.replace_document) as replace:
+            events = _run(model, session)
+        replace.assert_not_called()
+        self.assertEqual(session.html, SOURCE_HTML)
+        result = next(event["data"] for event in events if event["event"] == "tool_result")
+        self.assertEqual(result["activity"]["details"]["code"], "invalid_tool_arguments")
+        self.assertIn("完整", result["result"])
+        self.assertEqual(events[-1]["event"], "final")
+
+    def test_invalid_parallel_call_does_not_discard_the_valid_search(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tools": [("search_html", {}), ("search_html", {"keywords": "正文内容"})]},
+                {"text": "已读取可定位的内容。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        with patch.object(session, "search", wraps=session.search) as search:
+            events = _run(model, session)
+        search.assert_called_once_with("正文内容", 8, 0)
+        results = {event["data"]["id"]: event["data"] for event in events if event["event"] == "tool_result"}
+        self.assertEqual(set(results), {"call-1-0", "call-1-1"})
+        self.assertEqual(results["call-1-0"]["activity"]["kind"], "error")
+        self.assertEqual(results["call-1-1"]["activity"]["kind"], "search")
+        messages = model.seen_messages[1][-2:]
+        self.assertEqual([message.tool_call_id for message in messages], ["call-1-0", "call-1-1"])
+
+    def test_parallel_calls_without_chunk_indexes_keep_arguments_separate(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tools": [("search_html", {"query": "旧标题"}), ("search_html", {"query": "正文内容"})], "omit_tool_indexes": True},
+                {"text": "已分别定位。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        with patch.object(session, "search", wraps=session.search) as search:
+            events = _run(model, session)
+        self.assertEqual(search.call_count, 2)
+        self.assertCountEqual([call.args[0] for call in search.call_args_list], ["旧标题", "正文内容"])
+        results = [event["data"] for event in events if event["event"] == "tool_result"]
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["activity"]["kind"] == "search" for result in results))
+
+    def test_parallel_compliance_with_sparse_chunk_indexes_keeps_timeline_ids(self) -> None:
+        for indexes in ([1, 2], [0, 3], [2, 7]):
+            for omit_ids in (False, True):
+                with self.subTest(indexes=indexes, omit_ids=omit_ids):
+                    session = HtmlEditSession(SOURCE_HTML)
+                    model = ScriptedChatModel(
+                        script=[
+                            {
+                                "tools": [("read_blocks", {}), ("check_compliance", {})],
+                                "tool_indexes": indexes,
+                                "omit_tool_ids": omit_ids,
+                            },
+                            {"text": "核对完成。"},
+                        ], seen_message_counts=[], seen_messages=[],
+                    )
+                    report = {"isValid": True, "violations": []}
+                    with patch("app.services.chat_agent.run_compliance_check", return_value=SimpleNamespace(to_dict=lambda: report)) as checker:
+                        events = _run(model, session)
+
+                    checker.assert_called_once_with(SOURCE_HTML)
+                    calls = [event["data"] for event in events if event["event"] == "tool_call"]
+                    preparing = {call["name"]: call["id"] for call in calls if call.get("preparing")}
+                    completed = [call for call in calls if not call.get("preparing")]
+                    self.assertEqual({call["name"]: call["id"] for call in completed}, preparing)
+                    self.assertTrue(all("replaces_id" not in call for call in completed))
+                    results = [event["data"] for event in events if event["event"] == "tool_result"]
+                    self.assertEqual(len(results), 2)
+                    self.assertEqual({result["name"]: result["id"] for result in results}, preparing)
+
+    def test_omitted_call_id_gets_a_matching_result_and_provider_history(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("search_html", {"query": "旧标题"}), "omit_tool_ids": True},
+                {"text": "已定位。"},
+            ], seen_message_counts=[], seen_messages=[],
+        )
+        events = _run(model, session)
+        result = next(event["data"] for event in events if event["event"] == "tool_result")
+        self.assertTrue(result["id"])
+        self.assertEqual(result["activity"]["kind"], "search")
+        assistant, tool_message = model.seen_messages[1][-2:]
+        self.assertEqual(assistant.tool_calls[0]["id"], tool_message.tool_call_id)
+        self.assertEqual(tool_message.tool_call_id, result["id"])
+
     def test_invalid_replace_document_is_preserved_and_returns_warning_to_model_and_ui(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
         model = ScriptedChatModel(
@@ -258,6 +417,8 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
         self.assertEqual(model.seen_messages[1][-1].tool_call_id, "call-1")
         self.assertIn('"ok":true', str(model.seen_messages[1][-1].content))
+        self.assertEqual(result["model_input"]["state"], "available")
+        self.assertEqual(result["model_input"]["content"], str(model.seen_messages[1][-1].content))
 
     def test_attached_template_reader_accepts_json_array_tool_argument(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
@@ -323,7 +484,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     None,
                     [],
                     session=session,
-                    theme_application=theme_application,
+                    theme_application=theme_application, tool_protocol="v1"
                 )
             ]
 
@@ -378,7 +539,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                 HtmlEditSession(SOURCE_HTML).document_map(),
                 None,
                 [],
-                theme_application=theme_application,
+                theme_application=theme_application, tool_protocol="v1"
             ):
                 pass
 
@@ -386,6 +547,41 @@ class AgentLoopEndToEndTests(unittest.TestCase):
 
         self.assertIn("check_compliance", theme_model.bound_tool_names)
         self.assertIn("validate_gzh_html", theme_model.bound_tool_names)
+
+    def test_read_blocks_tool_accepts_oversized_block_continuation_cursor(self) -> None:
+        source = "<section><p>" + ("很长的正文" * 350) + "</p></section>"
+        session = HtmlEditSession(source, tool_result_max_tokens=512)
+        block_id = next(block.block_id for block in session.workspace().blocks if block.tag == "section")
+        first_page = session.read_blocks([block_id])
+        self.assertIsInstance(first_page["next_cursor"], str)
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("read_blocks", {"block_ids": [block_id]})},
+                {"tool": ("read_blocks", {"block_ids": [block_id], "cursor": first_page["next_cursor"]})},
+                {"text": "已继续读取源码。"},
+            ],
+            seen_message_counts=[], seen_messages=[],
+        )
+
+        events = _run(model, session)
+
+        results = [
+            event["data"] for event in events
+            if event["event"] == "tool_result" and event["data"]["name"] == "read_blocks"
+        ]
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["activity"]["kind"] == "read" for result in results))
+        first_content = next(
+            message.content for message in model.seen_messages[1]
+            if isinstance(message, ToolMessage) and message.name == "read_blocks"
+        )
+        second_contents = [
+            message.content for message in model.seen_messages[2]
+            if isinstance(message, ToolMessage) and message.name == "read_blocks"
+        ]
+        self.assertIn("html_fragment", str(first_content))
+        self.assertEqual(len(second_contents), 2)
+        self.assertEqual(json.loads(str(second_contents[1]))["cursor"], first_page["next_cursor"])
 
     def test_multimodal_view_tool_injects_ephemeral_image_message(self) -> None:
         image_bytes = b"not-a-real-image-but-validated-by-the-test"
@@ -424,7 +620,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     tool_output_store=store,
                     actor_user_id=7,
                     model_is_multimodal=True,
-                    provider_type="openai_compatible",
+                    provider_type="openai_compatible", tool_protocol="v1"
                 )
             ]
 
@@ -449,14 +645,103 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                 if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
             )
             self.assertEqual(result["activity"]["kind"], "image_view")
+            self.assertTrue(result["activity"]["details"]["include_image_requested"])
+            self.assertTrue(result["activity"]["details"]["image_content_included"])
             self.assertEqual(result["activity"]["details"]["items"][0]["width"], 640)
             self.assertEqual(result["activity"]["details"]["items"][0]["height"], 360)
+            self.assertNotIn("preview_url", result["activity"]["details"]["items"][0])
+            text_result = next(
+                message
+                for message in model.seen_messages[1]
+                if isinstance(message, ToolMessage) and message.name == "view_article_images"
+            )
+            self.assertEqual(result["model_input"]["content"], str(text_result.content))
+            self.assertNotIn(base64.b64encode(image_bytes).decode("ascii"), result["model_input"]["content"])
+            completed_call = next(
+                event["data"] for event in events
+                if event["event"] == "tool_call" and event["data"]["name"] == "view_article_images"
+                and not event["data"].get("preparing")
+            )
+            self.assertTrue(completed_call["arguments"]["include_image"])
             persisted_context = [
                 event["data"].get("context_events", [])
                 for event in events
                 if isinstance(event.get("data"), dict) and event["event"] in {"final", "error"}
             ]
             self.assertNotIn(base64.b64encode(image_bytes).decode("ascii"), json.dumps(persisted_context, ensure_ascii=False))
+        finally:
+            engine.dispose()
+
+    def test_chat_image_view_reads_active_session_only(self) -> None:
+        image_bytes = b"chat-image-pixels"
+        session = HtmlEditSession(SOURCE_HTML)
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        with factory() as db:
+            current_session = ChatSession(document_id=1, title="current")
+            other_session = ChatSession(document_id=1, title="other")
+            db.add_all([current_session, other_session])
+            db.flush()
+            old = ChatMessage(document_id=1, session_id=current_session.id, role=MessageRole.USER, content="old")
+            active = ChatMessage(document_id=1, session_id=current_session.id, role=MessageRole.USER, content="active")
+            superseded = ChatMessage(document_id=1, session_id=current_session.id, role=MessageRole.USER, content="superseded", is_superseded=True)
+            foreign = ChatMessage(document_id=1, session_id=other_session.id, role=MessageRole.USER, content="foreign")
+            db.add_all([old, active, superseded, foreign])
+            db.flush()
+            current_session.context_start_message_id = old.id
+            for key, message in (("old", old), ("active", active), ("superseded", superseded), ("foreign", foreign)):
+                db.add(ChatImageAttachment(
+                    id=f"chat-{key}", document_id=1, uploader_id=7,
+                    message_id=message.id, filename=f"{key}.png", content_type="image/png",
+                    size=len(image_bytes), storage_mode="local", object_key=f"{key}.png",
+                ))
+            db.commit()
+            current_session_id = current_session.id
+
+        model = ScriptedChatModel(
+            script=[
+                {"tool": ("view_article_images", {"references": [{"kind": "chat", "attachment_id": f"chat-{key}"}]})}
+                for key in ("active", "old", "superseded", "foreign")
+            ] + [{"text": "已查看当前会话图片。"}],
+            seen_message_counts=[], seen_messages=[],
+        )
+        store = ToolOutputStore(document_id=1, session_id=current_session_id, run_id="chat-image-view-test")
+
+        async def go() -> list[dict[str, Any]]:
+            return [
+                event async for event in run_agent_loop(
+                    model, "会话图片测试稿", session.html, "查看附图", session.document_map(),
+                    None, [], session=session, tool_output_store=store,
+                    actor_user_id=7, model_is_multimodal=True,
+                    provider_type="openai_compatible", tool_protocol="v1"
+                )
+            ]
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+            patch("app.services.chat_agent.read_attachment_bytes", return_value=image_bytes) as read_image,
+            patch("app.services.document_image_transform.read_document_image_dimensions", return_value=("image/png", 640, 360)),
+        ):
+            events = asyncio.run(go())
+        try:
+            results = [
+                event["data"] for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images"
+            ]
+            self.assertEqual(len(results), 4)
+            self.assertEqual(results[0]["activity"]["details"]["items"][0]["kind"], "chat")
+            self.assertEqual(results[0]["activity"]["details"]["items"][0]["width"], 640)
+            self.assertTrue(all(result["activity"]["kind"] == "error" for result in results[1:]))
+            self.assertEqual(read_image.call_count, 1)
+            visual_messages = [
+                message for message in model.seen_messages[1]
+                if isinstance(message, HumanMessage) and getattr(message, "additional_kwargs", {}).get("ephemeral_tool_images")
+            ]
+            self.assertEqual(len(visual_messages), 1)
+            self.assertIn(base64.b64encode(image_bytes).decode("ascii"), json.dumps(visual_messages[0].content))
+            self.assertNotIn(base64.b64encode(image_bytes).decode("ascii"), json.dumps(results))
         finally:
             engine.dispose()
 
@@ -497,7 +782,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     tool_output_store=store,
                     actor_user_id=7,
                     model_is_multimodal=False,
-                    provider_type="openai_compatible",
+                    provider_type="openai_compatible", tool_protocol="v1"
                 )
             ]
 
@@ -515,6 +800,10 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             )
             details = result["activity"]["details"]
             self.assertFalse(details["vision_supported"])
+            self.assertTrue(details["include_image_requested"])
+            self.assertFalse(details["image_content_included"])
+            self.assertIn("当前模型不支持图片输入", details["notice"])
+            self.assertIn("当前模型不支持看图", result["result"])
             self.assertEqual(details["viewed_count"], 0)
             self.assertEqual(details["items"][0]["width"], 1200)
             self.assertEqual(details["items"][0]["height"], 628)
@@ -561,7 +850,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     tool_output_store=store,
                     actor_user_id=7,
                     model_is_multimodal=True,
-                    provider_type="openai_compatible",
+                    provider_type="openai_compatible", tool_protocol="v1"
                 )
             ]
 
@@ -586,9 +875,19 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             )
             details = result["activity"]["details"]
             self.assertTrue(details["vision_supported"])
+            self.assertFalse(details["include_image_requested"])
             self.assertFalse(details["image_content_included"])
+            self.assertIn("本次调用选择仅读取尺寸", details["notice"])
+            self.assertIn("仅请求尺寸", result["result"])
             self.assertEqual(details["viewed_count"], 0)
             self.assertEqual((details["items"][0]["width"], details["items"][0]["height"]), (1200, 628))
+            self.assertNotIn("preview_url", details["items"][0])
+            completed_call = next(
+                event["data"] for event in events
+                if event["event"] == "tool_call" and event["data"]["name"] == "view_article_images"
+                and not event["data"].get("preparing")
+            )
+            self.assertEqual(completed_call["arguments"], {"include_image": False})
         finally:
             engine.dispose()
 
@@ -655,7 +954,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     tool_output_store=store,
                     actor_user_id=7,
                     model_is_multimodal=True,
-                    provider_type="openai_compatible",
+                    provider_type="openai_compatible", tool_protocol="v1"
                 )
             ]
 
@@ -728,7 +1027,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     tool_output_store=store,
                     actor_user_id=7,
                     model_is_multimodal=True,
-                    provider_type="openai_compatible",
+                    provider_type="openai_compatible", tool_protocol="v1"
                 )
             ]
 
@@ -794,7 +1093,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     [],
                     session=session,
                     tool_output_store=store,
-                    actor_user_id=7,
+                    actor_user_id=7, tool_protocol="v1"
                 )
             ]
 
@@ -867,7 +1166,10 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             script=self._patch_script(session), seen_message_counts=[], seen_messages=[]
         )
 
-        events = _run(model, session)
+        report = {"isValid": True, "violations": [], "warnMsgs": []}
+        with patch("app.services.chat_agent.run_compliance_check", return_value=SimpleNamespace(to_dict=lambda: report)) as checker:
+            events = _run(model, session)
+        checker.assert_called_once_with(session.html)
 
         kinds = [event["event"] for event in events]
         self.assertEqual(kinds[-1], "final")
@@ -877,12 +1179,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         completed_tools = [
             event["data"]
             for event in events
-            if event["event"] == "tool_result" and event["data"].get("id") != "automatic-final-compliance"
-        ]
-        automatic_compliance_results = [
-            event["data"]
-            for event in events
-            if event["event"] == "tool_result" and event["data"].get("id") == "automatic-final-compliance"
+            if event["event"] == "tool_result"
         ]
         tool_contexts = [
             event["data"]
@@ -894,10 +1191,6 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             [context["tool_call_id"] for context in tool_contexts],
             [tool["id"] for tool in completed_tools],
         )
-        self.assertEqual(len(automatic_compliance_results), 1)
-        self.assertEqual(automatic_compliance_results[0]["name"], "check_compliance")
-        self.assertIn("任务结束自动合规检测", automatic_compliance_results[0]["result"])
-        self.assertIsInstance(automatic_compliance_results[0]["activity"].get("compliance"), dict)
         model_compliance_result = next(
             tool for tool in completed_tools if tool["name"] == "check_compliance"
         )
@@ -908,15 +1201,24 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             for event in events
             if event["event"] == "context_stats" and event["data"].get("state") == "streaming"
         ]
+        request_stats = [
+            event["data"]
+            for event in events
+            if event["event"] == "context_stats" and event["data"].get("state") == "request_context"
+        ]
+        self.assertTrue(request_stats)
+        self.assertGreater(request_stats[0]["breakdown"]["runtime_system"], 0)
+        self.assertEqual(sum(request_stats[0]["breakdown"].values()), request_stats[0]["used_tokens"])
         self.assertTrue(runtime_stats, "流式输出期间必须持续发布上下文遥测")
         self.assertGreater(runtime_stats[0]["runtime_projected_tokens"], 0)
+        self.assertEqual(sum(runtime_stats[0]["breakdown"].values()), runtime_stats[0]["used_tokens"])
 
         final = events[-1]["data"]
         self.assertTrue(final["html_changed"])
         self.assertIn("新标题", final["html"])
         self.assertNotIn("旧标题", final["html"])
         self.assertEqual(final["content"], "已将标题改为《新标题》。")
-        self.assertIn("compliance", final)
+        self.assertEqual(final["compliance"], report)
         # 会话对象与 final 事件必须一致，取消时的部分持久化依赖这一点。
         self.assertEqual(session.html, final["html"])
 
@@ -991,7 +1293,6 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                 "read_blocks",
                 "apply_html_patch",
                 "apply_html_patch",
-                "check_compliance",
                 "check_compliance",
             ],
         )
@@ -1168,7 +1469,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                         "image_slots": 1,
                         "image_assets": 1,
                     },
-                    session=session,
+                    session=session, tool_protocol="v1"
                 )
             ]
 
@@ -1262,7 +1563,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
 
         self.assertEqual(
             tool_names,
-            ["inspect_current_images", "read_blocks", "apply_html_patch", "check_compliance", "check_compliance"],
+            ["inspect_current_images", "read_blocks", "apply_html_patch", "check_compliance"],
         )
         inspect_call = next(
             event["data"]
@@ -1316,7 +1617,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     None,
                     20_000,
                     "output-store-run",
-                    store,
+                    store, tool_protocol="v1"
                 )
             ]
 
@@ -1335,10 +1636,96 @@ class AgentLoopEndToEndTests(unittest.TestCase):
             self.assertTrue(payload["truncated"])
             self.assertTrue(payload["output_id"].startswith("toolout-"))
             self.assertNotIn('"slot":160', str(replayed_tool.content))
+            timeline_result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "inspect_current_images"
+            )
+            self.assertEqual(timeline_result["model_input"]["state"], "available")
+            self.assertTrue(timeline_result["model_input"]["truncated"])
+            self.assertEqual(timeline_result["model_input"]["content"], str(replayed_tool.content))
+            self.assertNotIn('"slot":160', timeline_result["model_input"]["content"])
             with Session(engine) as db:
                 stored = db.get(ChatToolOutput, payload["output_id"])
                 self.assertIsNotNone(stored)
                 self.assertIn('"slot":320', stored.content)
+        finally:
+            engine.dispose()
+
+    def test_read_tool_output_continuation_reaches_model_and_timeline(self) -> None:
+        """A continuation page is already provider-bounded and must be shown verbatim."""
+        session = HtmlEditSession(SOURCE_HTML, tool_result_max_tokens=512)
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+        store = ToolOutputStore(document_id=1, session_id=2, run_id="read-output-run")
+        source = "完整暂存工具结果。" * 800
+
+        async def go(output_id: str) -> tuple[list[dict[str, Any]], ScriptedChatModel]:
+            model = ScriptedChatModel(
+                script=[
+                    {"tool": ("read_tool_output", {"output_id": output_id, "max_tokens": 512})},
+                    {"text": "已读取需要的续读内容。"},
+                ],
+                seen_message_counts=[],
+                seen_messages=[],
+            )
+            events = [
+                event
+                async for event in run_agent_loop(
+                    model,
+                    "工具续读测试稿",
+                    session.html,
+                    "读取已暂存结果",
+                    session.document_map(),
+                    None,
+                    [],
+                    None,
+                    None,
+                    session,
+                    None,
+                    20_000,
+                    "read-output-run",
+                    store, tool_protocol="v1"
+                )
+            ]
+            return events, model
+
+        with (
+            patch("app.services.chat_agent.SessionLocal", factory),
+            patch("app.services.tool_output_store.SessionLocal", factory),
+        ):
+            binding = store.bind(
+                tool_call_id="source-call",
+                tool_name="read_blocks",
+                content=source,
+                max_preview_tokens=256,
+                force_store=True,
+            )
+            self.assertIsNotNone(binding.output_id)
+            events, model = asyncio.run(go(str(binding.output_id)))
+        try:
+            replayed_tool = next(
+                message
+                for message in model.seen_messages[1]
+                if isinstance(message, ToolMessage) and message.name == "read_tool_output"
+            )
+            timeline_result = next(
+                event["data"]
+                for event in events
+                if event["event"] == "tool_result" and event["data"]["name"] == "read_tool_output"
+            )
+            self.assertEqual(timeline_result["model_input"], {
+                "state": "available",
+                "content": str(replayed_tool.content),
+                "truncated": False,
+            })
+            self.assertIn("next_cursor", timeline_result["model_input"]["content"])
+            self.assertNotEqual(timeline_result["model_input"]["content"], source)
         finally:
             engine.dispose()
 
@@ -1382,7 +1769,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     20_000,
                     "theme-output-store-run",
                     store,
-                    theme_application,
+                    theme_application, tool_protocol="v1"
                 )
             ]
 
@@ -1458,7 +1845,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     store,
                     None,
                     None,
-                    theme_reference,
+                    theme_reference, tool_protocol="v1"
                 )
             ]
 
@@ -1610,7 +1997,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertGreater(token_counts[-1], token_counts[0])
 
     def test_complete_write_tool_json_does_not_wait_for_provider_stream_close(self) -> None:
-        """兼容网关漏掉 finish_reason 时，完整补丁仍必须立即执行。"""
+        """完整补丁只为终结用量等待有界宽限，网关挂起不能阻止执行。"""
         session = HtmlEditSession(SOURCE_HTML)
         script = self._patch_script(session)
         script[1]["hang_after_tool"] = True
@@ -1618,9 +2005,12 @@ class AgentLoopEndToEndTests(unittest.TestCase):
 
         # This case verifies that a complete write call is dispatched before a
         # gateway's missing terminal frame. Browser-backed compliance is
-        # unrelated and would make the sub-second transport assertion flaky.
-        with patch.object(session, "check_compliance", return_value={"isValid": True, "violations": []}):
-            events = _run(model, session, timeout=0.5)
+        # unrelated. Allow graph/schema setup time under the complete suite;
+        # the simulated provider hangs for 60 seconds without bounded draining.
+        with patch.object(session, "check_compliance", return_value={"isValid": True, "violations": []}), patch(
+            "app.services.chat_agent.MODEL_TOOL_TERMINAL_GRACE_SECONDS", 0.01
+        ):
+            events = _run(model, session, timeout=2.0)
 
         self.assertEqual(events[-1]["event"], "final")
         self.assertNotIn("error", [event["event"] for event in events])
@@ -1816,33 +2206,34 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "error")
         self.assertIn("响应整理超过", events[-1]["data"]["message"])
 
-    def test_stalled_final_compliance_returns_an_unverified_final_report(self) -> None:
+    def test_finishing_without_a_model_compliance_call_does_not_start_the_checker(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
         model = ScriptedChatModel(
             script=[{"text": "正文已经输出。"}], seen_message_counts=[], seen_messages=[]
         )
 
-        def block_compliance() -> dict[str, Any]:
-            time.sleep(0.2)
-            return {}
+        with patch.object(session, "check_compliance", side_effect=AssertionError("Unexpected automatic check")) as checker:
+            events = _run(model, session)
+        checker.assert_not_called()
+        self.assertEqual(events[-1]["event"], "final")
+        self.assertIsNone(events[-1]["data"]["compliance"])
+        self.assertFalse(any(event["event"] in {"tool_call", "tool_result"} for event in events))
 
-        with (
-            patch("app.services.chat_agent.COMPLIANCE_CHECK_TIMEOUT_SECONDS", 0.1),
-            patch.object(session, "check_compliance", side_effect=block_compliance),
-        ):
+    def test_editing_after_a_model_compliance_call_discards_the_old_final_report(self) -> None:
+        session = HtmlEditSession(SOURCE_HTML)
+        script = self._patch_script(session)
+        model = ScriptedChatModel(
+            script=[script[2], script[0], script[1], script[3]],
+            seen_message_counts=[],
+            seen_messages=[],
+        )
+        with patch("app.services.chat_agent.run_compliance_check", return_value=SimpleNamespace(to_dict=lambda: {"isValid": True})) as checker:
             events = _run(model, session)
 
+        checker.assert_called_once_with(SOURCE_HTML)
         self.assertEqual(events[-1]["event"], "final")
-        report = events[-1]["data"]["compliance"]
-        self.assertIsNone(report["isValid"])
-        self.assertFalse(report["engine"]["available"])
-        self.assertIn("未完成检测", report["engine"]["detail"])
-        automatic_result = next(
-            event["data"]
-            for event in events
-            if event["event"] == "tool_result" and event["data"].get("id") == "automatic-final-compliance"
-        )
-        self.assertEqual(automatic_result["result"], "任务结束自动合规检测未验证")
+        self.assertIn("新标题", events[-1]["data"]["html"])
+        self.assertIsNone(events[-1]["data"]["compliance"])
 
     def test_ask_user_pauses_then_resumes_with_the_original_tool_call_id(self) -> None:
         session = HtmlEditSession(SOURCE_HTML)
@@ -1888,7 +2279,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                         "letter_spacing_px": 0.5,
                         "text_indent_em": 1.5,
                         "text_color": "#123456",
-                    },
+                    }, tool_protocol="v1"
                 )
             ]
 
@@ -1936,7 +2327,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                         "letter_spacing_px": 0.5,
                         "text_indent_em": 1.5,
                         "text_color": "#123456",
-                    },
+                    }, tool_protocol="v1"
                 )
             ]
 
@@ -2097,6 +2488,8 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertEqual(invalid_result["activity"]["kind"], "error")
         self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
         self.assertEqual(model.seen_messages[1][-1].tool_call_id, "call-1")
+        self.assertEqual(invalid_result["model_input"]["state"], "available")
+        self.assertEqual(invalid_result["model_input"]["content"], str(model.seen_messages[1][-1].content))
         self.assertEqual(events[-1]["data"]["tool_call_id"], "call-2")
 
     def test_repeated_invalid_ask_user_degrades_to_a_text_question(self) -> None:
@@ -2162,7 +2555,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     resume_tool_result={
                         "tool_call_id": "call-timeout",
                         "content": json.dumps({"action": "no_response"}, ensure_ascii=False),
-                    },
+                    }, tool_protocol="v1"
                 )
             ]
 
@@ -2200,6 +2593,8 @@ class AgentLoopEndToEndTests(unittest.TestCase):
         self.assertEqual(error_result["activity"]["kind"], "error")
         self.assertIsInstance(model.seen_messages[1][-1], ToolMessage)
         self.assertEqual(model.seen_messages[1][-1].tool_call_id, "call-1")
+        self.assertEqual(error_result["model_input"]["state"], "available")
+        self.assertEqual(error_result["model_input"]["content"], str(model.seen_messages[1][-1].content))
 
     def test_ask_user_can_pause_and_resume_for_three_rounds(self) -> None:
         """Each answered question may lead to another independent question."""
@@ -2251,7 +2646,7 @@ class AgentLoopEndToEndTests(unittest.TestCase):
                     None,
                     [],
                     session=session,
-                    **kwargs,
+                    **kwargs, tool_protocol="v1"
                 )
             ]
 

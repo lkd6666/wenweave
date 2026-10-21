@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -33,6 +33,7 @@ class ChatUserQuestion(Base):
         # twice.
         UniqueConstraint("run_id", "tool_call_id", name="uq_chat_user_questions_run_call"),
         UniqueConstraint("answer_client_request_id", name="uq_chat_user_questions_answer_request"),
+        Index("ix_chat_user_questions_user_status_created", "user_id", "status", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

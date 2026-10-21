@@ -15,7 +15,18 @@ class AgentRunRecoveryTests(unittest.TestCase):
             ),
             SimpleNamespace(
                 event="tool_result",
-                payload_json=json.dumps({"id": "tool-1", "name": "read_blocks", "result": "已读取目标段落。"}),
+                payload_json=json.dumps(
+                    {
+                        "id": "tool-1",
+                        "name": "read_blocks",
+                        "result": "已读取目标段落。",
+                        "model_input": {
+                            "state": "available",
+                            "content": '{"revision":"r-1","blocks":[]}',
+                            "truncated": False,
+                        },
+                    }
+                ),
             ),
             SimpleNamespace(event="text_delta", payload_json=json.dumps({"text": "正在调整标题层级"})),
         ]
@@ -24,6 +35,8 @@ class AgentRunRecoveryTests(unittest.TestCase):
 
         self.assertEqual(replayed.reasoning_trace["status"], "thinking")
         self.assertEqual(replayed.tool_calls[0]["status"], "success")
+        self.assertEqual(replayed.tool_calls[0]["model_input"]["state"], "available")
+        self.assertEqual(replayed.tool_calls[0]["model_input"]["content"], '{"revision":"r-1","blocks":[]}')
         self.assertEqual(replayed.turn_blocks[-1]["type"], "content")
         self.assertEqual(replayed.turn_blocks[-1]["state"], "active")
         self.assertEqual(replayed.content, "正在调整标题层级")

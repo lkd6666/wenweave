@@ -1,5 +1,8 @@
-import { ApiError, authenticatedFetch } from './client'
+import { ApiError, apiUpload as uploadForm, authenticatedFetch } from './client'
+import type { UploadOptions } from './client'
 import type { AgentRunStatus, AssistantTurnBlock, ChangeSummary, ChatContextCompactResult, ChatContextStats, ChatHistoryArchive, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ContextCompaction, LayoutReferenceImitationStrength, ReadRange, ReasoningTrace, SelectedElementContext, ToolActivity, ToolExecution } from '../types'
+
+export const MAX_CHAT_IMAGES_PER_MESSAGE = 100
 import { sanitizeSelectedElements } from '../utils/selectedElements'
 
 const API_BASE = '/api'
@@ -17,7 +20,7 @@ export type ChatStreamEvent =
   | { event: 'user_question'; data: ChatUserQuestion }
   | {
       event: 'tool_result'
-      data: { id?: string; name: string; result: string; html?: string; read_range?: ReadRange; change_summary?: ChangeSummary; activity?: ToolActivity }
+      data: { id?: string; name: string; result: string; html?: string; read_range?: ReadRange; change_summary?: ChangeSummary; activity?: ToolActivity; model_input?: ToolExecution['model_input'] }
     }
   | { event: 'agent_status'; data: { thinking: { requested: ThinkingMode; applied: boolean; detail: string } } }
   | {
@@ -239,7 +242,13 @@ export async function startChatRun(
     } catch (err) {
       lastError = err
       if (signal?.aborted) throw err
-      if (err instanceof ApiError || attempt === 2) throw err
+      // The client request ID makes a retry idempotent. A cold/restarting
+      // backend can briefly answer 408/429/5xx before the run is committed;
+      // retry those transport failures, while surfacing validation, access,
+      // capacity, and conflict responses immediately.
+      const retryableApiError = err instanceof ApiError
+        && (err.status === 408 || err.status === 429 || err.status >= 500)
+      if ((err instanceof ApiError && !retryableApiError) || attempt === 2) throw err
       await delay(300 * (attempt + 1))
     }
   }
@@ -378,6 +387,9 @@ export const chatApi = {
   listMessages: (documentId: number, sessionId: number, includeHidden = false) => apiGet<ChatMessageItem[]>(
     `/documents/${documentId}/messages?session_id=${encodeURIComponent(sessionId)}&include_hidden=${includeHidden}`,
   ),
+  listRecentMessages: (documentId: number, sessionId: number, limit: number, beforeId?: number) => apiGet<ChatMessageItem[]>(
+    `/documents/${documentId}/messages?session_id=${encodeURIComponent(sessionId)}&limit=${encodeURIComponent(limit)}${beforeId === undefined ? '' : `&before_id=${encodeURIComponent(beforeId)}`}`,
+  ),
   listHistoryArchives: (documentId: number, sessionId: number) => apiGet<ChatHistoryArchive[]>(
     `/documents/${documentId}/chat-sessions/${sessionId}/history-archives`,
   ),
@@ -392,7 +404,7 @@ export const chatApi = {
   answerUserQuestion: answerChatUserQuestion,
   recordUserQuestionActivity: recordChatUserQuestionActivity,
   getContext: (documentId: number, modelId: number, sessionId: number) => apiGet<ChatContextStats>(`/documents/${documentId}/chat-context?model_id=${encodeURIComponent(modelId)}&session_id=${encodeURIComponent(sessionId)}`),
-  previewContext: (documentId: number, modelId: number, sessionId: number, message: string, selectedElements: SelectedElementContext[], imageAttachmentIds: string[] = [], templateIds: number[] = []) => apiPost<ChatContextStats>(
+  previewContext: (documentId: number, modelId: number, sessionId: number, message: string, selectedElements: SelectedElementContext[], imageAttachmentIds: string[] = [], templateIds: number[] = [], signal?: AbortSignal) => apiPost<ChatContextStats>(
     `/documents/${documentId}/chat-context/preview`,
     {
       model_id: modelId,
@@ -402,12 +414,13 @@ export const chatApi = {
       image_attachment_ids: imageAttachmentIds,
       template_ids: templateIds.slice(0, 6),
     },
+    signal,
   ),
   compactContext: (documentId: number, modelId: number, sessionId: number, rebuild = false) => apiPost<ChatContextCompactResult>(
     `/documents/${documentId}/chat-context/compact`,
     { model_id: modelId, session_id: sessionId, rebuild },
   ),
-  uploadImage: (documentId: number, file: File) => apiUpload<ChatImageAttachment>(`/documents/${documentId}/chat-images`, file),
+  uploadImage: (documentId: number, file: File, options?: UploadOptions) => apiUpload<ChatImageAttachment>(`/documents/${documentId}/chat-images`, file, options),
   duplicateImage: (documentId: number, attachmentId: string) => apiPost<ChatImageAttachment>(
     `/documents/${documentId}/chat-images/${encodeURIComponent(attachmentId)}/duplicate`,
     {},
@@ -486,13 +499,14 @@ async function apiGet<T>(path: string): Promise<T> {
   return (await res.json()) as T
 }
 
-async function apiPost<T>(path: string, body: unknown): Promise<T> {
+async function apiPost<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const res = await authenticatedFetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
+    signal,
   })
   if (!res.ok) {
     let detail: unknown = res.statusText
@@ -549,15 +563,10 @@ async function apiPut<T>(path: string, body: unknown): Promise<T> {
   return (await res.json()) as T
 }
 
-async function apiUpload<T>(path: string, file: File): Promise<T> {
+async function apiUpload<T>(path: string, file: File, options?: UploadOptions): Promise<T> {
   const body = new FormData()
   body.append('file', file)
-  const res = await authenticatedFetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    body,
-  })
-  if (!res.ok) throw await toApiError(res)
-  return await res.json() as T
+  return uploadForm<T>(path, body, options)
 }
 
 async function apiDelete<T>(path: string): Promise<T> {

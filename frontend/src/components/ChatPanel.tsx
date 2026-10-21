@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, UIEvent, WheelEvent } from 'react'
 import { useStickToBottom } from 'use-stick-to-bottom'
 import { Alert, Button, Collapse, Drawer, Dropdown, Grid, Image, Input, Modal, Popover, Select, Tag, Tooltip, Typography, message } from 'antd'
@@ -43,16 +43,20 @@ import {
 } from '@ant-design/icons'
 import type { AssistantTurnBlock, ChangeSummary, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ReasoningTrace, SelectedElementContext, TaskPlanItem, TemplateItem, ToolExecution } from '../types'
 import type { ThinkingEffort, ThinkingMode } from '../api/chat'
+import { MAX_CHAT_IMAGES_PER_MESSAGE } from '../api/chat'
 import { useAuthStore } from '../store/authStore'
 import ModelSelector from './ModelSelector'
 import type { AIModelItem } from '../types'
 import MarkdownContent from './MarkdownContent'
-import CodeBlock from './CodeBlock'
 import PromptComposer from './PromptComposer'
 import { resolveOutgoingReferences } from './PromptComposer'
 import type { PromptComposerHandle } from './PromptComposer'
 import ElementRenderPreview from './ElementRenderPreview'
+import ToolResultView from './ToolResultView'
 import UserQuestionPanel from './UserQuestionPanel'
+import ImageUploadProgress from './ImageUploadProgress'
+import CollapsibleMessage from './CollapsibleMessage'
+import type { ImageUploadProgress as UploadState } from '../utils/imageUpload'
 import type { UserQuestionAnswer } from './UserQuestionPanel'
 import {
   AiFileDiff,
@@ -91,6 +95,13 @@ export interface QueuedChatMessage {
 }
 
 const TOOL_LABELS: Record<string, string> = {
+  list_files: '查看源码文件',
+  read_file: '读取源码',
+  search_files: '搜索源码',
+  edit_file: '修改源码',
+  apply_patch: '应用源码补丁',
+  write_file: '写入源码文件',
+  enable_tool_groups: '加载专用工具',
   preparing_tool: '准备工具调用',
   ask_user: '确认排版偏好',
   get_document_map: '读取文档地图',
@@ -128,7 +139,9 @@ const TOOL_LABELS: Record<string, string> = {
   validate_gzh_html: '主题严格检查',
   search_article_images: '搜索文章配图',
   view_article_images: '查看文章图片',
+  view_chat_images_page: '分页查看附图',
   import_searched_image: '导入搜索图片',
+  import_chat_image: '保存会话附图',
   apply_searched_cover: '设为搜索封面',
   generate_article_images: '生成文章配图',
   apply_generated_cover: '设为 AI 封面',
@@ -139,9 +152,13 @@ const TOOL_LABELS: Record<string, string> = {
   transform_document_image: '裁切或旋转图片',
 }
 
+const EMPTY_IMAGE_PREVIEWS: ReadonlyMap<string, string> = new Map()
+const ChatImagePreviewContext = createContext(EMPTY_IMAGE_PREVIEWS)
+
 const MemoMarkdownContent = memo(MarkdownContent)
 const CONTEXT_BREAKDOWN_LABELS: Record<string, string> = {
-  system: '系统提示',
+  system: '固定规则',
+  runtime_state: '最新运行状态',
   document_map: '文档地图',
   memory: '压缩记忆',
   recent_history: '近期对话',
@@ -150,13 +167,16 @@ const CONTEXT_BREAKDOWN_LABELS: Record<string, string> = {
   current_request: '当前请求',
   image_inputs: '图片输入',
   selected_context: '选中元素',
-  runtime_system: '系统提示',
-  runtime_history: '本轮消息',
+  runtime_system: '固定规则',
+  runtime_history: '用户与助手消息',
   runtime_tools: '工具结果',
-  runtime_images: '工具图片提示',
+  runtime_cache_boundaries: '工具轮分隔资料',
+  runtime_images: '图片及附带文字',
+  runtime_streaming: '正在生成',
 }
 const CONTEXT_BREAKDOWN_COLORS: Record<string, string> = {
   system: '#a0a5af',
+  runtime_state: '#b27ad8',
   document_map: '#b27ad8',
   memory: '#43ad78',
   recent_history: '#f0b45f',
@@ -168,7 +188,9 @@ const CONTEXT_BREAKDOWN_COLORS: Record<string, string> = {
   runtime_system: '#a0a5af',
   runtime_history: '#f0b45f',
   runtime_tools: '#5d8c5a',
+  runtime_cache_boundaries: '#7fa0c2',
   runtime_images: '#4b9f9f',
+  runtime_streaming: '#d28a5b',
 }
 const THINKING_EFFORT_LABELS: Record<string, string> = {
   minimal: '极简',
@@ -328,13 +350,27 @@ function forwardCompactionBoundaryWheel(event: WheelEvent<HTMLElement>) {
   parent.scrollTop = Math.max(0, Math.min(parent.scrollHeight - parent.clientHeight, parent.scrollTop + delta))
 }
 
+function hasRuntimeContextBudget(stats: ChatContextStats): boolean {
+  return stats.runtime_context_tokens != null
+    && (Boolean(stats.runtime_context_source) || stats.runtime_context_tokens > 0)
+}
+
 export function contextUsageValues(stats: ChatContextStats) {
   const runtimeContextTokens = Math.max(0, Math.round(stats.runtime_context_tokens ?? 0))
   return {
-    compiledInputTokens: runtimeContextTokens || stats.compiled_input_tokens || stats.used_tokens,
+    compiledInputTokens: hasRuntimeContextBudget(stats)
+      ? runtimeContextTokens
+      : stats.compiled_input_tokens ?? stats.used_tokens,
     ledgerTokens: stats.ledger_tokens ?? stats.conversation_tokens ?? 0,
     runtimeContextTokens,
   }
+}
+
+export function contextInputWindowLabel(stats: ChatContextStats): string {
+  const threshold = stats.active_context_threshold_tokens || stats.usable_tokens || stats.max_tokens
+  const outputReserve = stats.max_output_tokens ?? 0
+  const inputLimit = stats.input_limit_tokens || Math.max(0, stats.max_tokens - outputReserve)
+  return `达到 ${formatTokenCount(threshold)} tokens 时自动压缩；模型总窗口 ${formatTokenCount(stats.max_tokens)}，输出预留 ${formatTokenCount(outputReserve)}，输入上限 ${formatTokenCount(inputLimit)} tokens`
 }
 
 export function isRuntimeContextCompacting(
@@ -405,8 +441,8 @@ function ContextUsage({
   onCompactContext: (rebuild: boolean) => void | Promise<void>
 }) {
   const [compacting, setCompacting] = useState(false)
-  const { compiledInputTokens, ledgerTokens, runtimeContextTokens } = contextUsageValues(stats)
-  const hasRuntimeContext = runtimeContextTokens > 0
+  const { compiledInputTokens, ledgerTokens } = contextUsageValues(stats)
+  const hasRuntimeContext = hasRuntimeContextBudget(stats)
   const sourceLabel = stats.runtime_context_source === 'provider_reported'
     ? '最近模型调用实报'
     : stats.runtime_context_source === 'server_recomputed_after_tool'
@@ -426,11 +462,16 @@ function ContextUsage({
             ? '当前配置不足'
             : sourceLabel
   const usedTokens = compiledInputTokens
-  const usagePercent = Math.min(100, Math.round(usedTokens / Math.max(1, stats.usable_tokens) * 100))
+  const inputThreshold = stats.active_context_threshold_tokens || stats.usable_tokens
+  const usagePercent = Math.min(100, Math.round(usedTokens / Math.max(1, inputThreshold) * 100))
   const activeBreakdown = hasRuntimeContext && Object.keys(stats.runtime_context_breakdown ?? {}).length
     ? stats.runtime_context_breakdown ?? {}
     : stats.breakdown
   const breakdownItems = Object.entries(activeBreakdown).filter(([, value]) => value > 0)
+  const preparedBreakdownItems = hasRuntimeContext
+    ? Object.entries(stats.breakdown).filter(([, value]) => value > 0)
+    : []
+  const preparedBreakdownTokens = preparedBreakdownItems.reduce((total, [, value]) => total + value, 0)
   const ringColor = usagePercent >= 85 ? '#e88b2d' : usagePercent >= 65 ? '#d6a33d' : '#3c84e8'
   const ringStyle = {
     background: `conic-gradient(${ringColor} ${usagePercent}%, var(--app-border) 0)`,
@@ -438,7 +479,7 @@ function ContextUsage({
   const detail = (
     <div className="chat-context-popover">
       <div className="chat-context-popover-head">
-        <strong>上下文使用</strong>
+        <strong>上下文预算</strong>
         <span>
           {stateLabel}
           <Tooltip title="立即压缩">
@@ -472,8 +513,13 @@ function ContextUsage({
         </span>
       </div>
       <div className="chat-context-summary">
-        <b>{usagePercent}% 已用</b>
-        <span>{hasRuntimeContext ? sourceLabel : '下次输入约'} {formatTokenCount(usedTokens)} / {formatTokenCount(stats.usable_tokens)} tokens</span>
+        <div className="chat-context-summary-main">
+          <b>{usagePercent}% 预算占用</b>
+          <span>约 {formatTokenCount(usedTokens)} / {formatTokenCount(inputThreshold)} tokens</span>
+        </div>
+        <div className="chat-context-summary-note">
+          {contextInputWindowLabel(stats)}
+        </div>
       </div>
       <div className="chat-context-bar" aria-label={`上下文已使用 ${usagePercent}%`}>
         {breakdownItems.map(([key, value]) => (
@@ -481,6 +527,7 @@ function ContextUsage({
         ))}
       </div>
       <div className="chat-context-breakdown">
+        {hasRuntimeContext && <div className="chat-context-breakdown-heading">下一次请求预算</div>}
         {breakdownItems.map(([key, value]) => (
           <span key={key}>
             <i><em style={{ background: CONTEXT_BREAKDOWN_COLORS[key] ?? '#98a2b3' }} />{CONTEXT_BREAKDOWN_LABELS[key] ?? key}</i>
@@ -488,15 +535,33 @@ function ContextUsage({
           </span>
         ))}
       </div>
+      {preparedBreakdownItems.length > 0 && (
+        <div className="chat-context-prepared-breakdown">
+          <div className="chat-context-breakdown-heading">
+            发送前细分 <small>约 {formatTokenCount(preparedBreakdownTokens)} tokens</small>
+          </div>
+          <div className="chat-context-breakdown">
+            {preparedBreakdownItems.map(([key, value]) => (
+              <span key={key}>
+                <i><em style={{ background: CONTEXT_BREAKDOWN_COLORS[key] ?? '#98a2b3' }} />{CONTEXT_BREAKDOWN_LABELS[key] ?? key}</i>
+                <b>{formatTokenCount(value)}</b>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="chat-context-foot">
         原始账本约 {formatTokenCount(ledgerTokens)} tokens（{stats.event_count ?? stats.conversation_message_count ?? 0} 条事件）
         {stats.snapshot_covered_event_count ? `；快照覆盖 ${stats.snapshot_covered_event_count} 条事件` : ''}
         <br />完整事件 {stats.event_count ?? 0} 条，当前回放 {stats.replayed_event_count ?? 0} 条，已节省约 {stats.tokens_saved.toLocaleString()} tokens
         {stats.compaction_strategy ? `；压缩方式：${stats.compaction_strategy === 'agentic' ? '模型摘要' : stats.compaction_strategy}` : ''}
-        {hasRuntimeContext ? (stats.runtime_context_is_estimate ? '；服务端估算值' : '；提供方实报') : (stats.is_estimate ? '，为估算值' : '')}
+        {hasRuntimeContext ? (stats.runtime_context_is_estimate ? '；服务端预算估算' : '；提供方实报') : (stats.is_estimate ? '；服务端预算估算' : '')}
+        {(stats.token_estimate_multiplier ?? 1) > 1 ? `；文本估算含 ${stats.token_estimate_multiplier} 倍安全余量` : ''}
         {stats.runtime_context_source === 'server_recomputed_after_tool' && stats.runtime_context_tool_name ? `；工具 ${stats.runtime_context_tool_name} 已完成` : ''}
-        {stats.runtime_input_tokens ? `；本轮最近调用约 ${formatTokenCount(stats.runtime_input_tokens)} tokens` : ''}
-        {stats.runtime_context_state === 'streaming' ? '；流式生成内容尚未进入下一次模型输入，工具完成后会重算' : ''}
+        {stats.last_model_usage_reported || (stats.runtime_input_tokens ?? 0) > 0
+          ? `；最近调用实报输入 ${formatTokenCount(stats.runtime_input_tokens ?? 0)} tokens（含缓存读取 ${formatTokenCount(stats.last_model_cached_input_tokens ?? 0)}）`
+          : ''}
+        {stats.runtime_context_state === 'streaming' ? '；已计入正在生成的正文和工具参数，工具完成后重算' : ''}
         <br />输出上限 {stats.max_output_tokens.toLocaleString()}，单次工具预览上限 {stats.tool_result_max_tokens.toLocaleString()} tokens
         {stats.effective_tool_preview_tokens && stats.effective_tool_preview_tokens !== stats.tool_result_max_tokens
           ? `（本轮动态上限 ${formatTokenCount(stats.effective_tool_preview_tokens)}）`
@@ -509,7 +574,7 @@ function ContextUsage({
   )
   return (
     <Popover content={detail} trigger="click" placement="topRight">
-      <button className={`chat-context-ring${usagePercent >= 85 ? ' is-warning' : ''}`} type="button" title={`上下文使用 ${usagePercent}%`} style={ringStyle}>
+      <button className={`chat-context-ring${usagePercent >= 85 ? ' is-warning' : ''}`} type="button" title={`上下文预算占用 ${usagePercent}%`} style={ringStyle}>
         <span>{usagePercent}%</span>
       </button>
     </Popover>
@@ -531,7 +596,11 @@ interface ChatPanelProps {
   activeChatSession: ChatSessionItem | null
   hiddenHistory: ChatMessageItem[]
   messages: ChatMessageItem[]
+  hasOlderMessages: boolean
+  olderMessagesLoading: boolean
+  onLoadOlderMessages: () => Promise<boolean>
   queuedMessages: QueuedChatMessage[]
+  queuePaused: boolean
   streaming: boolean
   stopping: boolean
   streamText: string
@@ -551,6 +620,7 @@ interface ChatPanelProps {
   composerTemplates: TemplateItem[]
   imageAttachments: ChatImageAttachment[]
   imageUploading: boolean
+  imageUploadProgress?: UploadState | null
   onRemoveSelectedElement: (index: number) => void
   onDuplicateSelectedElement: (index: number) => void
   onMoveSelectedElement: (fromIndex: number, toIndex: number) => void
@@ -559,6 +629,7 @@ interface ChatPanelProps {
   onRemoveQueuedMessage: (id: string) => void
   onUpdateQueuedMessage: (id: string, content: string) => void
   onMoveQueuedMessage: (fromIndex: number, toIndex: number) => void
+  onResumeQueuedMessages: () => void
   onEditRequest: (message: ChatMessageItem) => void
   onSend: (text: string, references: SelectedElementContext[], images: ChatImageAttachment[]) => void
   onAnswerUserQuestion: (answer: UserQuestionAnswer) => void
@@ -566,6 +637,7 @@ interface ChatPanelProps {
   onUserQuestionTimeoutElapsed: () => void
   onUploadImages: (files: File[]) => void
   onRemoveImage: (attachment: ChatImageAttachment) => void
+  onMoveImage: (fromIndex: number, toIndex: number) => void
   onContextDraftChange: (text: string) => void
   onDismissReaskConflict: () => void
   onDiscardReaskConflict: () => void
@@ -600,7 +672,11 @@ export default function ChatPanel({
   activeChatSession,
   hiddenHistory,
   messages,
+  hasOlderMessages,
+  olderMessagesLoading,
+  onLoadOlderMessages,
   queuedMessages,
+  queuePaused,
   streaming,
   stopping,
   streamText,
@@ -620,6 +696,7 @@ export default function ChatPanel({
   composerTemplates,
   imageAttachments,
   imageUploading,
+  imageUploadProgress,
   onRemoveSelectedElement,
   onDuplicateSelectedElement,
   onMoveSelectedElement,
@@ -628,6 +705,7 @@ export default function ChatPanel({
   onRemoveQueuedMessage,
   onUpdateQueuedMessage,
   onMoveQueuedMessage,
+  onResumeQueuedMessages,
   onEditRequest,
   onSend,
   onAnswerUserQuestion,
@@ -635,6 +713,7 @@ export default function ChatPanel({
   onUserQuestionTimeoutElapsed,
   onUploadImages,
   onRemoveImage,
+  onMoveImage,
   onContextDraftChange,
   onDismissReaskConflict,
   onDiscardReaskConflict,
@@ -654,6 +733,12 @@ export default function ChatPanel({
   onClearThemeContext,
 }: ChatPanelProps) {
   const currentUserId = useAuthStore((state) => state.user?.id)
+  const chatImagePreviews = useMemo(() => new Map([
+    ...messages.flatMap((item) => item.image_attachments ?? []),
+    ...hiddenHistory.flatMap((item) => item.image_attachments ?? []),
+    ...queuedMessages.flatMap((item) => item.images),
+    ...imageAttachments,
+  ].map((image) => [image.id, image.preview_url])), [messages, hiddenHistory, queuedMessages, imageAttachments])
   const screens = Grid.useBreakpoint()
   const isCompact = !screens.lg
   const [renameOpen, setRenameOpen] = useState(false)
@@ -667,6 +752,14 @@ export default function ChatPanel({
   const queuedEditPreviousDraftRef = useRef<string | null>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
   const messageListContentElementRef = useRef<HTMLDivElement | null>(null)
+  const historyAnchorRef = useRef<{
+    element: HTMLDivElement
+    firstId: number
+    sessionId: number
+    scrollHeight: number
+    scrollTop: number
+    suspensionId: number
+  } | null>(null)
   const autoFollowSuspensionsRef = useRef(new Set<number>())
   const autoFollowSuspensionIdRef = useRef(0)
   const {
@@ -702,12 +795,46 @@ export default function ChatPanel({
       messageListContentRef(messageListContentElementRef.current)
     }
   }, [messageListContentRef])
+  const requestOlderMessages = useCallback((element: HTMLDivElement) => {
+    if (!hasOlderMessages || olderMessagesLoading || historyAnchorRef.current || !messages.length || !activeChatSession) return
+    const suspensionId = suspendChatAutoFollow()
+    historyAnchorRef.current = {
+      element,
+      firstId: messages[0].id,
+      sessionId: activeChatSession.id,
+      scrollHeight: element.scrollHeight,
+      scrollTop: element.scrollTop,
+      suspensionId,
+    }
+    void onLoadOlderMessages().then((loaded) => {
+      if (loaded) return
+      const anchor = historyAnchorRef.current
+      if (anchor?.suspensionId === suspensionId) {
+        historyAnchorRef.current = null
+        resumeChatAutoFollow(suspensionId)
+      }
+    })
+  }, [activeChatSession, hasOlderMessages, messages, olderMessagesLoading, onLoadOlderMessages, resumeChatAutoFollow, suspendChatAutoFollow])
+  useLayoutEffect(() => {
+    const anchor = historyAnchorRef.current
+    if (!anchor) return
+    if (anchor.sessionId !== activeChatSession?.id) {
+      historyAnchorRef.current = null
+      resumeChatAutoFollow(anchor.suspensionId)
+    } else if (messages[0]?.id !== anchor.firstId) {
+      anchor.element.scrollTop = anchor.scrollTop + anchor.element.scrollHeight - anchor.scrollHeight
+      historyAnchorRef.current = null
+      resumeChatAutoFollow(anchor.suspensionId)
+    }
+  }, [activeChatSession?.id, messages, resumeChatAutoFollow])
 
   const handleSend = () => {
+    if (imageUploading || submitting || stopping || pendingUserQuestion || !activeChatSession || activeChatSession.is_archived) return
     const composerPayload = composerRef.current?.getPayload() ?? {
       message: composerDraft.trim(),
       references: [],
       templateIds: composerTemplates.map((template) => template.id),
+      imageIds: imageAttachments.map((image) => image.id),
     }
     const payload = {
       ...composerPayload,
@@ -733,7 +860,13 @@ export default function ChatPanel({
       message.error('当前模型的压缩阈值不足以容纳此文档，请选择更大上下文模型或在模型管理中调整预算')
       return
     }
-    onSend(text, payload.references, imageAttachments)
+    const imageById = new Map(imageAttachments.map((image) => [image.id, image]))
+    const orderedImages = payload.imageIds.flatMap((id) => {
+      const image = imageById.get(id)
+      imageById.delete(id)
+      return image ? [image] : []
+    })
+    onSend(text, payload.references, [...orderedImages, ...imageById.values()])
     resumeAllChatAutoFollow()
     void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
   }
@@ -754,16 +887,16 @@ export default function ChatPanel({
     window.requestAnimationFrame(() => composerRef.current?.focus())
   }
 
-  const finishQueuedMessageEdit = (restorePreviousDraft: boolean) => {
+  const finishQueuedMessageEdit = useCallback((restorePreviousDraft: boolean) => {
     const previousDraft = queuedEditPreviousDraftRef.current
     queuedEditPreviousDraftRef.current = null
     setEditingQueuedMessageId(null)
     if (restorePreviousDraft && previousDraft !== null) onContextDraftChange(previousDraft)
-  }
+  }, [onContextDraftChange])
 
-  const cancelQueuedMessageEdit = () => {
+  const cancelQueuedMessageEdit = useCallback(() => {
     finishQueuedMessageEdit(true)
-  }
+  }, [finishQueuedMessageEdit])
 
   const saveQueuedMessageEdit = () => {
     if (!editingQueuedMessageId) return
@@ -790,7 +923,7 @@ export default function ChatPanel({
     if (editingQueuedMessageId && !queuedMessages.some((item) => item.id === editingQueuedMessageId)) {
       cancelQueuedMessageEdit()
     }
-  }, [editingQueuedMessageId, queuedMessages])
+  }, [cancelQueuedMessageEdit, editingQueuedMessageId, queuedMessages])
 
   const selectedModel = models.find((model) => model.id === modelId)
   const isMultimodal = Boolean(selectedModel?.is_multimodal)
@@ -975,7 +1108,7 @@ export default function ChatPanel({
   }, [resumeAllChatAutoFollow, scrollToBottom, streaming])
 
   return (
-    <>
+    <ChatImagePreviewContext.Provider value={chatImagePreviews}>
     <div className="chat-panel chat-panel-aichat">
       <div className="chat-panel-header">
         <div className="chat-panel-title-row">
@@ -984,7 +1117,7 @@ export default function ChatPanel({
             <Text type="secondary">编辑当前推文</Text>
           </div>
           {streaming && (
-            <span className={`chat-live-status${activeTool ? ' is-tool' : ''}`}>
+            <span className={`chat-live-status${activeTool ? ' is-tool' : ''}`} title={liveLabel}>
               <i /> <span className="chat-live-status-text">{liveLabel}</span>
             </span>
           )}
@@ -1095,7 +1228,7 @@ export default function ChatPanel({
                                 type="text"
                                 size="small"
                                 icon={<CloseOutlined />}
-                                disabled={conversationControlsDisabled || activeChatSession.is_archived}
+                                disabled={composerDisabled || activeChatSession.is_archived}
                                 onClick={() => onRemoveAttachedTemplate(template.id)}
                               />
                             </Tooltip>
@@ -1155,14 +1288,33 @@ export default function ChatPanel({
             message="当前模型的实际输入上下文不足，压缩后仍无法容纳文档工作区与近期对话。请提高压缩阈值或选择更大上下文模型。"
           />
         )}
-        {thinkingStatus && <Text className="chat-thinking-status" type="secondary">{thinkingStatus}</Text>}
+        {thinkingStatus && (!streaming || thinkingStatus !== liveLabel) && (
+          <Text className="chat-thinking-status" type="secondary">{thinkingStatus}</Text>
+        )}
       </div>
 
       {taskPlan && <TaskPlanPanel plan={taskPlan} live={streaming} />}
 
       <div className="chat-messages-shell">
-        <div className="chat-messages" ref={messageListRef}>
+        <div className="chat-messages" ref={messageListRef} onScroll={(event) => {
+          const element = event.currentTarget
+          if (element.scrollTop <= 96 && element.scrollHeight > element.clientHeight + 20) requestOlderMessages(element)
+        }}>
           <div className="chat-messages-content" ref={setMessageListContentElement}>
+        {hasOlderMessages && (
+          <div className="chat-history-loader">
+            <Button
+              type="text"
+              size="small"
+              icon={olderMessagesLoading ? <LoadingOutlined spin /> : <UpOutlined />}
+              disabled={olderMessagesLoading}
+              onClick={(event) => {
+                const element = event.currentTarget.closest('.chat-messages')
+                if (element instanceof HTMLDivElement) requestOlderMessages(element)
+              }}
+            >{olderMessagesLoading ? '正在加载' : '加载更早记录'}</Button>
+          </div>
+        )}
         {messages.length === 0 && !streaming && (
           <div className="chat-empty">
             <Text strong>开始排版对话</Text>
@@ -1244,7 +1396,21 @@ export default function ChatPanel({
           <section className="chat-queue" aria-label="待处理队列">
             <div className="chat-queue-header">
               <span className="chat-queue-title"><UnorderedListOutlined aria-hidden="true" />待处理队列</span>
-              <span className="chat-queue-count">{queuedMessages.length}</span>
+              <div className="chat-queue-header-actions">
+                {queuePaused && <span role="status">已暂停</span>}
+                <span className="chat-queue-count">{queuedMessages.length}</span>
+                {queuePaused && (
+                  <Button
+                    size="small"
+                    type="link"
+                    icon={<SendOutlined />}
+                    disabled={streaming || stopping || submitting || Boolean(pendingUserQuestion)}
+                    onClick={onResumeQueuedMessages}
+                  >
+                    继续队列
+                  </Button>
+                )}
+              </div>
             </div>
             <div className="chat-queue-list" role="list">
               {queuedMessages.map((queuedMessage, index) => {
@@ -1371,36 +1537,10 @@ export default function ChatPanel({
             />
           ) : (
             <>
-          {imageAttachments.length > 0 && (
-            <div className="chat-image-attachments" aria-label="待发送图片">
-              <Image.PreviewGroup>
-                {imageAttachments.map((attachment) => (
-                  <div className="chat-image-attachment" key={attachment.id}>
-                    <Image
-                      className="chat-image-attachment-preview"
-                      src={attachment.preview_url}
-                      alt={attachment.filename}
-                      preview={{ mask: <span className="chat-history-image-mask"><ZoomInOutlined />放大</span> }}
-                    />
-                    <Tooltip title="移除图片">
-                      <Button
-                        aria-label={`移除图片 ${attachment.filename}`}
-                        size="small"
-                        type="text"
-                        icon={<CloseOutlined />}
-                        disabled={composerDisabled}
-                        onClick={() => onRemoveImage(attachment)}
-                      />
-                    </Tooltip>
-                  </div>
-                ))}
-              </Image.PreviewGroup>
-            </div>
-          )}
-          {imageUploading && (
+          {imageUploadProgress ? <div className="chat-image-upload-progress"><ImageUploadProgress progress={imageUploadProgress} /></div> : imageUploading && (
             <div className="chat-image-uploading" role="status">
               <LoadingOutlined spin />
-              <span>正在上传图片</span>
+              <span>正在添加图片</span>
             </div>
           )}
           {editingQueuedMessageId && (
@@ -1412,10 +1552,12 @@ export default function ChatPanel({
             </div>
           )}
           <PromptComposer
+            key={editingQueuedMessageId ?? 'draft'}
             ref={composerRef}
             value={composerDraft}
-            references={selectedElements}
-            templates={composerTemplates}
+            references={editingQueuedMessageId ? [] : selectedElements}
+            templates={editingQueuedMessageId ? [] : composerTemplates}
+            images={editingQueuedMessageId ? [] : imageAttachments}
             onChange={handleInputChange}
             onSubmit={handleSend}
             disabled={composerDisabled}
@@ -1423,7 +1565,9 @@ export default function ChatPanel({
             onDuplicateReference={onDuplicateSelectedElement}
             onMoveReference={onMoveSelectedElement}
             onRemoveTemplate={onRemoveComposerTemplate}
-            acceptImages={isMultimodal}
+            onRemoveImage={onRemoveImage}
+            onMoveImage={onMoveImage}
+            acceptImages={isMultimodal && !editingQueuedMessageId}
             onPasteImages={onUploadImages}
           />
           <div className="chat-input-actions">
@@ -1432,7 +1576,7 @@ export default function ChatPanel({
                 <Button
                   aria-label="模仿排版"
                   icon={<FormatPainterOutlined />}
-                  disabled={conversationControlsDisabled || !modelId || activeChatSession?.is_archived}
+                  disabled={composerDisabled || !modelId || activeChatSession?.is_archived}
                   onClick={onOpenLayoutImitation}
                 />
               </Tooltip>
@@ -1441,7 +1585,7 @@ export default function ChatPanel({
                   <Button
                   aria-label="添加图片"
                   icon={<PaperClipOutlined />}
-                  disabled={composerDisabled || imageUploading || activeChatSession?.is_archived || imageAttachments.length >= 5}
+                  disabled={composerDisabled || imageUploading || Boolean(editingQueuedMessageId) || activeChatSession?.is_archived || imageAttachments.length >= MAX_CHAT_IMAGES_PER_MESSAGE}
                     onClick={() => imageInputRef.current?.click()}
                   />
                 </Tooltip>
@@ -1548,12 +1692,19 @@ export default function ChatPanel({
       </p>
       <p>舍弃修改会回退到该历史要求之前，并丢弃之后的当前稿改动；已保存内容仍可从版本历史恢复。</p>
     </Modal>
-    </>
+    </ChatImagePreviewContext.Provider>
   )
 }
 
-function toolLabel(name: string): string {
-  return TOOL_LABELS[name] ?? name
+export function toolLabel(tool: ToolExecution): string {
+  if (tool.name === 'view_article_images' || tool.name === 'view_chat_images_page') {
+    const details = tool.activity?.kind === 'image_view' ? tool.activity.details : undefined
+    const dimensionsOnly = tool.arguments.include_image === false
+      || details?.include_image_requested === false
+      || (details?.image_content_included === false && Array.isArray(details.items) && details.items.length > 0)
+    if (dimensionsOnly) return tool.name === 'view_chat_images_page' ? '分页读取附图尺寸' : '读取图片尺寸'
+  }
+  return TOOL_LABELS[tool.name] ?? tool.name
 }
 
 const ChatHistoryTurn = memo(function ChatHistoryTurn({
@@ -1587,15 +1738,26 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
               archiveScrollAnchorEnabled={!editingDisabled}
             />
           ) : messageItem.role === 'tool' ? (
-            <ContextCompactionNotice content={messageItem.content} />
+            messageItem.turn_blocks?.some((block) => block.type === 'context_compaction') ? (
+              <AssistantTurnTimeline
+                blocks={messageItem.turn_blocks}
+                fallbackContent=""
+                fallbackTrace={messageItem.reasoning_trace}
+                fallbackTools={[]}
+                streaming={false}
+                suspendChatAutoFollow={suspendChatAutoFollow}
+                resumeChatAutoFollow={resumeChatAutoFollow}
+                archiveScrollAnchorEnabled={!editingDisabled}
+              />
+            ) : <ContextCompactionNotice content={messageItem.content} />
           ) : (
             <div className="chat-turn-content">
-              <UserMessageContent
+              <CollapsibleMessage><UserMessageContent
                 content={messageItem.content}
                 elements={messageItem.selected_elements ?? []}
                 templates={messageItem.template_refs ?? []}
                 images={messageItem.image_attachments ?? []}
-              />
+              /></CollapsibleMessage>
             </div>
           )}
         </div>
@@ -1605,9 +1767,17 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
             {messageItem.role === 'assistant' && messageItem.model_usage && (
               <>
                 {' · '}
-                <Tooltip title={modelUsageDetail(messageItem.model_usage)}>
-                  <span className="chat-turn-model-usage">{modelUsageLabel(messageItem.model_usage)}</span>
-                </Tooltip>
+                <Popover
+                  content={<ModelUsageDetails usage={messageItem.model_usage} />}
+                  classNames={{ root: 'chat-model-usage-popover', container: 'chat-model-usage-container' }}
+                  color="var(--app-surface-raised)"
+                  placement="top"
+                  trigger={['hover', 'click']}
+                >
+                  <button type="button" className="chat-turn-model-usage" aria-label="查看本轮模型用量">
+                    {modelUsageLabel(messageItem.model_usage)}
+                  </button>
+                </Popover>
               </>
             )}
             {' · '}{formatMessageTime(messageItem.created_at)}
@@ -1662,10 +1832,16 @@ function modelUsageValues(usage: NonNullable<ChatMessageItem['model_usage']>) {
   }
 }
 
+function formatModelUsageTokens(value: number): string {
+  if (value >= 999_950) return `${Number((value / 1_000_000).toFixed(2))}M`
+  if (value >= 1_000) return `${Number((value / 1_000).toFixed(1))}K`
+  return value.toLocaleString()
+}
+
 export function modelUsageLabel(usage: NonNullable<ChatMessageItem['model_usage']>): string {
   const { modelNames, totalTokens, cacheHitRate, callCount } = modelUsageValues(usage)
   return usage.usage_reported
-    ? `${modelNames} · 本轮 ${callCount} 次累计 ${formatTokenCount(totalTokens)} tokens · 缓存命中 ${cacheHitRate}%`
+    ? `${modelNames} · 本轮 ${callCount} 次累计 ${formatModelUsageTokens(totalTokens)} tokens · 缓存命中 ${cacheHitRate}%`
     : `${modelNames} · Token 未返回`
 }
 
@@ -1673,6 +1849,38 @@ export function modelUsageDetail(usage: NonNullable<ChatMessageItem['model_usage
   const { modelNames, inputTokens, outputTokens, totalTokens, cacheReadTokens, cacheHitRate, callCount } = modelUsageValues(usage)
   if (!usage.usage_reported) return `${modelNames} 未返回 token 用量`
   return `${modelNames}：本轮累计 ${callCount.toLocaleString()} 次模型调用；输入 ${inputTokens.toLocaleString()} tokens；缓存命中 ${cacheReadTokens.toLocaleString()} tokens（${cacheHitRate}%）；输出 ${outputTokens.toLocaleString()} tokens；合计 ${totalTokens.toLocaleString()} tokens`
+}
+
+function ModelUsageDetails({ usage }: { usage: NonNullable<ChatMessageItem['model_usage']> }) {
+  const { modelNames, inputTokens, outputTokens, totalTokens, cacheReadTokens, cacheHitRate, callCount } = modelUsageValues(usage)
+  return (
+    <div className="chat-model-usage-details">
+      <div className="chat-model-usage-heading">
+        <strong>本轮用量</strong>
+        {usage.usage_reported && <span>{callCount.toLocaleString()} 次调用</span>}
+      </div>
+      <div className="chat-model-usage-models">{modelNames}</div>
+      {usage.usage_reported ? (
+        <>
+          <div className="chat-model-usage-total">
+            <span>Token 合计</span>
+            <div><strong title={`${totalTokens.toLocaleString()} tokens`}>{formatModelUsageTokens(totalTokens)}</strong><span>tokens</span></div>
+          </div>
+          <dl className="chat-model-usage-breakdown">
+            <div><dt>输入</dt><dd title={`${inputTokens.toLocaleString()} tokens`}>{formatModelUsageTokens(inputTokens)}</dd></div>
+            <div><dt>输出</dt><dd title={`${outputTokens.toLocaleString()} tokens`}>{formatModelUsageTokens(outputTokens)}</dd></div>
+          </dl>
+          <div className="chat-model-usage-cache">
+            <div className="chat-model-usage-cache-heading"><span>缓存命中率</span><strong>{cacheHitRate}%</strong></div>
+            <div className="chat-model-usage-cache-track" aria-hidden="true">
+              <div style={{ width: `${Math.min(100, Math.max(0, cacheHitRate))}%` }} />
+            </div>
+            <div className="chat-model-usage-cache-caption"><span>缓存读取（已计入输入）</span><span title={`${cacheReadTokens.toLocaleString()} tokens`}>{formatModelUsageTokens(cacheReadTokens)}</span></div>
+          </div>
+        </>
+      ) : <p className="chat-model-usage-empty">模型未返回 Token 用量</p>}
+    </div>
+  )
 }
 
 export function formatMessageTime(value: string, now = new Date()): string {
@@ -1696,7 +1904,7 @@ export function formatMessageTime(value: string, now = new Date()): string {
 
 function streamingLabel(blocks: AssistantTurnBlock[], streamText: string): string {
   const runningTool = getRunningTool(blocks)
-  if (runningTool) return runningTool.preparing ? `正在准备${toolLabel(runningTool.name)}` : toolLabel(runningTool.name)
+  if (runningTool) return runningTool.preparing ? `正在准备${toolLabel(runningTool)}` : toolLabel(runningTool)
   for (let index = blocks.length - 1; index >= 0; index -= 1) {
     const block = blocks[index]
     if (block.type === 'thought' && block.state === 'active') return 'Thinking'
@@ -1770,9 +1978,28 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
       const remaining = Math.max(0, deadline - Date.now()) / 1000
       setRetryRemainingSeconds(Math.ceil(remaining * 100) / 100)
     }
-    update()
-    const timer = window.setInterval(update, 100)
-    return () => window.clearInterval(timer)
+    let timer: number | null = null
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer)
+        timer = null
+      }
+    }
+    const syncTimer = () => {
+      stopTimer()
+      update()
+      if (document.visibilityState === 'visible') {
+        timer = window.setInterval(update, 100)
+      }
+    }
+    syncTimer()
+    document.addEventListener('visibilitychange', syncTimer)
+    window.addEventListener('focus', syncTimer)
+    return () => {
+      document.removeEventListener('visibilitychange', syncTimer)
+      window.removeEventListener('focus', syncTimer)
+      stopTimer()
+    }
   }, [notice.kind, notice.retryDelaySeconds, notice.retryStartedAtMs])
 
   const formattedRetryRemaining = retryRemainingSeconds === null
@@ -2310,7 +2537,7 @@ function ProcessArchiveLabel({ blocks }: { blocks: AssistantTurnBlock[] }) {
   const thoughtCount = blocks.filter((block) => block.type === 'thought').length
   const tools = blocks.flatMap((block) => block.type === 'tool' && block.tool ? [block.tool] : [])
   const toolCount = tools.length
-  const editTools = tools.filter((tool) => ['apply_html_patch', 'replace_document'].includes(tool.name))
+  const editTools = tools.filter((tool) => ['apply_html_patch', 'replace_document', 'edit_file', 'apply_patch', 'write_file'].includes(tool.name))
   const latestFailedEdit = editTools.at(-1)?.status === 'error'
   const summary = toolCount > 0
     ? latestFailedEdit
@@ -2481,15 +2708,17 @@ function legacyTimelineBlocks(
 type ToolVisualKind = 'read' | 'search' | 'history' | 'image' | 'edit' | 'check' | 'plan' | 'reference' | 'other'
 
 function toolVisualKind(name: string): ToolVisualKind {
-  if (['get_document_map', 'read_blocks', 'read_gzh_theme', 'read_current_gzh_theme', 'get_layout_reference_map', 'read_layout_reference_blocks'].includes(name)) return 'read'
+  if (['list_files', 'read_file', 'enable_tool_groups'].includes(name)) return 'read'
+  if (name === 'search_files') return 'search'
+  if (['edit_file', 'apply_patch', 'write_file'].includes(name)) return 'edit'
+  if (['get_document_map', 'read_blocks', 'read_gzh_theme', 'read_current_gzh_theme', 'get_layout_reference_map', 'read_layout_reference_blocks', 'read_wechat_compliance_spec', 'read_gzh_theme_generator', 'read_gzh_theme_recipe', 'read_gzh_theme_components', 'read_attached_templates', 'read_tool_output'].includes(name)) return 'read'
   if (['search_html', 'search_layout_reference'].includes(name)) return 'search'
   if (['list_history_versions', 'search_history_versions', 'search_history_version', 'compare_history_version', 'read_history_blocks', 'search_session_history', 'read_session_detail'].includes(name)) return 'history'
-  if (name === 'read_tool_output') return 'read'
-  if (['inspect_current_images', 'inspect_history_images', 'search_article_images', 'view_article_images', 'import_searched_image', 'apply_searched_cover', 'generate_article_images', 'apply_generated_cover', 'edit_article_image', 'apply_edited_image', 'edit_article_cover', 'apply_edited_cover'].includes(name)) return 'image'
-  if (['apply_html_patch', 'replace_document'].includes(name)) return 'edit'
+  if (['inspect_current_images', 'inspect_history_images', 'search_article_images', 'view_article_images', 'view_chat_images_page', 'import_chat_image', 'import_searched_image', 'apply_searched_cover', 'generate_article_images', 'apply_generated_cover', 'edit_article_image', 'apply_edited_image', 'edit_article_cover', 'apply_edited_cover', 'transform_document_image'].includes(name)) return 'image'
+  if (['apply_html_patch', 'replace_document', 'create_gzh_theme_draft', 'publish_gzh_theme'].includes(name)) return 'edit'
   if (name === 'check_compliance' || name === 'validate_gzh_html') return 'check'
   if (name === 'update_task_plan') return 'plan'
-  if (name === 'apply_layout_reference') return 'reference'
+  if (['apply_layout_reference', 'list_gzh_themes', 'apply_gzh_theme_proposal'].includes(name)) return 'reference'
   return 'other'
 }
 
@@ -2556,6 +2785,7 @@ function ToolTrace({
   resumeChatAutoFollow: (suspensionId: number | null) => void
   autoFollowSuspensionEnabled: boolean
 }) {
+  const chatImagePreviews = useContext(ChatImagePreviewContext)
   const [expanded, setExpanded] = useState(tool.status === 'running')
   const previousStatus = useRef(tool.status)
   const expansionSuspensionRef = useRef<number | null>(null)
@@ -2597,8 +2827,8 @@ function ToolTrace({
   const isRunning = tool.status === 'running'
   const activity = tool.activity
   const htmlValidation = toolHtmlValidation(tool)
-  const detailResult = toolDetailResult(tool)
   const generatedImages = generatedImagePreviews(tool)
+  const modelInputImages = modelImagePreviews(tool, chatImagePreviews)
   const statusTone = status.tone
   const argumentTokens = tool.status === 'running' && tool.preparing && typeof tool.argument_tokens === 'number' && tool.argument_tokens > 0
     ? tool.argument_tokens
@@ -2631,7 +2861,7 @@ function ToolTrace({
     <AiToolCall
       icon={<ToolGlyph name={tool.name} />}
       iconTone={toolVisualKind(tool.name)}
-      title={toolLabel(tool.name)}
+      title={toolLabel(tool)}
       summary={summary}
       status={mappedStatus}
       expanded={expanded}
@@ -2640,16 +2870,9 @@ function ToolTrace({
     >
       <div className={`tool-trace-detail${isRunning ? ' is-live' : ''}`} onScroll={onProcessScroll}>
             {toolVisualKind(tool.name) === 'search' && <AiWebSearch query={String(activity?.query || summary)} running={isRunning} sources={searchSources} />}
-            {activity?.targets && activity.targets.length > 0 && !['image_search', 'image_generation', 'image_view'].includes(activity.kind) && (
-              <div className="tool-activity-targets">
-                {activity.targets.slice(0, activity.kind === 'plan' ? 12 : 4).map((target, index) => (
-                  <span key={`${target.block_id ?? target.path ?? 'target'}-${index}`} title={target.path || target.text || ''}>
-                    {target.text || target.path || target.tag || '排版块'}
-                  </span>
-                ))}
-              </div>
-            )}
             {generatedImages.length > 0 && <GeneratedImagePreviews images={generatedImages} />}
+            {modelInputImages.length > 0 && <ModelImagePreviews images={modelInputImages} />}
+            <ToolResultView tool={tool} hasImageGallery={generatedImages.length > 0 || modelInputImages.length > 0} />
             {htmlValidation?.valid === false && htmlValidation.errors?.length && !activity?.validation_warning ? (
               <div className="tool-trace-result">{htmlValidation.errors.join('；')}</div>
             ) : null}
@@ -2668,11 +2891,7 @@ function ToolTrace({
               </div>
             )}
             {tool.change_summary && !activity && <ChangeSummaryLine summary={tool.change_summary} />}
-            {!activity && Object.keys(tool.arguments).length > 0 && (
-              <ToolCodeSection label="调用参数" language="json" code={JSON.stringify(tool.arguments, null, 2)} />
-            )}
             {!activity && tool.change_summary?.diff_preview && <AiFileDiff file={tool.change_summary.diff_truncated ? '变更 diff（已截断）' : '变更 diff'} rows={aiDiffRows(tool.change_summary.diff_preview)} />}
-            {detailResult && <div className="tool-trace-result">{detailResult}</div>}
       </div>
     </AiToolCall>
   )
@@ -2687,10 +2906,26 @@ interface GeneratedImagePreview {
   width: number | null
   height: number | null
   sourcePageUrl: string
-  kind: 'search' | 'generation'
+  kind: 'search' | 'generation' | 'applied'
 }
 
-function generatedImagePreviews(tool: ToolExecution): GeneratedImagePreview[] {
+export function generatedImagePreviews(tool: ToolExecution): GeneratedImagePreview[] {
+  if (tool.activity?.kind === 'image_import' || tool.activity?.kind === 'image_application') {
+    const details = tool.activity.details
+    const url = typeof details?.url === 'string' ? details.url.trim() : ''
+    if (!isSafeImagePreviewUrl(url)) return []
+    return [{
+      id: `applied-image-${String(details?.asset_id || url)}`,
+      url,
+      label: tool.activity.kind === 'image_import' ? '已导入图片' : '已应用图片',
+      title: typeof details?.title === 'string' ? details.title : '',
+      engine: tool.activity.kind === 'image_import' ? '搜索图片' : '当前图片',
+      width: typeof details?.width === 'number' && details.width > 0 ? details.width : null,
+      height: typeof details?.height === 'number' && details.height > 0 ? details.height : null,
+      sourcePageUrl: typeof details?.source_page_url === 'string' ? details.source_page_url : '',
+      kind: 'applied',
+    }]
+  }
   const isSearch = tool.activity?.kind === 'image_search'
   if (!isSearch && tool.activity?.kind !== 'image_generation') return []
   const details = tool.activity?.details
@@ -2719,8 +2954,10 @@ function generatedImagePreviews(tool: ToolExecution): GeneratedImagePreview[] {
 }
 
 function isSafeImagePreviewUrl(value: string): boolean {
+  if (!value.trim()) return false
   try {
-    const url = new URL(value, window.location.origin)
+    const origin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
+    const url = new URL(value, origin)
     return url.protocol === 'https:' || url.protocol === 'http:'
   } catch {
     return false
@@ -2752,7 +2989,7 @@ function GeneratedImagePreviews({ images }: { images: GeneratedImagePreview[] })
           <figcaption>
             <span className="tool-generated-image-label">{image.title || image.label}</span>
             <span className="tool-generated-image-meta">
-              {image.engine || (image.kind === 'generation' ? 'AI 生图' : '搜图')}
+              {image.engine || (image.kind === 'generation' ? 'AI 生图' : image.kind === 'applied' ? '已应用' : '搜图')}
               {image.width && image.height ? ` · ${image.width} × ${image.height}` : ' · 尺寸未知'}
             </span>
             {image.sourcePageUrl && <AiInlineCitation href={image.sourcePageUrl}>来源</AiInlineCitation>}
@@ -2770,26 +3007,75 @@ function GeneratedImagePreviews({ images }: { images: GeneratedImagePreview[] })
   )
 }
 
-function toolDetailResult(tool: ToolExecution): string {
-  const result = tool.result?.trim()
-  if (!result) return ''
-  if (tool.status === 'error') return toolHtmlValidation(tool)?.errors?.length ? '' : result
-  if (tool.activity?.validation_warning) return ''
-  const summary = tool.activity?.summary?.trim()
-  if (!summary) return result
+interface ModelImagePreview {
+  id: string
+  url: string
+  label: string
+  width: number | null
+  height: number | null
+}
 
-  const normalise = (value: string) => value.replace(/\s+/g, ' ').trim()
-  const normalizedResult = normalise(result)
-  const normalizedSummary = normalise(summary)
-  // Successful activity summaries are already shown in the collapsed row.
-  if (
-    normalizedResult === normalizedSummary
-    || normalizedResult === `错误：${normalizedSummary}`
-    || normalizedResult === `错误: ${normalizedSummary}`
-  ) {
-    return ''
-  }
-  return result
+export function modelImagePreviews(tool: ToolExecution, chatImagePreviews: ReadonlyMap<string, string> = EMPTY_IMAGE_PREVIEWS): ModelImagePreview[] {
+  const details = tool.activity?.kind === 'image_view' ? tool.activity.details : undefined
+  if (!details?.image_content_included || !Array.isArray(details.items)) return []
+  return details.items.flatMap((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const value = item as Record<string, unknown>
+    // Tool records keep unsigned references. Prefer the uploaded article asset,
+    // then the freshly authorized preview from the loaded conversation.
+    const url = [
+      value.article_url,
+      typeof value.attachment_id === 'string' ? chatImagePreviews.get(value.attachment_id) : undefined,
+      value.preview_url,
+    ].find((candidate): candidate is string => typeof candidate === 'string' && isSafeImagePreviewUrl(candidate))?.trim()
+    if (!url) return []
+    const number = typeof value.index === 'number' && value.index > 0 ? value.index : index + 1
+    const width = typeof value.width === 'number' && value.width > 0 ? value.width : null
+    const height = typeof value.height === 'number' && value.height > 0 ? value.height : null
+    return [{
+      id: `model-image-${number}-${url}`,
+      url,
+      label: typeof value.label === 'string' && value.label.trim() ? value.label.trim() : `图片 ${number}`,
+      width,
+      height,
+    }]
+  })
+}
+
+function ModelImagePreviews({ images }: { images: ModelImagePreview[] }) {
+  const [failed, setFailed] = useState<Set<string>>(() => new Set())
+  if (!images.length) return null
+  return (
+    <section className="tool-model-image-gallery" aria-label="本次提供给模型的图片">
+      <div className="tool-model-image-heading"><EyeOutlined /> 本次提供给模型的图片</div>
+      <div className="tool-generated-image-grid">
+        {images.map((image) => (
+          <figure className="tool-generated-image" key={image.id}>
+            <div className="tool-generated-image-frame">
+              {failed.has(image.id) ? (
+                <div className="tool-generated-image-fallback"><PictureOutlined /><span>图片暂不可用</span></div>
+              ) : (
+                <Image
+                  alt={image.label}
+                  className="tool-generated-image-preview"
+                  preview={{ mask: <EyeOutlined /> }}
+                  src={image.url}
+                  onError={() => setFailed((current) => new Set(current).add(image.id))}
+                />
+              )}
+            </div>
+            <figcaption>
+              <span className="tool-generated-image-label">{image.label}</span>
+              <span className="tool-generated-image-meta">
+                多模态输入{image.width && image.height ? ` · ${image.width} × ${image.height}` : ''}
+              </span>
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+      <div className="tool-model-image-note">模型同时收到图片编号、名称和实际像素尺寸。</div>
+    </section>
+  )
 }
 
 function toolErrorMetadata(tool: ToolExecution): string {
@@ -2832,7 +3118,7 @@ function toolActionTarget(tool: ToolExecution): string {
   if (tool.activity?.summary) return tool.activity.summary
   if (['get_document_map', 'search_html', 'read_blocks'].includes(tool.name)) return 'HTML'
   if (tool.name === 'check_compliance') return '兼容性'
-  return toolLabel(tool.name)
+  return toolLabel(tool)
 }
 
 function ChangeSummaryLine({ summary }: { summary: ChangeSummary }) {
@@ -2840,10 +3126,6 @@ function ChangeSummaryLine({ summary }: { summary: ChangeSummary }) {
     { label: '新增行', value: `+${summary.added_lines}`, tone: 'add' },
     { label: '删除行', value: `-${summary.removed_lines}`, tone: 'remove' },
   ]} />
-}
-
-function ToolCodeSection({ label, language, code }: { label: string; language: string; code: string }) {
-  return <section className="tool-code-section"><div className="tool-code-section-title">{label}</div><CodeBlock code={code} language={language} showLineNumbers={code.split('\n').length > 1} /></section>
 }
 
 function ThinkingTrace({
@@ -2876,14 +3158,27 @@ function useLiveThoughtDuration(isThinking: boolean, startedAtMs?: number): numb
   useEffect(() => {
     if (!isThinking || !startedAtMs) return
     const update = () => setNow(Date.now())
-    update()
-    const timer = window.setInterval(update, 100)
-    document.addEventListener('visibilitychange', update)
-    window.addEventListener('focus', update)
+    let timer: number | null = null
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer)
+        timer = null
+      }
+    }
+    const syncTimer = () => {
+      stopTimer()
+      update()
+      if (document.visibilityState === 'visible') {
+        timer = window.setInterval(update, 100)
+      }
+    }
+    syncTimer()
+    document.addEventListener('visibilitychange', syncTimer)
+    window.addEventListener('focus', syncTimer)
     return () => {
-      window.clearInterval(timer)
-      document.removeEventListener('visibilitychange', update)
-      window.removeEventListener('focus', update)
+      document.removeEventListener('visibilitychange', syncTimer)
+      window.removeEventListener('focus', syncTimer)
+      stopTimer()
     }
   }, [isThinking, startedAtMs])
 

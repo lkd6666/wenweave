@@ -39,6 +39,7 @@ interface TemplateLibraryPanelProps {
   modelId: number | null
   models: AIModelItem[]
   disabled?: boolean
+  attachmentDisabled?: boolean
   canInsertAtCaret: boolean
   attachedTemplateIds: number[]
   themeContext: ChatSessionItem['theme_context']
@@ -173,6 +174,7 @@ export default function TemplateLibraryPanel({
   modelId,
   models,
   disabled = false,
+  attachmentDisabled = false,
   canInsertAtCaret,
   attachedTemplateIds,
   themeContext,
@@ -291,7 +293,7 @@ export default function TemplateLibraryPanel({
     setGenerationPrompt('')
     setDraft({ ...emptyDraft(), html: collection.html, sourceType: 'source', mode: 'source' })
     onCollectionHandled()
-  }, [collection, onCollectionHandled])
+  }, [collection, onCollectionHandled, setTab])
 
   const categoryOptions = useMemo(
     () => [{ label: '未分类', value: 0 }, ...categories.map((item) => ({ label: item.name, value: item.id }))],
@@ -551,7 +553,7 @@ export default function TemplateLibraryPanel({
                 </Popconfirm>
               </span>
             </Tooltip>
-            <Button aria-label="新建模板" title="新建模板" type="primary" icon={<PlusOutlined />} disabled={disabled || localizingTemplateImages} onClick={openCreate} />
+            <Button aria-label="新建模板" title="新建模板" type="primary" icon={<PlusOutlined />} disabled={localizingTemplateImages} onClick={openCreate} />
           </div>
           <div className="template-category-row">
             <button type="button" className={`template-category-chip${categoryFilter === 'all' ? ' is-active' : ''}`} onClick={() => { setCategoryFilter('all'); resetTemplatePage() }}>全部</button>
@@ -595,7 +597,7 @@ export default function TemplateLibraryPanel({
                           <Button aria-label={`插入 ${template.name} 到光标处`} icon={<AppstoreAddOutlined />} disabled={disabled || localizingTemplateImages || !canInsertAtCaret} onClick={() => { void onInsertAtCaret(template) }} />
                         </Tooltip>
                         <Tooltip title={attached ? '从 AI 对话移除' : attachedTemplateIds.length >= 6 ? '每次对话最多附加 6 个模板' : '附到 AI 对话'}>
-                          <Button aria-label={`${attached ? '移除' : '附加'}模板 ${template.name}`} icon={attached ? <CheckOutlined /> : <PaperClipOutlined />} type={attached ? 'primary' : 'default'} disabled={disabled || (!attached && attachedTemplateIds.length >= 6)} onClick={() => onToggleAttach(template)} />
+                          <Button aria-label={`${attached ? '移除' : '附加'}模板 ${template.name}`} icon={attached ? <CheckOutlined /> : <PaperClipOutlined />} type={attached ? 'primary' : 'default'} disabled={attachmentDisabled || (!attached && attachedTemplateIds.length >= 6)} onClick={() => onToggleAttach(template)} />
                         </Tooltip>
                         <Tooltip title="编辑模板"><Button aria-label={`编辑模板 ${template.name}`} type="text" icon={<EditOutlined />} disabled={disabled} onClick={() => openEdit(template)} /></Tooltip>
                         <Popconfirm title={`删除「${template.name}」？`} description="已转存的模板图片也会清理。" okText="删除" cancelText="取消" onConfirm={() => deleteTemplate(template)}>
@@ -619,7 +621,7 @@ export default function TemplateLibraryPanel({
                 <span>完整套用与组件配方</span>
               </div>
             </div>
-            <Button className="theme-library-open-button" type="primary" icon={<ReadOutlined />} disabled={disabled || !modelId} onClick={() => onOpenThemeGallery()}>打开主题库</Button>
+            <Button className="theme-library-open-button" type="primary" icon={<ReadOutlined />} onClick={() => onOpenThemeGallery()}>打开主题库</Button>
           </div>
           {themeContext && (
             <div className="theme-library-active-context">
@@ -635,7 +637,7 @@ export default function TemplateLibraryPanel({
               {themeItems.map((theme) => {
                 const preview = themePreviews[theme.key]
                 return (
-                  <button type="button" className="theme-library-preview-card" key={theme.key} onClick={() => onOpenThemeGallery(theme.key)} disabled={disabled || !modelId}>
+                  <button type="button" className="theme-library-preview-card" key={theme.key} onClick={() => onOpenThemeGallery(theme.key)}>
                     <span className="theme-library-preview-frame" style={{ borderTopColor: theme.accent_color }}>
                       {preview ? <ResourcePreviewFrame title={`${theme.name} 预览`} html={preview} theme /> : <LoadingOutlined />}
                     </span>

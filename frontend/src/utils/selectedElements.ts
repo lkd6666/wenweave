@@ -36,7 +36,7 @@ const sanitizeLocator = (locator: SelectedElementContext['locator']): SelectedEl
     .slice(0, 16)
     .reduce<Record<string, string>>((result, [key, value]) => {
       const normalizedKey = String(key).toLowerCase().trim()
-      if (!normalizedKey || !/^(id|src|srcset|href|name|data-[a-z0-9_-]+)$/.test(normalizedKey)) return result
+      if (!normalizedKey || !/^(id|src|srcset|href|xlink:href|name|data-[a-z0-9_-]+)$/.test(normalizedKey)) return result
       result[normalizedKey] = redactInlineDataForIdentity(String(value ?? '')).slice(0, 2048)
       return result
     }, {})
@@ -62,13 +62,19 @@ export function sanitizeSelectedElement(element: SelectedElementContext): Select
   const html = String(element.html ?? '').replace(DATA_URI_PATTERN, (_match, mediaType: string) => (
     `[inline ${mediaType.toLowerCase().split('/', 1)[0]} data omitted]`
   ))
-  return {
+  const sanitized: SelectedElementContext = {
     selector: String(element.selector ?? '').slice(0, 1024),
     tag_name: String(element.tag_name ?? '').slice(0, 64),
     html: truncate(html, MAX_SELECTED_ELEMENT_HTML_CHARS),
     text: String(element.text ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_SELECTED_ELEMENT_TEXT_CHARS),
     locator: sanitizeLocator(element.locator),
   }
+  if (element.kind === 'image' || element.kind === 'element') sanitized.kind = element.kind
+  if (element.source_attribute === 'src' || element.source_attribute === 'href' || element.source_attribute === 'xlink:href') {
+    sanitized.source_attribute = element.source_attribute
+  }
+  if (element.source_fingerprint) sanitized.source_fingerprint = String(element.source_fingerprint).slice(0, 128)
+  return sanitized
 }
 
 export function sanitizeSelectedElements(elements: SelectedElementContext[]): SelectedElementContext[] {

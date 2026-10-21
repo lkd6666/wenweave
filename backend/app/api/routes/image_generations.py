@@ -305,6 +305,12 @@ def delete_document_generated_image(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="图片已保存到图片库，请在图库中移出")
     if asset.is_applied:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="已应用到文章的图片不能删除")
+    from app.models.chat_image_attachment import ChatImageAttachment
+    if db.query(ChatImageAttachment.id).filter(
+        ChatImageAttachment.storage_mode == asset.storage_mode,
+        ChatImageAttachment.object_key == asset.object_key,
+    ).first() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="图片已被对话引用，不能删除")
     delete_tracked_document_image(
         db, StoredDocumentImage(url=asset.url, object_key=asset.object_key, storage_mode=asset.storage_mode)
     )

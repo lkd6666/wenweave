@@ -2,12 +2,7 @@
 from __future__ import annotations
 
 import io
-from typing import Callable, List
-
-import fitz  # PyMuPDF
-from docx import Document as DocxDocument
-from docx.oxml.ns import qn
-from docx.text.paragraph import Paragraph
+from typing import Any, Callable, List
 
 # (图片二进制, 文件名, content-type) -> 上传后的外链 URL
 ImageUploader = Callable[[bytes, str, str], str]
@@ -41,6 +36,8 @@ def _append_pdf_text_block(html_parts: List[str], block: dict) -> None:
 
 
 def parse_pdf(file_bytes: bytes, upload_image: ImageUploader) -> str:
+    import fitz  # PyMuPDF
+
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     html_parts: List[str] = []
     try:
@@ -70,8 +67,10 @@ def parse_pdf(file_bytes: bytes, upload_image: ImageUploader) -> str:
     return "\n".join(html_parts) or "<p>（PDF 未提取到文本内容）</p>"
 
 
-def _docx_image_tags(node, document: DocxDocument, upload_image: ImageUploader) -> list[str]:
+def _docx_image_tags(node: Any, document: Any, upload_image: ImageUploader) -> list[str]:
     """解析一个 drawing / pict 节点中的图片关系，并按节点内出现顺序上传。"""
+    from docx.oxml.ns import qn
+
     relationship_ids: list[str] = []
     for child in node.iter():
         if child.tag == qn("a:blip"):
@@ -96,8 +95,10 @@ def _docx_image_tags(node, document: DocxDocument, upload_image: ImageUploader) 
     return tags
 
 
-def _render_docx_paragraph(paragraph: Paragraph, document: DocxDocument, upload_image: ImageUploader) -> str:
+def _render_docx_paragraph(paragraph: Any, document: Any, upload_image: ImageUploader) -> str:
     """保留段落内文字、换行和图片的 XML 顺序。"""
+    from docx.oxml.ns import qn
+
     contents: list[str] = []
     for node in paragraph._p.iter():
         if node.tag == qn("w:t"):
@@ -116,8 +117,11 @@ def _render_docx_paragraph(paragraph: Paragraph, document: DocxDocument, upload_
     return f"<p>{content}</p>"
 
 
-def _iter_docx_body_paragraphs(document: DocxDocument):
+def _iter_docx_body_paragraphs(document: Any):
     """按 body 顺序返回段落，也处理表格单元格中的段落。"""
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
     for child in document.element.body.iterchildren():
         if child.tag == qn("w:p"):
             yield Paragraph(child, document._body)
@@ -127,6 +131,8 @@ def _iter_docx_body_paragraphs(document: DocxDocument):
 
 
 def parse_docx(file_bytes: bytes, upload_image: ImageUploader) -> str:
+    from docx import Document as DocxDocument
+
     buffer = io.BytesIO(file_bytes)
     document = DocxDocument(buffer)
 

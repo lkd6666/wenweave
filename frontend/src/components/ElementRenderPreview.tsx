@@ -1,18 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { frameDocumentWithNewWindowLinks, SANDBOX_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
+import { extractImagePreview } from '../utils/elementImagePreview'
 
 interface ElementRenderPreviewProps {
   html: string
-}
-
-function extractImagePreview(html: string): { src: string; alt: string } | null {
-  const document = new DOMParser().parseFromString(html, 'text/html')
-  const element = document.body.firstElementChild
-  if (!element || document.body.children.length !== 1 || element.tagName !== 'IMG') return null
-  return {
-    src: element.getAttribute('src') ?? '',
-    alt: element.getAttribute('alt') ?? '',
-  }
 }
 
 /** 在 sandbox iframe 中渲染已引用元素，避免预览 HTML 影响应用页面。 */

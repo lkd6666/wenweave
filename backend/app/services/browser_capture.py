@@ -20,7 +20,9 @@ CAPTURE_PURPOSE_WEB_ARTICLE_IMPORT = "web_article_import"
 CAPTURE_PURPOSES = {CAPTURE_PURPOSE_LAYOUT_REFERENCE, CAPTURE_PURPOSE_WEB_ARTICLE_IMPORT}
 CAPTURE_SESSION_TTL = timedelta(minutes=10)
 MAX_CAPTURE_HTML_BYTES = 5 * 1024 * 1024
-MAX_CAPTURE_ASSETS = 50
+# Count is deliberately higher than the legacy 50-image ceiling.  Byte limits
+# still bound memory, storage, and upload cost for image-heavy articles.
+MAX_CAPTURE_ASSETS = 200
 MAX_CAPTURE_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_CAPTURE_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 WECHAT_HOST = "mp.weixin.qq.com"
@@ -157,9 +159,21 @@ def complete_browser_capture_session(capture_session: LayoutCaptureSession) -> N
 
 
 def cleanup_expired_browser_capture_sessions(db: Session, now: datetime | None = None) -> int:
+    expired_ids = [
+        session_id
+        for (session_id,) in (
+            db.query(LayoutCaptureSession.id)
+            .filter(LayoutCaptureSession.expires_at <= (now or _utcnow()))
+            .order_by(LayoutCaptureSession.expires_at, LayoutCaptureSession.id)
+            .limit(500)
+            .all()
+        )
+    ]
+    if not expired_ids:
+        return 0
     deleted = (
         db.query(LayoutCaptureSession)
-        .filter(LayoutCaptureSession.expires_at <= (now or _utcnow()))
+        .filter(LayoutCaptureSession.id.in_(expired_ids))
         .delete(synchronize_session=False)
     )
     if deleted:

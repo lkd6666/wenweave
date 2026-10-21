@@ -38,6 +38,7 @@ class ChatContextSnapshot(Base):
     # describes the active immutable ledger prefix after a historical re-ask.
     source_event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source_prefix_hash: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    source_max_event_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     context_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     active_slot: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)

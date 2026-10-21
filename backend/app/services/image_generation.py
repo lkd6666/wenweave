@@ -52,6 +52,8 @@ _DASHSCOPE_RESULT_HOST_RE = re.compile(
     r"^(?:dashscope-result-[a-z0-9-]+\.oss-cn-[a-z0-9-]+\.aliyuncs\.com|"
     r"dashscope-[a-z0-9-]+\.oss-accelerate\.aliyuncs\.com)$"
 )
+_IMAGE_TAG_PATTERN = re.compile(r"<(?:img|image)\b[^>]*>", re.IGNORECASE)
+_IMAGE_SOURCE_ATTRIBUTES = ("src", "href", "xlink:href")
 
 
 class ImageGenerationError(ValueError):
@@ -87,9 +89,10 @@ class _CurrentImageSourceParser(HTMLParser):
         self.sources: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() != "img":
+        if tag.lower() not in {"img", "image"}:
             return
-        source = dict(attrs).get("src")
+        attributes = dict(attrs)
+        source = next((attributes.get(name) for name in _IMAGE_SOURCE_ATTRIBUTES if attributes.get(name)), None)
         if source:
             self.sources.add(source.strip())
 
@@ -104,13 +107,34 @@ def _current_image_sources(current_html: str) -> set[str]:
     return parser.sources
 
 
+def _image_source_match(tag: str) -> re.Match[str] | None:
+    for attribute in _IMAGE_SOURCE_ATTRIBUTES:
+        match = re.search(rf"(?<![\w:-]){re.escape(attribute)}\s*=\s*(['\"])(.*?)\1", tag, flags=re.IGNORECASE | re.DOTALL)
+        if match and match.group(2).strip():
+            return match
+    return None
+
+
+def _replace_image_tag_source(tag: str, source_match: re.Match[str], next_url: str) -> str:
+    if re.match(r"<image\b", tag, re.IGNORECASE):
+        matches = list(re.finditer(
+            r"(?<![\w:-])(?:src|href|xlink:href)\s*=\s*(['\"])(.*?)\1",
+            tag,
+            flags=re.IGNORECASE | re.DOTALL,
+        ))
+        for match in reversed(matches):
+            tag = tag[:match.start(2)] + html_escape_url(next_url) + tag[match.end(2):]
+        return tag
+    return tag[:source_match.start(2)] + html_escape_url(next_url) + tag[source_match.end(2):]
+
+
 def image_target_fingerprint(current_html: str, image_index: int, source_url: str = "") -> str:
     """Hash one image tag's attributes for optimistic replacement checks."""
-    tags = re.findall(r"<img\b[^>]*>", current_html or "", flags=re.IGNORECASE)
+    tags = _IMAGE_TAG_PATTERN.findall(current_html or "")
     if image_index < 0 or image_index >= len(tags):
         return ""
     tag = tags[image_index]
-    match = re.search(r"\bsrc\s*=\s*(['\"])(.*?)\1", tag, flags=re.IGNORECASE | re.DOTALL)
+    match = _image_source_match(tag)
     actual_source = match.group(2).strip() if match else ""
     # Browsers expose an HTML attribute as a decoded URL (`&`), while the
     # serialized document commonly stores the same value as `&amp;`. Compare
@@ -133,25 +157,24 @@ def cover_source_fingerprint(source_url: str) -> str:
 
 def image_source_at(current_html: str, image_index: int) -> str:
     """Return the serialized src of one image for an Agent replacement."""
-    tags = re.findall(r"<img\b[^>]*>", current_html or "", flags=re.IGNORECASE)
+    tags = _IMAGE_TAG_PATTERN.findall(current_html or "")
     if image_index < 0 or image_index >= len(tags):
         return ""
-    match = re.search(r"\bsrc\s*=\s*(['\"])(.*?)\1", tags[image_index], flags=re.IGNORECASE | re.DOTALL)
+    match = _image_source_match(tags[image_index])
     return unescape(match.group(2).strip()) if match else ""
 
 
 def replace_image_source(current_html: str, image_index: int, source_url: str, next_url: str) -> str:
     """Replace exactly one img src while leaving all surrounding markup intact."""
-    tags = list(re.finditer(r"<img\b[^>]*>", current_html or "", flags=re.IGNORECASE))
+    tags = list(_IMAGE_TAG_PATTERN.finditer(current_html or ""))
     if image_index < 0 or image_index >= len(tags):
         raise ImageGenerationError("目标图片不存在，请重新选择")
     tag_match = tags[image_index]
     tag = tag_match.group(0)
-    src_match = re.search(r"(\bsrc\s*=\s*)(['\"])(.*?)\2", tag, flags=re.IGNORECASE | re.DOTALL)
-    if not src_match or unescape(src_match.group(3).strip()) != unescape(source_url.strip()):
+    src_match = _image_source_match(tag)
+    if not src_match or unescape(src_match.group(2).strip()) != unescape(source_url.strip()):
         raise ImageGenerationError("目标图片已发生变化，请重新选择")
-    replacement = f"{src_match.group(1)}{src_match.group(2)}{html_escape_url(next_url)}{src_match.group(2)}"
-    next_tag = tag[:src_match.start()] + replacement + tag[src_match.end():]
+    next_tag = _replace_image_tag_source(tag, src_match, next_url)
     return current_html[:tag_match.start()] + next_tag + current_html[tag_match.end():]
 
 
@@ -170,16 +193,15 @@ def replace_transformed_image_source(current_html: str, image_index: int, source
     different source at this point as well. Presentation attributes such as
     ``alt``, ``class``, dimensions and inline style intentionally remain.
     """
-    tags = list(re.finditer(r"<img\b[^>]*>", current_html or "", flags=re.IGNORECASE))
+    tags = list(_IMAGE_TAG_PATTERN.finditer(current_html or ""))
     if image_index < 0 or image_index >= len(tags):
         raise ImageGenerationError("目标图片不存在，请重新选择")
     tag_match = tags[image_index]
     tag = tag_match.group(0)
-    src_match = re.search(r"(\bsrc\s*=\s*)(['\"])(.*?)\2", tag, flags=re.IGNORECASE | re.DOTALL)
-    if not src_match or unescape(src_match.group(3).strip()) != unescape(source_url.strip()):
+    src_match = _image_source_match(tag)
+    if not src_match or unescape(src_match.group(2).strip()) != unescape(source_url.strip()):
         raise ImageGenerationError("目标图片已发生变化，请重新选择")
-    replacement = f"{src_match.group(1)}{src_match.group(2)}{html_escape_url(next_url)}{src_match.group(2)}"
-    next_tag = tag[:src_match.start()] + replacement + tag[src_match.end():]
+    next_tag = _replace_image_tag_source(tag, src_match, next_url)
     next_tag = _STALE_TRANSFORMED_IMAGE_ATTRIBUTES.sub("", next_tag)
     return current_html[:tag_match.start()] + next_tag + current_html[tag_match.end():]
 
@@ -944,6 +966,8 @@ def cleanup_unused_assets(db: Session) -> int:
             ImageGeneration.source_object_key != "",
             ImageGeneration.created_at < cutoff,
         )
+        .order_by(ImageGeneration.created_at, ImageGeneration.id)
+        .limit(100)
         .all()
     )
     for generation in source_generations:

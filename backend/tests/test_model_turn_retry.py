@@ -422,6 +422,29 @@ class RetryClassifierTests(unittest.TestCase):
 
 
 class RetryStreamTests(unittest.TestCase):
+    def test_empty_provider_stream_is_retried_before_graph_sees_a_missing_response(self) -> None:
+        model = _FakeModel([[], [AIMessageChunk(content="首条响应")]])
+
+        chunks, events = _drain(model)
+
+        self.assertEqual([chunk.content for chunk in chunks], ["首条响应"])
+        self.assertEqual(model.attempts, 2)
+        self.assertEqual(events[0]["data"]["reason"], "stream_empty_response")
+
+    def test_metadata_only_ai_stream_is_retried(self) -> None:
+        model = _FakeModel(
+            [
+                [AIMessageChunk(content="", usage_metadata={"input_tokens": 1, "output_tokens": 0, "total_tokens": 1})],
+                [AIMessageChunk(content="可用响应")],
+            ]
+        )
+
+        chunks, events = _drain(model)
+
+        self.assertEqual([chunk.content for chunk in chunks], ["可用响应"])
+        self.assertEqual(model.attempts, 2)
+        self.assertEqual(events[0]["data"]["reason"], "stream_empty_response")
+
     def test_transient_failure_before_any_output_is_retried(self) -> None:
         model = _FakeModel([_Status("overloaded", 503), "chunk-1"])
 

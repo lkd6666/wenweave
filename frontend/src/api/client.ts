@@ -2,12 +2,28 @@ import { useAuthStore } from '../store/authStore'
 
 const API_BASE = '/api'
 
+function apiErrorMessage(detail: unknown): string {
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) return detail.map(apiErrorMessage).filter(Boolean).join('\n')
+  if (detail && typeof detail === 'object') {
+    const fields = detail as Record<string, unknown>
+    for (const key of ['message', 'msg', 'detail', 'error', 'reason', 'errors']) {
+      if (fields[key] !== undefined && fields[key] !== null) {
+        const text = apiErrorMessage(fields[key])
+        if (text) return text
+      }
+    }
+    return JSON.stringify(detail)
+  }
+  return detail == null ? '请求失败' : String(detail)
+}
+
 export class ApiError extends Error {
   status: number
   detail: unknown
 
   constructor(status: number, detail: unknown) {
-    super(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    super(apiErrorMessage(detail))
     this.status = status
     this.detail = detail
   }
@@ -17,6 +33,16 @@ interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   body?: unknown
   isFormData?: boolean
+  signal?: AbortSignal
+}
+
+export interface UploadProgress {
+  loaded: number
+  total: number
+}
+
+export interface UploadOptions {
+  onProgress?: (progress: UploadProgress) => void
   signal?: AbortSignal
 }
 
@@ -129,6 +155,70 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   return (await res.json()) as T
 }
 
+function uploadWithCurrentAccessToken(path: string, body: FormData, options: UploadOptions): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    const signal = options.signal
+    const onAbort = () => request.abort()
+    const cleanup = () => signal?.removeEventListener('abort', onAbort)
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException('上传已取消', 'AbortError'))
+      return
+    }
+    request.open('POST', `${API_BASE}${path}`)
+    const token = useAuthStore.getState().token
+    if (token) request.setRequestHeader('Authorization', `Bearer ${token}`)
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) options.onProgress?.({ loaded: event.loaded, total: event.total })
+    }
+    request.upload.onload = () => options.onProgress?.({ loaded: 1, total: 1 })
+    request.onload = () => {
+      cleanup()
+      if (!request.status) {
+        reject(new ApiError(0, '上传连接中断，请重试'))
+        return
+      }
+      resolve(new Response(request.status === 204 ? null : request.responseText, {
+        status: request.status,
+        statusText: request.statusText,
+      }))
+    }
+    request.onerror = () => { cleanup(); reject(new ApiError(0, '上传连接中断，请重试')) }
+    request.onabort = () => { cleanup(); reject(signal?.reason ?? new DOMException('上传已取消', 'AbortError')) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      request.send(body)
+    } catch (error) {
+      cleanup()
+      reject(error)
+    }
+  })
+}
+
+export async function apiUpload<T>(path: string, body: FormData, options: UploadOptions = {}): Promise<T> {
+  if (!options.onProgress) return apiRequest<T>(path, { method: 'POST', body, isFormData: true, signal: options.signal })
+  const tokenUsedForRequest = useAuthStore.getState().token
+  let response = await uploadWithCurrentAccessToken(path, body, options)
+  if (response.status === 401 && tokenUsedForRequest) {
+    const refreshed = useAuthStore.getState().token !== tokenUsedForRequest || await refreshAccessToken()
+    if (refreshed) {
+      options.onProgress({ loaded: 0, total: 0 })
+      response = await uploadWithCurrentAccessToken(path, body, options)
+    }
+  }
+  if (!response.ok) {
+    let detail: unknown = response.statusText
+    try {
+      const data = await response.json()
+      detail = data.detail ?? data
+    } catch {
+      // Reverse proxies may return a non-JSON upload error.
+    }
+    throw new ApiError(response.status, detail)
+  }
+  return response.status === 204 ? undefined as T : await response.json() as T
+}
+
 export async function apiBlob(path: string, options: Pick<RequestOptions, 'signal'> = {}): Promise<Blob> {
   const res = await authenticatedFetch(`${API_BASE}${path}`, {
     method: 'GET',
@@ -211,6 +301,5 @@ export const api = {
   put: <T>(path: string, body?: unknown) => apiRequest<T>(path, { method: 'PUT', body }),
   patch: <T>(path: string, body?: unknown) => apiRequest<T>(path, { method: 'PATCH', body }),
   delete: <T>(path: string) => apiRequest<T>(path, { method: 'DELETE' }),
-  upload: <T>(path: string, formData: FormData) =>
-    apiRequest<T>(path, { method: 'POST', body: formData, isFormData: true }),
+  upload: apiUpload,
 }

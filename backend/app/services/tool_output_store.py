@@ -364,9 +364,21 @@ class ToolOutputStore:
 
 def cleanup_expired_tool_outputs(db: Session, *, now: datetime | None = None) -> int:
     """Delete expired full tool payloads while keeping compact event records."""
+    expired_ids = [
+        output_id
+        for (output_id,) in (
+            db.query(ChatToolOutput.output_id)
+            .filter(ChatToolOutput.retention_mode == "ttl", ChatToolOutput.expires_at <= (now or _now()))
+            .order_by(ChatToolOutput.expires_at, ChatToolOutput.output_id)
+            .limit(500)
+            .all()
+        )
+    ]
+    if not expired_ids:
+        return 0
     deleted = (
         db.query(ChatToolOutput)
-        .filter(ChatToolOutput.retention_mode == "ttl", ChatToolOutput.expires_at <= (now or _now()))
+        .filter(ChatToolOutput.output_id.in_(expired_ids))
         .delete(synchronize_session=False)
     )
     db.commit()

@@ -25,6 +25,7 @@ from app.models.agent_run_event import AgentRunEvent
 from app.models.model_call_record import ModelCallRecord, ModelCallStatus
 from app.models.chat_user_question import ChatUserQuestion
 from app.models.chat_message import ChatMessage, MessageRole
+from app.models.chat_image_attachment import ChatImageAttachment
 from app.models.document import Document
 from app.models.chat_session import ChatSession, ChatSessionMemory
 from app.models.chat_context_event import ChatContextEvent, ContextEventKind
@@ -41,6 +42,7 @@ from app.services.document_activity import repair_document_activity_timestamps, 
 from app.services.document_versions import create_document_version, migrate_legacy_document_versions
 from app.services.operation_logs import append_operation_log
 from app.services.agent_run_recovery import recover_interrupted_turn
+from app.services.context_recovery import persist_recovered_context
 from app.services.model_presets import (
     anthropic_adaptive_thinking_config,
     _gemini_25_thinking_config,
@@ -48,7 +50,6 @@ from app.services.model_presets import (
     is_official_deepseek_openai_endpoint,
     official_deepseek_thinking_config,
 )
-from app.services.wechat_compliance import run_compliance_check
 
 
 SCHEMA_REVISION = "20260816_password_change_policy_v1"
@@ -860,6 +861,37 @@ def migrate_schema() -> None:
                     text("UPDATE gzh_theme_proposals SET selected_component_ids_json = '[]' WHERE selected_component_ids_json IS NULL")
                 )
 
+        # Historical re-asks share the existing image object. Each attachment
+        # still owns its own immutable message binding, but object keys repeat.
+        if inspector.has_table("chat_image_attachments"):
+            image_inspector = inspect(connection)
+            if "is_direct_input" not in {item["name"] for item in image_inspector.get_columns("chat_image_attachments")}:
+                connection.execute(text("ALTER TABLE chat_image_attachments ADD COLUMN is_direct_input BOOLEAN NOT NULL DEFAULT 0"))
+                connection.execute(text(
+                    "UPDATE chat_image_attachments SET is_direct_input = 1 "
+                    "WHERE object_key LIKE 'local/chat-images/%' OR object_key LIKE 'yibanpaiban/chat-images/%'"
+                ))
+            unique_keys = [
+                item for item in image_inspector.get_unique_constraints("chat_image_attachments")
+                if item.get("column_names") == ["object_key"]
+            ]
+            if unique_keys:
+                if is_sqlite:
+                    columns = ", ".join(ChatImageAttachment.__table__.columns.keys())
+                    connection.execute(text(f"CREATE TEMPORARY TABLE chat_image_refs_backup AS SELECT {columns} FROM chat_image_attachments"))
+                    connection.execute(text("DROP TABLE chat_image_attachments"))
+                    ChatImageAttachment.__table__.create(bind=connection)
+                    connection.execute(text(f"INSERT INTO chat_image_attachments ({columns}) SELECT {columns} FROM chat_image_refs_backup"))
+                    connection.execute(text("DROP TABLE chat_image_refs_backup"))
+                else:
+                    for item in unique_keys:
+                        index_name = str(item["name"]).replace("`", "``")
+                        connection.execute(text(f"ALTER TABLE chat_image_attachments DROP INDEX `{index_name}`"))
+            if "ix_chat_image_attachments_object_key" not in {
+                item["name"] for item in inspect(connection).get_indexes("chat_image_attachments")
+            }:
+                connection.execute(text("CREATE INDEX ix_chat_image_attachments_object_key ON chat_image_attachments (object_key)"))
+
         # Theme selection now belongs to a conversation, rather than being
         # inferred from the document's newest applied theme.  Preserve the
         # useful existing choice for old sessions once, without guessing from
@@ -975,6 +1007,7 @@ def migrate_schema() -> None:
             snapshot_definitions = {
                 "source_event_count": "INTEGER NOT NULL DEFAULT 0",
                 "source_prefix_hash": "VARCHAR(80) NOT NULL DEFAULT ''",
+                "source_max_event_id": "INTEGER NOT NULL DEFAULT 0",
                 "context_generation": "INTEGER NOT NULL DEFAULT 0",
                 # Only the active row holds ``1``.  A unique index on this
                 # nullable column enforces one active snapshot per session on
@@ -1206,6 +1239,19 @@ def migrate_schema() -> None:
                     {"archive_id": archive_id, "session_id": session_id},
                 )
 
+        if inspector.has_table("chat_layout_references"):
+            layout_reference_columns = {
+                column["name"] for column in inspect(connection).get_columns("chat_layout_references")
+            }
+            if "preview_token_encrypted" not in layout_reference_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE chat_layout_references ADD COLUMN preview_token_encrypted VARCHAR(512) NULL"
+                        if not is_sqlite
+                        else "ALTER TABLE chat_layout_references ADD COLUMN preview_token_encrypted TEXT"
+                    )
+                )
+
         # Questions created before inactivity handling have no deadline. Their
         # creation time remains the fallback inactivity start; new questions
         # receive both timestamps atomically with the pause.
@@ -1228,6 +1274,13 @@ def migrate_schema() -> None:
             if "ix_chat_user_questions_timeout_at" not in question_indexes:
                 connection.execute(
                     text("CREATE INDEX ix_chat_user_questions_timeout_at ON chat_user_questions (timeout_at)")
+                )
+            if "ix_chat_user_questions_user_status_created" not in question_indexes:
+                connection.execute(
+                    text(
+                        "CREATE INDEX ix_chat_user_questions_user_status_created "
+                        "ON chat_user_questions (user_id, status, created_at)"
+                    )
                 )
 
             # ``run_id`` used to be unique, which made a second sequential
@@ -1438,6 +1491,8 @@ def migrate_schema() -> None:
             connection.execute(text("CREATE INDEX ix_agent_runs_session_id ON agent_runs (session_id)"))
         if "ix_agent_runs_lease_expires_at" not in run_indexes:
             connection.execute(text("CREATE INDEX ix_agent_runs_lease_expires_at ON agent_runs (lease_expires_at)"))
+        if "ix_agent_runs_status_lease" not in run_indexes:
+            connection.execute(text("CREATE INDEX ix_agent_runs_status_lease ON agent_runs (status, lease_expires_at)"))
 
         if inspector.has_table("model_call_records"):
             model_call_columns = {
@@ -1483,22 +1538,17 @@ def migrate_schema() -> None:
         # Legacy tool results are less precise than the new live capture, but
         # preserving their ordering lets old sessions grow and compact without
         # contaminating another session's context.
-        existing_event_message_ids = set(
-            connection.execute(
-                text("SELECT DISTINCT message_id FROM chat_context_events WHERE message_id IS NOT NULL")
-            ).scalars().all()
-        )
         legacy_messages = connection.execute(
             text(
-                "SELECT id, document_id, session_id, role, content, tool_calls_json "
-                "FROM chat_messages WHERE session_id IS NOT NULL ORDER BY session_id, id"
+                "SELECT m.id, m.document_id, m.session_id, m.role, m.content, m.tool_calls_json "
+                "FROM chat_messages m WHERE m.session_id IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM chat_context_events e WHERE e.message_id = m.id) "
+                "ORDER BY m.session_id, m.id"
             )
         ).mappings().all()
         event_rows = []
         for message in legacy_messages:
             message_id = int(message["id"])
-            if message_id in existing_event_message_ids:
-                continue
             # SQLAlchemy's Enum persists member names on MySQL by default
             # (``USER``/``ASSISTANT``), while imported SQLite data may hold
             # their lowercase values. Treat both representations identically.
@@ -1612,11 +1662,12 @@ def migrate_schema() -> None:
         )
 
         memory_rows = connection.execute(
-            text("SELECT id, session_id, compacted_through_message_id FROM chat_session_memories")
+            text(
+                "SELECT id, session_id, compacted_through_message_id FROM chat_session_memories "
+                "WHERE compacted_through_event_id = 0 AND compacted_through_message_id <> 0"
+            )
         ).mappings().all()
         for memory in memory_rows:
-            if not memory["compacted_through_message_id"]:
-                continue
             event_id = connection.execute(
                 text(
                     "SELECT MAX(id) FROM chat_context_events "
@@ -1761,7 +1812,9 @@ def migrate_schema() -> None:
         migration_session = Session(bind=connection, join_transaction_mode="create_savepoint")
         try:
             migrate_legacy_document_versions(migration_session)
-            migration_session.flush()
+            # Release the savepoint while keeping the outer transaction in
+            # charge. Closing an uncommitted Session rolls this work back.
+            migration_session.commit()
         finally:
             migration_session.close()
 
@@ -1772,8 +1825,7 @@ def migrate_schema() -> None:
 
         # Older messages did not retain an author. Every persisted user turn
         # has an AgentRun, which is the authoritative historical owner. This
-        # must run after closing the bound ORM session above: SQLite rolls back
-        # its pending DML when that session closes, while retaining prior DDL.
+        # runs after committing the bound ORM session's savepoint above.
         connection.execute(
             text(
                 "UPDATE chat_messages SET created_by_id = ("
@@ -1908,6 +1960,7 @@ def recover_expired_agent_runs(db: Session) -> int:
             ),
         )
         .order_by(AgentRun.created_at)
+        .limit(50)
         .all()
     )
     recovered = 0
@@ -2033,6 +2086,7 @@ def recover_expired_agent_runs(db: Session) -> int:
             db.flush()
             run.assistant_message_id = assistant_message.id
             assistant_content = assistant_message.content
+            persist_recovered_context(db, assistant_message, run.id)
         else:
             assistant_message = db.get(ChatMessage, run.assistant_message_id)
             if assistant_message:
@@ -2061,7 +2115,7 @@ def recover_expired_agent_runs(db: Session) -> int:
                         "content": assistant_content,
                         "html": report_html,
                         "html_changed": partial_saved,
-                        "compliance": run_compliance_check(report_html).to_dict(),
+                        "compliance": None,
                         "cancelled": False,
                         "partial": True,
                         "partial_save_state": save_state,

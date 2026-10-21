@@ -11,6 +11,7 @@ import ipaddress
 import re
 import socket
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -22,6 +23,8 @@ from uuid import uuid4
 import httpx
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
+from app.core.crypto import decrypt_secret, encrypt_secret
 from app.models.chat_layout_reference import ChatLayoutReference, ChatLayoutReferenceAsset
 from app.models.chat_session_layout_reference import ChatSessionLayoutReference
 from app.models.layout_capture_session import LayoutCaptureSession
@@ -45,6 +48,7 @@ from app.services.browser_capture import (
 )
 from app.services.document_images import DocumentImageStorageError, store_document_image
 from app.services.external_fetch import PublicFetchError, fetch_public_html, fetch_public_image
+from app.services.css_declarations import split_css_declarations as _split_css_declarations
 
 
 REFERENCE_TTL_SECONDS = 15 * 60
@@ -72,9 +76,54 @@ _ALLOWED_TAGS = {
     "blockquote", "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "br", "hr", "pre", "code",
     "figure", "figcaption", "small", "sup", "sub", "a",
 }
-_ALLOWED_ATTRIBUTES = {"style", "class", "align", "width", "height", "colspan", "rowspan", "valign", "alt"}
+_SVG_TAGS = {
+    "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "text", "tspan", "title", "desc",
+    "defs", "clippath", "mask", "lineargradient", "radialgradient", "stop", "use", "image", "filter", "feflood", "feblend",
+    "fegaussianblur", "feoffset", "fecolormatrix", "fecomponenttransfer", "fefuncr", "fefuncg", "fefuncb", "fefunca",
+    "fecomposite", "femerge", "femergenode", "fedropshadow",
+}
+_SVG_OUTPUT_TAG_NAMES = {
+    "clippath": "clipPath",
+    "lineargradient": "linearGradient",
+    "radialgradient": "radialGradient",
+    "feflood": "feFlood",
+    "feblend": "feBlend",
+    "fegaussianblur": "feGaussianBlur",
+    "feoffset": "feOffset",
+    "fecolormatrix": "feColorMatrix",
+    "fecomponenttransfer": "feComponentTransfer",
+    "fefuncr": "feFuncR",
+    "fefuncg": "feFuncG",
+    "fefuncb": "feFuncB",
+    "fefunca": "feFuncA",
+    "fecomposite": "feComposite",
+    "femerge": "feMerge",
+    "femergenode": "feMergeNode",
+    "fedropshadow": "feDropShadow",
+}
+_ALLOWED_TAGS.update(_SVG_TAGS)
+_ALLOWED_ATTRIBUTES = {
+    "style", "class", "id", "align", "width", "height", "colspan", "rowspan", "valign", "alt", "role", "aria-label",
+    "data-w", "data-ratio", "data-mode", "data-ignore-width", "data-no-dark", "data-ignore-dm",
+    "xmlns", "viewbox", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy", "r", "rx", "ry", "d", "points",
+    "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width", "stroke-opacity", "stroke-linecap", "stroke-linejoin",
+    "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "transform", "transform-origin", "opacity", "preserveaspectratio",
+    "text-anchor", "dominant-baseline", "font-size", "font-family", "font-weight", "offset", "stop-color", "stop-opacity",
+    "gradientunits", "gradienttransform", "spreadmethod", "clip-path", "clip-rule", "mask", "maskunits", "maskcontentunits",
+    "filter", "filterunits", "primitiveunits", "color-interpolation-filters", "in", "in2", "result", "stddeviation", "dx", "dy",
+    "operator", "k1", "k2", "k3", "k4", "mode", "type", "values", "slope", "intercept", "tablevalues", "flood-color",
+    "flood-opacity", "focusable", "href", "xlink:href",
+}
+_BASE_ALLOWED_ATTRIBUTES = {
+    "style", "class", "id", "align", "width", "height", "colspan", "rowspan", "valign", "alt", "role", "aria-label",
+    "data-w", "data-ratio", "data-mode", "data-ignore-width", "data-no-dark", "data-ignore-dm",
+}
+_SVG_ONLY_ATTRIBUTES = _ALLOWED_ATTRIBUTES - _BASE_ALLOWED_ATTRIBUTES
 _BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "li", "figure", "table", "section"}
-_DISCARDED_TAGS = {"script", "style", "iframe", "object", "embed", "template", "noscript", "svg", "canvas", "form", "button", "input"}
+_DISCARDED_TAGS = {
+    "script", "style", "iframe", "object", "embed", "template", "noscript", "canvas", "form", "button", "input",
+    "foreignobject", "animate", "animatetransform", "animatemotion", "set",
+}
 _DANGEROUS_STYLE = re.compile(r"(?:expression\s*\(|@import|behavior\s*:|-moz-binding)", re.IGNORECASE)
 _ASSET_URL_RE = re.compile(r"^layout-reference://([a-f0-9]{32})$", re.IGNORECASE)
 _CSS_URL_RE = re.compile(r"url\(\s*(?P<quote>['\"]?)(?P<url>.*?)(?P=quote)\s*\)", re.IGNORECASE | re.DOTALL)
@@ -84,6 +133,8 @@ _DATA_IMAGE_URL_RE = re.compile(
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.IGNORECASE | re.DOTALL)
 _IMAGE_SOURCE_ATTRIBUTES = ("data-src", "data-original", "data-actualsrc", "src")
 _CAPTURE_ASSET_URL_RE = re.compile(r"^layout-capture://([a-f0-9]{32})$", re.IGNORECASE)
+_SAFE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,255}$")
+_SVG_LOCAL_URL_ATTRIBUTES = {"fill", "stroke", "filter", "clip-path", "mask"}
 
 
 class LayoutReferenceError(ValueError):
@@ -177,6 +228,12 @@ class LayoutReference:
                 template,
                 flags=re.IGNORECASE,
             )
+            template = re.sub(
+                rf'<image\b[^>]*\bhref="layout-reference://{escaped}"[^>]*>\s*</image>',
+                "",
+                template,
+                flags=re.IGNORECASE,
+            )
 
         def remove_unselected_style_assets(match: re.Match[str]) -> str:
             quote_char = match.group("quote")
@@ -224,14 +281,14 @@ class LayoutReference:
             template,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        # Removing a photo must not leave a blank figure/p/div that the Agent
-        # could mistake for a required spacing rule. A parent carrying a
-        # selected background must remain: the empty box itself is the layout.
+        # Empty styled elements can be author decorations, grid cells or spacing.
+        # Only clear empty unstyled wrappers left after photo removal.
         empty_element = re.compile(r"<(figure|p|div|span|section)\b[^>]*>\s*</\1>", re.IGNORECASE)
         previous = ""
         while previous != template:
             def remove_empty_element(match: re.Match[str]) -> str:
-                return match.group(0) if "layout-reference://" in match.group(0) else ""
+                opening_tag = match.group(0).split(">", 1)[0]
+                return match.group(0) if re.search(r"\bstyle\s*=", opening_tag, re.IGNORECASE) else ""
 
             previous, template = template, empty_element.sub(remove_empty_element, template)
         return template
@@ -305,8 +362,45 @@ class LayoutReference:
 
 
 class _ReferenceCache:
-    def __init__(self) -> None:
-        self._items: dict[str, LayoutReference] = {}
+    def __init__(self, *, max_entries: int | None = None, max_bytes: int | None = None) -> None:
+        settings = get_settings()
+        self.max_entries = max(1, int(max_entries or settings.LAYOUT_REFERENCE_CACHE_MAX_ENTRIES))
+        self.max_bytes = max(1024 * 1024, int(max_bytes or settings.LAYOUT_REFERENCE_CACHE_MAX_BYTES))
+        self._items: OrderedDict[str, LayoutReference] = OrderedDict()
+
+    @staticmethod
+    def _entry_bytes(item: LayoutReference) -> int:
+        text_bytes = sum(
+            len(str(value or "").encode("utf-8"))
+            for value in (
+                item.canonical_url,
+                item.title,
+                item.site_name,
+                item.html_template,
+                item.extracted_from,
+                item.warning,
+                item.preview_token,
+            )
+        )
+        asset_bytes = sum(
+            len(asset.data or b"")
+            + len(asset.object_key.encode("utf-8"))
+            + len(asset.content_type.encode("utf-8"))
+            + len(asset.role.encode("utf-8"))
+            + 128
+            for asset in item.assets
+        )
+        return text_bytes + asset_bytes + 512
+
+    def _total_bytes(self) -> int:
+        return sum(self._entry_bytes(item) for item in self._items.values())
+
+    def _enforce_limits(self) -> None:
+        while self._items and (
+            len(self._items) > self.max_entries or self._total_bytes() > self.max_bytes
+        ):
+            _reference_id, item = self._items.popitem(last=False)
+            item.cleanup()
 
     def purge(self) -> None:
         now = time.monotonic()
@@ -316,13 +410,16 @@ class _ReferenceCache:
 
     def put(self, item: LayoutReference) -> None:
         self.purge()
+        self._items.pop(item.reference_id, None)
         self._items[item.reference_id] = item
+        self._enforce_limits()
 
     def get(self, reference_id: str, user_id: int) -> LayoutReference:
         self.purge()
         item = self._items.get(reference_id)
         if not item or item.user_id != user_id:
             raise LayoutReferenceExpiredError("参考排版已过期或不可用，请重新解析链接")
+        self._items.move_to_end(reference_id)
         return item
 
     def get_preview_asset(self, reference_id: str, asset_id: str, preview_token: str) -> LayoutReferenceAsset:
@@ -330,6 +427,7 @@ class _ReferenceCache:
         item = self._items.get(reference_id)
         if not item or not hmac.compare_digest(item.preview_token, preview_token):
             raise LayoutReferenceExpiredError("参考图片已过期或不可用，请重新解析链接")
+        self._items.move_to_end(reference_id)
         for asset in item.assets:
             if hmac.compare_digest(asset.asset_id, asset_id):
                 return asset
@@ -372,7 +470,11 @@ def _reference_from_record(
         expires_at=time.monotonic() + seconds_remaining,
         # Capability validation happens against the persisted hash. A record
         # loaded by another worker must never be able to mint a new URL.
-        preview_token="",
+        preview_token=(
+            decrypt_secret(record.preview_token_encrypted)
+            if getattr(record, "preview_token_encrypted", "")
+            else ""
+        ),
         assets=[
             LayoutReferenceAsset(
                 asset_id=asset.asset_id,
@@ -468,6 +570,8 @@ def cleanup_expired_layout_references(db: Session, now: datetime | None = None) 
         reference_id
         for (reference_id,) in db.query(ChatLayoutReference.reference_id)
         .filter(ChatLayoutReference.expires_at <= (now or _utcnow()))
+        .order_by(ChatLayoutReference.expires_at, ChatLayoutReference.reference_id)
+        .limit(500)
         .all()
     ]
     if not expired_ids:
@@ -583,29 +687,7 @@ async def _fetch_html(raw_url: str) -> tuple[str, str]:
         raise LayoutReferenceError(str(exc)) from exc
 
 
-def _split_css_declarations(value: str) -> list[str]:
-    declarations: list[str] = []
-    start = 0
-    depth = 0
-    quote_char = ""
-    for index, char in enumerate(value):
-        if quote_char:
-            if char == quote_char and (index == 0 or value[index - 1] != "\\"):
-                quote_char = ""
-        elif char in {"'", '"'}:
-            quote_char = char
-        elif char == "(":
-            depth += 1
-        elif char == ")" and depth:
-            depth -= 1
-        elif char == ";" and depth == 0:
-            declarations.append(value[start:index])
-            start = index + 1
-    declarations.append(value[start:])
-    return declarations
-
-
-def _safe_style(value: str) -> str:
+def _safe_style(value: str, *, preserve_authored: bool = False) -> str:
     clean = value.strip()
     if not clean or _DANGEROUS_STYLE.search(clean):
         return ""
@@ -618,25 +700,30 @@ def _safe_style(value: str) -> str:
         normalized_value = property_value.strip().lower().replace("!important", "").strip()
         if "url(" in normalized_value:
             matches = list(_CSS_URL_RE.finditer(property_value))
-            if not matches or any(not _ASSET_URL_RE.fullmatch(match.group("url").strip()) for match in matches):
+            if not matches or any(
+                not _ASSET_URL_RE.fullmatch(match.group("url").strip())
+                and not (match.group("url").strip().startswith("#") and _SAFE_ID_RE.fullmatch(match.group("url").strip()[1:]))
+                for match in matches
+            ):
                 return ""
-        if normalized_name == "display" and normalized_value == "none":
+        if not preserve_authored and normalized_name == "display" and normalized_value == "none":
             continue
-        if normalized_name == "visibility" and normalized_value in {"hidden", "collapse"}:
+        if not preserve_authored and normalized_name == "visibility" and normalized_value in {"hidden", "collapse"}:
             continue
-        if normalized_name == "opacity":
+        if not preserve_authored and normalized_name == "opacity":
             try:
                 if float(normalized_value) <= 0:
                     continue
             except ValueError:
                 pass
-        if normalized_name == "content-visibility" and normalized_value == "hidden":
+        if not preserve_authored and normalized_name == "content-visibility" and normalized_value == "hidden":
             continue
         declarations.append(f"{property_name.strip()}:{property_value.strip()}")
-    return ";".join(declarations)[:4000]
+    rendered = ";".join(declarations)
+    return rendered if preserve_authored else rendered[:4000]
 
 
-def _safe_attributes(attrs: Iterable[tuple[str, str | None]]) -> str:
+def _safe_attributes(attrs: Iterable[tuple[str, str | None]], *, svg: bool = False, preserve_authored: bool = False) -> str:
     values: list[str] = []
     for name, value in attrs:
         normalized = name.lower()
@@ -650,18 +737,30 @@ def _safe_attributes(attrs: Iterable[tuple[str, str | None]]) -> str:
             continue
         if normalized not in _ALLOWED_ATTRIBUTES:
             continue
+        if normalized in _SVG_ONLY_ATTRIBUTES and not svg:
+            continue
+        if normalized in {"href", "xlink:href"}:
+            if not svg or not value.startswith("#") or not _SAFE_ID_RE.fullmatch(value[1:]):
+                continue
+        if normalized == "id" and not _SAFE_ID_RE.fullmatch(value):
+            continue
+        if normalized in _SVG_LOCAL_URL_ATTRIBUTES and "url(" in value.lower():
+            if not re.fullmatch(r"url\(\s*#[A-Za-z_][A-Za-z0-9_.:-]{0,255}\s*\)", value, flags=re.IGNORECASE):
+                continue
         if normalized == "style":
-            value = _safe_style(value)
+            value = _safe_style(value, preserve_authored=preserve_authored)
             if not value:
                 continue
-        values.append(f' {normalized}="{html.escape(value[:4000], quote=True)}"')
+        safe_value = value if preserve_authored else value[:4000]
+        values.append(f' {normalized}="{html.escape(safe_value, quote=True)}"')
     return "".join(values)
 
 
 class _SanitisingCaptureParser(HTMLParser):
-    def __init__(self, target: str) -> None:
+    def __init__(self, target: str, *, preserve_authored: bool = False) -> None:
         super().__init__(convert_charrefs=False)
         self.target = target
+        self.preserve_authored = preserve_authored
         self.capture_depth = 0
         self.output: list[str] = []
         self.open_tags: list[str] = []
@@ -698,7 +797,7 @@ class _SanitisingCaptureParser(HTMLParser):
         if not source:
             raise LayoutReferenceError("参考图片缺少可访问地址")
         self.image_slots += 1
-        if self.image_slots > MAX_REFERENCE_IMAGES:
+        if not self.preserve_authored and self.image_slots > MAX_REFERENCE_IMAGES:
             raise LayoutReferenceError(f"参考页面图片超过 {MAX_REFERENCE_IMAGES} 张，无法完整保留")
         attr_values = {name.lower(): value or "" for name, value in attrs}
         style = attr_values.get("style", "")
@@ -731,12 +830,15 @@ class _SanitisingCaptureParser(HTMLParser):
             if not separator:
                 declarations.append(declaration)
                 continue
-            if property_name.strip().lower() not in {"background", "background-image"}:
+            if "url(" not in property_value.lower():
                 declarations.append(declaration)
                 continue
 
             def replace_url(match: re.Match[str]) -> str:
-                asset_id = self._register_asset(match.group("url"), kind="background", attrs=attrs)
+                source = match.group("url").strip()
+                if source.startswith("#") and _SAFE_ID_RE.fullmatch(source[1:]):
+                    return f"url({source})"
+                asset_id = self._register_asset(source, kind="background", attrs=attrs)
                 return f'url("layout-reference://{asset_id}")'
 
             rewritten, count = _CSS_URL_RE.subn(replace_url, property_value)
@@ -745,7 +847,7 @@ class _SanitisingCaptureParser(HTMLParser):
             declarations.append(f"{property_name}:{rewritten}")
         return ";".join(declarations)
 
-    def _sanitised_attributes(self, attrs: Iterable[tuple[str, str | None]]) -> str:
+    def _sanitised_attributes(self, tag: str, attrs: Iterable[tuple[str, str | None]]) -> str:
         values_source = list(attrs)
         values: list[tuple[str, str | None]] = []
         for name, value in values_source:
@@ -753,14 +855,23 @@ class _SanitisingCaptureParser(HTMLParser):
                 values.append((name, self._rewrite_background_assets(value, values_source)))
             else:
                 values.append((name, value))
-        return _safe_attributes(values)
+        return _safe_attributes(values, svg=tag in _SVG_TAGS, preserve_authored=self.preserve_authored)
 
     def _append_open_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "image" and "svg" in self.open_tags:
+            attr_values = {name.lower(): value or "" for name, value in attrs}
+            source = attr_values.get("href") or attr_values.get("xlink:href")
+            if source:
+                asset_id = self._register_asset(source, kind="img", attrs=attrs)
+                safe_attrs = self._sanitised_attributes(tag, [(name, value) for name, value in attrs if name.lower() not in {"href", "xlink:href"}])
+                self.output.append(f'<image href="layout-reference://{asset_id}"{safe_attrs}>')
+                self.open_tags.append(tag)
+            return
         if tag == "img":
             attr_values = {name.lower(): value or "" for name, value in attrs}
             source = next((attr_values[name] for name in _IMAGE_SOURCE_ATTRIBUTES if attr_values.get(name, "").strip()), "")
             asset_id = self._register_asset(source, kind="img", attrs=attrs)
-            safe_attrs = self._sanitised_attributes(attrs)
+            safe_attrs = self._sanitised_attributes(tag, attrs)
             self.output.append(
                 f'<img src="layout-reference://{asset_id}" data-layout-reference-asset="{asset_id}"{safe_attrs}>'
             )
@@ -769,7 +880,8 @@ class _SanitisingCaptureParser(HTMLParser):
             return
         if tag in _BLOCK_TAGS:
             self.block_count += 1
-        self.output.append(f"<{tag}{self._sanitised_attributes(attrs)}>")
+        output_tag = _SVG_OUTPUT_TAG_NAMES.get(tag, tag)
+        self.output.append(f"<{output_tag}{self._sanitised_attributes(tag, attrs)}>")
         if tag not in _VOID_TAGS:
             self.open_tags.append(tag)
 
@@ -796,7 +908,12 @@ class _SanitisingCaptureParser(HTMLParser):
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self.capture_depth:
-            self._append_open_tag(tag.lower(), attrs)
+            normalized = tag.lower()
+            previous_depth = len(self.open_tags)
+            self._append_open_tag(normalized, attrs)
+            if len(self.open_tags) > previous_depth and self.open_tags[-1] == normalized:
+                self.open_tags.pop()
+                self.output.append(f"</{_SVG_OUTPUT_TAG_NAMES.get(normalized, normalized)}>")
 
     def handle_endtag(self, tag: str) -> None:
         if not self.capture_depth:
@@ -809,7 +926,7 @@ class _SanitisingCaptureParser(HTMLParser):
         if normalized in _ALLOWED_TAGS and normalized != "img" and normalized in self.open_tags:
             while self.open_tags:
                 open_tag = self.open_tags.pop()
-                self.output.append(f"</{open_tag}>")
+                self.output.append(f"</{_SVG_OUTPUT_TAG_NAMES.get(open_tag, open_tag)}>")
                 if open_tag == normalized:
                     break
         if normalized not in _VOID_TAGS:
@@ -832,7 +949,8 @@ class _SanitisingCaptureParser(HTMLParser):
     def close_result(self) -> tuple[str, int, int, list[_AssetSource]]:
         self.close()
         while self.open_tags:
-            self.output.append(f"</{self.open_tags.pop()}>")
+            tag = self.open_tags.pop()
+            self.output.append(f"</{_SVG_OUTPUT_TAG_NAMES.get(tag, tag)}>")
         return "".join(self.output), self.block_count, self.image_slots, self.asset_sources
 
 
@@ -862,18 +980,21 @@ class _HtmlTruncator(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self.truncated:
             return
-        value = f"<{tag}{_safe_attributes(attrs)}>"
+        normalized = tag.lower()
+        output_tag = _SVG_OUTPUT_TAG_NAMES.get(normalized, normalized)
+        value = f"<{output_tag}{_safe_attributes(attrs, svg=normalized in _SVG_TAGS)}>"
         if self._append(value) and tag not in _VOID_TAGS:
-            self.open_tags.append(tag)
+            self.open_tags.append(normalized)
 
     def handle_endtag(self, tag: str) -> None:
         if self.truncated:
             return
-        if tag in self.open_tags:
+        normalized = tag.lower()
+        if normalized in self.open_tags:
             while self.open_tags:
                 open_tag = self.open_tags.pop()
-                self._append(f"</{open_tag}>")
-                if open_tag == tag:
+                self._append(f"</{_SVG_OUTPUT_TAG_NAMES.get(open_tag, open_tag)}>")
+                if open_tag == normalized:
                     break
 
     def handle_data(self, data: str) -> None:
@@ -890,7 +1011,8 @@ class _HtmlTruncator(HTMLParser):
         if self.truncated:
             self.output.append("<p>（参考排版内容已截断）</p>")
         while self.open_tags:
-            self.output.append(f"</{self.open_tags.pop()}>")
+            tag = self.open_tags.pop()
+            self.output.append(f"</{_SVG_OUTPUT_TAG_NAMES.get(tag, tag)}>")
         return "".join(self.output), self.truncated
 
 
@@ -947,9 +1069,9 @@ def _extract_title(source: str) -> str:
         return value[:200] or "未命名参考文章"
 
 
-def _extract_layout_reference_with_assets(source: str, canonical_url: str) -> tuple[str, int, int, list[_AssetSource], str, str | None]:
+def _extract_layout_reference_with_assets(source: str, canonical_url: str, *, truncate: bool = True) -> tuple[str, int, int, list[_AssetSource], str, str | None]:
     for target, label in (("wechat", "公众号正文"), ("article", "article 正文"), ("main", "main 正文"), ("body", "页面正文")):
-        parser = _SanitisingCaptureParser(target)
+        parser = _SanitisingCaptureParser(target, preserve_authored=not truncate)
         try:
             parser.feed(source)
             rendered, block_count, image_slots, asset_sources = parser.close_result()
@@ -958,8 +1080,8 @@ def _extract_layout_reference_with_assets(source: str, canonical_url: str) -> tu
         except Exception as exc:
             raise LayoutReferenceError("参考页面 HTML 无法解析") from exc
         plain = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html.unescape(rendered))).strip()
-        if parser.found and (plain or image_slots):
-            limited, truncated = _truncate_html(rendered)
+        if parser.found and (plain or image_slots or "<svg" in rendered):
+            limited, truncated = _truncate_html(rendered) if truncate else (rendered, False)
             warning = "参考页面较长，已截取主要排版结构" if truncated else None
             return limited, block_count, image_slots, asset_sources, label, warning
     raise LayoutReferenceError("未能从参考页面提取可用正文，请尝试公开文章链接")
@@ -1086,6 +1208,7 @@ def persist_layout_reference(db: Session, reference: LayoutReference) -> None:
         extracted_from=reference.extracted_from,
         warning=reference.warning,
         preview_token_hash=hashlib.sha256(reference.preview_token.encode("utf-8")).hexdigest(),
+        preview_token_encrypted=encrypt_secret(reference.preview_token),
         expires_at=_expiry_from_monotonic(reference.expires_at),
     )
     db.add(record)
@@ -1272,7 +1395,7 @@ def complete_layout_capture_session(
         raise LayoutReferenceError("浏览器采集图片总大小超过 50MB 限制")
 
     rendered, block_count, image_slots, asset_sources, _, extraction_warning = (
-        _extract_layout_reference_with_assets(source_html, capture_session.canonical_url)
+        _extract_layout_reference_with_assets(source_html, capture_session.canonical_url, truncate=False)
     )
     fetched_assets = _captured_reference_assets(asset_sources, captured_assets)
     warning_parts = [part for part in (extraction_warning,) if part]

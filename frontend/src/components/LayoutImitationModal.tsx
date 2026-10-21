@@ -219,7 +219,7 @@ export default function LayoutImitationModal({
         <div className="layout-imitation-url-row">
           <Input
             value={url}
-            disabled={parsing || streaming}
+            disabled={parsing}
             prefix={<LinkOutlined />}
             placeholder="粘贴公开文章链接（公众号文章优先）"
             onChange={(event) => {
@@ -234,7 +234,7 @@ export default function LayoutImitationModal({
             }}
             onPressEnter={() => { void parseReference() }}
           />
-          <Button icon={<ReloadOutlined />} loading={parsing} disabled={streaming} onClick={() => { void parseReference() }}>
+          <Button icon={<ReloadOutlined />} loading={parsing} onClick={() => { void parseReference() }}>
             解析
           </Button>
         </div>

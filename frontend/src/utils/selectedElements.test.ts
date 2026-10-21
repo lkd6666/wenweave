@@ -27,4 +27,20 @@ describe('selected element locator sanitization', () => {
     )
     expect(result.html).not.toContain('data:image')
   })
+
+  it('preserves image metadata for inline SVG image selections', () => {
+    const result = sanitizeSelectedElement({
+      selector: 'svg:nth-of-type(1) > image:nth-of-type(2)',
+      tag_name: 'image',
+      html: '<image xlink:href="https://cdn.example/lab.png" />',
+      text: '',
+      kind: 'image',
+      source_attribute: 'xlink:href',
+      source_fingerprint: 'abc123',
+    })
+
+    expect(result.kind).toBe('image')
+    expect(result.source_attribute).toBe('xlink:href')
+    expect(result.source_fingerprint).toBe('abc123')
+  })
 })

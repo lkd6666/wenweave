@@ -300,6 +300,17 @@ class DocumentHistoryWorkspace:
         }
 
     @_with_isolated_read_session
+    def source_file(self, version_id: int) -> dict[str, Any]:
+        """Materialize a permitted history file without building a DOM index."""
+        with self._db_lock:
+            version = self._version(version_id)
+            try:
+                source = materialize_document_version(self.db, version)
+            except DocumentVersionStorageError as exc:
+                raise WorkspaceError("历史版本内容无法读取", {"version_id": version_id}) from exc
+            return {"content": source, "version": self._version_metadata(version)}
+
+    @_with_isolated_read_session
     def list_versions(self, cursor: int = 0, limit: int = HISTORY_VERSION_PAGE_SIZE) -> dict[str, Any]:
         with self._db_lock:
             versions, total, page_size = self._page_versions(cursor, limit)
@@ -410,7 +421,7 @@ class DocumentHistoryWorkspace:
             }
 
     @_with_isolated_read_session
-    def read_blocks(self, version_id: int, block_ids: list[str], cursor: int = 0) -> dict[str, Any]:
+    def read_blocks(self, version_id: int, block_ids: list[str], cursor: int | str = 0) -> dict[str, Any]:
         with self._db_lock:
             version, workspace = self._workspace(version_id)
             return {

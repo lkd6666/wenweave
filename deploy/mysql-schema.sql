@@ -239,6 +239,7 @@ CREATE TABLE chat_layout_references (
 	extracted_from VARCHAR(64) NOT NULL,
 	warning VARCHAR(1024),
 	preview_token_hash VARCHAR(64) NOT NULL,
+	preview_token_encrypted VARCHAR(512) NULL,
 	expires_at DATETIME NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (reference_id),
@@ -836,6 +837,7 @@ CREATE TABLE chat_context_snapshots (
 	input_budget_tokens INTEGER NOT NULL,
 	source_event_count INTEGER NOT NULL,
 	source_prefix_hash VARCHAR(80) NOT NULL,
+	source_max_event_id INTEGER NOT NULL DEFAULT 0,
 	context_generation INTEGER NOT NULL,
 	is_active BOOL NOT NULL,
 	active_slot INTEGER,
@@ -1140,6 +1142,7 @@ CREATE TABLE agent_runs (
 CREATE INDEX ix_agent_runs_document_status ON agent_runs (document_id, status);
 CREATE INDEX ix_agent_runs_lease_expires_at ON agent_runs (lease_expires_at);
 CREATE INDEX ix_agent_runs_session_id ON agent_runs (session_id);
+CREATE INDEX ix_agent_runs_status_lease ON agent_runs (status, lease_expires_at);
 
 
 CREATE TABLE chat_image_attachments (
@@ -1152,13 +1155,14 @@ CREATE TABLE chat_image_attachments (
 	size INTEGER NOT NULL,
 	storage_mode VARCHAR(8) NOT NULL,
 	object_key VARCHAR(768) NOT NULL,
+	is_direct_input BOOL NOT NULL DEFAULT 0,
 	created_at DATETIME NOT NULL DEFAULT now(),
 	PRIMARY KEY (id),
 	FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE,
 	FOREIGN KEY(uploader_id) REFERENCES users (id) ON DELETE CASCADE,
-	FOREIGN KEY(message_id) REFERENCES chat_messages (id) ON DELETE CASCADE,
-	UNIQUE (object_key)
+	FOREIGN KEY(message_id) REFERENCES chat_messages (id) ON DELETE CASCADE
 )CHARSET=utf8mb4 ENGINE=InnoDB COLLATE utf8mb4_unicode_ci;
+CREATE INDEX ix_chat_image_attachments_object_key ON chat_image_attachments (object_key);
 CREATE INDEX ix_chat_image_attachments_document_id ON chat_image_attachments (document_id);
 CREATE INDEX ix_chat_image_attachments_message_id ON chat_image_attachments (message_id);
 CREATE INDEX ix_chat_image_attachments_uploader_id ON chat_image_attachments (uploader_id);
@@ -1268,5 +1272,6 @@ CREATE INDEX ix_chat_user_questions_run_id ON chat_user_questions (run_id);
 CREATE INDEX ix_chat_user_questions_session_id ON chat_user_questions (session_id);
 CREATE INDEX ix_chat_user_questions_timeout_at ON chat_user_questions (timeout_at);
 CREATE INDEX ix_chat_user_questions_user_id ON chat_user_questions (user_id);
+CREATE INDEX ix_chat_user_questions_user_status_created ON chat_user_questions (user_id, status, created_at);
 
 SET FOREIGN_KEY_CHECKS = 1;

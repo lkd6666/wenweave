@@ -31,6 +31,7 @@ class AgentRun(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "client_request_id", name="uq_agent_run_user_request"),
         Index("ix_agent_runs_document_status", "document_id", "status"),
+        Index("ix_agent_runs_status_lease", "status", "lease_expires_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)

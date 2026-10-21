@@ -130,10 +130,11 @@ def _validate_prompt_cache_provider(provider: AIProvider, enabled: bool) -> None
     if enabled and provider.provider_type not in {
         ProviderType.OPENAI_COMPATIBLE,
         ProviderType.OPENAI_RESPONSES,
+        ProviderType.ANTHROPIC,
     }:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="提示缓存仅适用于 OpenAI Responses 或 OpenAI-compatible Provider",
+            detail="提示缓存优化仅适用于 OpenAI Responses、OpenAI-compatible 或 Anthropic Provider",
         )
 
 

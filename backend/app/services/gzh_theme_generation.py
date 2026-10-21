@@ -192,7 +192,13 @@ def delete_reference_asset_object(db: Session, asset: GzhThemeReferenceAsset) ->
 
 
 def cleanup_expired_reference_assets(db: Session, now: datetime | None = None) -> int:
-    rows = db.query(GzhThemeReferenceAsset).filter(GzhThemeReferenceAsset.expires_at < (now or _utcnow())).all()
+    rows = (
+        db.query(GzhThemeReferenceAsset)
+        .filter(GzhThemeReferenceAsset.expires_at < (now or _utcnow()))
+        .order_by(GzhThemeReferenceAsset.expires_at, GzhThemeReferenceAsset.id)
+        .limit(100)
+        .all()
+    )
     deleted = 0
     for asset in rows:
         try:

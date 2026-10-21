@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -21,6 +22,8 @@ from app.schemas.image_library import (
     ImageLibrarySettingsRead,
     ImageLibrarySettingsUpdate,
 )
+from app.schemas.chat_images import ChatImageAttachmentRead, ChatImageLibraryReference, ChatImageLibraryBatchReference
+from app.services.chat_images import MAX_CHAT_IMAGES_PER_MESSAGE, ChatImageError, create_library_attachment
 from app.services import local_uploads
 from app.services.document_activity import touch_document
 from app.services.document_images import (
@@ -49,6 +52,7 @@ from app.services.image_search import (
 
 
 router = APIRouter(prefix="/api/image-library", tags=["image-library"])
+logger = logging.getLogger(__name__)
 
 
 def _visible_query(db: Session, user: User):
@@ -163,8 +167,10 @@ async def upload_image_library_assets(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    if not files or len(files) > 20:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="每次可上传 1 到 20 张图片")
+    if not files or len(files) > MAX_CHAT_IMAGES_PER_MESSAGE:
+        for file in files:
+            await file.close()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"每次可上传 1 到 {MAX_CHAT_IMAGES_PER_MESSAGE} 张图片")
     if document_id is not None:
         _document_or_404(db, document_id, current_user)
     stored_rows: list[StoredDocumentImage] = []
@@ -260,6 +266,56 @@ def update_image_library_asset(
     db.commit()
     db.refresh(asset)
     return asset_payload(db, asset, current_user, mode)
+
+
+@router.post("/assets/{asset_id}/chat-reference", response_model=ChatImageAttachmentRead, status_code=status.HTTP_201_CREATED)
+def reference_image_library_asset(
+    asset_id: str,
+    payload: ChatImageLibraryReference,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.api.routes.chat import _attachment_read
+
+    asset, _ = _asset_or_404(db, asset_id, current_user)
+    _document_or_404(db, payload.document_id, current_user)
+    try:
+        attachment = create_library_attachment(
+            db, asset=asset, document_id=payload.document_id, uploader_id=current_user.id
+        )
+        db.commit()
+        db.refresh(attachment)
+        return _attachment_read(attachment, current_user)
+    except Exception as exc:
+        db.rollback()
+        code = status.HTTP_400_BAD_REQUEST if isinstance(exc, ChatImageError) else status.HTTP_503_SERVICE_UNAVAILABLE
+        detail = str(exc) if isinstance(exc, ChatImageError) else "图库图片引用失败，请稍后重试"
+        raise HTTPException(status_code=code, detail=detail) from exc
+
+
+@router.post("/assets/chat-references", response_model=list[ChatImageAttachmentRead], status_code=status.HTTP_201_CREATED)
+def reference_image_library_assets(
+    payload: ChatImageLibraryBatchReference,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    from app.api.routes.chat import _attachment_read
+
+    _document_or_404(db, payload.document_id, current_user)
+    if len(set(payload.asset_ids)) != len(payload.asset_ids):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="不能重复选择同一张图片")
+    assets = [_asset_or_404(db, asset_id, current_user)[0] for asset_id in payload.asset_ids]
+    try:
+        attachments = [create_library_attachment(
+            db, asset=asset, document_id=payload.document_id, uploader_id=current_user.id
+        ) for asset in assets]
+        db.commit()
+        return [_attachment_read(attachment, current_user) for attachment in attachments]
+    except Exception as exc:
+        db.rollback()
+        code = status.HTTP_400_BAD_REQUEST if isinstance(exc, ChatImageError) else status.HTTP_503_SERVICE_UNAVAILABLE
+        detail = str(exc) if isinstance(exc, ChatImageError) else "图库图片引用失败，请稍后重试"
+        raise HTTPException(status_code=code, detail=detail) from exc
 
 
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)

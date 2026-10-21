@@ -42,7 +42,7 @@ function isNotSplitEle(ele: any, opts: GetParaListOpts): boolean {
 
 function getParaList(element: any, opts: GetParaListOpts, isRoot = true): any[] {
   const children = element.children;
-  if (!children.length) return children;
+  if (!children.length) return Array.from(children);
 
   let child: any;
   let paragraphList: any[] = [];

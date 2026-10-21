@@ -27,6 +27,10 @@ class ChatLayoutReference(Base):
     extracted_from: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     warning: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     preview_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The raw capability is encrypted so a cache miss or worker restart can
+    # rebuild the same preview URLs without invalidating already-rendered
+    # clients. The hash remains the authorization check at the asset endpoint.
+    preview_token_encrypted: Mapped[str | None] = mapped_column(String(512), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

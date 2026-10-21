@@ -12,6 +12,7 @@ import asyncio
 import logging
 import sys
 import threading
+from time import monotonic
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,23 +189,48 @@ class OfficialComplianceEngine:
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._playwright: Any = None
         self._browser: Any = None
+        self._browser_ready = threading.Event()
         self._bundle_source: str | None = None
         self._closed = False
+        self._active_checks = 0
+        self._idle_timer: threading.Timer | None = None
+        self._activity_generation = 0
+        self._worker_timeout_seconds = 0.0
 
     def check(self, html: str, timeout_seconds: float | None = None) -> ComplianceReport:
         settings = get_settings()
         timeout = timeout_seconds if timeout_seconds is not None else settings.WECHAT_COMPLIANCE_CHECK_TIMEOUT_SECONDS
+        startup_timeout = settings.WECHAT_COMPLIANCE_BROWSER_STARTUP_TIMEOUT_SECONDS
+        # The regular timeout protects rule execution. A cold browser gets a
+        # separate launch budget; explicit caller deadlines retain their meaning.
+        cold_start = timeout_seconds is None and not self._browser_ready.is_set()
+        result_timeout = max(0.1, timeout) + (startup_timeout + 2 if cold_start else 0)
         try:
             executor = self._executor_for_check()
         except RuntimeError as exc:
             return ComplianceReport.unavailable(str(exc))
-        future: Future[ComplianceReport] = executor.submit(self._check_on_worker, html)
         try:
-            return future.result(timeout=max(0.1, timeout))
+            future: Future[ComplianceReport] = executor.submit(
+                self._run_check_job, html, max(0.1, timeout)
+            )
+        except Exception as exc:
+            self._check_finished(None)
+            detail = str(exc).strip()
+            suffix = f"{type(exc).__name__}{f'：{detail}' if detail else ''}"
+            logger.warning(
+                "wechat_compliance_submit_failed type=%s detail=%s",
+                type(exc).__name__,
+                detail,
+                exc_info=True,
+            )
+            return ComplianceReport.unavailable(f"官方微信合规引擎不可用：{suffix}")
+        future.add_done_callback(self._check_finished)
+        try:
+            return future.result(timeout=result_timeout)
         except FutureTimeoutError:
             future.cancel()
-            detail = f"官方微信合规引擎在 {timeout:g} 秒内未完成检测；文章未验证。"
-            logger.warning("wechat_compliance_timeout timeout_seconds=%s", timeout)
+            detail = f"官方微信合规引擎在 {result_timeout:g} 秒内未完成检测；文章未验证。"
+            logger.warning("wechat_compliance_timeout timeout_seconds=%s cold_start=%s", result_timeout, cold_start)
             return ComplianceReport.unavailable(detail)
         except Exception as exc:  # Worker errors must never block article editing.
             # Some browser-process failures stringify to an empty value.  The
@@ -218,6 +244,9 @@ class OfficialComplianceEngine:
     def close(self) -> None:
         with self._lock:
             executor = self._executor
+            idle_timer, self._idle_timer = self._idle_timer, None
+            if idle_timer is not None:
+                idle_timer.cancel()
             if self._closed or executor is None:
                 self._closed = True
                 return
@@ -244,7 +273,73 @@ class OfficialComplianceEngine:
                 raise RuntimeError("官方微信合规引擎已经关闭")
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wechat-compliance")
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+            self._activity_generation += 1
+            self._active_checks += 1
             return self._executor
+
+    def _run_check_job(self, html: str, timeout_seconds: float) -> ComplianceReport:
+        self._worker_timeout_seconds = timeout_seconds
+        return self._check_on_worker(html)
+
+    def _check_finished(self, _future: Future[ComplianceReport] | None) -> None:
+        with self._lock:
+            self._active_checks = max(0, self._active_checks - 1)
+            if self._closed or self._active_checks or self._executor is None:
+                return
+            idle_seconds = max(10, int(get_settings().WECHAT_COMPLIANCE_BROWSER_IDLE_SECONDS))
+            generation = self._activity_generation
+            timer = threading.Timer(idle_seconds, self._dispose_idle_browser, args=(generation, False))
+            timer.daemon = True
+            self._idle_timer = timer
+            timer.start()
+
+    def _dispose_idle_browser(self, generation: int, stop_playwright: bool = False) -> None:
+        with self._lock:
+            executor = self._executor
+            if (
+                self._closed
+                or self._active_checks
+                or executor is None
+                or generation != self._activity_generation
+            ):
+                return
+            self._idle_timer = None
+        try:
+            executor.submit(self._dispose_browser_if_still_idle_on_worker, generation, stop_playwright)
+        except RuntimeError:
+            return
+
+    def _dispose_browser_if_still_idle_on_worker(self, generation: int, stop_playwright: bool = False) -> None:
+        # The timer can enqueue cleanup just before a new check arrives. Check
+        # the generation again on the owning worker so queued work never tears
+        # down the browser needed by a newly submitted detection.
+        with self._lock:
+            if (
+                self._closed
+                or self._active_checks
+                or generation != self._activity_generation
+            ):
+                return
+        self._dispose_browser_on_worker(stop_playwright=stop_playwright)
+        if stop_playwright or self._playwright is None:
+            return
+        settings = get_settings()
+        browser_idle = max(10, int(settings.WECHAT_COMPLIANCE_BROWSER_IDLE_SECONDS))
+        driver_idle = max(browser_idle, int(settings.WECHAT_COMPLIANCE_DRIVER_IDLE_SECONDS))
+        remaining = driver_idle - browser_idle
+        if remaining <= 0:
+            self._dispose_browser_on_worker()
+            return
+        with self._lock:
+            if self._closed or self._active_checks or generation != self._activity_generation:
+                return
+            timer = threading.Timer(remaining, self._dispose_idle_browser, args=(generation, True))
+            timer.daemon = True
+            self._idle_timer = timer
+            timer.start()
 
     def _ensure_browser_on_worker(self) -> None:
         if self._browser is not None:
@@ -261,33 +356,67 @@ class OfficialComplianceEngine:
         if self._event_loop is None:
             self._event_loop = _new_browser_event_loop()
             asyncio.set_event_loop(self._event_loop)
-        self._playwright = self._event_loop.run_until_complete(async_playwright().start())
         launch_options: dict[str, Any] = {"headless": True}
         try:
-            configured_executable = settings.WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH.strip()
-            expected_executable = Path(
-                configured_executable or str(self._playwright.chromium.executable_path)
-            )
-            if not expected_executable.is_file():
-                if configured_executable:
-                    raise RuntimeError(
-                        "WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH 指向的浏览器不存在："
-                        f"{expected_executable}"
-                    )
-                raise RuntimeError(
-                    "未安装与当前 Playwright 版本匹配的 Chromium"
-                    f"（期望路径：{expected_executable}）。"
-                    "请以运行后端的同一系统用户，在当前生产虚拟环境执行 "
-                    "`python -m playwright install chromium`，然后重启后端。"
+            startup_deadline = monotonic() + settings.WECHAT_COMPLIANCE_BROWSER_STARTUP_TIMEOUT_SECONDS
+            if self._playwright is None:
+                self._playwright = self._event_loop.run_until_complete(
+                    asyncio.wait_for(async_playwright().start(), timeout=max(0.1, startup_deadline - monotonic()))
                 )
+            configured_executable = settings.WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH.strip()
             if configured_executable:
-                launch_options["executable_path"] = str(expected_executable)
+                executable = Path(configured_executable)
+                # Earlier deployments pinned Playwright's full managed Chrome
+                # here to work around a missing headless shell. That binary
+                # can crash at startup on small Linux hosts. Managed browser
+                # selection belongs to Playwright; preserve this setting only
+                # for genuinely external browser installations.
+                if "ms-playwright" in executable.parts and any(
+                    part.startswith("chromium-") for part in executable.parts
+                ):
+                    logger.warning(
+                        "wechat_compliance_ignoring_managed_chromium_override path=%s",
+                        executable,
+                    )
+                else:
+                    if not executable.is_file():
+                        raise RuntimeError(
+                            "WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH 指向的浏览器不存在："
+                            f"{executable}"
+                        )
+                    launch_options["executable_path"] = str(executable)
             self._browser = self._event_loop.run_until_complete(
-                self._playwright.chromium.launch(**launch_options)
+                asyncio.wait_for(
+                    self._playwright.chromium.launch(**launch_options),
+                    timeout=max(0.1, startup_deadline - monotonic()),
+                )
             )
-        except Exception:
-            self._event_loop.run_until_complete(self._playwright.stop())
+            self._browser_ready.set()
+        except Exception as exc:
+            self._browser_ready.clear()
+            try:
+                if self._playwright is not None:
+                    self._event_loop.run_until_complete(self._playwright.stop())
+            except Exception:
+                logger.debug("wechat_compliance_playwright_stop_after_launch_failed", exc_info=True)
             self._playwright = None
+            detail = str(exc)
+            if isinstance(exc, TimeoutError):
+                raise RuntimeError(
+                    f"Chromium 启动超过 {settings.WECHAT_COMPLIANCE_BROWSER_STARTUP_TIMEOUT_SECONDS:g} 秒；"
+                    "本次文章未验证。"
+                ) from exc
+            if "Executable doesn't exist" in detail and "chromium_headless_shell" in detail:
+                raise RuntimeError(
+                    "缺少与当前 Playwright 版本匹配的 Chromium headless shell。"
+                    "请以运行后端的同一系统用户，在当前生产虚拟环境执行 "
+                    "`python -m playwright install --only-shell chromium`，然后重启后端。"
+                ) from exc
+            if "SIGSEGV" in detail:
+                raise RuntimeError(
+                    "Chromium 启动后崩溃（SIGSEGV）；请检查生产环境的浏览器依赖和可用内存。"
+                    "完整启动日志已记录在后端日志中。"
+                ) from exc
             raise
 
     def _check_on_worker(self, html: str) -> ComplianceReport:
@@ -301,37 +430,58 @@ class OfficialComplianceEngine:
         for attempt in range(2):
             try:
                 return self._check_once_on_worker(html)
-            except Exception:
+            except Exception as exc:
+                recoverable = self._is_browser_process_failure(exc)
                 logger.warning(
                     "wechat_compliance_worker_attempt_failed attempt=%s/2; recreating_browser=%s",
                     attempt + 1,
-                    attempt == 0,
+                    attempt == 0 and recoverable,
                     exc_info=True,
                 )
-                self._dispose_browser_on_worker()
-                if attempt:
+                if attempt or not recoverable:
                     raise
+                self._dispose_browser_on_worker()
         raise RuntimeError("官方微信合规引擎未执行检测")  # pragma: no cover - loop always returns or raises.
+
+    @staticmethod
+    def _is_browser_process_failure(exc: BaseException) -> bool:
+        if isinstance(exc, (EOFError, ConnectionError, BrokenPipeError)):
+            return True
+        detail = f"{type(exc).__name__}: {exc}".lower()
+        if "typeerror" in detail or "referenceerror" in detail or "syntaxerror" in detail:
+            return False
+        return any(
+            marker in detail
+            for marker in (
+                "browser page closed",
+                "target closed",
+                "browser has been closed",
+                "browser closed",
+                "connection closed",
+                "connection reset",
+                "browser crashed",
+                "page crashed",
+            )
+        )
 
     def _check_once_on_worker(self, html: str) -> ComplianceReport:
         self._ensure_browser_on_worker()
         assert self._event_loop is not None
-        return self._event_loop.run_until_complete(self._evaluate_on_browser(html))
+        check = self._evaluate_on_browser(html)
+        if self._worker_timeout_seconds > 0:
+            check = asyncio.wait_for(check, timeout=self._worker_timeout_seconds)
+        return self._event_loop.run_until_complete(check)
 
     async def _evaluate_on_browser(self, html: str) -> ComplianceReport:
         page: Any | None = None
         try:
             page = await self._browser.new_page(viewport={"width": 677, "height": 800})
-            await page.goto("about:blank", wait_until="load")
             await page.add_script_tag(content=self._bundle_source)
             raw = await page.evaluate(
                 """async (articleHtml) => {
                     const container = document.createElement('div');
                     container.innerHTML = articleHtml;
-                    const result = await window.VerifyArticleStructure.verifyArticleStructure(container);
-                    return JSON.parse(JSON.stringify(result, (key, value) => (
-                        value instanceof Node ? undefined : value
-                    )));
+                    return await window.VerifyArticleStructure.verifyArticleStructure(container);
                 }""",
                 html,
             )
@@ -349,21 +499,24 @@ class OfficialComplianceEngine:
                     # a false "unverified" report merely during cleanup.
                     logger.debug("wechat_compliance_page_close_failed", exc_info=True)
 
-    def _dispose_browser_on_worker(self) -> None:
-        """Close worker-owned browser state before a recovery launch."""
+    def _dispose_browser_on_worker(self, *, stop_playwright: bool = True) -> None:
+        """Release Chromium; retain the smaller driver until its own idle limit."""
         browser, self._browser = self._browser, None
+        self._browser_ready.clear()
+        self._bundle_source = None
         try:
             if browser is not None and self._event_loop is not None:
                 self._event_loop.run_until_complete(browser.close())
         except Exception:
             logger.debug("wechat_compliance_browser_close_failed", exc_info=True)
         finally:
-            playwright, self._playwright = self._playwright, None
-            if playwright is not None and self._event_loop is not None:
-                try:
-                    self._event_loop.run_until_complete(playwright.stop())
-                except Exception:
-                    logger.debug("wechat_compliance_playwright_stop_failed", exc_info=True)
+            if stop_playwright:
+                playwright, self._playwright = self._playwright, None
+                if playwright is not None and self._event_loop is not None:
+                    try:
+                        self._event_loop.run_until_complete(playwright.stop())
+                    except Exception:
+                        logger.debug("wechat_compliance_playwright_stop_failed", exc_info=True)
 
     def _close_on_worker(self) -> None:
         self._dispose_browser_on_worker()

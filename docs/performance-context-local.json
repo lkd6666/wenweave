@@ -1,0 +1,102 @@
+{
+  "measured_on": "2026-09-25",
+  "scope": "Synthetic local Python CPU and allocations; excludes provider/network waits and whole-process RSS.",
+  "before": {
+    "measurement": "synthetic_preflight_local_process_cpu",
+    "turns": 80,
+    "events": 720,
+    "samples": [
+      {
+        "cpu_seconds": 1.984375,
+        "calls": 32408,
+        "chars": 11753621
+      },
+      {
+        "cpu_seconds": 2.140625,
+        "calls": 32408,
+        "chars": 11753621
+      },
+      {
+        "cpu_seconds": 2.171875,
+        "calls": 32408,
+        "chars": 11753621
+      }
+    ],
+    "median_cpu_seconds": 2.140625,
+    "stats": {
+      "used_tokens": 389411,
+      "requires_compaction": true,
+      "projected_used_tokens": 29225,
+      "breakdown": {
+        "system": 17247,
+        "document_map": 24,
+        "memory": 90,
+        "recent_history": 15760,
+        "tool_replay": 349760,
+        "tool_schema": 6526,
+        "current_request": 4,
+        "image_inputs": 0,
+        "selected_context": 0
+      }
+    },
+    "static_prompt_neutral_tokens": 10779,
+    "tool_schema_tokens": 6526
+  },
+  "after": {
+    "measurement": "synthetic_preflight_local_process_cpu",
+    "turns": 80,
+    "events": 720,
+    "samples": [
+      {
+        "cpu_seconds": 0.078125,
+        "calls": 729,
+        "chars": 274757
+      },
+      {
+        "cpu_seconds": 0.0625,
+        "calls": 729,
+        "chars": 274757
+      },
+      {
+        "cpu_seconds": 0.0625,
+        "calls": 729,
+        "chars": 274757
+      }
+    ],
+    "median_cpu_seconds": 0.0625,
+    "stats": {
+      "used_tokens": 389411,
+      "requires_compaction": true,
+      "projected_used_tokens": 29225,
+      "breakdown": {
+        "system": 17247,
+        "document_map": 24,
+        "memory": 90,
+        "recent_history": 15760,
+        "tool_replay": 349760,
+        "tool_schema": 6526,
+        "current_request": 4,
+        "image_inputs": 0,
+        "selected_context": 0
+      }
+    },
+    "static_prompt_neutral_tokens": 10779,
+    "tool_schema_tokens": 6526,
+    "history_loading_allocations": {
+      "measurement": "tracemalloc_python_allocations_excluding_database_setup",
+      "html_snapshot_kib": 128,
+      "samples": [
+        {
+          "history_loading": "eager_all_columns",
+          "current_python_bytes": 43977236,
+          "peak_python_bytes": 45269600
+        },
+        {
+          "history_loading": "ledger_only",
+          "current_python_bytes": 1548890,
+          "peak_python_bytes": 2841038
+        }
+      ]
+    }
+  }
+}

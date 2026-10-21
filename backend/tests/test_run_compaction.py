@@ -229,7 +229,7 @@ class RunCompactionTests(unittest.TestCase):
         _assert_tool_pairing(self, compacted)
         self.assertIsInstance(compacted[1], SystemMessage)
 
-    def test_model_summary_is_reused_without_recompacting_the_same_prefix(self) -> None:
+    def test_new_work_over_budget_is_summarized_instead_of_silently_dropped(self) -> None:
         messages = _conversation(8)
         head, cycles = _split_run_cycles(messages)
         budget = _tokens([
@@ -246,9 +246,49 @@ class RunCompactionTests(unittest.TestCase):
             compact_run_messages_with_model([*first_projection, *_cycle(99)], budget, compactor)
         )
 
-        self.assertEqual(compactor.ainvoke.await_count, 1)
-        self.assertEqual(next_stats["fallback"], "existing_summary")
+        self.assertEqual(compactor.ainvoke.await_count, 2)
+        self.assertGreater(next_stats["summarized_cycles"], 0)
+        self.assertEqual(next_stats["dropped_cycles"], 0)
+        self.assertEqual(sum(isinstance(m, SystemMessage) and str(m.content).startswith("以下是较早工具循环") for m in next_projection), 1)
         _assert_tool_pairing(self, next_projection)
+
+    def test_second_model_compaction_merges_previous_runtime_summary(self) -> None:
+        marker = "首批图片已生成且标题已修改"
+
+        class MergingCompactor:
+            prompts: list[str] = []
+
+            async def ainvoke(self, messages):
+                prompt = str(messages[-1].content)
+                self.prompts.append(prompt)
+                completed = marker if len(self.prompts) == 1 or marker in prompt else "早期进展已丢失"
+                return AIMessage(content=json.dumps({
+                    "objective": "完成当前排版",
+                    "constraints": "保留原文",
+                    "decisions": "重新读取当前块",
+                    "completed": completed,
+                    "active_work": "继续处理最新循环",
+                    "blockers": "无",
+                    "next_steps": "继续当前工具链",
+                    "source_refs": "",
+                }, ensure_ascii=False))
+
+        messages = _conversation(8)
+        head, cycles = _split_run_cycles(messages)
+        budget = _tokens([
+            *head, *(message for cycle in cycles[-RUN_VERBATIM_CYCLE_COUNT:] for message in cycle),
+        ]) + 1_000
+        compactor = MergingCompactor()
+        first, _ = asyncio.run(compact_run_messages_with_model(messages, budget, compactor))
+        second, stats = asyncio.run(compact_run_messages_with_model([*first, *_cycle(99)], budget, compactor))
+
+        self.assertEqual(len(compactor.prompts), 2)
+        self.assertIn(marker, compactor.prompts[1])
+        self.assertIn("已有本轮运行工作摘要", compactor.prompts[1])
+        self.assertIn(marker, second[1].content)
+        self.assertGreater(stats["summarized_cycles"], 0)
+        self.assertEqual(stats["dropped_cycles"], 0)
+        _assert_tool_pairing(self, second)
 
     def test_reused_summary_does_not_emit_a_second_compaction_card(self) -> None:
         """A later structural trim must not look like another model summary."""
@@ -297,7 +337,7 @@ class RunCompactionTests(unittest.TestCase):
 
         self.assertLess(message_tokens, legacy_budget)
         self.assertGreater(message_tokens + tool_schema_tokens, provider_threshold)
-        effective_budget = _effective_run_input_budget(legacy_budget, tool_schema_tokens)
+        effective_budget = _effective_run_input_budget(provider_threshold, tool_schema_tokens)
         self.assertLess(effective_budget, message_tokens)
 
         _, stats = asyncio.run(
@@ -395,6 +435,25 @@ class RunCompactionTests(unittest.TestCase):
         self.assertFalse(stats["compacted"])
         self.assertEqual(stats["digested_cycles"], 0)
         self.assertEqual(stats["dropped_cycles"], 0)
+
+    def test_runtime_compaction_starts_at_configured_budget(self) -> None:
+        messages = _conversation(8)
+        measured = sum(_provider_message_tokens(message, 1.0) for message in messages)
+        compactor = self._Compactor()
+
+        _, below = asyncio.run(compact_run_messages_with_model(
+            messages, measured + 1, compactor, token_estimate_multiplier=1.0,
+        ))
+        self.assertFalse(below["compacted"])
+
+        _, at_threshold = asyncio.run(compact_run_messages_with_model(
+            messages, measured, compactor, token_estimate_multiplier=1.0,
+        ))
+        self.assertTrue(at_threshold["compacted"])
+        self.assertLess(at_threshold["used_tokens"], measured)
+
+        _, structural = compact_run_messages(messages, measured, token_estimate_multiplier=1.0)
+        self.assertTrue(structural["compacted"])
 
     def test_over_budget_conversation_is_brought_within_budget(self) -> None:
         messages = _conversation(12)

@@ -21,6 +21,19 @@ export function markLinksToOpenInNewWindow(root: ParentNode): void {
 }
 
 /**
+ * Normalizes links in an article fragment before it is embedded in a trusted
+ * iframe document. Keeping this separate is important for documents that use
+ * CSP nonces: browsers deliberately hide nonce attributes during DOM
+ * serialization, so serializing the complete document would invalidate its
+ * trusted scripts.
+ */
+export function articleHtmlWithNewWindowLinks(html: string): string {
+  const document = new DOMParser().parseFromString(html, 'text/html')
+  markLinksToOpenInNewWindow(document)
+  return document.body.innerHTML
+}
+
+/**
  * Adds safe new-window semantics before untrusted rich HTML is assigned to an
  * iframe's srcDoc. DOMParser does not execute the document's scripts.
  */

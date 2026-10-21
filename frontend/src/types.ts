@@ -488,6 +488,7 @@ export interface ToolExecution {
   result?: string | null
   html_changed: boolean
   activity?: ToolActivity | null
+  model_input?: ToolModelInput | null
   read_range?: ReadRange | null
   change_summary?: ChangeSummary | null
 }
@@ -538,14 +539,36 @@ export interface ToolActivity {
   validation_warning?: boolean
 }
 
+export type ToolModelInputState = 'available' | 'pending' | 'not_sent' | 'unavailable'
+
+export interface ToolModelInput {
+  state: ToolModelInputState
+  content?: string | null
+  truncated?: boolean
+  message?: string
+}
+
 export interface ChatContextStats {
+  model_id?: number
+  session_id?: number
   used_tokens: number
   max_tokens: number
   usable_tokens: number
+  input_limit_tokens?: number
+  token_estimate_multiplier?: number
   usage_percent: number
   is_estimate: boolean
   state: string
   breakdown: Record<string, number>
+  image_loading?: {
+    mode: 'none' | 'inline' | 'paged'
+    total_count: number
+    inline_count: number
+    deferred_count: number
+    page_size: number
+    current_inline_count: number
+    history_inline_count: number
+  }
   tool_calls_count: number
   tool_summary_replayed_count: number
   tool_compact_replayed_count: number
@@ -590,6 +613,7 @@ export interface ChatContextStats {
   runtime_context_tool_name?: string
   last_model_output_tokens?: number
   last_model_cached_input_tokens?: number
+  last_model_usage_reported?: boolean
   ledger_tokens?: number
   raw_input_tokens?: number
   compiled_input_tokens?: number
@@ -679,6 +703,7 @@ export interface ChatHistoryArchive {
 
 export interface ChatImageAttachment {
   id: string
+  message_id?: number | null
   filename: string
   content_type: string
   size: number
@@ -723,6 +748,7 @@ export interface PreviewImageTarget {
   sourceUrl: string
   imageIndex: number
   alt: string
+  kind?: 'html-image' | 'svg-image'
 }
 
 export interface GeneratedImageAsset {
@@ -840,6 +866,9 @@ export interface SelectedElementContext {
   tag_name: string
   html: string
   text: string
+  kind?: 'element' | 'image'
+  source_attribute?: 'src' | 'href' | 'xlink:href'
+  source_fingerprint?: string
   locator?: SelectedElementLocator
 }
 

@@ -1,4 +1,5 @@
 import { createCaptureDraft, discardCaptureDraft, finalizeCaptureDraft } from './extractor'
+import { readOriginalArticleDocument } from './articleSource'
 import {
   capturePurpose,
   captureUrlsMatch,
@@ -109,11 +110,11 @@ function installWechatCapture(): void {
           || !captureUrlsMatch(location.href, message.session.canonical_url)) {
           throw new Error('当前微信文章与采集会话不匹配，或会话已过期')
         }
-        sendResponse({
-          ok: true,
-          draft: createCaptureDraft(document, location.href, capturePurpose(message.session) || 'layout_reference'),
-        })
-        return false
+        const purpose = capturePurpose(message.session) || 'layout_reference'
+        void readOriginalArticleDocument(document, location.href).then((original) => {
+          sendResponse({ ok: true, draft: createCaptureDraft(original, location.href, purpose, document) })
+        }).catch((error: unknown) => sendResponse({ ok: false, message: extensionErrorMessage(error) }))
+        return true
       }
       if (message.type === 'layoutCapture:finalizeDraft'
         && typeof message.draftId === 'string'

@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "微信公众号 AI 排版系统"
     APP_ENV: str = "development"
+    CHAT_AGENT_TOOL_PROTOCOL: Literal["v1", "v2"] = "v2"
     INSTANCE_ID: str = ""
 
     SECRET_KEY: str = "change-this-to-a-random-secret-in-production"
@@ -35,6 +36,8 @@ class Settings(BaseSettings):
 
     # MySQL 5.7+ / 8.0+，必须在 backend/.env 中替换用户、密码、主机和库名。
     DATABASE_URL: str = "mysql+pymysql://yibanpaiban:change-me@127.0.0.1:3306/yibanpaiban?charset=utf8mb4"
+    DATABASE_POOL_SIZE: int = Field(default=5, ge=1, le=32)
+    DATABASE_MAX_OVERFLOW: int = Field(default=0, ge=0, le=32)
 
     DEFAULT_ADMIN_USERNAME: str = "admin"
     DEFAULT_ADMIN_PASSWORD: str = "admin123"
@@ -76,17 +79,21 @@ class Settings(BaseSettings):
     CHAT_AGENT_MODEL_RETRY_MAX_ATTEMPTS: int = 3
     CHAT_AGENT_MODEL_RETRY_BASE_SECONDS: float = 1.5
     CHAT_AGENT_MODEL_RETRY_MAX_DELAY_SECONDS: float = 60.0
-    # 模型已结束 token 输出后的消息转换、图收尾和合规检查不应无限等待。
+    # 模型已结束 token 输出后的消息转换和图收尾不应无限等待。
     CHAT_AGENT_TURN_FINALIZATION_TIMEOUT_SECONDS: float = 30.0
     CHAT_AGENT_MODEL_MESSAGE_CONVERSION_TIMEOUT_SECONDS: float = 30.0
-    CHAT_AGENT_COMPLIANCE_CHECK_TIMEOUT_SECONDS: float = 30.0
     # The official WeChat checker uses a single, lazy Playwright Chromium
-    # worker. This timeout includes waiting for an earlier check in that
-    # worker's queue; a timeout yields an explicit "unverified" report.
+    # worker. Rule execution keeps this limit; a cold launch has a separate
+    # startup budget. Queue delays can still yield an "unverified" report.
     WECHAT_COMPLIANCE_CHECK_TIMEOUT_SECONDS: float = Field(default=20.0, gt=0)
+    WECHAT_COMPLIANCE_BROWSER_STARTUP_TIMEOUT_SECONDS: float = Field(default=40.0, gt=0)
     # Leave empty to use Playwright's managed Chromium. Set this when a
     # deployment installs Chromium through its operating-system package manager.
     WECHAT_COMPLIANCE_BROWSER_EXECUTABLE_PATH: str = ""
+    # Release the expensive Chromium child after a quiet period. The next
+    # verification recreates it lazily; queued/running checks keep it alive.
+    WECHAT_COMPLIANCE_BROWSER_IDLE_SECONDS: int = Field(default=10, ge=10)
+    WECHAT_COMPLIANCE_DRIVER_IDLE_SECONDS: int = Field(default=120, ge=10)
     # Deprecated compatibility alias for deployments that already configured
     # the earlier single idle limit. New deployments use the two limits above.
     CHAT_AGENT_MODEL_STREAM_IDLE_TIMEOUT_SECONDS: float = 300.0
@@ -108,6 +115,7 @@ class Settings(BaseSettings):
     # exceed thirty seconds. The control watcher renews this lease while the
     # local worker is active; keep enough margin for a slow database roundtrip.
     CHAT_AGENT_RUN_LEASE_SECONDS: int = 120
+    CHAT_AGENT_RUN_LEASE_RENEW_INTERVAL_SECONDS: float = Field(default=10.0, ge=1.0)
     CHAT_AGENT_RUN_EVENT_RETENTION_SECONDS: int = 3600
     CHAT_AGENT_RUN_LOCAL_EVENT_LIMIT: int = 128
     # Token streams are batched before they reach MySQL. This preserves a
@@ -125,6 +133,8 @@ class Settings(BaseSettings):
     # automatically answered with ``no_response`` after this much completely
     # inactive time so the original Agent run can finish on its own.
     CHAT_USER_QUESTION_INACTIVITY_SECONDS: int = 120
+    LAYOUT_REFERENCE_CACHE_MAX_ENTRIES: int = Field(default=16, ge=1)
+    LAYOUT_REFERENCE_CACHE_MAX_BYTES: int = Field(default=32 * 1024 * 1024, ge=1024 * 1024)
     MAX_JSON_BODY_BYTES: int = 2 * 1024 * 1024
     MAX_CHAT_MESSAGE_CHARS: int = 20_000
     MAX_DOCUMENT_HTML_BYTES: int = 10 * 1024 * 1024

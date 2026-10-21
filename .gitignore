@@ -52,6 +52,8 @@ artifacts/
 *.private.7z
 tmp/
 debug-artifacts/
+outputs/
+/benchmark-2g.jsonl
 
 # Editor and operating system files
 .DS_Store

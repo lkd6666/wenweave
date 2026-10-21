@@ -606,6 +606,21 @@ class WeChatOfficialAccountClient:
             if isinstance(srcset, str):
                 for _start, _end, srcset_source in srcset_source_spans(srcset):
                     add_source(srcset_source)
+        # SVG's raster image elements use ``href`` (or the legacy
+        # ``xlink:href``) instead of an HTML ``img[src]``.  Generated
+        # article layouts frequently use those elements for a composite
+        # infographic, so ignoring them makes the whole graphic disappear
+        # after WeChat rejects the original, non-WeChat image hosts.
+        for image in soup.find_all("image"):
+            image_sources = [
+                value
+                for attribute in ("href", "xlink:href")
+                if isinstance((value := image.get(attribute)), str) and value.strip()
+            ]
+            if not image_sources:
+                raise WeChatApiError("正文存在未设置 href 的 SVG 图片")
+            for source in image_sources:
+                add_source(source)
         for element in soup.find_all(style=True):
             style = element.get("style")
             if not isinstance(style, str):
@@ -944,6 +959,13 @@ class WeChatOfficialAccountClient:
             srcset = image.get("srcset")
             if isinstance(srcset, str):
                 image["srcset"] = replace_srcset_sources(srcset, replacements)
+        for image in soup.find_all("image"):
+            for attribute in ("href", "xlink:href"):
+                source = image.get(attribute)
+                if isinstance(source, str):
+                    replacement = replacements.get(unescape(source).strip())
+                    if replacement:
+                        image[attribute] = replacement
         return BodyImageReplacementResult(
             html=str(soup),
             cache_entries=tuple(cache_entries),

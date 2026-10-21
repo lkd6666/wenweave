@@ -43,10 +43,13 @@ from app.services.document_versions import create_document_version
 from app.services.chat_sessions import ensure_default_chat_session
 from app.services.external_fetch import PublicFetchError, fetch_public_html, fetch_public_image
 from app.services.html_validation import validate_html_structure
+from app.services.css_declarations import split_css_declarations
 
 
 WEB_ARTICLE_IMPORT_TTL = timedelta(minutes=15)
-MAX_ARTICLE_IMAGES = 50
+# Keep direct imports aligned with browser capture. The aggregate byte budget
+# remains the resource guard for image-heavy articles.
+MAX_ARTICLE_IMAGES = MAX_CAPTURE_ASSETS
 IMAGE_FETCH_CONCURRENCY = 4
 _ASSET_URL_PREFIX = "web-article-import://asset/"
 _WECHAT_HOST = "mp.weixin.qq.com"
@@ -54,17 +57,38 @@ _WECHAT_COVER_CONTENT_TYPES = {"image/jpeg", "image/png", "image/gif", "image/bm
 _ALLOWED_TAGS = {
     "article", "section", "div", "p", "span", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "b", "em", "i",
     "u", "s", "blockquote", "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "br", "hr",
-    "pre", "code", "figure", "figcaption", "small", "sup", "sub", "a", "img",
+    "pre", "code", "figure", "figcaption", "small", "sup", "sub", "a", "img", "mark", "del", "ins", "kbd", "samp",
+    "abbr", "cite", "q", "time", "details", "summary",
 }
+_SVG_TAGS = {
+    "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "text", "tspan", "title", "desc",
+    "defs", "clippath", "mask", "lineargradient", "radialgradient", "stop", "use", "image", "filter", "feflood", "feblend",
+    "fegaussianblur", "feoffset", "fecolormatrix", "fecomponenttransfer", "fefuncr", "fefuncg", "fefuncb", "fefunca",
+    "fecomposite", "femerge", "femergenode", "fedropshadow",
+}
+_ALLOWED_TAGS.update(_SVG_TAGS)
 _DISCARDED_TAGS = {
-    "script", "style", "iframe", "object", "embed", "template", "noscript", "svg", "canvas", "form", "button", "input",
-    "video", "audio", "source", "track", "dialog",
+    "script", "style", "iframe", "object", "embed", "template", "noscript", "canvas", "form", "button", "input",
+    "video", "audio", "source", "track", "dialog", "foreignobject", "animate", "animatetransform", "animatemotion", "set",
 }
 _DANGEROUS_STYLE = re.compile(r"(?:expression\s*\(|@import|behavior\s*:|-moz-binding|url\s*\()", re.IGNORECASE)
 _CAPTURE_DANGEROUS_STYLE = re.compile(r"(?:expression\s*\(|@import|behavior\s*:|-moz-binding)", re.IGNORECASE)
 _CAPTURE_ASSET_URL_RE = re.compile(r"^layout-capture://([a-f0-9]{32})$", re.IGNORECASE)
 _CSS_URL_RE = re.compile(r"url\(\s*(?P<quote>['\"]?)(?P<url>.*?)(?P=quote)\s*\)", re.IGNORECASE | re.DOTALL)
 _IMAGE_SOURCE_ATTRIBUTES = ("data-src", "data-original", "data-actualsrc", "src")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,255}$")
+_SVG_ATTRIBUTES = {
+    "xmlns", "viewbox", "width", "height", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy", "r", "rx", "ry", "d",
+    "points", "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width", "stroke-opacity", "stroke-linecap",
+    "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "transform", "transform-origin", "opacity",
+    "preserveaspectratio", "text-anchor", "dominant-baseline", "font-size", "font-family", "font-weight", "offset",
+    "stop-color", "stop-opacity", "gradientunits", "gradienttransform", "spreadmethod", "clip-path", "clip-rule", "mask",
+    "maskunits", "maskcontentunits", "filter", "filterunits", "primitiveunits", "color-interpolation-filters", "in", "in2",
+    "result", "stddeviation", "dx", "dy", "operator", "k1", "k2", "k3", "k4", "mode", "type", "values", "slope",
+    "intercept", "tablevalues", "flood-color", "flood-opacity", "role", "aria-label", "focusable", "data-mode",
+    "data-ignore-width", "id", "class", "style", "href", "xlink:href",
+}
+_SVG_LOCAL_URL_ATTRIBUTES = {"fill", "stroke", "filter", "clip-path", "mask"}
 CapturedAsset = tuple[str, str, str, bytes, int, int]
 
 
@@ -134,6 +158,64 @@ def _safe_image_source(raw_url: str, canonical_url: str) -> str:
     return resolved if parsed.scheme.lower() == "https" and bool(parsed.hostname) else ""
 
 
+def _safe_common_attributes(tag: Tag) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    for name in ("align", "valign", "colspan", "rowspan", "width", "height"):
+        value = str(tag.get(name) or "").strip()
+        if value and len(value) <= 32:
+            attributes[name] = value
+    for name in ("class", "role", "aria-label", "data-w", "data-ratio", "data-ignore-width", "data-no-dark", "data-ignore-dm"):
+        raw_value = tag.get(name) or ""
+        value = " ".join(raw_value) if isinstance(raw_value, list) else str(raw_value).strip()
+        if value and len(value) <= 512:
+            attributes[name] = value
+    identifier = str(tag.get("id") or "").strip()
+    if _SAFE_ID_RE.fullmatch(identifier):
+        attributes["id"] = identifier
+    return attributes
+
+
+def _is_safe_svg_local_url(value: str) -> bool:
+    matched = re.fullmatch(r"url\(\s*#([A-Za-z_][A-Za-z0-9_.:-]{0,255})\s*\)", value, flags=re.IGNORECASE)
+    return matched is not None
+
+
+def _safe_svg_attributes(tag: Tag, *, captured: bool) -> tuple[dict[str, str], set[str]]:
+    """Preserve inert vector structure without allowing executable or remote SVG content."""
+    attributes: dict[str, str] = {}
+    used_ids: set[str] = set()
+    for raw_name, raw_value in tag.attrs.items():
+        name = str(raw_name).lower()
+        value = " ".join(raw_value) if isinstance(raw_value, list) else " ".join(str(raw_value).split())
+        if not value or (not captured and len(value) > 4000) or name not in _SVG_ATTRIBUTES:
+            continue
+        if name == "style":
+            if captured:
+                style, style_ids = _captured_style(value)
+                used_ids.update(style_ids)
+            else:
+                style = _safe_style(value)
+            if style:
+                attributes["style"] = style
+            continue
+        if name in {"href", "xlink:href"}:
+            image_asset = _CAPTURE_ASSET_URL_RE.fullmatch(value) if captured and tag.name == "image" else None
+            if image_asset is not None:
+                asset_id = image_asset.group(1).lower()
+                attributes["href"] = f"{_ASSET_URL_PREFIX}{asset_id}"
+                used_ids.add(asset_id)
+                continue
+            if value.startswith("#") and _SAFE_ID_RE.fullmatch(value[1:]):
+                attributes[name] = value
+            continue
+        if name in _SVG_LOCAL_URL_ATTRIBUTES and "url(" in value.lower() and not _is_safe_svg_local_url(value):
+            continue
+        if name == "id" and not _SAFE_ID_RE.fullmatch(value):
+            continue
+        attributes[name] = value
+    return attributes, used_ids
+
+
 def _article_title(soup: BeautifulSoup) -> str:
     for selector in ("meta[property='og:title']", "meta[name='twitter:title']"):
         meta = soup.select_one(selector)
@@ -187,14 +269,15 @@ def _sanitize_article(source: str, canonical_url: str) -> tuple[str, str, list[s
             tag.unwrap()
             continue
         attributes: dict[str, str] = {}
+        if name in _SVG_TAGS:
+            attributes, _ = _safe_svg_attributes(tag, captured=False)
+            tag.attrs = attributes
+            continue
         if tag.has_attr("style"):
             style = _safe_style(str(tag.get("style") or ""))
             if style:
                 attributes["style"] = style
-        for name in ("align", "valign", "colspan", "rowspan", "width", "height"):
-            value = str(tag.get(name) or "").strip()
-            if value and len(value) <= 32:
-                attributes[name] = value
+        attributes.update(_safe_common_attributes(tag))
         if tag.name == "a":
             href = _safe_link(str(tag.get("href") or ""), canonical_url)
             if href:
@@ -226,18 +309,13 @@ def _captured_style(value: str) -> tuple[str, set[str]]:
         return "", set()
     declarations: list[str] = []
     used_ids: set[str] = set()
-    for declaration in clean.split(";"):
+    for declaration in split_css_declarations(clean):
         name, separator, raw_value = declaration.partition(":")
         if not separator:
             continue
-        normalized_name = name.strip().lower()
+        normalized_name = name.strip() if name.strip().startswith("--") else name.strip().lower()
         normalized_value = raw_value.strip()
         if not normalized_name or not normalized_value:
-            continue
-        hidden_value = normalized_value.lower().replace("!important", "").strip()
-        if normalized_name == "display" and hidden_value == "none":
-            continue
-        if normalized_name == "visibility" and hidden_value in {"hidden", "collapse"}:
             continue
         if "url(" in normalized_value.lower():
             matches = list(_CSS_URL_RE.finditer(normalized_value))
@@ -248,7 +326,10 @@ def _captured_style(value: str) -> tuple[str, set[str]]:
 
             def replace_url(match: re.Match[str]) -> str:
                 nonlocal valid
-                captured = _CAPTURE_ASSET_URL_RE.fullmatch(match.group("url").strip())
+                source = match.group("url").strip()
+                if source.startswith("#") and _SAFE_ID_RE.fullmatch(source[1:]):
+                    return f"url({source})"
+                captured = _CAPTURE_ASSET_URL_RE.fullmatch(source)
                 if captured is None:
                     valid = False
                     return ""
@@ -262,7 +343,9 @@ def _captured_style(value: str) -> tuple[str, set[str]]:
             normalized_value = rewritten
             used_ids.update(declaration_ids)
         declarations.append(f"{normalized_name}:{normalized_value}")
-    return ";".join(declarations)[:4000], used_ids
+    # The complete upload has a byte limit. Do not cut individual declarations:
+    # a cut can corrupt variables, long vector styles or image placeholders.
+    return ";".join(declarations), used_ids
 
 
 def _sanitize_captured_article(source: str, canonical_url: str) -> tuple[str, set[str]]:
@@ -276,11 +359,14 @@ def _sanitize_captured_article(source: str, canonical_url: str) -> tuple[str, se
     fragment = BeautifulSoup("<section></section>", "html.parser")
     container = fragment.section
     assert container is not None
+    # The article root carries inherited colors, variables and layout too.
+    # Sanitize it with the descendants instead of dropping its declarations.
+    container.attrs = dict(root.attrs)
     for child in list(root.contents):
         container.append(child.extract())
 
     used_ids: set[str] = set()
-    for tag in list(container.find_all(True)):
+    for tag in [container, *list(container.find_all(True))]:
         name = tag.name.lower()
         if name in _DISCARDED_TAGS:
             tag.decompose()
@@ -289,15 +375,17 @@ def _sanitize_captured_article(source: str, canonical_url: str) -> tuple[str, se
             tag.unwrap()
             continue
         attributes: dict[str, str] = {}
+        if name in _SVG_TAGS:
+            attributes, style_ids = _safe_svg_attributes(tag, captured=True)
+            used_ids.update(style_ids)
+            tag.attrs = attributes
+            continue
         if tag.has_attr("style"):
             style, style_ids = _captured_style(str(tag.get("style") or ""))
             if style:
                 attributes["style"] = style
                 used_ids.update(style_ids)
-        for attribute_name in ("align", "valign", "colspan", "rowspan", "width", "height"):
-            attribute_value = str(tag.get(attribute_name) or "").strip()
-            if attribute_value and len(attribute_value) <= 32:
-                attributes[attribute_name] = attribute_value
+        attributes.update(_safe_common_attributes(tag))
         if tag.name == "a":
             href = _safe_link(str(tag.get("href") or ""), canonical_url)
             if href:
@@ -317,7 +405,7 @@ def _sanitize_captured_article(source: str, canonical_url: str) -> tuple[str, se
 
     rendered = str(container)
     plain = re.sub(r"\s+", " ", container.get_text(" ", strip=True)).strip()
-    if not plain and not container.find("img"):
+    if not plain and not container.find(["img", "svg"]):
         raise WebArticleImportError("未能从浏览器采集内容中提取公众号正文")
     if len(rendered.encode("utf-8")) > get_settings().MAX_DOCUMENT_HTML_BYTES:
         raise WebArticleImportError("文章正文超过允许大小")
@@ -408,27 +496,41 @@ async def _capture_article_images(html_template: str, canonical_url: str) -> tup
                 except PublicFetchError as exc:
                     return source, None, None, str(exc)
 
-        results = await asyncio.gather(*(fetch_one(source) for source in source_to_tags))
-
-    assets: list[CapturedAsset] = []
-    imported_count = 0
-    external_count = max(0, len(image_tags) - len(candidates))
-    for source, data, image, error in results:
-        tags = source_to_tags[source]
-        if data is None or image is None:
-            if source.lower().startswith("data:"):
+        assets: list[CapturedAsset] = []
+        imported_count = 0
+        external_count = max(0, len(image_tags) - len(candidates))
+        total_bytes = 0
+        over_budget_count = 0
+        sources = list(source_to_tags)
+        # Process bounded batches instead of retaining every downloaded image in
+        # an asyncio.gather result. This allows 200-image articles while the
+        # 50 MiB aggregate limit continues to cap memory and storage use.
+        for offset in range(0, len(sources), IMAGE_FETCH_CONCURRENCY):
+            results = await asyncio.gather(*(fetch_one(source) for source in sources[offset : offset + IMAGE_FETCH_CONCURRENCY]))
+            for source, data, image, error in results:
+                tags = source_to_tags[source]
+                if data is None or image is None:
+                    if source.lower().startswith("data:"):
+                        for tag in tags:
+                            tag.decompose()
+                        warnings.append("一张内嵌图片无法安全保存，已从导入稿中移除。")
+                    else:
+                        external_count += len(tags)
+                        warnings.append(f"{len(tags)} 张图片无法保存，将保留原始外链：{error or '未知错误'}。")
+                    continue
+                if total_bytes + len(data) > MAX_CAPTURE_IMAGE_TOTAL_BYTES:
+                    external_count += len(tags)
+                    over_budget_count += len(tags)
+                    continue
+                total_bytes += len(data)
+                asset_id = uuid4().hex
+                assets.append((asset_id, image.content_type, image.extension, data, image.width, image.height))
                 for tag in tags:
-                    tag.decompose()
-                warnings.append("一张内嵌图片无法安全保存，已从导入稿中移除。")
-            else:
-                external_count += len(tags)
-                warnings.append(f"{len(tags)} 张图片无法保存，将保留原始外链：{error or '未知错误'}。")
-            continue
-        asset_id = uuid4().hex
-        assets.append((asset_id, image.content_type, image.extension, data, image.width, image.height))
-        for tag in tags:
-            tag["src"] = f"{_ASSET_URL_PREFIX}{asset_id}"
-        imported_count += len(tags)
+                    tag["src"] = f"{_ASSET_URL_PREFIX}{asset_id}"
+                imported_count += len(tags)
+
+    if over_budget_count:
+        warnings.append(f"图片总大小超过 50MB，{over_budget_count} 张图片将保留原始外链。")
 
     return str(soup), assets, imported_count, external_count, warnings
 
@@ -585,7 +687,7 @@ def complete_captured_web_article_import(
     import_id = str(uuid4())
     preview_token = token_urlsafe(32)
     normalized_title = re.sub(r"\s+", " ", title).strip()[:256] or "未命名推文"
-    image_count = len(BeautifulSoup(html_template, "html.parser").find_all("img"))
+    image_count = len(BeautifulSoup(html_template, "html.parser").find_all(["img", "image"]))
     import_session = WebArticleImport(
         id=import_id,
         owner_id=capture_session.user_id,
@@ -746,6 +848,8 @@ def cleanup_expired_web_article_imports(db: Session, now: datetime | None = None
         import_id
         for (import_id,) in db.query(WebArticleImport.id)
         .filter(WebArticleImport.expires_at <= (now or _utcnow()))
+        .order_by(WebArticleImport.expires_at, WebArticleImport.id)
+        .limit(500)
         .all()
     ]
     if not expired_ids:

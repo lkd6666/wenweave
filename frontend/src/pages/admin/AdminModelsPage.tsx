@@ -193,6 +193,7 @@ export default function AdminModelsPage() {
   const modelModalProvider = providers.find((provider) => provider.id === modelModalProviderId)
   const supportsPromptCache = modelModalProvider?.provider_type === 'openai_compatible'
     || modelModalProvider?.provider_type === 'openai_responses'
+    || modelModalProvider?.provider_type === 'anthropic'
   const isAnthropicProvider = modelModalProvider?.provider_type === 'anthropic'
   const isGeminiNativeProvider = modelModalProvider?.provider_type === 'gemini_native'
   const automaticTokenBudget = deriveModelTokenBudget(inputLimitK, outputLimitK)
@@ -1314,7 +1315,7 @@ export default function AdminModelsPage() {
               {automaticTokenBudget && (
                 <Space size={[8, 8]} wrap className="model-editor-automatic-budget" aria-label="自动配置">
                   <Text type="secondary">自动配置</Text>
-                  <Tag>压缩开始约 {formatKTokens(Math.floor(automaticTokenBudget.context_compaction_threshold_tokens * 0.9))}</Tag>
+                  <Tag>压缩阈值 {formatKTokens(automaticTokenBudget.context_compaction_threshold_tokens)}</Tag>
                   <Tag>压缩目标约 {formatKTokens(Math.min(automaticTokenBudget.context_compaction_threshold_tokens, 20_000))}</Tag>
                   <Tag>工具预览 {formatKTokens(automaticTokenBudget.tool_result_max_tokens)}</Tag>
                 </Space>
@@ -1382,7 +1383,7 @@ export default function AdminModelsPage() {
               name="prompt_cache_enabled"
               label="提示缓存优化"
               valuePropName="checked"
-              extra="仅在当前网关支持 prompt_cache_key 时开启。模型仍使用服务端自动缓存；此选项只提供稳定路由键以提高重复前缀的命中率，不会复用旧回答。"
+              extra="请在当前模型和网关验证后开启。按供应商协议启用稳定缓存键或原生缓存边界，分离固定规则与最新状态，并保留工具历史的稳定前缀；关闭后恢复原提示传递方式。缓存命中由上游服务决定，不会复用旧回答。"
             >
               <Switch />
             </Form.Item>

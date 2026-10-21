@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { AIModelItem, ChatContextStats } from '../types'
-import { contextCompactionNotice, contextUsageValues, formatMessageTime, isRuntimeContextCompacting, mergeFallbackThoughtBlocks, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, parseCompactionSummary, supportsDisabledThinkingOption, visibleAssistantTurnBlocks, visibleTemplateReferenceIndexes } from './ChatPanel'
+import type { AIModelItem, ChatContextStats, ToolExecution } from '../types'
+import { contextCompactionNotice, contextInputWindowLabel, contextUsageValues, formatMessageTime, generatedImagePreviews, isRuntimeContextCompacting, mergeFallbackThoughtBlocks, modelImagePreviews, modelUsageDetail, modelUsageLabel, normaliseAssistantTurnBlocks, parseCompactionSummary, supportsDisabledThinkingOption, toolLabel, visibleAssistantTurnBlocks, visibleTemplateReferenceIndexes } from './ChatPanel'
 import { questionDeadlineMs } from './UserQuestionPanel'
 
 describe('contextUsageValues', () => {
@@ -36,6 +36,19 @@ describe('contextUsageValues', () => {
     })
   })
 
+  it('retains explicit zero for a current runtime projection', () => {
+    const stats = {
+      used_tokens: 26_800, compiled_input_tokens: 26_800,
+      runtime_context_tokens: 0, runtime_context_source: 'server_request_budget',
+    } as ChatContextStats
+    expect(contextUsageValues(stats).compiledInputTokens).toBe(0)
+  })
+
+  it('retains explicit zero for a prepared projection', () => {
+    const stats = { used_tokens: 26_800, compiled_input_tokens: 0 } as ChatContextStats
+    expect(contextUsageValues(stats).compiledInputTokens).toBe(0)
+  })
+
   it('shows the in-conversation compaction container only during runtime compaction', () => {
     const stats = {
       runtime_context_state: 'run_compacting',
@@ -45,6 +58,25 @@ describe('contextUsageValues', () => {
     expect(isRuntimeContextCompacting(stats, false)).toBe(false)
     expect(isRuntimeContextCompacting({ ...stats, runtime_context_state: 'in_run_compacted' }, true)).toBe(false)
     expect(isRuntimeContextCompacting({ state: 'preparing', requires_compaction: true } as ChatContextStats, true)).toBe(true)
+  })
+})
+
+describe('contextInputWindowLabel', () => {
+  it('distinguishes the compression threshold, total window and reserved output', () => {
+    const stats = {
+      active_context_threshold_tokens: 300_000,
+      usable_tokens: 300_000,
+      max_tokens: 428_000,
+      max_output_tokens: 100_000,
+      input_limit_tokens: 328_000,
+    } as ChatContextStats
+
+    expect(contextInputWindowLabel(stats)).toBe('达到 300K tokens 时自动压缩；模型总窗口 428K，输出预留 100K，输入上限 328K tokens')
+  })
+
+  it('derives the physical input limit for older responses', () => {
+    const stats = { active_context_threshold_tokens: 20_000, max_tokens: 32_000, max_output_tokens: 8_000 } as ChatContextStats
+    expect(contextInputWindowLabel(stats)).toContain('输入上限 24K tokens')
   })
 })
 
@@ -65,6 +97,17 @@ describe('formatMessageTime', () => {
 })
 
 describe('model usage display', () => {
+  it.each([
+    [0, '0'], [999, '999'], [1000, '1K'], [11141, '11.1K'],
+    [999949, '999.9K'], [999950, '1M'], [1000000, '1M'],
+    [4832735, '4.83M'], [4843876, '4.84M'],
+  ])('abbreviates %i tokens as %s', (totalTokens, expected) => {
+    expect(modelUsageLabel({
+      model_names: ['测试模型'], input_tokens: totalTokens, output_tokens: 0,
+      total_tokens: totalTokens, usage_reported: true,
+    })).toContain(`累计 ${expected} tokens`)
+  })
+
   it('renders legacy records without cache or call-count fields', () => {
     const legacyUsage = {
       model_names: ['测试模型'],
@@ -108,6 +151,101 @@ describe('normaliseAssistantTurnBlocks', () => {
       content: '',
       tool: null,
     }])
+  })
+})
+
+describe('tool image previews', () => {
+  const tool = (overrides: Partial<ToolExecution> = {}): ToolExecution => ({
+    id: 'tool-1',
+    name: 'read_blocks',
+    arguments: {},
+    status: 'success',
+    html_changed: false,
+    ...overrides,
+  })
+
+  it('keeps the image gallery data', () => {
+    const imageTool = tool({
+      name: 'view_article_images',
+      model_input: { state: 'available', content: '{"items":[{"index":1}]}', truncated: false },
+      activity: {
+        kind: 'image_view',
+        summary: '已读取图片',
+        details: {
+          image_content_included: true,
+          items: [{ index: 1, label: '文章首图', width: 640, height: 360, preview_url: 'https://cdn.example/hero.png' }],
+        },
+      },
+    })
+
+    expect(modelImagePreviews(imageTool)).toEqual([{
+      id: 'model-image-1-https://cdn.example/hero.png',
+      url: 'https://cdn.example/hero.png',
+      label: '文章首图',
+      width: 640,
+      height: 360,
+    }])
+  })
+
+  it('resolves private chat image references to current authorized previews', () => {
+    const unsigned = '/api/documents/1/chat-images/photo-1/content'
+    const imageTool = tool({
+      name: 'view_chat_images_page',
+      activity: { kind: 'image_view', summary: '', details: {
+        image_content_included: true,
+        items: [{ index: 5, kind: 'chat', attachment_id: 'photo-1', label: '@图片5', preview_url: unsigned }],
+      } },
+    })
+    const previews = new Map([['photo-1', `${unsigned}?token=fresh-token`]])
+
+    expect(modelImagePreviews(imageTool, previews)).toMatchObject([{ label: '@图片5', url: `${unsigned}?token=fresh-token` }])
+    previews.set('photo-1', `${unsigned}?token=renewed-token`)
+    expect(modelImagePreviews(imageTool, previews)).toMatchObject([{ url: `${unsigned}?token=renewed-token` }])
+    expect(imageTool.activity?.details?.items).toEqual([
+      { index: 5, kind: 'chat', attachment_id: 'photo-1', label: '@图片5', preview_url: unsigned },
+    ])
+  })
+
+  it('uses uploaded article assets for chat images outside the loaded history', () => {
+    const imageTool = tool({
+      name: 'view_chat_images_page',
+      activity: { kind: 'image_view', summary: '', details: {
+        image_content_included: true,
+        items: [{ attachment_id: 'photo-1', article_url: '/uploads/photo-1.png', preview_url: '/api/documents/1/chat-images/photo-1/content' }],
+      } },
+    })
+    expect(modelImagePreviews(imageTool)).toMatchObject([{ url: '/uploads/photo-1.png' }])
+    expect(modelImagePreviews(imageTool, new Map([['photo-1', '/api/documents/1/chat-images/photo-1/content?token=expiring']]))).toMatchObject([
+      { url: '/uploads/photo-1.png' },
+    ])
+    expect(modelImagePreviews({ ...imageTool, activity: { ...imageTool.activity!, details: {
+      ...imageTool.activity!.details, image_content_included: false,
+    } } })).toEqual([])
+  })
+
+  it('rejects empty or unsafe image sources and keeps safe fallback previews', () => {
+    const imageTool = tool({ activity: { kind: 'image_view', summary: '', details: {
+      image_content_included: true,
+      items: [
+        { preview_url: '' },
+        { attachment_id: 'photo-1', article_url: 'javascript:alert(1)', preview_url: 'https://cdn.example/photo.png' },
+        { preview_url: 'data:text/html,unsafe' },
+      ],
+    } } })
+    expect(modelImagePreviews(imageTool, new Map([['photo-1', 'javascript:alert(2)']]))).toMatchObject([
+      { url: 'https://cdn.example/photo.png' },
+    ])
+  })
+
+  it('previews images returned by import and application tools', () => {
+    expect(generatedImagePreviews(tool({
+      name: 'import_searched_image',
+      activity: { kind: 'image_import', summary: '搜索图片已导入', details: { asset_id: 'asset-1', url: 'https://cdn.example/photo.png', title: '文章照片', width: 1200, height: 800 } },
+    }))).toMatchObject([{ url: 'https://cdn.example/photo.png', title: '文章照片', width: 1200, height: 800 }])
+    expect(generatedImagePreviews(tool({
+      name: 'apply_edited_cover',
+      activity: { kind: 'image_application', summary: '封面已更新', details: { url: 'javascript:alert(1)' } },
+    }))).toEqual([])
   })
 })
 
@@ -273,5 +411,39 @@ describe('visibleTemplateReferenceIndexes', () => {
 
   it('keeps only valid component references written in the message', () => {
     expect([...visibleTemplateReferenceIndexes('使用 @组件2，再参考 @组件1 和 @组件3。', 2)]).toEqual([1, 0])
+  })
+})
+
+describe('image viewing tool labels', () => {
+  const imageTool = {
+    id: 'image-view', name: 'view_article_images', arguments: {}, status: 'success', html_changed: false,
+  } as ToolExecution
+
+  it('distinguishes a dimensions-only request while running and after completion', () => {
+    expect(toolLabel({ ...imageTool, status: 'running', arguments: { include_image: false } })).toBe('读取图片尺寸')
+    expect(toolLabel({ ...imageTool, activity: { kind: 'image_view', summary: '', details: {
+      include_image_requested: false, image_content_included: false, items: [{ width: 3600, height: 1500 }],
+    } } })).toBe('读取图片尺寸')
+    expect(toolLabel({ ...imageTool, name: 'view_chat_images_page', arguments: { include_image: false } })).toBe('分页读取附图尺寸')
+  })
+
+  it('recognizes legacy dimensions-only results without implying that images were provided', () => {
+    expect(toolLabel({ ...imageTool, activity: { kind: 'image_view', summary: '', details: {
+      vision_supported: true, image_content_included: false, items: [{ width: 3600, height: 1500 }],
+    } } })).toBe('读取图片尺寸')
+  })
+
+  it('retains the viewing label when pixels are requested or a visual read was budget-blocked', () => {
+    expect(toolLabel(imageTool)).toBe('查看文章图片')
+    expect(toolLabel({ ...imageTool, name: 'view_chat_images_page', status: 'running' })).toBe('分页查看附图')
+    expect(toolLabel({ ...imageTool, name: 'view_chat_images_page', activity: { kind: 'image_view', summary: '', details: {
+      image_content_included: true, items: [{ width: 3600, height: 1500 }],
+    } } })).toBe('分页查看附图')
+    expect(toolLabel({ ...imageTool, activity: { kind: 'image_view', summary: '', details: {
+      image_content_included: true, items: [{ width: 3600, height: 1500 }],
+    } } })).toBe('查看文章图片')
+    expect(toolLabel({ ...imageTool, activity: { kind: 'image_view', summary: '', details: {
+      image_content_included: false, budget_limited: true, items: [],
+    } } })).toBe('查看文章图片')
   })
 })

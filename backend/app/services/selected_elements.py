@@ -62,7 +62,7 @@ def _normalize_locator(value: Any) -> dict[str, Any] | None:
     if isinstance(raw_attributes, Mapping):
         for raw_key, raw_value in list(raw_attributes.items())[:16]:
             key = str(raw_key).lower().strip()
-            if not re.fullmatch(r"(?:id|src|srcset|href|name|data-[a-z0-9_-]+)", key):
+            if not re.fullmatch(r"(?:id|src|srcset|href|xlink:href|name|data-[a-z0-9_-]+)", key):
                 continue
             stable_attributes[key] = redact_inline_data_for_identity(str(raw_value))[:2048]
     try:
@@ -89,6 +89,15 @@ def normalize_selected_element(value: Mapping[str, Any]) -> dict[str, Any]:
         "html": _truncate(html, MAX_SELECTED_ELEMENT_HTML_CHARS),
         "text": re.sub(r"\s+", " ", str(value.get("text", ""))).strip()[:MAX_SELECTED_ELEMENT_TEXT_CHARS],
     }
+    kind = str(value.get("kind", "")).strip().lower()
+    if kind in {"element", "image"}:
+        normalized["kind"] = kind
+    source_attribute = str(value.get("source_attribute", "")).strip().lower()
+    if source_attribute in {"src", "href", "xlink:href"}:
+        normalized["source_attribute"] = source_attribute
+    source_fingerprint = str(value.get("source_fingerprint", "")).strip()
+    if source_fingerprint:
+        normalized["source_fingerprint"] = source_fingerprint[:128]
     locator = _normalize_locator(value.get("locator"))
     if locator:
         normalized["locator"] = locator

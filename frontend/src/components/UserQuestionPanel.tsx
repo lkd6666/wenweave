@@ -77,15 +77,50 @@ export default function UserQuestionPanel({
   }, [inactivitySeconds, question.timeout_at])
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
-    return () => window.clearInterval(timer)
+    let timer: number | null = null
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer)
+        timer = null
+      }
+    }
+    const syncTimer = () => {
+      stopTimer()
+      if (document.visibilityState !== 'visible') return
+      setNow(Date.now())
+      timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    }
+    syncTimer()
+    document.addEventListener('visibilitychange', syncTimer)
+    window.addEventListener('focus', syncTimer)
+    return () => {
+      document.removeEventListener('visibilitychange', syncTimer)
+      window.removeEventListener('focus', syncTimer)
+      stopTimer()
+    }
   }, [])
 
   useEffect(() => {
     if (!timedOut || submitting) return
-    timeoutElapsedHandlerRef.current()
-    const poll = window.setInterval(() => timeoutElapsedHandlerRef.current(), 3_000)
-    return () => window.clearInterval(poll)
+    let poll: number | null = null
+    const stopPolling = () => {
+      if (poll !== null) {
+        window.clearInterval(poll)
+        poll = null
+      }
+    }
+    const syncPolling = () => {
+      stopPolling()
+      if (document.visibilityState !== 'visible') return
+      timeoutElapsedHandlerRef.current()
+      poll = window.setInterval(() => timeoutElapsedHandlerRef.current(), 3_000)
+    }
+    syncPolling()
+    document.addEventListener('visibilitychange', syncPolling)
+    return () => {
+      document.removeEventListener('visibilitychange', syncPolling)
+      stopPolling()
+    }
   }, [question.id, submitting, timedOut])
 
   const markActivity = () => {

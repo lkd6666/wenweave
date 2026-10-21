@@ -33,7 +33,7 @@ class LayoutCaptureManifest(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
     omitted_asset_count: int = Field(default=0, ge=0, le=1000)
     cover_asset_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
-    assets: list[LayoutCaptureAssetManifest] = Field(default_factory=list, max_length=50)
+    assets: list[LayoutCaptureAssetManifest] = Field(default_factory=list, max_length=200)
 
 
 class LayoutReferenceSummary(BaseModel):

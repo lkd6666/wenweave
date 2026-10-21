@@ -1,9 +1,27 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { parseSseChunk, recordChatUserQuestionActivity, reaskSourceUnavailableFromError, startChatRun } from './chat'
+import { chatApi, parseSseChunk, recordChatUserQuestionActivity, reaskSourceUnavailableFromError, startChatRun } from './chat'
 import { ApiError } from './client'
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe('chat message pagination', () => {
+  it('requests the latest page or an older page by message ID', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response('[]', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await chatApi.listRecentMessages(12, 3, 31)
+    await chatApi.listRecentMessages(12, 3, 31, 95)
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/documents/12/messages?session_id=3&limit=31',
+      '/api/documents/12/messages?session_id=3&limit=31&before_id=95',
+    ])
+  })
 })
 
 describe('recordChatUserQuestionActivity', () => {
@@ -37,6 +55,25 @@ describe('startChatRun', () => {
 
     const [, request] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(JSON.parse(String(request.body))).not.toHaveProperty('template_ids')
+  })
+
+  it('retries a transient backend failure with the same idempotency key', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: '服务正在启动' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ run_id: 'run-1' }), {
+        status: 202,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('window', { setTimeout, clearTimeout })
+
+    await startChatRun(12, 3, '首条请求', 4, 'enabled', 'auto', 'stable-client-request')
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [, firstRequest] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const [, secondRequest] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(JSON.parse(String(firstRequest.body)).client_request_id).toBe('stable-client-request')
+    expect(JSON.parse(String(secondRequest.body)).client_request_id).toBe('stable-client-request')
   })
 })
 

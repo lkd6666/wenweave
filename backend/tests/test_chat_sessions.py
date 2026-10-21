@@ -12,8 +12,11 @@ from app.api.routes.chat import (
     _session_message_query,
     archive_chat_session,
     create_chat_session,
+    get_chat_context,
     list_messages,
     list_chat_sessions,
+    replace_chat_session_template_attachments,
+    remove_chat_session_template_attachment,
     restore_chat_session,
     restore_chat_session_context,
     truncate_chat_session_context,
@@ -23,6 +26,8 @@ from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.ai_model import AIModel
 from app.models.ai_provider import AIProvider, ProviderType
 from app.models.chat_message import ChatMessage, MessageRole
+from app.models.chat_context_event import ChatContextEvent, ContextEventKind
+from app.models.chat_context_snapshot import ChatContextSnapshot
 from app.models.chat_image_attachment import ChatImageAttachment
 from app.models.chat_session import ChatSession, ChatSessionMemory
 from app.models.chat_session_layout_reference import ChatSessionLayoutReference
@@ -31,7 +36,7 @@ from app.models.gzh_theme_proposal import GzhThemeProposal, GzhThemeProposalStat
 from app.models.model_call_record import ModelCallRecord, ModelCallSource, ModelCallStatus
 from app.models.template_library import TemplateLibraryItem, TemplateSourceType
 from app.models.user import User, UserRole
-from app.schemas.chat import ChatSessionCreate
+from app.schemas.chat import ChatSessionCreate, ChatSessionTemplateAttachmentsUpdate
 from app.services.layout_reference import (
     clear_session_layout_reference,
     get_session_layout_reference,
@@ -45,6 +50,7 @@ from app.services.chat_session_context import (
     session_attached_templates,
     session_approved_theme_proposal,
 )
+from app.services.agent_context import ContextRecord, context_prefix_hash
 
 
 class ChatSessionRouteTests(unittest.TestCase):
@@ -82,6 +88,51 @@ class ChatSessionRouteTests(unittest.TestCase):
         self.db.add(item)
         self.db.flush()
         return item
+
+    def test_context_get_persists_recovered_snapshot_after_refresh(self) -> None:
+        provider = AIProvider(name="context-test", provider_type=ProviderType.OPENAI_COMPATIBLE,
+                              base_url="https://example.invalid")
+        self.db.add(provider)
+        self.db.flush()
+        model = AIModel(provider_id=provider.id, model_name="test", display_name="test",
+                        context_window_tokens=800_000, context_compaction_threshold_tokens=500_000,
+                        max_output_tokens=1_000, tool_result_max_tokens=1_000)
+        self.db.add(model)
+        first = self.add_message(self.primary, "旧进度", MessageRole.ASSISTANT)
+        second = self.add_message(self.primary, "继续")
+        initial = [
+            ChatContextEvent(document_id=self.document.id, session_id=self.primary.id,
+                             message_id=first.id, ordinal=0, kind=ContextEventKind.ASSISTANT,
+                             payload_json='{"content":"旧进度"}', created_at=datetime(2026, 9, 25, 20, 12)),
+            ChatContextEvent(document_id=self.document.id, session_id=self.primary.id,
+                             message_id=second.id, ordinal=0, kind=ContextEventKind.USER,
+                             payload_json='{"content":"继续"}', created_at=datetime(2026, 9, 25, 20, 12)),
+        ]
+        self.db.add_all(initial)
+        self.db.flush()
+        records = [ContextRecord(row.id, row.message_id, row.kind.value, row.payload) for row in initial]
+        snapshot = ChatContextSnapshot(
+            session_id=self.primary.id, compacted_through_event_id=initial[-1].id,
+            compacted_through_message_id=second.id, retained_from_event_id=initial[-1].id + 1,
+            summary_json='{"objective":"继续排版"}', source_event_count=2,
+            source_prefix_hash=context_prefix_hash(records), is_active=False, active_slot=None,
+            invalidation_reason="source_diverged", created_at=datetime(2026, 9, 25, 20, 14),
+        )
+        self.db.add(snapshot)
+        self.db.add(ChatContextEvent(
+            document_id=self.document.id, session_id=self.primary.id, message_id=first.id,
+            ordinal=1, kind=ContextEventKind.ASSISTANT,
+            payload_json='{"content":"晚到的工具结果"}', created_at=datetime(2026, 9, 25, 20, 26),
+        ))
+        self.db.commit()
+
+        preview = get_chat_context(self.document.id, model.id, self.primary.id, self.user, self.db)
+        self.assertEqual(preview["snapshot_id"], snapshot.id)
+        self.assertFalse(preview["requires_compaction"])
+        with Session(self.engine) as fresh:
+            persisted = fresh.get(ChatContextSnapshot, snapshot.id)
+            self.assertTrue(persisted.is_active)
+            self.assertEqual(persisted.source_max_event_id, initial[-1].id)
 
     def test_truncation_hides_only_the_current_session_and_clears_its_memory(self) -> None:
         first = self.add_message(self.primary, "旧约束")
@@ -202,6 +253,23 @@ class ChatSessionRouteTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["image_attachments"][0]["filename"], "reference.png")
         self.assertIn("/chat-images/attachment-1/content?token=", messages[0]["image_attachments"][0]["preview_url"])
+
+    def test_listing_messages_pages_backward_within_visible_session(self) -> None:
+        rows = [self.add_message(self.primary, f"消息 {index}") for index in range(7)]
+        self.add_message(self.other, "其他对话")
+        self.db.commit()
+        self.primary.context_start_message_id = rows[0].id
+        self.db.commit()
+
+        latest = list_messages(self.document.id, self.primary.id, False, self.user, self.db, limit=3)
+        older = list_messages(self.document.id, self.primary.id, False, self.user, self.db, limit=3, before_id=latest[0]["id"])
+
+        self.assertEqual([item["id"] for item in latest], [row.id for row in rows[4:]])
+        self.assertEqual([item["id"] for item in older], [row.id for row in rows[1:4]])
+        self.assertEqual(
+            [item["id"] for item in list_messages(self.document.id, self.primary.id, True, self.user, self.db, limit=3, before_id=older[0]["id"])],
+            [rows[0].id],
+        )
 
     def test_listing_messages_includes_the_request_author(self) -> None:
         collaborator = User(
@@ -362,6 +430,52 @@ class ChatSessionRouteTests(unittest.TestCase):
         self.assertTrue(clear_session_theme_proposal(self.db, self.primary.id))
         self.db.commit()
         self.assertIsNone(_session_read(self.db, self.primary)["theme_context"])
+
+    def test_template_references_can_change_while_a_run_keeps_its_request_snapshot(self) -> None:
+        first = TemplateLibraryItem(name="First", html="<p>First</p>", source_type=TemplateSourceType.SOURCE)
+        second = TemplateLibraryItem(name="Second", html="<p>Second</p>", source_type=TemplateSourceType.SOURCE)
+        self.db.add_all([first, second])
+        self.db.flush()
+        replace_session_attached_templates(self.db, self.primary.id, [first.id])
+        request = self.add_message(self.primary, "Edit article")
+        request.template_refs_json = json.dumps([{"id": first.id, "name": first.name}])
+        run = AgentRun(
+            id="template-reference-run", document_id=self.document.id, session_id=self.primary.id,
+            user_id=self.user.id, user_message_id=request.id, client_request_id="template-reference-request",
+            status=AgentRunStatus.RUNNING,
+        )
+        self.db.add(run)
+        self.db.commit()
+        for run_status in (AgentRunStatus.PENDING, AgentRunStatus.RUNNING, AgentRunStatus.WAITING_FOR_INPUT):
+            with self.subTest(status=run_status):
+                run.status = run_status
+                self.db.commit()
+                result = replace_chat_session_template_attachments(
+                    self.document.id, self.primary.id,
+                    ChatSessionTemplateAttachmentsUpdate(template_ids=[first.id, second.id]), self.user, self.db,
+                )
+                self.assertEqual([item["id"] for item in result["attached_templates"]], [first.id, second.id])
+                result = remove_chat_session_template_attachment(
+                    self.document.id, self.primary.id, first.id, self.user, self.db,
+                )
+                self.assertEqual([item["id"] for item in result["attached_templates"]], [second.id])
+                self.assertEqual(request.template_refs, [{"id": first.id, "name": first.name}])
+                self.assertEqual(run.status, run_status)
+                self.assertEqual(self.document.current_html, "<p>正文</p>")
+                self.assertEqual(session_attached_templates(self.db, self.other.id), [])
+                with self.assertRaises(HTTPException) as raised:
+                    truncate_chat_session_context(self.document.id, self.primary.id, self.user, self.db)
+                self.assertEqual(raised.exception.status_code, 409)
+
+    def test_archived_session_template_references_cannot_be_changed(self) -> None:
+        self.primary.is_archived = True
+        self.db.commit()
+        with self.assertRaises(HTTPException) as raised:
+            replace_chat_session_template_attachments(
+                self.document.id, self.primary.id,
+                ChatSessionTemplateAttachmentsUpdate(template_ids=[]), self.user, self.db,
+            )
+        self.assertEqual(raised.exception.status_code, 404)
 
     def test_approved_theme_remains_available_to_continue_its_initial_application(self) -> None:
         proposal = GzhThemeProposal(

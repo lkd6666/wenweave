@@ -9,8 +9,9 @@ from <https://github.com/wechatjs/verify-article-structure-spec>.
 - Fixed upstream commit: `fa69e37341c86bfec4c8c533845910511e534c0c`
 - Browser checker package: `@tencent/verify-article-structure` v0.2.16
 - License: MIT; the upstream license is retained in the vendored directory.
-- The bundled `mp-darkmode` v1.2.3-alpha.1 dependency is MIT licensed; its
-  retained license notice is `MP_DARKMODE_LICENSE` in that directory.
+- The bundled `mp-darkmode` v1.2.3-alpha.1 dependency is MIT licensed; it is
+  also used by the editor's isolated Dark Mode preview. Its retained license
+  notice is `MP_DARKMODE_LICENSE` in that directory.
 
 The application runs this fixed browser bundle through Python Playwright; it
 does not execute the upstream Node.js CLI in production. See the vendored
@@ -68,3 +69,18 @@ No license or terms page was published by the source site at the time this
 notice was added. This notice records the source and the exact components used;
 review any subsequently published upstream license terms before redistributing
 the adapted implementation.
+
+## Specificity and CSS parsing
+
+The browser capture extension uses `specificity` (MIT) to preserve the cascade
+of authored CSS declarations, with `css-tree` (MIT), `mdn-data` (CC0-1.0), and
+`source-map-js` (BSD-3-Clause). Extension builds include their original license
+texts in `THIRD_PARTY_LICENSES.txt`.
+
+## tiktoken token estimator
+
+The backend bundles OpenAI's `o200k_base` token table and encoding definition
+from tiktoken 0.13.0 in `backend/app/assets/tokenizers`. The upstream project is
+<https://github.com/openai/tiktoken>, licensed under MIT; the original license
+is retained in that directory. The table's upstream URL and SHA-256 are recorded
+in the adjacent `README.md`.

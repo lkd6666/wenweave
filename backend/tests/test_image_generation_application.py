@@ -14,7 +14,7 @@ from app.schemas.image_generation import ImageGenerationApply
 from app.services.chat_agent import HtmlEditSession, _take_matching_tool_report, run_agent_loop
 from app.services.html_workspace import HtmlWorkspace
 from app.services.document_images import StoredDocumentImage
-from app.services.image_generation import cover_source_fingerprint, image_target_fingerprint, materialize_source_image, replace_image_source
+from app.services.image_generation import cover_source_fingerprint, image_source_at, image_target_fingerprint, materialize_source_image, replace_image_source
 from app.services.image_search import ImageSearchCandidate
 from app.services.tool_output_store import ToolOutputStore
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
@@ -108,6 +108,40 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         self.assertTrue(image_target_fingerprint(source_html, 0, source_url))
         replaced = replace_image_source(source_html, 0, source_url, "https://cdn.example.test/replaced.png")
         self.assertIn('src="https://cdn.example.test/replaced.png"', replaced)
+
+    def test_svg_image_sources_use_the_same_replacement_slots(self) -> None:
+        source_url = "https://cdn.example.test/lab.png"
+        source_html = (
+            '<section><svg><image href="https://cdn.example.test/other.png" />'
+            f'<image xlink:href="{source_url}" /></svg></section>'
+        )
+
+        self.assertEqual(image_source_at(source_html, 1), source_url)
+        self.assertTrue(image_target_fingerprint(source_html, 1, source_url))
+        replaced = replace_image_source(source_html, 1, source_url, "https://cdn.example.test/replaced.png")
+        self.assertIn('xlink:href="https://cdn.example.test/replaced.png"', replaced)
+
+    def test_svg_image_replacement_keeps_href_and_xlink_in_sync(self) -> None:
+        source_url = "https://cdn.example.test/original.png"
+        next_url = "https://cdn.example.test/replaced.png"
+        source_html = (
+            '<svg><image xlink:href="https://cdn.example.test/legacy.png" '
+            f'href="{source_url}" data-href="keep-me" /></svg>'
+        )
+
+        self.assertEqual(image_source_at(source_html, 0), source_url)
+        replaced = replace_image_source(source_html, 0, source_url, next_url)
+        self.assertIn(f'href="{next_url}"', replaced)
+        self.assertIn(f'xlink:href="{next_url}"', replaced)
+        self.assertIn('data-href="keep-me"', replaced)
+
+    def test_svg_image_empty_href_uses_xlink_source(self) -> None:
+        source_url = "https://cdn.example.test/original.png"
+        source_html = f'<svg><image href="" xlink:href="{source_url}" /></svg>'
+
+        self.assertEqual(image_source_at(source_html, 0), source_url)
+        replaced = replace_image_source(source_html, 0, source_url, "https://cdn.example.test/replaced.png")
+        self.assertEqual(replaced.count('https://cdn.example.test/replaced.png'), 2)
 
     def test_regular_candidate_can_replace_explicit_image_target(self) -> None:
         source_url = "/api/documents/local-images/original.png"
@@ -289,7 +323,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-image-patch-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}):
@@ -381,7 +415,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="searched-image-patch-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -467,7 +501,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="searched-cover-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -528,7 +562,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="searched-cover-unavailable-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -602,7 +636,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-image-patch-retry-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}):
@@ -678,7 +712,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-cover-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -741,7 +775,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="generated-cover-foreign-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -825,7 +859,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-image-test"),
                     actor_user_id=7,
                     image_generation_context={"explicit_requested": False},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -913,7 +947,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="transform-body-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         transformed = SimpleNamespace(
@@ -1014,7 +1048,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="transform-cover-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         transformed = SimpleNamespace(
@@ -1043,7 +1077,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         create_version.assert_called_once()
         db.commit.assert_called_once()
 
-    def test_agent_can_view_cover_dimensions_and_fingerprint(self) -> None:
+    def test_multimodal_agent_can_view_cover_preview_dimensions_and_fingerprint(self) -> None:
         source_html = "<section><p>正文保持不变</p></section>"
         source_url = "https://cdn.example.test/current-cover.png"
         document = SimpleNamespace(id=1, wechat_cover_url=source_url)
@@ -1074,8 +1108,8 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="view-cover-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                    model_is_multimodal=False,
-                )
+                    model_is_multimodal=True,
+                 tool_protocol="v1")
             ]
 
         with (
@@ -1088,6 +1122,9 @@ class ImageGenerationApplicationTests(unittest.TestCase):
 
         result = next(event["data"] for event in events if event["event"] == "tool_result" and event["data"]["name"] == "view_article_images")
         item = result["activity"]["details"]["items"][0]
+        self.assertTrue(result["activity"]["details"]["image_content_included"])
+        self.assertEqual(result["activity"]["details"]["viewed_count"], 1)
+        self.assertEqual(item["preview_url"], source_url)
         self.assertEqual((item["width"], item["height"]), (1200, 628))
         self.assertEqual(item["source_fingerprint"], cover_source_fingerprint(source_url))
 
@@ -1156,7 +1193,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-cover-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -1201,7 +1238,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         model = _ScriptedToolModel(script=[{"tool": ("apply_edited_cover", {"generation_id": generation.id, "asset_id": asset.id})}, {"text": "封面已变化。"}], seen_messages=[], bound_tool_names=[])
 
         async def run() -> list[dict[str, Any]]:
-            return [event async for event in run_agent_loop(model, "测试文章", source_html, "应用封面编辑", workspace.map_payload(), None, [], session=HtmlEditSession(source_html), tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="stale-cover-test"), actor_user_id=7, image_generation_context={})]
+            return [event async for event in run_agent_loop(model, "测试文章", source_html, "应用封面编辑", workspace.map_payload(), None, [], session=HtmlEditSession(source_html), tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="stale-cover-test"), actor_user_id=7, image_generation_context={}, tool_protocol="v1")]
 
         with (patch("app.services.chat_agent.SessionLocal", return_value=db), patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0})):
             events = asyncio.run(run())
@@ -1262,7 +1299,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-cover-create-test"),
                     actor_user_id=7,
                     image_generation_context={"image_model_id": 5},
-                )
+                 tool_protocol="v1")
             ]
 
         payload = {"id": created.id, "status": "succeeded", "assets": []}
@@ -1319,7 +1356,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     tool_output_store=ToolOutputStore(document_id=1, session_id=1, run_id="edited-cover-missing-test"),
                     actor_user_id=7,
                     image_generation_context={},
-                )
+                 tool_protocol="v1")
             ]
 
         with (
@@ -1384,7 +1421,7 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                     workspace.map_payload(),
                     None,
                     [],
-                )
+                 tool_protocol="v1")
             ]
 
         events = asyncio.run(run())

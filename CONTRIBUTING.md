@@ -23,6 +23,7 @@ python -m unittest discover -s tests
 cd frontend
 npm run lint
 npm run test
+npm run build:layout-capture-extension
 npm run build
 ```
 
@@ -34,7 +35,7 @@ npm run build
 
 - `.env`、API Key、对象存储凭据、公众号 AppSecret、JWT 密钥或加密密钥；
 - 数据库备份、`backend/data/`、上传的用户文件、真实用户数据或日志；
-- `tmp/`、`debug-artifacts/` 等临时抓取、调试和性能分析产物。
+- `outputs/`、`tmp/`、`debug-artifacts/` 等临时抓取、调试和性能分析产物。
 
 提交前请执行 `git status --short`，并检查新增文件、截图和日志不含敏感信息。安全问题请避免在公开 Issue 中披露可利用细节，并联系项目维护者进行私下协调。
 

@@ -216,13 +216,51 @@ class HtmlWorkspaceTests(unittest.TestCase):
         self.assertEqual(resolved.status, "missing")
         self.assertEqual(resolved.block_id, "")
 
-    def test_read_rejects_oversized_html_without_returning_partial_markup(self) -> None:
+    def test_read_paginates_oversized_block_without_presenting_fragments_as_complete_html(self) -> None:
         source = "<section><p>" + ("很长的正文" * 600) + "</p></section>"
-        workspace = HtmlWorkspace(source, tool_result_max_tokens=180)
+        workspace = HtmlWorkspace(source, tool_result_max_tokens=450)
         block = next(block for block in workspace.blocks if block.tag == "section")
 
-        with self.assertRaisesRegex(WorkspaceError, "未返回不完整 HTML"):
-            workspace.read([block.block_id])
+        fragments: list[str] = []
+        cursor: int | str = 0
+        while True:
+            page = workspace.read([block.block_id], cursor)
+            item = page["blocks"][0]
+            self.assertLessEqual(estimate_tokens(json.dumps(page, ensure_ascii=False, separators=(",", ":"))), 450)
+            self.assertNotIn("html", item)
+            self.assertFalse(item["complete_block"])
+            self.assertEqual(item["fragment_start"], sum(len(fragment) for fragment in fragments))
+            fragments.append(item["html_fragment"])
+            self.assertEqual(item["fragment_end"], sum(len(fragment) for fragment in fragments))
+            if page["next_cursor"] is None:
+                break
+            self.assertIsInstance(page["next_cursor"], str)
+            cursor = page["next_cursor"]
+
+        self.assertGreater(len(fragments), 1)
+        self.assertEqual("".join(fragments), source)
+
+    def test_read_fragment_cursor_rejects_changed_revision_or_block_list(self) -> None:
+        source = "<p>短</p><section><p>" + ("很长的正文" * 300) + "</p></section>"
+        workspace = HtmlWorkspace(source, tool_result_max_tokens=450)
+        short, large = workspace.blocks[0], next(block for block in workspace.blocks if block.tag == "section")
+        block_ids = [short.block_id, large.block_id]
+
+        first = workspace.read(block_ids)
+        self.assertEqual(first["blocks"][0]["html"], "<p>短</p>")
+        self.assertEqual(first["next_cursor"], 1)
+        second = workspace.read(block_ids, first["next_cursor"])
+        self.assertEqual(second["blocks"][0]["fragment_start"], 0)
+        fragment_cursor = second["next_cursor"]
+        self.assertIsInstance(fragment_cursor, str)
+
+        with self.assertRaisesRegex(WorkspaceError, "已失效"):
+            workspace.read([large.block_id, short.block_id], fragment_cursor)
+        with self.assertRaisesRegex(WorkspaceError, "已失效"):
+            workspace.read([large.block_id, large.block_id], fragment_cursor)
+        changed = HtmlWorkspace(source + "<p>新增</p>", tool_result_max_tokens=450)
+        with self.assertRaisesRegex(WorkspaceError, "已失效"):
+            changed.read(block_ids, fragment_cursor)
 
     def test_read_accepts_fourteen_requested_blocks(self) -> None:
         workspace = self.make_workspace("".join(f"<p>段落 {index}</p>" for index in range(14)))
@@ -371,6 +409,23 @@ class HtmlWorkspaceTests(unittest.TestCase):
         self.assertIn("前文：一、活动主题", theme["images"][0]["location_label"])
         self.assertEqual(theme["images"][0]["section"], "一、活动主题")
         self.assertTrue(theme["images"][0]["match_reasons"])
+
+    def test_image_inventory_includes_svg_image_slots(self) -> None:
+        workspace = self.make_workspace(
+            "<section><h2>实验室展示</h2><svg viewBox='0 0 100 50'>"
+            "<image href='https://cdn.example/lab-a.png' />"
+            "<image xlink:href='https://cdn.example/lab-b.png' alt='设备照片' />"
+            "</svg></section>"
+        )
+
+        payload = workspace.image_inventory(query="设备照片", limit=8)
+
+        self.assertEqual(payload["image_count"], 2)
+        self.assertEqual(payload["match_count"], 1)
+        self.assertEqual(payload["images"][0]["slot"], 2)
+        self.assertEqual(payload["images"][0]["kind"], "svg-image")
+        self.assertEqual(payload["images"][0]["source_attribute"], "xlink:href")
+        self.assertNotIn("https://cdn.example/lab-b.png", json.dumps(payload, ensure_ascii=False))
 
     def test_image_inventory_exposes_semantic_metadata_but_not_image_sources(self) -> None:
         secret_url = "https://private.example/assets/should-not-leak.png?token=secret"

@@ -20,7 +20,6 @@ from app.models.chat_session import ChatSession
 from app.services.agent_context import (
     AgentContextBuilder,
     COMPACTION_TARGET_TOKENS,
-    COMPACTION_TRIGGER_RATIO,
     CompactionModelError,
     ContextRecord,
     _normalise_memory,
@@ -170,7 +169,8 @@ class ContextEventLedgerTests(unittest.TestCase):
         builder = self.builder()
         preview = builder.snapshot()
         self.assertTrue(preview["requires_compaction"])
-        self.assertGreaterEqual(preview["raw_input_tokens"], int(self.model.context_compaction_threshold_tokens * COMPACTION_TRIGGER_RATIO))
+        self.assertGreaterEqual(preview["raw_input_tokens"], self.model.context_compaction_threshold_tokens)
+        self.assertEqual(preview["active_context_threshold_tokens"], self.model.context_compaction_threshold_tokens)
         self.assertEqual(preview["compiled_input_tokens"], preview["raw_input_tokens"])
         self.assertLess(preview["projected_used_tokens"], preview["raw_input_tokens"])
         self.assertEqual(

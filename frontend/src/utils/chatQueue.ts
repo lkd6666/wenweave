@@ -1,6 +1,12 @@
+import type { AgentRunStatus } from '../types'
+
 interface QueuedChatItem {
   id: string
   content: string
+}
+
+export function canAdvanceQueuedChat(status: AgentRunStatus | undefined): boolean {
+  return status === 'completed'
 }
 
 export function updateQueuedChatContent<T extends QueuedChatItem>(items: T[], id: string, content: string): T[] {

@@ -18,6 +18,7 @@ from app.models.document import DocumentSourceType
 from app.models.user import User, UserRole
 from app.models.web_article_import import WebArticleImport, WebArticleImportAsset
 from app.schemas.document import WebArticleImportPreviewRequest
+from app.schemas.layout_reference import LayoutCaptureManifest
 from app.services import local_uploads
 from app.services.external_fetch import PublicFetchError, fetch_public_html, normalize_public_https_url
 from app.services.web_article_import import (
@@ -319,6 +320,125 @@ class WebArticleImportTests(unittest.TestCase):
         )
         self.assertIsNone(import_session.cover_asset_id)
         self.assertIn("手动上传", import_session.warnings_json)
+
+    def test_browser_capture_accepts_image_heavy_articles_within_safe_limits(self) -> None:
+        image = local_uploads.inspect_image(PNG)
+        asset_ids = [f"{index:032x}" for index in range(81)]
+        manifest = LayoutCaptureManifest(
+            url="https://mp.weixin.qq.com/s/article",
+            assets=[
+                {"asset_id": asset_id, "content_type": "image/png", "size": len(PNG)}
+                for asset_id in asset_ids
+            ],
+        )
+        self.assertEqual(len(manifest.assets), len(asset_ids))
+
+        capture_session, token = create_web_article_capture_session(
+            "https://mp.weixin.qq.com/s/article",
+            self.user.id,
+            self.db,
+        )
+        source = '<div id="js_content">' + ''.join(
+            f'<img src="layout-capture://{asset_id}">' for asset_id in asset_ids
+        ) + '</div>'
+        import_session, _ = complete_captured_web_article_import(
+            self.db,
+            capture_session.id,
+            token,
+            capture_session.canonical_url,
+            source,
+            "多素材文章",
+            {asset_id: (PNG, image) for asset_id in asset_ids},
+        )
+
+        self.assertEqual(import_session.image_count, len(asset_ids))
+        self.assertEqual(import_session.imported_image_count, len(asset_ids))
+
+    def test_browser_capture_preserves_safe_static_svg_without_executable_content(self) -> None:
+        capture_session, token = create_web_article_capture_session(
+            "https://mp.weixin.qq.com/s/article",
+            self.user.id,
+            self.db,
+        )
+        source = """
+        <div id="js_content"><p>正文</p>
+          <svg viewBox="0 0 10 10" role="img" aria-label="示意图" onclick="alert(1)">
+            <defs><linearGradient id="gradient"><stop offset="0%" stop-color="#fff"/></linearGradient>
+            <filter id="blur"><feGaussianBlur stdDeviation="1"/></filter></defs>
+            <path d="M0 0 L10 10" stroke="url(#gradient)" filter="url(#blur)" onload="alert(2)"/>
+            <script>alert(3)</script><foreignObject>危险内容</foreignObject>
+          </svg>
+        </div>
+        """
+        import_session, _ = complete_captured_web_article_import(
+            self.db,
+            capture_session.id,
+            token,
+            capture_session.canonical_url,
+            source,
+            "矢量图文章",
+            {},
+        )
+
+        html = import_session.html_template.lower()
+        self.assertIn("<svg", html)
+        self.assertIn("<path", html)
+        self.assertIn("<filter", html)
+        self.assertIn("url(#gradient)", html)
+        self.assertNotIn("onclick", html)
+        self.assertNotIn("onload", html)
+        self.assertNotIn("<script", html)
+        self.assertNotIn("foreignobject", html)
+
+    def test_browser_capture_preserves_root_styles_classes_and_svg_picture_resources(self) -> None:
+        capture_session, token = create_web_article_capture_session(
+            "https://mp.weixin.qq.com/s/article", self.user.id, self.db,
+        )
+        asset_id = "a" * 32
+        image = local_uploads.inspect_image(PNG)
+        source = (
+            '<div id="js_content" class="article original" style="--accent:#123456;display:flex;gap:2%;color:var(--accent)" onclick="alert(1)">'
+            '<section style="width:32%;mask-image:url(layout-capture://' + asset_id + ')">'
+            '<svg viewBox="0 0 10 10"><image href="layout-capture://' + asset_id + '" width="10" height="10" onload="alert(2)"/></svg>'
+            '</section></div>'
+        )
+        import_session, _ = complete_captured_web_article_import(
+            self.db, capture_session.id, token, capture_session.canonical_url,
+            source, "原始 HTML", {asset_id: (PNG, image)},
+        )
+        rendered = import_session.html_template
+        self.assertIn('class="article original"', rendered)
+        self.assertIn("--accent:#123456", rendered)
+        self.assertIn("width:32%", rendered)
+        self.assertIn("display:flex", rendered)
+        self.assertIn("mask-image:url", rendered)
+        self.assertIn('<image', rendered)
+        self.assertIn(f'href="web-article-import://asset/{asset_id}"', rendered)
+        self.assertNotIn("onclick", rendered)
+        self.assertNotIn("onload", rendered)
+        self.assertEqual(import_session.image_count, 1)
+
+    def test_capture_keeps_case_sensitive_variables_quoted_values_and_long_author_styles(self) -> None:
+        capture_session, token = create_web_article_capture_session(
+            "https://mp.weixin.qq.com/s/article", self.user.id, self.db,
+        )
+        long_value = "x" * 5000
+        source = (
+            '<div id="js_content" style="--Accent:#123456">'
+            '<p style="--Copy:\'first;last\';--Long:' + long_value + ';color:var(--Accent);display:none">正文</p>'
+            '<svg viewBox="0 0 10 10"><path d="M0 0' + ' L1 1' * 900 + '"/></svg></div>'
+        )
+        import_session, _ = complete_captured_web_article_import(
+            self.db, capture_session.id, token, capture_session.canonical_url,
+            source, "作者声明", {},
+        )
+        rendered = import_session.html_template
+        self.assertIn("--Accent:#123456", rendered)
+        self.assertIn("--Copy:'first;last'", rendered)
+        self.assertIn("--Long:" + long_value, rendered)
+        self.assertIn("color:var(--Accent)", rendered)
+        self.assertIn("display:none", rendered)
+        self.assertIn('d="M0 0' + ' L1 1' * 900 + '"', rendered)
 
     def test_failed_https_image_remains_an_external_link_with_a_warning(self) -> None:
         source = "<html><body><article><h1>文章</h1><p>正文</p><img src=\"https://images.example.com/fail.png\"></article></body></html>"

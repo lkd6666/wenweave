@@ -17,6 +17,15 @@ from app.services.selected_elements import (
 )
 
 
+class ToolModelInputRead(BaseModel):
+    """The provider-visible result paired with one completed tool call."""
+
+    state: Literal["available", "pending", "not_sent", "unavailable"]
+    content: str | None = None
+    truncated: bool = False
+    message: str = ""
+
+
 class ToolExecutionRead(BaseModel):
     id: str
     name: str
@@ -29,6 +38,9 @@ class ToolExecutionRead(BaseModel):
     result: str | None = None
     html_changed: bool = False
     activity: dict[str, Any] | None = None
+    # Old persisted conversations predate this field.  Keep it optional so
+    # they remain readable and the browser can state that it is unavailable.
+    model_input: ToolModelInputRead | None = None
     read_range: "ReadRangeRead | None" = None
     change_summary: "ChangeSummaryRead | None" = None
 
@@ -49,13 +61,18 @@ class ChangeSummaryRead(BaseModel):
 
 
 class ChatContextStatsRead(BaseModel):
+    model_id: int = 0
+    session_id: int = 0
     used_tokens: int = 0
     max_tokens: int = 32768
     usable_tokens: int = 0
+    input_limit_tokens: int = 0
+    token_estimate_multiplier: float = 1.0
     usage_percent: int = 0
     is_estimate: bool = True
     state: str = "ready"
     breakdown: dict[str, int] = Field(default_factory=dict)
+    image_loading: dict[str, Any] = Field(default_factory=dict)
     tool_calls_count: int = 0
     tool_summary_replayed_count: int = 0
     tool_compact_replayed_count: int = 0
@@ -103,6 +120,7 @@ class ChatContextStatsRead(BaseModel):
     input_budget_tokens: int = 0
     last_model_output_tokens: int = 0
     last_model_cached_input_tokens: int = 0
+    last_model_usage_reported: bool = False
     # The raw ledger and the compiled provider request intentionally use
     # different accounting. The latter is the value shown as the primary UI
     # meter because it is what the next model call will actually receive.
@@ -169,6 +187,9 @@ class SelectedElementInput(BaseModel):
     tag_name: str = Field(min_length=1, max_length=64)
     html: str = Field(min_length=1, max_length=MAX_SELECTED_ELEMENT_HTML_CHARS)
     text: str = Field(default="", max_length=MAX_SELECTED_ELEMENT_TEXT_CHARS)
+    kind: Literal["element", "image"] = "element"
+    source_attribute: Literal["src", "href", "xlink:href"] | None = None
+    source_fingerprint: str = Field(default="", max_length=128)
     locator: SelectedElementLocator | None = None
 
     @model_validator(mode="before")
@@ -304,10 +325,10 @@ class ChatSendRequest(BaseModel):
     # ``None`` means an older caller did not send this field; an explicit list
     # is the requested persistent session selection/order.
     template_ids: list[int] | None = Field(default=None, max_length=6)
-    image_attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    image_attachment_ids: list[str] = Field(default_factory=list, max_length=100)
     layout_reference_id: str | None = Field(default=None, min_length=36, max_length=36)
     layout_reference_assets_confirmed: bool = False
-    layout_reference_selected_asset_ids: list[str] = Field(default_factory=list, max_length=50)
+    layout_reference_selected_asset_ids: list[str] = Field(default_factory=list, max_length=200)
     layout_reference_imitation_strength: Literal["style", "structure", "maximum"] = "structure"
     gzh_theme_proposal_id: str | None = Field(default=None, min_length=16, max_length=36)
     reask_from_message_id: int | None = Field(default=None, gt=0)
@@ -337,7 +358,7 @@ class ChatContextPreviewRequest(BaseModel):
     message: str = Field(default="", max_length=get_settings().MAX_CHAT_MESSAGE_CHARS)
     selected_elements: list[SelectedElementInput] = Field(default_factory=list, max_length=12)
     template_ids: list[int] | None = Field(default=None, max_length=6)
-    image_attachment_ids: list[str] = Field(default_factory=list, max_length=5)
+    image_attachment_ids: list[str] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def limit_selected_context(self):

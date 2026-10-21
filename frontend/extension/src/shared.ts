@@ -4,7 +4,10 @@ export const APP_ORIGINS = typeof __LAYOUT_CAPTURE_ALLOWED_APP_ORIGINS__ !== 'un
   : ['http://localhost:5173', 'http://127.0.0.1:5173']
 export const LAYOUT_CAPTURE_CHANNEL = 'yibanpaiban-layout-capture-v1'
 export const SESSION_STORAGE_KEY = 'layoutCaptureSession'
-export const MAX_CAPTURE_ASSETS = 50
+// Image-heavy official-account articles commonly exceed 50 distinct assets.
+// The byte limits below remain the primary resource guard; this count prevents
+// an unusually fragmented article from creating an unbounded multipart upload.
+export const MAX_CAPTURE_ASSETS = 200
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 export const MAX_TOTAL_IMAGE_BYTES = 50 * 1024 * 1024
 export const MAX_HTML_BYTES = 5 * 1024 * 1024
@@ -146,6 +149,13 @@ export function isAllowedWechatAssetUrl(rawUrl: string): boolean {
   } catch {
     return false
   }
+}
+
+export function isAllowedCaptureAssetUrl(rawUrl: string): boolean {
+  // Embedded raster images are part of source HTML too. SVG markup is kept as
+  // DOM and sanitized by the server, rather than accepted as a binary image.
+  return /^data:image\/(?:png|jpeg|jpg|gif|webp|avif|bmp);base64,[a-z0-9+/=\s]+$/i.test(rawUrl)
+    || isAllowedWechatAssetUrl(rawUrl)
 }
 
 export function extensionErrorMessage(error: unknown): string {

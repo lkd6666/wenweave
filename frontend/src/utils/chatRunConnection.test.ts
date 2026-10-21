@@ -2,11 +2,22 @@ import { describe, expect, it } from 'vitest'
 import {
   createChatRunConnection,
   detachChatRunConnection,
+  ownsChatRunConnection,
   requestChatRunStop,
   retireChatRunConnection,
 } from './chatRunConnection'
 
 describe('chat run connection lifecycle', () => {
+  it('allows callbacks only from the attached current document connection', () => {
+    const oldConnection = createChatRunConnection()
+    const currentConnection = createChatRunConnection()
+    expect(ownsChatRunConnection(currentConnection, currentConnection, 12, 12)).toBe(true)
+    expect(ownsChatRunConnection(oldConnection, currentConnection, 12, 12)).toBe(false)
+    expect(ownsChatRunConnection(currentConnection, currentConnection, 12, 13)).toBe(false)
+    expect(ownsChatRunConnection(currentConnection, currentConnection, 12, null)).toBe(false)
+    detachChatRunConnection(currentConnection)
+    expect(ownsChatRunConnection(currentConnection, currentConnection, 12, 12)).toBe(false)
+  })
   it('keeps an in-flight start request alive when the editor page detaches', () => {
     const connection = createChatRunConnection()
 

@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401
+from app import bootstrap
 from app.api.routes import documents
 from app.db.base import Base
 from app.models.document import Document
@@ -64,6 +65,57 @@ class DocumentVersionStorageTests(unittest.TestCase):
     def large_html() -> str:
         paragraphs = [f"<p data-index='{index}'>正文 {index:04d} - {index * 7919:08x}</p>" for index in range(900)]
         return "<section>" + "".join(paragraphs) + "</section>"
+
+    def test_startup_migration_persists_legacy_versions_and_is_idempotent(self) -> None:
+        original_html = self.large_html()
+        document = self.make_document(original_html)
+        version = DocumentVersion(
+            document_id=document.id, version_number=1, title=document.title,
+            html=original_html, source=DocumentVersionSource.INITIAL, created_by_id=self.user.id,
+        )
+        self.db.add(version)
+        self.db.commit()
+        version_id = version.id
+        self.db.close()
+
+        with patch.object(bootstrap, "engine", self.engine):
+            bootstrap.migrate_schema()
+            with self.Session() as verification_db:
+                migrated = verification_db.get(DocumentVersion, version_id)
+                self.assertIsNotNone(migrated.content_object_id)
+                self.assertEqual(migrated.html, "")
+                self.assertEqual(materialize_document_version(verification_db, migrated), original_html)
+                object_id = migrated.content_object_id
+                object_count = verification_db.query(DocumentContentObject).count()
+            bootstrap.migrate_schema()
+            with self.Session() as verification_db:
+                migrated = verification_db.get(DocumentVersion, version_id)
+                self.assertEqual(migrated.content_object_id, object_id)
+                self.assertEqual(materialize_document_version(verification_db, migrated), original_html)
+                self.assertEqual(verification_db.query(DocumentContentObject).count(), object_count)
+
+    def test_version_migration_still_rolls_back_with_outer_transaction(self) -> None:
+        original_html = "<p>迁移失败时保留原始版本</p>"
+        document = self.make_document(original_html)
+        version = DocumentVersion(
+            document_id=document.id, version_number=1, title=document.title,
+            html=original_html, source=DocumentVersionSource.INITIAL, created_by_id=self.user.id,
+        )
+        self.db.add(version)
+        self.db.commit()
+        version_id = version.id
+        self.db.close()
+        with (
+            patch.object(bootstrap, "engine", self.engine),
+            patch.object(bootstrap, "repair_document_activity_timestamps", side_effect=RuntimeError("later migration failed")),
+            self.assertRaisesRegex(RuntimeError, "later migration failed"),
+        ):
+            bootstrap.migrate_schema()
+        with self.Session() as verification_db:
+            original = verification_db.get(DocumentVersion, version_id)
+            self.assertIsNone(original.content_object_id)
+            self.assertEqual(original.html, original_html)
+            self.assertEqual(verification_db.query(DocumentContentObject).count(), 0)
 
     def test_reuses_identical_content_and_reconstructs_delta(self) -> None:
         base_html = self.large_html()

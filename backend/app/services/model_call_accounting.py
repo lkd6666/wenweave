@@ -60,7 +60,30 @@ def _usage_candidates(message: BaseMessage | object) -> list[Mapping[str, object
     return candidates
 
 
-def _usage_from_mapping(usage: Mapping[str, object]) -> ModelUsage | None:
+def _cache_tokens(usage: Mapping[str, object], *, write: bool) -> int | None:
+    details = [
+        mapping for key in ("input_token_details", "input_tokens_details", "prompt_tokens_details")
+        if (mapping := _usage_mapping(usage.get(key))) is not None
+    ]
+    names = (
+        ("cache_creation", "cache_creation_tokens", "cache_creation_input_tokens", "cache_write_tokens")
+        if write else
+        ("cache_read", "cache_read_tokens", "cache_read_input_tokens", "cached_tokens", "cached_input_tokens", "prompt_cache_hit_tokens")
+    )
+    for mapping in [*details, usage]:
+        value = _first_token(mapping, *names)
+        if value is not None:
+            return value
+    for mapping in [*details, usage]:
+        # Tier counters are aliases of the aggregate, not additional tokens.
+        tiers = [_first_token(mapping, f"{tier}_{'cache_creation' if write else 'cache_read'}")
+                 for tier in ("priority", "flex")]
+        if any(value is not None for value in tiers):
+            return sum(value or 0 for value in tiers)
+    return None
+
+
+def _usage_fields(usage: Mapping[str, object]) -> tuple[int | None, int | None, int | None, int | None]:
     # LangChain normalizes OpenAI and Anthropic usage into ``input_tokens`` /
     # ``output_tokens``. Some compatible gateways preserve their native
     # response in ``response_metadata`` instead, where OpenAI calls them
@@ -73,44 +96,22 @@ def _usage_from_mapping(usage: Mapping[str, object]) -> ModelUsage | None:
         "candidates_token_count",
         "completion_token_count",
     )
+    cache_read = _cache_tokens(usage, write=False)
+    cache_write = _cache_tokens(usage, write=True)
+    # Anthropic native input_tokens counts only uncached input. LangChain's
+    # input_token_details representation already includes reads and writes.
+    if input_tokens is not None and _usage_mapping(usage.get("input_token_details")) is None:
+        native_read = _first_token(usage, "cache_read_input_tokens")
+        native_write = _first_token(usage, "cache_creation_input_tokens")
+        if native_read is not None or native_write is not None:
+            input_tokens += (native_read or 0) + (native_write or 0)
+    return input_tokens, output_tokens, cache_read, cache_write
+
+
+def _usage_from_mapping(usage: Mapping[str, object]) -> ModelUsage | None:
+    input_tokens, output_tokens, cache_read, cache_write = _usage_fields(usage)
     if input_tokens is None or output_tokens is None or input_tokens <= 0:
         return None
-
-    details = (
-        _usage_mapping(usage.get("input_token_details"))
-        or _usage_mapping(usage.get("input_tokens_details"))
-        or _usage_mapping(usage.get("prompt_tokens_details"))
-        or {}
-    )
-    cache_read = _first_token(
-        details,
-        "cache_read",
-        "cache_read_tokens",
-        "cache_read_input_tokens",
-        "cached_tokens",
-    )
-    if cache_read is None:
-        cache_read = _first_token(
-            usage,
-            "cache_read_tokens",
-            "cache_read_input_tokens",
-            "cached_tokens",
-            "cached_input_tokens",
-        )
-    cache_write = _first_token(
-        details,
-        "cache_creation",
-        "cache_creation_tokens",
-        "cache_creation_input_tokens",
-        "cache_write_tokens",
-    )
-    if cache_write is None:
-        cache_write = _first_token(
-            usage,
-            "cache_creation_tokens",
-            "cache_creation_input_tokens",
-            "cache_write_tokens",
-        )
     return ModelUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -121,11 +122,15 @@ def _usage_from_mapping(usage: Mapping[str, object]) -> ModelUsage | None:
 
 def usage_from_message(message: BaseMessage | object) -> ModelUsage | None:
     """Read provider-reported usage without replacing missing values by estimates."""
+    fields: list[int | None] = [None, None, None, None]
     for usage in _usage_candidates(message):
-        parsed = _usage_from_mapping(usage)
-        if parsed is not None:
-            return parsed
-    return None
+        for index, value in enumerate(_usage_fields(usage)):
+            if fields[index] is None and value is not None:
+                fields[index] = value
+    input_tokens, output_tokens, cache_read, cache_write = fields
+    if input_tokens is None or output_tokens is None or input_tokens <= 0:
+        return None
+    return ModelUsage(input_tokens, output_tokens, cache_read or 0, cache_write or 0)
 
 
 class ModelCallTracker:

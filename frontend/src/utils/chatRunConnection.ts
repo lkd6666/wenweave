@@ -16,6 +16,15 @@ export function createChatRunConnection(): ChatRunConnection {
   }
 }
 
+export function ownsChatRunConnection(
+  connection: ChatRunConnection,
+  currentConnection: ChatRunConnection | null,
+  documentId: number,
+  attachedDocumentId: number | null,
+): boolean {
+  return currentConnection === connection && !connection.detached && documentId === attachedDocumentId
+}
+
 /** Release page-owned resources without cancelling a run accepted by the server. */
 export function detachChatRunConnection(connection: ChatRunConnection | null): void {
   if (!connection) return

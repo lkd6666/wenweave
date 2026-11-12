@@ -195,12 +195,12 @@ _third_party/       保留许可与来源记录的第三方快照
 | 前端开发、代理与扩展构建       | [前端说明](frontend/README.md)                                                                           |
 | Linux / 宝塔生产部署           | [Linux 部署](docs/DEPLOY_LINUX.md) · [宝塔部署](docs/DEPLOY_BAOTA.md)                                    |
 | Chrome / Edge 排版采集助手     | [构建、安装与企业分发](deploy/layout-capture-extension.md)                                               |
-| 源码工具、授权边界与旧协议回退 | [源码 Agent](docs/SOURCE_AGENT.md) · [历史验收记录](docs/SOURCE_AGENT_ACCEPTANCE.md)                     |
-| 上下文预算、压缩、图片与恢复   | [上下文管理](docs/CONTEXT_MANAGEMENT.md) · [预检性能](docs/CONTEXT_PERFORMANCE.md)                       |
+| 源码工具、授权边界与旧协议回退 | [源码 Agent](docs/SOURCE_AGENT.md)                                                                     |
+| 上下文预算、压缩、图片与恢复   | [上下文管理](docs/CONTEXT_MANAGEMENT.md)                                                                |
 | 模型提示缓存与用量统计         | [提示缓存优化](docs/PROMPT_CACHE_OPTIMIZATION.md)                                                        |
 | 小内存资源配置与性能复测       | [2 核 2 GiB 部署](docs/PERFORMANCE_2G.md)                                                                |
 | 微信规范与生成提示约束         | [规则维护说明](docs/WECHAT_PROMPT_RULES.md)                                                              |
-| 搜图、贡献与第三方许可         | [SearXNG](deploy/searxng/README.md) · [贡献指南](CONTRIBUTING.md) · [第三方声明](THIRD_PARTY_NOTICES.md) |
+| 搜图与第三方许可               | [SearXNG](deploy/searxng/README.md) · [第三方声明](THIRD_PARTY_NOTICES.md)                                |
 
 ## 关于作者与维护
 
@@ -208,7 +208,7 @@ _third_party/       保留许可与来源记录的第三方快照
 
 ## 贡献
 
-欢迎通过 Issue 反馈问题，并以 Pull Request 提交改进。提交前请阅读[贡献指南](CONTRIBUTING.md)，并确保相关检查通过。请不要在 Issue、日志、截图或提交记录中泄露访问令牌、用户数据、公众号凭据或其他敏感信息。
+欢迎通过 Issue 反馈问题，并以 Pull Request 提交改进。提交前请运行与修改相关的检查，并保留现有版权及许可证声明。请不要在 Issue、日志、截图或提交记录中泄露访问令牌、用户数据、公众号凭据或其他敏感信息。
 
 ## 第三方组件、合规与免责声明
 

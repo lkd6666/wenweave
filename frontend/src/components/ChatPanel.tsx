@@ -217,9 +217,8 @@ interface TaskPlan {
   items: TaskPlanItem[]
 }
 
-// AssistantTurnTimeline.vue renders every live delta through its Markdown
-// renderer. Keep that behavior so inline Markdown such as **bold** is never
-// shown as literal source while the Agent is still streaming.
+// Render every live delta as Markdown so inline formatting is visible
+// while the Agent is still streaming.
 const StreamingMarkdownContent = memo(function StreamingMarkdownContent({ content }: { content: string }) {
   return <MemoMarkdownContent content={content} streaming />
 })

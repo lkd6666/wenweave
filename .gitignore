@@ -45,6 +45,21 @@ backend/sse_raw_output.txt
 # Local snapshots of WeChat editor frontend assets (not for distribution)
 wechatediter/
 
+# Local development references and reports
+/sync_to_wechat.js
+/AGENT_ROBUSTNESS_AUDIT.md
+/AiChat.vue
+/AssistantTurnTimeline.vue
+/CONTRIBUTING.md
+/docs/CONTEXT_PERFORMANCE.md
+/docs/SOURCE_AGENT_ACCEPTANCE.md
+/docs/TERMINAL_RECOVERY.md
+/docs/WAITING_QUESTION_AUDIT.md
+/docs/performance-*-local.json
+/docs/context-management.html
+/docs/pasted-content.html
+/docs/retry-recovery.html
+
 # Local tooling and generated delivery artifacts
 .claude/
 .agents/

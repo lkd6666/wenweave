@@ -1,6 +1,6 @@
-# 2 核 2 GiB 性能优化与验收记录
+# 2 核 2 GiB 部署与资源检查
 
-本轮目标环境是单 Uvicorn worker、MySQL 与 SearXNG 同机、同时 1–2 个排版任务。建议将 Agent 全局并发设为 2、单用户并发设为 1，使用 SQLAlchemy 连接池 5 且无 overflow、SearXNG 单 worker/单线程/320 MiB 上限。应用的 Agent 并发默认值是 10 / 3，小内存部署须在 `backend/.env` 中显式覆盖：
+建议部署环境为单 Uvicorn worker、MySQL 与 SearXNG 同机、同时 1–2 个排版任务。建议将 Agent 全局并发设为 2、单用户并发设为 1，使用 SQLAlchemy 连接池 5 且无 overflow、SearXNG 单 worker/单线程/320 MiB 上限。应用的 Agent 并发默认值是 10 / 3，小内存部署须在 `backend/.env` 中显式覆盖：
 
 ```dotenv
 CHAT_AGENT_MAX_CONCURRENT_RUNS=2
@@ -10,39 +10,6 @@ DATABASE_MAX_OVERFLOW=0
 ```
 
 MySQL 小内存起点见 [`deploy/mysql-2g.cnf.example`](../deploy/mysql-2g.cnf.example)。
-
-## 已完成的可重复本机对比
-
-以下数据在 2026-09-22 的 Windows 开发机、项目虚拟环境中产生。它只度量本地流式处理 CPU，不包含模型网络等待，因此不会把外部模型波动算作收益。原始 JSON 保存在 `docs/performance-runtime-local.json`。
-
-运行命令：
-
-```powershell
-cd backend
-.\venv\Scripts\python.exe scripts\benchmark_runtime_performance.py `
-  --html-chars 524288 --fragment-chars 2048 --rounds 3 `
-  --output ..\docs\performance-runtime-local.json
-```
-
-固定 512 KiB HTML 参数被拆成 264 个分片。旧路径每个分片都尝试完整 JSON 解析并计算 token；新路径增量扫描 JSON，只在完整候选出现时解析，并按 250 ms 展示节奏及流结束边界计算 token。
-
-| 指标 | 优化前 | 优化后 | 变化 |
-| --- | ---: | ---: | ---: |
-| 本地 CPU 中位数 | 4.391 s | 0.125 s | 降低 97.2% |
-| 10 个同用户闲置 SSE 的稳态通知查询 | 10 次/秒 | 1 次/秒 | 降低 90% |
-| 无通知订阅者 | 0 次/秒 | 0 次/秒 | 保持为 0 |
-| 单个执行任务的租约续写 | 120 次/分钟 | 6 次/分钟 | 降低 95% |
-
-通知和租约数据来自调度频率及自动化回归：通知测试验证 10 个标签页共享 broker、多个用户同轮只执行一条带权限过滤的 SELECT、最后一个订阅者离开后停止轮询；控制测试验证取消仍每 0.5 秒读取，而 42 次取消检查只触发 2 次续租。SQL 读写数量应在目标 MySQL 上再次用 `performance_schema.events_statements_summary_by_digest` 或慢查询采样核对。
-
-快速模型分片另用 `scripts/benchmark_fast_model_stream.py` 测量。这个基准覆盖此前大参数测试没有覆盖的两条路径：兼容网关反复发送累计工具参数前缀，以及模型把普通文本拆成大量单字 chunk。结果保存在 `docs/performance-fast-stream-local.json`。
-
-| 快速流场景 | 优化前 CPU 中位数 | 优化后 CPU 中位数 | 变化 |
-| --- | ---: | ---: | ---: |
-| 65,596 字符累计工具参数，2,050 个前缀 | 0.453 s | 0.031 s | 降低 93.1% |
-| 20,000 个单字文本 chunk | 0.578 s | 0.031 s | 降低 94.6% |
-
-工具参数超时检测现在只保留每个工具的最新定长签名，不再序列化并缓存全部历史前缀。文本和思考流按 40 ms 或 2,048 字符合并；响应 chunk 按 128 条分段汇总，服务端时间线在段落结束时一次拼接。HTTP API、SSE 事件名称、事件顺序和最终正文保持不变。
 
 ## 目标机整机复测
 

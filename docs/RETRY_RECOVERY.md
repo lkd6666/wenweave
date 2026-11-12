@@ -66,7 +66,3 @@ SSE 的失败计数只在收到近期实际输出或连接健康持续至少 10 
 模型设置来自 `backend/app/core/config.py`：CHAT_AGENT_MODEL_RETRY_MAX_ATTEMPTS、CHAT_AGENT_MODEL_RETRY_BASE_SECONDS、CHAT_AGENT_MODEL_RETRY_MAX_DELAY_SECONDS、CHAT_AGENT_MODEL_RETRY_MAX_ELAPSED_SECONDS。变更这些环境变量需按项目原有方式重新加载进程。
 
 测试涵盖 HTTP 日期/毫秒、抖动上限、永久错误、取消、次数/时间预算、摘要格式重试、分批快照原子性、局部流撤回、手动压缩 SSE 与断线取消、前端倒计时、确认结果幂等键及 SSE 序号恢复。测试使用离线故障注入；本次没有调用付费供应商制造真实故障，也没有部署或重启服务。
-
-验收记录：主版全量后端 1073 通过 / 1 跳过、前端 306 通过；SMS 全量后端 1095 通过 / 1 跳过、前端 321 通过。全量检查之后新增的手动压缩流、停止原因与界面保护修改另做专项回归；两个版本均完成生产构建和 lint（保留已有警告）。真实编辑器在桌面与手机 Chromium 中完成了“503 + Retry-After → 同一幂等键重试 → 成功恢复”的故障注入验证。
-
-交互示意：[retry-recovery.html](retry-recovery.html)。

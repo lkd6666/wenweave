@@ -12,6 +12,7 @@ from datetime import timezone
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
+from app.services.retry_policy import retry_safe_read
 import jwt
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -178,6 +179,10 @@ def _searx_image_proxy_url(source_url: str, base_url: str | None = None) -> str:
 
 
 async def _fetch_internal_proxy(client: httpx.AsyncClient, proxy_url: str) -> tuple[bytes, local_uploads.ImageInfo]:
+    return await retry_safe_read(lambda: _fetch_internal_proxy_once(client, proxy_url), tool="fetch_image_proxy")
+
+
+async def _fetch_internal_proxy_once(client: httpx.AsyncClient, proxy_url: str) -> tuple[bytes, local_uploads.ImageInfo]:
     try:
         async with client.stream(
             "GET",
@@ -185,7 +190,10 @@ async def _fetch_internal_proxy(client: httpx.AsyncClient, proxy_url: str) -> tu
             headers={"Accept": "image/*", "X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"},
         ) as response:
             if response.status_code >= 400:
-                raise ImageSearchError(f"图片代理不可用（HTTP {response.status_code}）")
+                error = ImageSearchError(f"图片代理不可用（HTTP {response.status_code}）")
+                error.status_code = response.status_code
+                error.headers = response.headers
+                raise error
             body = bytearray()
             async for chunk in response.aiter_bytes():
                 body.extend(chunk)
@@ -285,11 +293,16 @@ async def _fetch_search_page(
     }
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-            response = await client.get(
+            async def fetch_page():
+                response = await client.get(
                 f"{base_url}/search",
                 params=params,
                 headers={"Accept": "application/json", "X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"},
-            )
+                )
+                if response.status_code >= 400:
+                    response.raise_for_status()
+                return response
+            response = await retry_safe_read(fetch_page, tool="search_article_images")
             if response.status_code >= 400:
                 raise ImageSearchError(f"搜图服务暂时不可用（HTTP {response.status_code}）")
             if len(response.content) > MAX_SEARCH_RESPONSE_BYTES:
@@ -302,6 +315,8 @@ async def _fetch_search_page(
         raise
     except httpx.RequestError as exc:
         raise ImageSearchError("搜图服务暂时不可用") from exc
+    except httpx.HTTPStatusError as exc:
+        raise ImageSearchError(f"搜图服务暂时不可用（HTTP {exc.response.status_code}）") from exc
     return _store_cached_page(
         query,
         page,
@@ -777,16 +792,7 @@ async def fetch_candidate_image(candidate: ImageSearchCandidate) -> tuple[bytes,
             proxy_url = _searx_image_proxy_url(candidate.image_url)
             if not proxy_url:
                 raise direct_error
-            # The proxy occasionally races a remote thumbnail/image origin.
-            # A short retry avoids forcing the Agent to duplicate a valid
-            # candidate token while keeping the normal per-image timeout.
-            for attempt in range(2):
-                try:
-                    return await _fetch_internal_proxy(client, proxy_url)
-                except ImageSearchError:
-                    if attempt:
-                        raise
-                    await asyncio.sleep(0.2)
+            return await _fetch_internal_proxy(client, proxy_url)
     raise ImageSearchError("图片下载失败")
 
 

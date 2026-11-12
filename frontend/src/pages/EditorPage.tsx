@@ -7,6 +7,7 @@ import ChatPanel, { type ChatRunNotice, type QueuedChatMessage, type ReaskConfli
 import type { UserQuestionAnswer } from '../components/UserQuestionPanel'
 import PreviewFrame from '../components/PreviewFrame'
 import type { PreviewFrameHandle, PreviewMode } from '../components/PreviewFrame'
+import type { HtmlValidationReport } from '../types'
 import CompliancePanel from '../components/CompliancePanel'
 import VersionHistoryDrawer from '../components/VersionHistoryDrawer'
 import TemplateLibraryPanel, { type ResourceTab } from '../components/TemplateLibraryPanel'
@@ -20,13 +21,18 @@ import { wechatAccountsApi } from '../api/wechatAccounts'
 import { MAX_CHAT_IMAGES_PER_MESSAGE, cancelChatRun, chatApi, reaskDocumentConflictFromError, reaskSourceUnavailableFromError, startChatRun, streamChatRunEvents } from '../api/chat'
 import type { AgentRunTimeline, ReaskConflictResolution, ThinkingEffort, ThinkingMode } from '../api/chat'
 import { ApiError } from '../api/client'
+import { abortableDelay, isRetryable, retryDelayMs } from '../utils/retry'
+import { retryNotice } from '../utils/retryNotice'
 import type { UploadProgress } from '../api/client'
 import { runImageUploads } from '../utils/imageUpload'
 import useImageUploadProgress from '../hooks/useImageUploadProgress'
+import { useChatTextAttachments } from '../hooks/useChatTextAttachments'
+import type { ChatTextAttachment } from '../types'
 import type { AIModelItem, AssistantTurnBlock, ChatContextStats, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ComplianceReport, GzhThemeProposal, LayoutReferenceImitationStrength, LayoutReferencePreview, PreviewImageTarget, ReasoningTrace, SelectedElementContext, TemplateItem, ToolActivity, ToolExecution, VisibilitySettings, WeChatAvailableAccount } from '../types'
 import { sanitizeSelectedElement, sanitizeSelectedElements } from '../utils/selectedElements'
 import { prepareWeChatBodyImage } from '../utils/wechatBodyImage'
 import { clearChatComposerDraft, clearChatComposerDraftForRequest, readChatComposerDraft, writeChatComposerDraft } from '../utils/chatComposerDraft'
+import { orderMessageTemplates, restoreComposerTemplates } from '../utils/templateReferences'
 import { canAdvanceQueuedChat, moveQueuedChatItem, updateQueuedChatContent } from '../utils/chatQueue'
 import { createChatRunConnection, detachChatRunConnection, ownsChatRunConnection, requestChatRunStop, retireChatRunConnection } from '../utils/chatRunConnection'
 import type { ChatRunConnection } from '../utils/chatRunConnection'
@@ -134,7 +140,9 @@ interface QueuedChatRequest extends QueuedChatMessage {
   sessionId: number
   references: SelectedElementContext[]
   images: ChatImageAttachment[]
+  texts: ChatTextAttachment[]
   templates: TemplateItem[]
+  referencedTemplates: TemplateItem[]
   modelId: number
   thinkingMode: ThinkingMode
   thinkingEffort: ThinkingEffort
@@ -145,6 +153,8 @@ interface ChatRunOptions {
   thinkingMode: ThinkingMode
   thinkingEffort: ThinkingEffort
   templates?: TemplateItem[]
+  referencedTemplates?: TemplateItem[]
+  textAttachments?: ChatTextAttachment[]
 }
 
 export function getComplianceButtonStatus(
@@ -376,27 +386,6 @@ function createClientRequestId(): string {
   return `run-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
-function waitForReconnect(attempt: number, signal: AbortSignal): Promise<void> {
-  const delay = Math.min(5000, 400 * 2 ** (attempt - 1))
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(cleanupAndResolve, delay)
-    const abort = () => {
-      window.clearTimeout(timer)
-      cleanup()
-      reject(new DOMException('请求已取消', 'AbortError'))
-    }
-    const cleanup = () => signal.removeEventListener('abort', abort)
-    function cleanupAndResolve() {
-      cleanup()
-      resolve()
-    }
-    if (signal.aborted) {
-      abort()
-      return
-    }
-    signal.addEventListener('abort', abort, { once: true })
-  })
-}
 
 function codePointWidth(value: string, index: number): number {
   return (value.codePointAt(index) ?? 0) > 0xffff ? 2 : 1
@@ -548,13 +537,20 @@ export default function EditorPage() {
   const [streamText, setStreamText] = useState('')
   const [toolActivities, setToolActivities] = useState<ToolExecution[]>([])
   const [streamBlocks, setStreamBlocks] = useState<AssistantTurnBlock[]>([])
+  const compactionControllerRef = useRef<AbortController | null>(null)
   const [streamNotice, setStreamNotice] = useState<ChatRunNotice | null>(null)
+  const [recoveryNotice, setRecoveryNotice] = useState<ChatRunNotice | null>(null)
+  const [recoveryCheck, setRecoveryCheck] = useState(0)
+  const recoveredCheckRef = useRef(0)
   const [conversationError, setConversationError] = useState<string | null>(null)
+  const chatTexts = useChatTextAttachments(docId || undefined, activeChatSessionId)
+  const { restore: restoreChatTexts, detach: detachChatTexts } = chatTexts
   const [chatSubmitting, setChatSubmitting] = useState(false)
   const [queuedChatRequests, setQueuedChatRequests] = useState<QueuedChatRequest[]>([])
   const [chatQueuePaused, setChatQueuePaused] = useState(false)
   const [pendingUserQuestion, setPendingUserQuestion] = useState<ChatUserQuestion | null>(null)
   const [questionSubmitting, setQuestionSubmitting] = useState(false)
+  const documentEditingLocked = streaming || Boolean(pendingUserQuestion) || questionSubmitting
   const [reaskConflict, setReaskConflict] = useState<ReaskConflictState | null>(null)
   const [resolvingReaskConflict, setResolvingReaskConflict] = useState(false)
 
@@ -564,7 +560,7 @@ export default function EditorPage() {
   const [previewMode, setPreviewMode] = useState<PreviewMode>('browse')
   const [previewBrightness, setPreviewBrightness] = useState(100)
   const [previewDarkMode, setPreviewDarkMode] = useState(false)
-  const effectivePreviewMode = previewMode === 'edit' && (streaming || localizingArticleImages) ? 'select' : previewMode
+  const effectivePreviewMode = previewMode === 'edit' && (documentEditingLocked || localizingArticleImages) ? 'select' : previewMode
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState === 'visible')
   const [editHistoryState, setEditHistoryState] = useState({ canUndo: false, canRedo: false })
   const [selectedElements, setSelectedElements] = useState<SelectedElementContext[]>([])
@@ -612,12 +608,17 @@ export default function EditorPage() {
   const questionTimeoutRecoveryRef = useRef<string | null>(null)
   const pendingUserQuestionRef = useRef(pendingUserQuestion)
   pendingUserQuestionRef.current = pendingUserQuestion
+  const documentEditingLockedRef = useRef(documentEditingLocked)
+  const documentMutationEpochRef = useRef(0)
+  if (documentEditingLockedRef.current !== documentEditingLocked) documentMutationEpochRef.current += 1
+  documentEditingLockedRef.current = documentEditingLocked
   const columnsRef = useRef<HTMLDivElement>(null)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
   const htmlRef = useRef('')
   const draftHtmlRef = useRef('')
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const saveRequestRef = useRef<Promise<string | null> | null>(null)
+  const savedHtmlValidationRef = useRef<{ html: string; report: HtmlValidationReport | null } | null>(null)
   const previewFrameRef = useRef<PreviewFrameHandle>(null)
   const codeViewerHtmlRef = useRef('')
   const creatingChatSessionRef = useRef(false)
@@ -643,15 +644,30 @@ export default function EditorPage() {
   chatImagesRef.current = chatImages
   queuedChatRequestsRef.current = queuedChatRequests
   const activeChatSession = chatSessions.find((item) => item.id === activeChatSessionId) ?? null
+  useEffect(() => {
+    if (!docId || !activeChatSessionId) return
+    const saved = readChatComposerDraft(docId, activeChatSessionId)
+    if (saved?.textAttachments && ['editing', 'retry'].includes(saved.phase)) restoreChatTexts(saved.textAttachments)
+    // The attachment hook owns the current session lifetime.
+  }, [docId, activeChatSessionId, restoreChatTexts])
+
   const versionCopyDefaults = useMemo(() => ({ group_id: documentGroupId, ...documentVisibility }), [documentGroupId, documentVisibility])
 
   useEffect(() => () => resizeCleanupRef.current?.(), [])
+  useEffect(() => () => {
+    compactionControllerRef.current?.abort()
+    compactionControllerRef.current = null
+  }, [docId, activeChatSessionId])
 
   const cancelAutoSave = useCallback(() => {
     if (!autoSaveTimerRef.current) return
     clearTimeout(autoSaveTimerRef.current)
     autoSaveTimerRef.current = null
   }, [])
+
+  useEffect(() => {
+    if (documentEditingLocked) cancelAutoSave()
+  }, [cancelAutoSave, documentEditingLocked])
 
   const applyExternalHtml = useCallback((nextHtml: string) => {
     // AI、加载和版本恢复已由各自服务端流程持久化，不应进入手动自动保存队列。
@@ -686,6 +702,8 @@ export default function EditorPage() {
         // key instead of replaying the same failed request.
         const retry = {
           message: saved.message,
+          textAttachments: saved.textAttachments,
+          templateRefs: saved.templateRefs,
           reaskFromMessageId: saved.reaskFromMessageId,
           phase: 'retry' as const,
         }
@@ -705,20 +723,25 @@ export default function EditorPage() {
   useEffect(() => {
     if (!docId || !activeChatSessionId || loading || chatSubmitting) return
     const saved = readChatComposerDraft(docId, activeChatSessionId)
-    if (!contextDraft.trim()) {
+    const readyTexts = chatTexts.items.filter(item => item.status !== 'uploading' && item.status !== 'error')
+    if (!contextDraft.trim() && !readyTexts.length && !composerTemplates.length) {
       if (saved?.phase === 'editing' || saved?.phase === 'retry') clearChatComposerDraft(docId, activeChatSessionId)
       return
     }
     const retainRetryIdentity = saved?.phase === 'retry'
       && saved.message === contextDraft
       && saved.reaskFromMessageId === pendingReaskMessageId
+      && JSON.stringify((saved.textAttachments ?? []).map(item => item.id)) === JSON.stringify(readyTexts.map(item => item.id))
+      && JSON.stringify((saved.templateRefs ?? []).map(item => item.id)) === JSON.stringify(composerTemplates.map(item => item.id))
     writeChatComposerDraft(docId, activeChatSessionId, {
       message: contextDraft,
+      textAttachments: readyTexts,
+      templateRefs: composerTemplates.map(({ id, name }) => ({ id, name })),
       reaskFromMessageId: pendingReaskMessageId,
       phase: retainRetryIdentity ? 'retry' : 'editing',
       ...(retainRetryIdentity && saved.clientRequestId ? { clientRequestId: saved.clientRequestId } : {}),
     })
-  }, [activeChatSessionId, chatSubmitting, contextDraft, docId, loading, pendingReaskMessageId])
+  }, [activeChatSessionId, chatSubmitting, chatTexts.items, composerTemplates, contextDraft, docId, loading, pendingReaskMessageId])
 
   const handleChatPaneResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (!event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0) || window.matchMedia('(max-width: 720px)').matches) return
@@ -914,7 +937,7 @@ export default function EditorPage() {
       setChatSessions(sessions)
       setActiveChatSessionId(activeSession?.id ?? null)
       setAttachedTemplates(activeSession?.attached_templates ?? [])
-      setComposerTemplates([])
+      setComposerTemplates(restoreComposerTemplates(restoredComposerDraft?.templateRefs))
       setTemplateAttachmentsUpdating(false)
       templateAttachmentUpdateRef.current = false
       setContextDraft(restoredComposerDraft?.message ?? '')
@@ -1002,16 +1025,20 @@ export default function EditorPage() {
     attachedEditorDocumentRef.current = docId ?? null
     chatStartInProgressRef.current = false
     saveRequestRef.current = null
+    savedHtmlValidationRef.current = null
     activeRunRef.current = null
     resumedRunRef.current = null
     setChatSubmitting(false)
     setStreaming(false)
     setStopping(false)
     setSaving(false)
+    setMaterializingTemplateImages(false)
+    setLocalizingArticleImages(false)
     setStreamText('')
     setToolActivities([])
     setStreamBlocks([])
     setStreamNotice(null)
+    setRecoveryNotice(null)
     setThinkingStatus(null)
     setPendingUserQuestion(null)
     setQuestionSubmitting(false)
@@ -1031,7 +1058,7 @@ export default function EditorPage() {
       setContextStats(null)
       return
     }
-    if (streaming || !pageVisible) return
+    if (streaming || compactionControllerRef.current || !pageVisible) return
     let active = true
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
@@ -1044,13 +1071,14 @@ export default function EditorPage() {
         chatImages.map((item) => item.id),
         attachedTemplates.map((item) => item.id),
         controller.signal,
+        chatTexts.items.filter(item => item.status !== 'uploading' && item.status !== 'error').map(item => item.id),
       )
         .then((stats) => {
-          if (active) setContextStats(stats)
+          if (active && !compactionControllerRef.current) setContextStats(stats)
         })
         .catch((error) => {
           if (error instanceof DOMException && error.name === 'AbortError') return
-          if (active) setContextStats(null)
+          if (active && !compactionControllerRef.current) setContextStats(null)
         })
     }, contextDraft || selectedElements.length > 0 || chatImages.length > 0 || attachedTemplates.length > 0 ? 300 : 0)
     return () => {
@@ -1058,7 +1086,7 @@ export default function EditorPage() {
       controller.abort()
       window.clearTimeout(timer)
     }
-  }, [activeChatSession, activeChatSessionId, attachedTemplates, chatImages, contextDraft, docId, messages.length, modelId, pageVisible, selectedElements, streaming])
+  }, [activeChatSession, activeChatSessionId, attachedTemplates, chatImages, chatTexts.items, contextDraft, docId, messages.length, modelId, pageVisible, selectedElements, streaming])
 
   const handleImageUpload = useCallback(async (file: File): Promise<string> => {
     if (!docId) throw new Error('文档不存在')
@@ -1078,13 +1106,21 @@ export default function EditorPage() {
     const loadVersion = documentLoadVersionRef.current
     const ownsDocument = () => loadVersion === documentLoadVersionRef.current
       && documentIdRef.current === docId && attachedEditorDocumentRef.current === docId
-    if (!ownsDocument()) return null
+    if (!ownsDocument() || documentEditingLockedRef.current) return null
     cancelAutoSave()
+    const validationMessageKey = `document-html-validation-${docId}`
+    const warnAboutStructure = (report: HtmlValidationReport) => {
+      message.warning({
+        key: validationMessageKey,
+        content: `修改已保存，但正文 HTML 结构有误，同步前需要修复：${report.errors?.[0] || '请检查正文标签的嵌套与闭合。'}`,
+        duration: 8,
+      })
+    }
 
     // 同一文档同一时刻仅保存一笔。显式保存和发送前保存会继续写入最新草稿；
     // 自动保存只落当前快照，后续输入交给新的空闲计时器处理。
     while (true) {
-      if (!ownsDocument()) return null
+      if (!ownsDocument() || documentEditingLockedRef.current) return null
       const inFlight = saveRequestRef.current
       if (inFlight) {
         const saved = await inFlight
@@ -1096,7 +1132,11 @@ export default function EditorPage() {
       const snapshot = draftHtmlRef.current
       const baseHtml = htmlRef.current
       if (snapshot === htmlRef.current) {
-        if (showSuccess) message.success('预览修改已保存')
+        if (showSuccess) {
+          const validation = savedHtmlValidationRef.current
+          if (validation?.html === snapshot && validation.report?.valid === false) warnAboutStructure(validation.report)
+          else message.success('预览修改已保存')
+        }
         return htmlRef.current
       }
 
@@ -1107,10 +1147,17 @@ export default function EditorPage() {
             ...buildHtmlSplice(baseHtml, snapshot),
             base_checksum: await sha256(baseHtml),
           }
-          if (!ownsDocument()) return null
+          if (!ownsDocument() || documentEditingLockedRef.current) return null
           const result = await documentsApi.patchContent(docId, patch)
           const savedHtml = result.html
           if (!ownsDocument()) return null
+          const previousValidation = savedHtmlValidationRef.current
+          savedHtmlValidationRef.current = { html: savedHtml, report: result.html_validation ?? null }
+          if (result.html_validation?.valid === false) {
+            if (!showSuccess) warnAboutStructure(result.html_validation)
+          } else if (previousValidation?.report?.valid === false) {
+            message.destroy(validationMessageKey)
+          }
           htmlRef.current = savedHtml
           setHtml(savedHtml)
 
@@ -1141,43 +1188,59 @@ export default function EditorPage() {
 
   const scheduleAutoSave = useCallback(() => {
     cancelAutoSave()
+    if (documentEditingLockedRef.current) return
     autoSaveTimerRef.current = setTimeout(() => {
       autoSaveTimerRef.current = null
       void persistDraftHtml(false, false)
     }, AUTO_SAVE_DELAY_MS)
   }, [cancelAutoSave, persistDraftHtml])
 
+  const renderedDocumentEpoch = documentLoadVersionRef.current
+  const renderedMutationEpoch = documentMutationEpochRef.current
+  const ownsRenderedDocument = useCallback(() => documentIdRef.current === docId
+    && attachedEditorDocumentRef.current === docId
+    && documentLoadVersionRef.current === renderedDocumentEpoch, [docId, renderedDocumentEpoch])
+  const ownsRenderedMutation = useCallback(() => ownsRenderedDocument()
+    && documentMutationEpochRef.current === renderedMutationEpoch, [ownsRenderedDocument, renderedMutationEpoch])
+
   const handleHtmlChange = useCallback((next: string) => {
-    if (streaming || localizingArticleImages || next === draftHtmlRef.current) return
+    // Delayed editor/iframe callbacks can retain props from before the pause.
+    if (!ownsRenderedMutation() || documentEditingLockedRef.current || localizingArticleImages || next === draftHtmlRef.current) return
     draftHtmlRef.current = next
     setDraftHtml(next)
     invalidateCompliance()
     scheduleAutoSave()
-  }, [invalidateCompliance, localizingArticleImages, scheduleAutoSave, streaming])
+  }, [invalidateCompliance, localizingArticleImages, ownsRenderedMutation, scheduleAutoSave])
 
-  const handleAppendTemplate = useCallback(async (template: TemplateItem) => {
-    if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
+  const handleInsertTemplateAtBoundary = useCallback(async (template: TemplateItem, placement: 'prepend' | 'append') => {
+    if (!docId || !ownsRenderedMutation() || documentEditingLockedRef.current || saving || materializingTemplateImages || localizingArticleImages) return
     setMaterializingTemplateImages(true)
     try {
       const result = await documentsApi.materializeTemplateImages(docId, template.id)
-      const inserted = previewFrameRef.current?.insertTemplateHtml(result.html, 'append')
+      if (!ownsRenderedMutation() || documentEditingLockedRef.current) return
+      const inserted = previewFrameRef.current?.insertTemplateHtml(result.html, placement)
       if (!inserted) {
         message.error('画布尚未准备好，无法添加模板')
         return
       }
-      message.success(result.localized_count ? `已转存 ${result.localized_count} 张图片并添加「${template.name}」` : `已将「${template.name}」添加到文末`)
+      const position = placement === 'prepend' ? '文首' : '文末'
+      message.success(result.localized_count
+        ? `已转存 ${result.localized_count} 张图片并将「${template.name}」添加到${position}`
+        : `已将「${template.name}」添加到${position}`)
     } catch (err) {
+      if (!ownsRenderedDocument()) return
       message.error(err instanceof ApiError ? String(err.detail) : '组件图片转存失败，未插入文章')
     } finally {
-      setMaterializingTemplateImages(false)
+      if (ownsRenderedDocument()) setMaterializingTemplateImages(false)
     }
-  }, [docId, localizingArticleImages, materializingTemplateImages, saving, streaming])
+  }, [docId, localizingArticleImages, materializingTemplateImages, ownsRenderedDocument, ownsRenderedMutation, saving])
 
   const handleInsertTemplateAtCaret = useCallback(async (template: TemplateItem) => {
-    if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
+    if (!docId || !ownsRenderedMutation() || documentEditingLockedRef.current || saving || materializingTemplateImages || localizingArticleImages) return
     setMaterializingTemplateImages(true)
     try {
       const result = await documentsApi.materializeTemplateImages(docId, template.id)
+      if (!ownsRenderedMutation() || documentEditingLockedRef.current) return
       const inserted = previewFrameRef.current?.insertTemplateHtml(result.html, 'caret')
       if (!inserted) {
         setHasPreviewCaret(false)
@@ -1186,21 +1249,22 @@ export default function EditorPage() {
       }
       message.success(result.localized_count ? `已转存 ${result.localized_count} 张图片并插入「${template.name}」` : `已将「${template.name}」插入光标处`)
     } catch (err) {
+      if (!ownsRenderedDocument()) return
       message.error(err instanceof ApiError ? String(err.detail) : '组件图片转存失败，未插入文章')
     } finally {
-      setMaterializingTemplateImages(false)
+      if (ownsRenderedDocument()) setMaterializingTemplateImages(false)
     }
-  }, [docId, localizingArticleImages, materializingTemplateImages, saving, streaming])
+  }, [docId, localizingArticleImages, materializingTemplateImages, ownsRenderedDocument, ownsRenderedMutation, saving])
 
   const handleLocalizeArticleImages = useCallback(async () => {
-    if (!docId || streaming || saving || materializingTemplateImages || localizingArticleImages) return
+    if (!docId || !ownsRenderedMutation() || documentEditingLockedRef.current || saving || materializingTemplateImages || localizingArticleImages) return
     setLocalizingArticleImages(true)
-    const progressMessageKey = 'editor-localize-external-images'
+    const progressMessageKey = `editor-localize-external-images-${docId}-${renderedDocumentEpoch}`
     const externalImageCount = (draftHtmlRef.current.match(/<img\b[^>]*https?:\/\//gi) ?? []).length
     message.loading({ key: progressMessageKey, content: '正在保存文章并转存外链图片…', duration: 0 })
     try {
       previewFrameRef.current?.flushPendingChange()
-      if (await persistDraftHtml(false) === null) {
+      if (await persistDraftHtml(false) === null || !ownsRenderedMutation() || documentEditingLockedRef.current) {
         message.destroy(progressMessageKey)
         return
       }
@@ -1212,6 +1276,10 @@ export default function EditorPage() {
         duration: 0,
       })
       const result = await documentsApi.localizeExternalImages(docId)
+      if (!ownsRenderedMutation() || documentEditingLockedRef.current) {
+        message.destroy(progressMessageKey)
+        return
+      }
       applyExternalHtml(result.html)
       setPreviewRevision((value) => value + 1)
       setVersionRefreshToken((value) => value + 1)
@@ -1222,15 +1290,19 @@ export default function EditorPage() {
         duration: 3,
       })
     } catch (err) {
+      if (!ownsRenderedDocument()) {
+        message.destroy(progressMessageKey)
+        return
+      }
       message.error({
         key: progressMessageKey,
         content: err instanceof ApiError ? String(err.detail) : '文章图片转存失败，正文未修改',
         duration: 4,
       })
     } finally {
-      setLocalizingArticleImages(false)
+      if (ownsRenderedDocument()) setLocalizingArticleImages(false)
     }
-  }, [applyExternalHtml, docId, invalidateCompliance, localizingArticleImages, materializingTemplateImages, persistDraftHtml, saving, streaming])
+  }, [applyExternalHtml, docId, invalidateCompliance, localizingArticleImages, materializingTemplateImages, ownsRenderedDocument, ownsRenderedMutation, persistDraftHtml, renderedDocumentEpoch, saving])
 
   const handleExternalImagesPasted = useCallback(() => {
     // Wait for the iframe's native paste/input event to update draftHtmlRef.
@@ -1254,7 +1326,7 @@ export default function EditorPage() {
     const handleCanvasHistoryShortcut = (event: KeyboardEvent) => {
       if (
         centerView !== 'preview'
-        || streaming
+        || documentEditingLockedRef.current
         || saving
         || (!event.ctrlKey && !event.metaKey)
         || event.altKey
@@ -1284,7 +1356,7 @@ export default function EditorPage() {
 
     window.addEventListener('keydown', handleCanvasHistoryShortcut, true)
     return () => window.removeEventListener('keydown', handleCanvasHistoryShortcut, true)
-  }, [centerView, saving, streaming])
+  }, [centerView, saving])
 
   const applySessionResourceContext = useCallback((updated: ChatSessionItem) => {
     setChatSessions((items) => items.map((item) => item.id === updated.id ? updated : item))
@@ -1301,12 +1373,14 @@ export default function EditorPage() {
     }
   }, [activeChatSessionId, streaming])
 
-  const toggleAttachedTemplate = useCallback(async (template: TemplateItem) => {
+  const attachTemplateToChat = useCallback(async (template: TemplateItem) => {
     if (!docId || !activeChatSessionId || activeChatSession?.is_archived || templateAttachmentUpdateRef.current) return
-    const isAttached = attachedTemplates.some((item) => item.id === template.id)
-    const next = isAttached
-      ? attachedTemplates.filter((item) => item.id !== template.id)
-      : [...attachedTemplates, template]
+    const attached = attachedTemplates.find((item) => item.id === template.id)
+    if (attached) {
+      setComposerTemplates((items) => items.some((item) => item.id === attached.id) ? items : [...items, attached])
+      return
+    }
+    const next = [...attachedTemplates, template]
     if (next.length > 6) {
       message.warning('每个对话最多附加 6 个模板')
       return
@@ -1318,11 +1392,7 @@ export default function EditorPage() {
       const updated = await chatApi.replaceTemplateAttachments(docId, activeChatSessionId, next.map((item) => item.id))
       if (loadVersion !== documentLoadVersionRef.current) return
       applySessionResourceContext(updated)
-      setComposerTemplates((items) => (
-        isAttached
-          ? items.filter((item) => item.id !== template.id)
-          : items.some((item) => item.id === template.id) ? items : [...items, template]
-      ))
+      setComposerTemplates((items) => items.some((item) => item.id === template.id) ? items : [...items, template])
     } catch (err) {
       if (loadVersion === documentLoadVersionRef.current) message.error(err instanceof ApiError ? String(err.detail) : '更新对话组件失败')
     } finally {
@@ -1377,16 +1447,19 @@ export default function EditorPage() {
   const handleTemplateCollection = useCallback(() => setTemplateCollection(null), [])
 
   const handleSaveHtml = async () => {
+    if (documentEditingLockedRef.current) return
     previewFrameRef.current?.flushPendingChange()
     await persistDraftHtml(true)
   }
 
   const handleSaveTitle = async () => {
-    if (!docId) return
+    if (!docId || !ownsRenderedDocument() || documentEditingLockedRef.current) return
     try {
       await documentsApi.update(docId, { title })
+      if (!ownsRenderedDocument()) return
       setVersionRefreshToken((value) => value + 1)
     } catch (err) {
+      if (!ownsRenderedDocument()) return
       message.error(err instanceof ApiError ? String(err.detail) : '标题保存失败')
     }
   }
@@ -1554,13 +1627,18 @@ export default function EditorPage() {
     const requestModelId = runOptions?.modelId ?? modelId
     const requestThinkingMode = runOptions?.thinkingMode ?? thinkingMode
     const requestThinkingEffort = runOptions?.thinkingEffort ?? thinkingEffort
+    const attachedTexts = runOptions?.textAttachments ?? []
+    const referencedTemplates = [...(runOptions?.referencedTemplates ?? composerTemplates)]
+    const requestTemplates = runOptions?.templates
+      ? [...runOptions.templates]
+      : orderMessageTemplates([...composerTemplates, ...attachedTemplates], referencedTemplates.map(item => item.id))
     if (!docId || !sessionId || (!requestModelId && !existingRunId)) return
     if (documentIdRef.current !== docId || attachedEditorDocumentRef.current !== docId) return
     if (!existingRunId && chatSessions.find((item) => item.id === sessionId)?.is_archived) {
       message.warning('请先恢复该对话后再继续发送')
       return
     }
-    if (!existingRunId && chatStartInProgressRef.current) return
+    if (compactionControllerRef.current || (!existingRunId && chatStartInProgressRef.current)) return
     const isNewRun = !existingRunId
     retireChatRunConnection(chatRunConnectionRef.current)
     const connection = createChatRunConnection()
@@ -1590,7 +1668,7 @@ export default function EditorPage() {
       if (!ownsConnection() || !sanitizedAttachedElements.length) return
       setSelectedElements((current) => current.length ? current : sanitizedAttachedElements)
     }
-    const attachedTemplateRefs = (runOptions?.templates ?? attachedTemplates).map((template) => ({ id: template.id, name: template.name }))
+    const attachedTemplateRefs = requestTemplates.map((template) => ({ id: template.id, name: template.name }))
     const sentDraftImages = existingRunId ? [] : attachedImages
     const sentImageIds = new Set(sentDraftImages.map((item) => item.id))
     let sentImagesDetached = false
@@ -1658,6 +1736,7 @@ export default function EditorPage() {
           : null,
         model_usage: null,
         image_attachments: attachedImages,
+        text_attachments: attachedTexts,
         tool_calls: [],
         reasoning_trace: { status: 'idle', content: '', detail: '' },
         turn_blocks: [],
@@ -1687,6 +1766,7 @@ export default function EditorPage() {
       setReasoningTrace(restoredTimeline.reasoning)
     }
     setStreamNotice(null)
+    setRecoveryNotice(null)
     setConversationError(null)
     setThinkingStatus(isNewRun ? null : '正在继续处理排版…')
 
@@ -1710,6 +1790,7 @@ export default function EditorPage() {
     let runId: string | null = null
     let lastSequence = streamAfter
     let completed = false
+    let terminalRunStatus: string | undefined
     let pausedForUserQuestion = false
     let queueCanAdvance = false
     let streamRenderTimer: number | null = null
@@ -1719,6 +1800,8 @@ export default function EditorPage() {
     let reusableRequestId = savedComposerDraft?.phase === 'retry'
       && savedComposerDraft.message === text
       && savedComposerDraft.reaskFromMessageId === reaskFromMessageId
+      && JSON.stringify((savedComposerDraft.textAttachments ?? []).map(item => item.id)) === JSON.stringify(attachedTexts.map(item => item.id))
+      && JSON.stringify((savedComposerDraft.templateRefs ?? []).map(item => item.id)) === JSON.stringify(referencedTemplates.map(item => item.id))
       ? savedComposerDraft.clientRequestId
       : undefined
     if (reusableRequestId) {
@@ -1730,6 +1813,8 @@ export default function EditorPage() {
           reusableRequestId = undefined
           writeChatComposerDraft(docId, sessionId, {
             message: text,
+            textAttachments: attachedTexts,
+            templateRefs: referencedTemplates.map(({ id, name }) => ({ id, name })),
             reaskFromMessageId,
             phase: 'retry',
           })
@@ -1742,26 +1827,30 @@ export default function EditorPage() {
     if (!ownsConnection()) return
     const clientRequestId = existingRunId ? null : reusableRequestId ?? createClientRequestId()
     const submittedDraft = isNewRun
-      ? { message: text, reaskFromMessageId, clientRequestId: clientRequestId as string }
+      ? { message: text, reaskFromMessageId, clientRequestId: clientRequestId as string, textAttachments: attachedTexts,
+          templateRefs: referencedTemplates.map(({ id, name }) => ({ id, name })) }
       : null
     if (submittedDraft) {
       writeChatComposerDraft(docId, sessionId, { ...submittedDraft, phase: 'starting' })
       // Navigation must not delete attachments while the accepted POST binds
       // them to its user message. A rejected POST restores them below.
       detachSentDraftImages()
+      detachChatTexts(attachedTexts)
     }
     const restoreSubmittedDraft = (withFreshRequestId = false, nextReaskFromMessageId = submittedDraft?.reaskFromMessageId ?? null) => {
       if (!submittedDraft) return
       const storedDraft = readChatComposerDraft(docId, sessionId)
       const hasNewerDraft = Boolean(
-        storedDraft?.message.trim()
-        && storedDraft.clientRequestId !== submittedDraft.clientRequestId,
+        (storedDraft?.message.trim() || storedDraft?.textAttachments?.length)
+        && storedDraft?.clientRequestId !== submittedDraft.clientRequestId,
       )
       if (hasNewerDraft) return
       if (ownsConnection()) {
         setContextDraft(submittedDraft.message)
         setPendingReaskMessageId(nextReaskFromMessageId)
         restoreSubmittedElements()
+        restoreChatTexts(attachedTexts)
+        setComposerTemplates(referencedTemplates)
       }
       writeChatComposerDraft(
         docId,
@@ -1769,6 +1858,8 @@ export default function EditorPage() {
         withFreshRequestId
           ? {
               message: submittedDraft.message,
+              textAttachments: attachedTexts,
+              templateRefs: submittedDraft.templateRefs,
               reaskFromMessageId: nextReaskFromMessageId,
               phase: 'retry',
             }
@@ -1835,10 +1926,12 @@ export default function EditorPage() {
               attachedImages.map((item) => item.id),
               layoutReferenceSelectedAssetIds,
               layoutReferenceImitationStrength,
-              runOptions?.templates?.map((template) => template.id),
+              requestTemplates.map((template) => template.id),
               reaskFromMessageId ?? undefined,
               reaskConflictResolution,
               controller.signal,
+              (status) => { if (ownsConnection()) setStreamNotice(retryNotice(status)) },
+              attachedTexts.map(item => item.id),
             )
           } catch (startError) {
             // A timeout or an aborted browser request is ambiguous: the
@@ -1905,10 +1998,14 @@ export default function EditorPage() {
       }
 
       let reconnectAttempts = 0
+      let outageStartedAt: number | null = null
       let pendingTransientContent = ''
       let pendingTransientReasoning = ''
       while (!completed) {
         try {
+          const connectedAt = performance.now()
+          if (reconnectAttempts > 0) setStreamNotice((current) => current?.operationId === 'stream-reconnect'
+            ? { ...current, phase: 'attempting', title: '恢复实时输出：正在连接', retryDelaySeconds: undefined } : current)
           for await (const received of streamChatRunEvents(docId, run.run_id, lastSequence, controller.signal)) {
             if (!ownsConnection()) return
             if (received.sequence && received.sequence <= lastSequence) continue
@@ -1942,7 +2039,10 @@ export default function EditorPage() {
           if (!nextText) continue
           evt.data = { ...evt.data, text: nextText }
         }
-        if (evt.event !== 'heartbeat') reconnectAttempts = 0
+        const freshProgress = received.eventAgeMs < 10_000 && ['text_delta', 'reasoning_delta', 'tool_call', 'tool_result'].includes(evt.event)
+        const healthyConnection = evt.event === 'heartbeat' && performance.now() - connectedAt >= 10_000
+        if (freshProgress || healthyConnection) { reconnectAttempts = 0; outageStartedAt = null }
+        setStreamNotice((current) => current?.operationId === 'stream-reconnect' ? null : current)
         if (['text_delta', 'reasoning_delta', 'tool_call', 'tool_result'].includes(evt.event)) setStreamNotice(null)
         if (evt.event === 'text_delta') {
           accumulated += evt.data.text
@@ -2137,6 +2237,9 @@ export default function EditorPage() {
           flushStreamRender()
         } else if (evt.event === 'thinking_capability_fallback') {
           handleThinkingCapabilityFallback(evt.data)
+        } else if (evt.event === 'retry_status') {
+          setStreamNotice((current) => evt.data.phase === 'recovered' && current?.operationId !== evt.data.operation_id
+            ? current : retryNotice(evt.data, received.eventAgeMs))
         } else if (evt.event === 'model_turn_retry') {
           pendingTransientContent = ''
           pendingTransientReasoning = ''
@@ -2154,14 +2257,11 @@ export default function EditorPage() {
             flushStreamRender()
           }
           const retryReason = formatModelRetryReason(evt.data.reason)
-          const retryDelay = evt.data.retry_after_seconds ?? evt.data.delay_seconds
+          const retryDelay = evt.data.delay_seconds
           const returnedError = evt.data.detail?.trim() || retryReason
           const errorCode = evt.data.reason?.trim()
-          // The provider attempt is the next total request (the initial
-          // connection is attempt 1). Keep that initial request out of the
-          // user-facing retry count.
-          const maxRetries = Math.max(1, evt.data.max_attempts - 1)
-          const retryAttempt = Math.min(maxRetries, Math.max(1, evt.data.attempt - 1))
+          const maxRetries = evt.data.max_attempts
+          const retryAttempt = evt.data.attempt
           setStreamNotice({
             kind: 'retrying',
             title: '正在重新连接模型服务',
@@ -2220,6 +2320,7 @@ export default function EditorPage() {
             setThinkingStatus(`等待模型继续输出（${idleSeconds}s 未产生有效内容）`)
           }
         } else if (evt.event === 'final') {
+          terminalRunStatus = evt.data.run_status
           setPendingUserQuestion(null)
           setQuestionSubmitting(false)
           if (evt.data.partial && evt.data.partial_save_state === 'preserved') {
@@ -2265,8 +2366,8 @@ export default function EditorPage() {
           }
           setMessages((prev) => [...prev, assistant])
           if (evt.data.html_changed) setVersionRefreshToken((value) => value + 1)
-          if (isNewRun && evt.data.run_status === 'failed') {
-            restoreSubmittedDraft(true)
+          if (evt.data.run_status === 'failed') {
+            if (isNewRun) restoreSubmittedDraft(true)
             setConversationError(evt.data.error_message || '对话请求失败')
           } else if (isNewRun) {
             clearChatComposerDraftForRequest(docId, sessionId, submittedDraft?.clientRequestId ?? '')
@@ -2284,7 +2385,7 @@ export default function EditorPage() {
           if (!ownsConnection()) return
           if ((err as Error).name === 'AbortError') throw err
           try {
-            const runState = await chatApi.getRun(docId, run.run_id)
+            const runState = await chatApi.getRun(docId, run.run_id, controller.signal)
             if (!ownsConnection()) return
             if (runState.status === 'waiting_for_input' && runState.user_question) {
               // Recover directly from durable state if a proxy disconnect or
@@ -2312,7 +2413,18 @@ export default function EditorPage() {
               break
             }
             if (['completed', 'cancelled', 'failed'].includes(runState.status)) {
+              terminalRunStatus = runState.status
+              completed = true
+              queueCanAdvance = canAdvanceQueuedChat(runState.status)
               setThinkingStatus(null)
+              if (runState.status === 'failed') {
+                if (isNewRun) restoreSubmittedDraft(true)
+                setConversationError(runState.error_message || '对话请求失败')
+              } else {
+                setConversationError(null)
+                if (isNewRun) clearChatComposerDraftForRequest(docId, sessionId, submittedDraft?.clientRequestId ?? '')
+              }
+              setRecoveryNotice(null)
               const [freshDocument, freshMessages] = await Promise.all([
                 documentsApi.get(docId),
                 loadRecentMessages(docId, sessionId),
@@ -2324,33 +2436,32 @@ export default function EditorPage() {
               if (recoveredCompliance) setCompliance(recoveredCompliance)
               else invalidateCompliance()
               setRecentMessages(freshMessages)
-              if (runState.status === 'failed') {
-                restoreSubmittedDraft(true)
-                setConversationError(runState.error_message || '对话请求失败')
-              } else if ((runState.status === 'completed' || runState.status === 'cancelled') && isNewRun) {
-                clearChatComposerDraftForRequest(docId, sessionId, submittedDraft?.clientRequestId ?? '')
-              }
-              queueCanAdvance = canAdvanceQueuedChat(runState.status)
-              completed = true
               break
             }
           } catch (statusError) {
             if (!ownsConnection()) return
-            if ((statusError as Error).name === 'AbortError') throw statusError
+            if (completed || (statusError as Error).name === 'AbortError') throw statusError
           }
+          if (!isRetryable(err)) throw err
           reconnectAttempts += 1
-          if (reconnectAttempts > MAX_STREAM_RECONNECT_ATTEMPTS) {
+          outageStartedAt ??= performance.now()
+          const reconnectDelay = retryDelayMs(err, reconnectAttempts, 400, 15_000)
+          if (reconnectDelay === null || reconnectAttempts > MAX_STREAM_RECONNECT_ATTEMPTS
+              || performance.now() - outageStartedAt + reconnectDelay >= 180_000) {
             throw new Error('实时输出多次无法恢复，已停止等待。后台任务可能仍在执行，请刷新页面恢复连接或点击停止。')
           }
           setStreamNotice({
             kind: 'retrying',
             title: '正在恢复实时输出连接',
             detail: '后台 Agent 仍在执行，正在补拉遗漏的输出。',
-            attempt: reconnectAttempts,
-            maxAttempts: MAX_STREAM_RECONNECT_ATTEMPTS,
+            operationId: 'stream-reconnect', phase: 'waiting',
+            attempt: reconnectAttempts + 1,
+            maxAttempts: MAX_STREAM_RECONNECT_ATTEMPTS + 1,
+            retryDelaySeconds: reconnectDelay / 1000,
+            retryStartedAtMs: Date.now(),
           })
           setThinkingStatus(null)
-          await waitForReconnect(reconnectAttempts, controller.signal)
+          await abortableDelay(reconnectDelay, controller.signal)
         }
       }
 
@@ -2366,6 +2477,13 @@ export default function EditorPage() {
     } catch (err) {
       if (!ownsConnection()) {
         if (!runId && isNewRun) restoreSubmittedDraft()
+        return
+      }
+      if (completed) {
+        if (terminalRunStatus === 'completed' || terminalRunStatus === 'cancelled') setConversationError(null)
+        setRecoveryNotice({ kind: 'info', operationId: 'history-sync',
+          title: pausedForUserQuestion ? '确认面板已恢复，记录同步暂时失败' : '本轮已结束，记录同步暂时失败',
+          detail: '当前界面内容已保留，可重新检查并同步任务状态和记录。', phase: 'exhausted' })
         return
       }
       // A failed POST may leave only the client-side placeholder. It has no
@@ -2435,6 +2553,8 @@ export default function EditorPage() {
         thinkingMode: nextRequest.thinkingMode,
         thinkingEffort: nextRequest.thinkingEffort,
         templates: nextRequest.templates,
+        referencedTemplates: nextRequest.referencedTemplates,
+        textAttachments: nextRequest.texts,
       },
     )
   }
@@ -2443,6 +2563,9 @@ export default function EditorPage() {
     text: string,
     references: SelectedElementContext[],
     images: ChatImageAttachment[],
+    texts: ChatTextAttachment[] = [],
+    templates: TemplateItem[] = attachedTemplates,
+    referencedTemplates: TemplateItem[] = composerTemplates,
   ) => {
     if (!docId || !activeChatSessionId || !modelId) return
     const queuedRequest: QueuedChatRequest = {
@@ -2451,12 +2574,15 @@ export default function EditorPage() {
       sessionId: activeChatSessionId,
       references: sanitizeSelectedElements(references),
       images: [...images],
-      templates: [...attachedTemplates],
+      texts: [...texts],
+      templates: [...templates],
+      referencedTemplates: [...referencedTemplates],
       modelId,
       thinkingMode,
       thinkingEffort,
     }
     setQueuedChatRequests((items) => [...items, queuedRequest])
+    detachChatTexts(texts)
     setContextDraft('')
     setComposerTemplates([])
     setPendingReaskMessageId(null)
@@ -2473,16 +2599,20 @@ export default function EditorPage() {
     const queuedRequest = queuedChatRequestsRef.current.find((item) => item.id === requestId)
     setQueuedChatRequests((items) => items.filter((item) => item.id !== requestId))
     if (queuedChatRequestsRef.current.length === 1) setChatQueuePaused(false)
+    if (queuedRequest?.texts.length) restoreChatTexts(queuedRequest.texts)
     if (docId && queuedRequest?.images.length) {
       void Promise.allSettled(queuedRequest.images.map((image) => chatApi.deleteImage(docId, image.id)))
     }
-  }, [docId])
+  }, [docId, restoreChatTexts])
 
-  const updateQueuedChatRequest = useCallback((requestId: string, nextContent: string) => {
+  const updateQueuedChatRequest = useCallback((requestId: string, nextContent: string, texts: ChatTextAttachment[] = []) => {
     const content = nextContent.trim()
     if (!content) return
-    setQueuedChatRequests((items) => updateQueuedChatContent(items, requestId, content))
-  }, [])
+    const queued = queuedChatRequestsRef.current.find(item => item.id === requestId)
+    if (!queued || queued.texts.length + texts.length > 8) { message.error('每条任务最多 8 份文本附件'); return }
+    setQueuedChatRequests((items) => updateQueuedChatContent(items, requestId, content).map(item => item.id === requestId ? { ...item, texts: [...item.texts, ...texts] } : item))
+    detachChatTexts(texts)
+  }, [detachChatTexts])
 
   const moveQueuedChatRequest = useCallback((fromIndex: number, toIndex: number) => {
     setQueuedChatRequests((items) => moveQueuedChatItem(items, fromIndex, toIndex))
@@ -2550,6 +2680,8 @@ export default function EditorPage() {
     discardDraftChatImages()
     setReaskConflict(null)
     setSelectedElements(sanitizeSelectedElements(messageItem.selected_elements))
+    restoreChatTexts(messageItem.text_attachments ?? [])
+    setComposerTemplates(restoreComposerTemplates(messageItem.template_refs))
     setPendingReaskMessageId(messageItem.id)
 
     const historyImages = (messageItem.image_attachments ?? []).slice(0, MAX_CHAT_IMAGES_PER_MESSAGE)
@@ -2564,7 +2696,7 @@ export default function EditorPage() {
     chatImageDocumentIdRef.current = docId
     chatImagesRef.current = restored
     setChatImages(restored)
-  }, [discardDraftChatImages, docId])
+  }, [discardDraftChatImages, docId, restoreChatTexts])
 
   const handleDismissReaskConflict = useCallback(() => {
     if (resolvingReaskConflict) return
@@ -2573,7 +2705,8 @@ export default function EditorPage() {
 
   const handleDiscardReaskConflict = () => {
     if (!reaskConflict || resolvingReaskConflict || !pendingReaskMessageId) return
-    const retryText = contextDraft.trim() || (selectedElements.length > 0
+    const retryTexts = chatTexts.items.filter(item => item.status !== 'uploading' && item.status !== 'error')
+    const retryText = contextDraft.trim() || (retryTexts.length > 0 ? '请按当前对话要求读取并处理所附文本。' : selectedElements.length > 0
       ? '请处理所附元素。'
       : chatImages.length > 0
         ? '请分析所附图片，并继续处理当前推文。'
@@ -2605,6 +2738,9 @@ export default function EditorPage() {
       [],
       'structure',
       resolution,
+      0,
+      undefined,
+      modelId ? { modelId, thinkingMode, thinkingEffort, textAttachments: retryTexts } : undefined,
     )
   }
 
@@ -2631,6 +2767,7 @@ export default function EditorPage() {
         question.id,
         answer,
         clientRequestId,
+        (status) => { if (ownsQuestion()) setStreamNotice(retryNotice(status)) },
       )
       if (!ownsQuestion()) return
       setPendingUserQuestion(null)
@@ -2711,20 +2848,25 @@ export default function EditorPage() {
         setThinkingStatus('等待你确认排版偏好')
         return true
       }
-      setPendingUserQuestion(null)
       if (['completed', 'cancelled', 'failed'].includes(run.status)) {
-        const [freshMessages, sessions] = await Promise.all([
+        const [freshMessages, sessions, refreshedDocument] = await Promise.all([
           loadRecentMessages(docId, run.session_id),
           chatApi.listSessions(docId),
+          documentsApi.get(docId),
         ])
         if (loadVersion !== documentLoadVersionRef.current || attachedEditorDocumentRef.current !== docId) return false
+        setPendingUserQuestion(null)
         setRecentMessages(freshMessages)
+        applyExternalHtml(refreshedDocument.current_html)
+        setPreviewRevision((value) => value + 1)
+        setVersionRefreshToken((value) => value + 1)
         setChatSessions(sessions)
         setAttachedTemplates(sessions.find((item) => item.id === run.session_id)?.attached_templates ?? [])
         setThinkingStatus(null)
         if (run.status === 'failed') setConversationError(run.error_message || '对话请求失败')
         return true
       }
+      setPendingUserQuestion(null)
       activeRunRef.current = run.run_id
       setThinkingStatus('用户未回复，正在继续处理排版…')
       await handleSendMessage(
@@ -2763,6 +2905,10 @@ export default function EditorPage() {
   ) => handleSendMessage('', [], runId, undefined, sessionId, undefined, undefined, [], [], 'structure', undefined, streamAfter, undefined, undefined, timeline)
 
   const handleStopAgent = async () => {
+    if (compactionControllerRef.current) {
+      compactionControllerRef.current.abort()
+      return
+    }
     const runId = activeRunRef.current
     if (!docId) return
     const loadVersion = documentLoadVersionRef.current
@@ -2778,16 +2924,25 @@ export default function EditorPage() {
     try {
       setStopping(true)
       setThinkingStatus('正在停止 Agent…')
-      const cancelled = await cancelChatRun(docId, runId)
+      const cancelled = await cancelChatRun(docId, runId,
+        (status) => { if (ownsStop()) setStreamNotice(retryNotice(status)) })
       if (!ownsStop()) return
       if (['completed', 'cancelled', 'failed'].includes(cancelled.status)) {
+        const [stoppedMessages, refreshedDocument] = await Promise.all([
+          loadRecentMessages(docId, cancelled.session_id),
+          documentsApi.get(docId),
+        ])
+        if (!ownsStop()) return
+        applyExternalHtml(refreshedDocument.current_html)
+        setPreviewRevision((value) => value + 1)
+        setVersionRefreshToken((value) => value + 1)
         setPendingUserQuestion(null)
         setQuestionSubmitting(false)
         activeRunRef.current = null
         setStopping(false)
         setThinkingStatus(null)
-        const stoppedMessages = await loadRecentMessages(docId, cancelled.session_id)
-        if (ownsStop()) setRecentMessages(stoppedMessages)
+        setStreamNotice(null)
+        setRecentMessages(stoppedMessages)
       }
     } catch (err) {
       if (!ownsStop()) return
@@ -2799,10 +2954,12 @@ export default function EditorPage() {
   const selectChatSession = async (sessionId: number) => {
     if (!docId || streaming || chatStartInProgressRef.current || pendingUserQuestion || sessionId === activeChatSessionId) return
     try {
-      if (activeChatSessionId && contextDraft.trim()) {
+      if (activeChatSessionId && (contextDraft.trim() || chatTexts.items.length)) {
         const current = readChatComposerDraft(docId, activeChatSessionId)
         writeChatComposerDraft(docId, activeChatSessionId, {
           message: contextDraft,
+          textAttachments: chatTexts.items.filter(item => item.status !== 'uploading' && item.status !== 'error'),
+          templateRefs: composerTemplates.map(({ id, name }) => ({ id, name })),
           reaskFromMessageId: pendingReaskMessageId,
           phase: current?.phase === 'retry' ? 'retry' : 'editing',
           ...(current?.phase === 'retry' && current.clientRequestId ? { clientRequestId: current.clientRequestId } : {}),
@@ -2821,7 +2978,7 @@ export default function EditorPage() {
       setReaskConflict(null)
       setActiveChatSessionId(sessionId)
       setAttachedTemplates(chatSessions.find((item) => item.id === sessionId)?.attached_templates ?? [])
-      setComposerTemplates([])
+      setComposerTemplates(restoreComposerTemplates(restoredComposerDraft?.templateRefs))
       setRecentMessages(sessionMessages)
       setHiddenHistory([])
     } catch (err) {
@@ -2915,7 +3072,7 @@ export default function EditorPage() {
         ])
         setActiveChatSessionId(next.id)
         setAttachedTemplates(next.attached_templates ?? [])
-        setComposerTemplates([])
+        setComposerTemplates(restoreComposerTemplates(restoredComposerDraft?.templateRefs))
         setRecentMessages(nextMessages)
         setHiddenHistory([])
         setContextStats(null)
@@ -2979,10 +3136,17 @@ export default function EditorPage() {
   }
 
   const handleCompactChatContext = async (rebuild: boolean) => {
-    if (!docId || !activeChatSession || !modelId || streaming || chatStartInProgressRef.current) return
+    if (compactionControllerRef.current || !docId || !activeChatSession || !modelId || streaming || chatStartInProgressRef.current) return
+    const controller = new AbortController()
+    compactionControllerRef.current = controller
+    const ownsCompaction = () => compactionControllerRef.current === controller && !controller.signal.aborted
+    setStreamNotice({ kind: 'info', title: '正在压缩上下文', detail: '正在整理较早对话和工具结果，可点击停止取消。' })
     setContextStats((current) => current ? { ...current, state: 'compacting' } : current)
     try {
-      const stats = await chatApi.compactContext(docId, modelId, activeChatSession.id, rebuild)
+      const stats = await chatApi.compactContext(docId, modelId, activeChatSession.id, rebuild,
+        (status) => { if (ownsCompaction()) setStreamNotice(retryNotice(status)) }, controller.signal)
+      if (!ownsCompaction()) return
+      setStreamNotice(null)
       setContextStats(stats)
       const compactionNotice = stats.compaction_notice
       if (compactionNotice) {
@@ -2997,8 +3161,17 @@ export default function EditorPage() {
       }
       message.success(rebuild ? '已从完整历史重建上下文摘要' : '已压缩当前对话上下文')
     } catch (err) {
+      if (compactionControllerRef.current !== controller) return
+      if (controller.signal.aborted) {
+        setStreamNotice(null)
+        setContextStats(null)
+        return
+      }
+      setStreamNotice({ kind: 'error', title: '上下文压缩失败', detail: err instanceof Error ? err.message : '可稍后重试' })
       setContextStats(null)
       message.error(err instanceof ApiError ? String(err.detail) : '上下文压缩失败，可稍后重试')
+    } finally {
+      if (compactionControllerRef.current === controller) compactionControllerRef.current = null
     }
   }
 
@@ -3013,16 +3186,38 @@ export default function EditorPage() {
   }
 
   useEffect(() => {
-    if (!docId || loading || streaming || chatSubmitting) return
+    if (!docId || loading || streaming || chatSubmitting || !pageVisible) return
     let disposed = false
+    const controller = new AbortController()
+    const loadVersion = documentLoadVersionRef.current
+    const ownsRecovery = () => !disposed && !controller.signal.aborted
+      && loadVersion === documentLoadVersionRef.current && attachedEditorDocumentRef.current === docId
     void (async () => {
       try {
-        const activeRun = await chatApi.getActiveRun(docId)
-        if (!activeRun || disposed || chatStartInProgressRef.current || chatRunConnectionRef.current || resumedRunRef.current === activeRun.run_id) return
+        const activeRun = await chatApi.getActiveRun(docId, controller.signal, status => {
+          if (!ownsRecovery() || status.phase === 'recovered') return
+          setRecoveryNotice({ ...retryNotice(status), title: '正在重试检查后台任务状态',
+            detail: '状态检查暂时未连通，尚未确认任务是否仍在运行。已有对话结果会保留。' })
+        })
+        if (!ownsRecovery()) return
+        if (!activeRun && recoveryCheck > recoveredCheckRef.current) {
+          const [freshDocument, freshMessages] = await Promise.all([
+            documentsApi.get(docId),
+            activeChatSessionId ? loadRecentMessages(docId, activeChatSessionId) : Promise.resolve([]),
+          ])
+          if (!ownsRecovery() || chatStartInProgressRef.current || chatRunConnectionRef.current) return
+          recoveredCheckRef.current = recoveryCheck
+          setRecoveryNotice(null)
+          setRecentMessages(freshMessages)
+          // Synchronizing history must not replace a newer unsaved source edit.
+          if (draftHtmlRef.current === htmlRef.current) applyExternalHtml(freshDocument.current_html)
+        }
+        setRecoveryNotice(current => current?.operationId === 'history-sync' ? current : null)
+        if (!activeRun || !ownsRecovery() || chatStartInProgressRef.current || chatRunConnectionRef.current || resumedRunRef.current === activeRun.run_id) return
         const resumedMessages = activeRun.session_id !== activeChatSessionId
           ? await loadRecentMessages(docId, activeRun.session_id)
           : null
-        if (disposed || chatStartInProgressRef.current || chatRunConnectionRef.current) return
+        if (!ownsRecovery() || chatStartInProgressRef.current || chatRunConnectionRef.current) return
         resumedRunRef.current = activeRun.run_id
         if (activeRun.session_id !== activeChatSessionId) {
           setActiveChatSessionId(activeRun.session_id)
@@ -3054,15 +3249,20 @@ export default function EditorPage() {
           activeRun.timeline,
         )
       } catch (err) {
-        if (!disposed) setConversationError(err instanceof ApiError ? err.message : '恢复 Agent 输出失败')
+        if (!ownsRecovery() || (err instanceof Error && err.name === 'AbortError')) return
+        setThinkingStatus(null)
+        setRecoveryNotice({ kind: 'info', title: '暂时无法检查后台任务状态', phase: 'exhausted',
+          detail: `已有结果仍保留，可重试检查。${err instanceof Error ? `（${err.message}）` : ''}` })
       }
     })()
     return () => {
       disposed = true
+      controller.abort()
     }
-  }, [activeChatSessionId, chatSubmitting, docId, loadRecentMessages, loading, setRecentMessages, streaming])
+  }, [activeChatSessionId, chatSubmitting, docId, loadRecentMessages, loading, pageVisible, recoveryCheck, setRecentMessages, streaming, applyExternalHtml])
 
   const handleVersionRestored = async (document: { title: string; current_html: string }) => {
+    if (!ownsRenderedMutation() || documentEditingLockedRef.current) return
     setTitle(document.title)
     applyExternalHtml(document.current_html)
     setPreviewRevision((value) => value + 1)
@@ -3083,45 +3283,51 @@ export default function EditorPage() {
       } as CSSProperties)
 
   const handleSetLibraryCover = useCallback(async (assetId: string) => {
+    if (!ownsRenderedMutation() || documentEditingLockedRef.current) return
     const saved = await persistDraftHtml(false, true)
+    if (!ownsRenderedMutation() || documentEditingLockedRef.current) return
     if (saved === null) throw new Error('正文保存失败')
     try {
       await imageLibraryApi.setCover(assetId, docId)
+      if (!ownsRenderedDocument()) return
       setVersionRefreshToken((value) => value + 1)
       message.success('已设为文章封面')
     } catch (error) {
+      if (!ownsRenderedDocument()) return
       message.error(error instanceof ApiError ? String(error.detail) : '设置封面失败')
       throw error
     }
-  }, [docId, persistDraftHtml])
+  }, [docId, ownsRenderedDocument, ownsRenderedMutation, persistDraftHtml])
   // Streaming deltas only change the chat; keep resource previews and controls
   // outside that update cycle while retaining all resource-specific inputs.
   const resourceLibrary = useMemo(() => (
     <TemplateLibraryPanel
       modelId={modelId}
       models={models}
-      disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+      disabled={documentEditingLocked || saving || materializingTemplateImages || localizingArticleImages}
       attachmentDisabled={templateAttachmentsUpdating || !activeChatSession || activeChatSession.is_archived || stopping || chatSubmitting || Boolean(pendingUserQuestion)}
       canInsertAtCaret={centerView === 'preview' && previewMode === 'edit' && hasPreviewCaret}
       attachedTemplateIds={attachedTemplates.map((item) => item.id)}
       themeContext={activeChatSession?.theme_context ?? null}
-      onAppend={handleAppendTemplate}
+      onPrepend={(template) => handleInsertTemplateAtBoundary(template, 'prepend')}
+      onAppend={(template) => handleInsertTemplateAtBoundary(template, 'append')}
       onInsertAtCaret={handleInsertTemplateAtCaret}
-      onToggleAttach={toggleAttachedTemplate}
+      onAttachToChat={attachTemplateToChat}
       onClearThemeContext={() => { void clearSessionThemeContext() }}
       collection={templateCollection}
       onCollectionHandled={handleTemplateCollection}
       activeResourceTab={activeResourceTab}
       onResourceTabChange={setActiveResourceTab}
       imagePanel={<ImageLibraryPanel
+        key={`${docId}:${renderedDocumentEpoch}`}
         documentId={docId}
         sessionId={activeChatSessionId}
         initialModelId={activeChatSession?.image_model_id}
-        disabled={streaming || saving || localizingArticleImages}
+        disabled={documentEditingLocked || saving || localizingArticleImages}
         applicationTarget={imageApplicationTarget}
         selectedImage={activeCanvasImage}
         command={imageLibraryCommand}
-        onApply={(url, alt) => Boolean(previewFrameRef.current?.applyLibraryImage(url, alt))}
+        onApply={(url, alt) => ownsRenderedMutation() && !documentEditingLockedRef.current && Boolean(previewFrameRef.current?.applyLibraryImage(url, alt))}
         onSetCover={handleSetLibraryCover}
         onReference={handleReferenceLibraryImage}
         referenceDisabled={chatImageUploading || chatImages.length >= MAX_CHAT_IMAGES_PER_MESSAGE || !models.find((item) => item.id === modelId)?.is_multimodal || !activeChatSession || activeChatSession.is_archived || stopping || chatSubmitting || Boolean(pendingUserQuestion)}
@@ -3133,11 +3339,11 @@ export default function EditorPage() {
       }}
     />
   ), [
-    modelId, models, streaming, saving, materializingTemplateImages, localizingArticleImages,
+    modelId, models, documentEditingLocked, saving, materializingTemplateImages, localizingArticleImages,
     centerView, previewMode, hasPreviewCaret, attachedTemplates, activeChatSession,
-    handleAppendTemplate, handleInsertTemplateAtCaret, toggleAttachedTemplate,
+    handleInsertTemplateAtBoundary, handleInsertTemplateAtCaret, attachTemplateToChat, ownsRenderedMutation,
     clearSessionThemeContext, templateCollection, handleTemplateCollection,
-    activeResourceTab, docId, activeChatSessionId, imageApplicationTarget,
+    activeResourceTab, docId, renderedDocumentEpoch, activeChatSessionId, imageApplicationTarget,
     activeCanvasImage, imageLibraryCommand, handleSetLibraryCover,
     handleReferenceLibraryImage, chatImageUploading, chatImages.length, stopping, chatSubmitting, templateAttachmentsUpdating, pendingUserQuestion,
   ])
@@ -3232,7 +3438,7 @@ export default function EditorPage() {
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             onBlur={handleSaveTitle}
-            disabled={streaming}
+            disabled={documentEditingLocked}
             style={{ width: 280 }}
             placeholder="文档标题"
           />
@@ -3274,7 +3480,7 @@ export default function EditorPage() {
                 className="editor-mobile-toolbar-action"
                 icon={<SaveOutlined />}
                 type={draftHtml !== html ? 'primary' : 'default'}
-                disabled={streaming || saving || draftHtml === html}
+                disabled={documentEditingLocked || saving || draftHtml === html}
                 loading={saving}
                 onClick={handleSaveHtml}
               />
@@ -3299,7 +3505,7 @@ export default function EditorPage() {
                 options={[
                   { label: '浏览', value: 'browse' },
                   { label: <><SelectOutlined /> 选择</>, value: 'select', disabled: previewDarkMode },
-                  { label: <><EditOutlined /> 直接编辑</>, value: 'edit', disabled: streaming || localizingArticleImages || previewDarkMode },
+                  { label: <><EditOutlined /> 直接编辑</>, value: 'edit', disabled: documentEditingLocked || localizingArticleImages || previewDarkMode },
                 ]}
               />
             ) : (
@@ -3313,7 +3519,7 @@ export default function EditorPage() {
                   <Button
                     aria-label="撤销"
                     icon={<UndoOutlined />}
-                    disabled={streaming || saving || !editHistoryState.canUndo}
+                    disabled={documentEditingLocked || saving || !editHistoryState.canUndo}
                     onClick={() => previewFrameRef.current?.undo()}
                   />
                 </Tooltip>
@@ -3321,7 +3527,7 @@ export default function EditorPage() {
                   <Button
                     aria-label="恢复"
                     icon={<RedoOutlined />}
-                    disabled={streaming || saving || !editHistoryState.canRedo}
+                    disabled={documentEditingLocked || saving || !editHistoryState.canRedo}
                     onClick={() => previewFrameRef.current?.redo()}
                   />
                 </Tooltip>
@@ -3402,7 +3608,7 @@ export default function EditorPage() {
                   <Button
                     aria-label="批量转存当前文章的外链图片"
                     icon={<CloudDownloadOutlined />}
-                    disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+                    disabled={documentEditingLocked || saving || materializingTemplateImages || localizingArticleImages}
                     loading={localizingArticleImages}
                   />
                 </Popconfirm>
@@ -3413,7 +3619,7 @@ export default function EditorPage() {
                 <Button
                   aria-label="推送至公众号草稿箱"
                   icon={<SendOutlined />}
-                  disabled={streaming || saving || wechatAccounts.length === 0}
+                  disabled={documentEditingLocked || saving || wechatAccounts.length === 0}
                   onClick={() => setWechatDraftOpen(true)}
                 />
               </Tooltip>
@@ -3423,7 +3629,7 @@ export default function EditorPage() {
                 aria-label="保存手动修改"
                 icon={<SaveOutlined />}
                 type={draftHtml !== html ? 'primary' : 'default'}
-                disabled={streaming || saving || draftHtml === html}
+                disabled={documentEditingLocked || saving || draftHtml === html}
                 loading={saving}
                 onClick={handleSaveHtml}
               />
@@ -3461,7 +3667,7 @@ export default function EditorPage() {
                 />
               </Tooltip>
             )}
-            <Button icon={<ReloadOutlined />} disabled={streaming || saving} onClick={loadDocument}>
+            <Button icon={<ReloadOutlined />} disabled={documentEditingLocked || saving} onClick={loadDocument}>
               刷新
             </Button>
           </Space>
@@ -3517,7 +3723,7 @@ export default function EditorPage() {
             hasOlderMessages={hasOlderMessages}
             olderMessagesLoading={olderMessagesLoading}
             onLoadOlderMessages={loadOlderMessages}
-            queuedMessages={queuedChatRequests.map(({ id, content, images }) => ({ id, content, images }))}
+            queuedMessages={queuedChatRequests.map(({ id, content, images, texts }) => ({ id, content, images, texts }))}
             queuePaused={chatQueuePaused}
             streaming={streaming}
             stopping={stopping}
@@ -3526,9 +3732,17 @@ export default function EditorPage() {
             reasoningTrace={reasoningTrace}
             streamBlocks={streamBlocks}
             streamNotice={streamNotice}
+            recoveryNotice={recoveryNotice}
+            onRetryRecovery={() => {
+              if (chatStartInProgressRef.current || chatRunConnectionRef.current) return
+              resumedRunRef.current = null
+              setRecoveryNotice(null)
+              setRecoveryCheck(value => value + 1)
+            }}
             conversationError={conversationError}
             composerDraft={contextDraft}
             submitting={chatSubmitting || templateAttachmentsUpdating}
+            starting={chatSubmitting}
             pendingUserQuestion={pendingUserQuestion}
             questionSubmitting={questionSubmitting}
             reaskConflict={reaskConflict}
@@ -3537,6 +3751,15 @@ export default function EditorPage() {
             attachedTemplates={attachedTemplates}
             composerTemplates={composerTemplates}
             imageAttachments={chatImages}
+            textAttachments={chatTexts.items}
+            textAttachmentLoadError={chatTexts.loadError}
+            onReloadTexts={() => { void chatTexts.reload() }}
+            onPasteText={(text) => {
+              try { return chatTexts.paste(text) }
+              catch (error) { message.error(error instanceof Error ? error.message : '文本附件上传失败'); return false }
+            }}
+            onRemoveText={(item) => { void chatTexts.remove(item).catch(error => message.error(error instanceof Error ? error.message : '移除失败')) }}
+            onRetryText={(item) => { void chatTexts.retry(item) }}
             imageUploading={chatImageUploading}
             imageUploadProgress={chatImageUploadProgress}
             onRemoveSelectedElement={(index) => setSelectedElements((items) => items.filter((_, itemIndex) => itemIndex !== index))}
@@ -3564,17 +3787,27 @@ export default function EditorPage() {
             onMoveQueuedMessage={moveQueuedChatRequest}
             onResumeQueuedMessages={() => setChatQueuePaused(false)}
             onEditRequest={handleEditRequest}
-            onSend={(text, references, images) => {
+            onSend={(text, references, images, texts = [], templateIds = composerTemplates.map(item => item.id)) => {
+              let templates: TemplateItem[]
+              try {
+                templates = orderMessageTemplates([...composerTemplates, ...attachedTemplates], templateIds)
+              } catch (error) {
+                message.error(error instanceof Error ? error.message : '组件引用无效，请重新附加')
+                return
+              }
+              const byId = new Map(templates.map(item => [item.id, item]))
+              const referencedTemplates = templateIds.map(id => byId.get(id)!)
               requestChatQuestionNotificationPermissionOnce()
               // Clear the submitted draft immediately. The request handler
               // still owns recovery if persisting or starting the run fails.
               setContextDraft('')
               setSelectedElements([])
               if (streaming || chatSubmitting) {
-                enqueueChatRequest(text, references, images)
+                enqueueChatRequest(text, references, images, texts, templates, referencedTemplates)
                 return
               }
-              void handleSendMessage(text, references, undefined, undefined, undefined, undefined, undefined, images)
+              void handleSendMessage(text, references, undefined, undefined, undefined, undefined, undefined, images,
+                [], 'structure', undefined, 0, undefined, modelId ? { modelId, thinkingMode, thinkingEffort, textAttachments: texts, templates, referencedTemplates } : undefined)
             }}
             onAnswerUserQuestion={(answer) => { void handleAnswerUserQuestion(answer) }}
             onUserQuestionActivity={handleUserQuestionActivity}
@@ -3667,7 +3900,7 @@ export default function EditorPage() {
           <div className={`editor-center-panel${centerView === 'code' ? '' : ' is-hidden'}`}>
             {codeViewMounted && (
               <Suspense fallback={<div className="editor-panel-loading" aria-busy="true" />}>
-                <CodeViewer html={centerView === 'code' ? draftHtml : codeViewerHtmlRef.current} onChange={handleHtmlChange} onSave={handleSaveHtml} saving={saving || localizingArticleImages} disabled={streaming || localizingArticleImages} />
+                <CodeViewer html={centerView === 'code' ? draftHtml : codeViewerHtmlRef.current} onChange={handleHtmlChange} onSave={handleSaveHtml} saving={saving || localizingArticleImages} disabled={documentEditingLocked || localizingArticleImages} />
               </Suspense>
             )}
           </div>
@@ -3722,7 +3955,7 @@ export default function EditorPage() {
               options={[
                 { label: '浏览', value: 'browse' },
                 { label: '选择', value: 'select', disabled: previewDarkMode },
-                { label: '直接编辑', value: 'edit', disabled: streaming || localizingArticleImages || previewDarkMode },
+                { label: '直接编辑', value: 'edit', disabled: documentEditingLocked || localizingArticleImages || previewDarkMode },
               ]}
             />
             <div className="editor-mobile-dark-mode-control">
@@ -3776,7 +4009,7 @@ export default function EditorPage() {
             >
               <Button
                 icon={<CloudDownloadOutlined />}
-                disabled={streaming || saving || materializingTemplateImages || localizingArticleImages}
+                disabled={documentEditingLocked || saving || materializingTemplateImages || localizingArticleImages}
                 loading={localizingArticleImages}
               >
                 转存外链图片
@@ -3824,7 +4057,7 @@ export default function EditorPage() {
             )}
             <Button
               icon={<ReloadOutlined />}
-              disabled={streaming || saving}
+              disabled={documentEditingLocked || saving}
               onClick={() => {
                 setMobileActionsDrawerOpen(false)
                 void loadDocument()
@@ -3840,7 +4073,7 @@ export default function EditorPage() {
             <div className="editor-mobile-actions-grid">
               <Button
                 icon={<SendOutlined />}
-                disabled={streaming || saving || wechatAccounts.length === 0}
+                disabled={documentEditingLocked || saving || wechatAccounts.length === 0}
                 onClick={() => {
                   setMobileActionsDrawerOpen(false)
                   setWechatDraftOpen(true)
@@ -3866,11 +4099,12 @@ export default function EditorPage() {
         />
       </Drawer>
       <VersionHistoryDrawer
+        key={`${docId}:${renderedDocumentEpoch}`}
         documentId={docId}
         open={versionDrawerOpen}
         refreshToken={versionRefreshToken}
-        restoreDisabled={streaming || saving || draftHtml !== html}
-        copyDisabled={streaming || saving || draftHtml !== html}
+        restoreDisabled={documentEditingLocked || saving || draftHtml !== html}
+        copyDisabled={documentEditingLocked || saving || draftHtml !== html}
         copyDefaults={versionCopyDefaults}
         onClose={() => setVersionDrawerOpen(false)}
         onRestored={handleVersionRestored}
@@ -3898,7 +4132,7 @@ export default function EditorPage() {
             sessionId={activeChatSessionId}
             modelId={modelId}
             models={models}
-            disabled={streaming || saving || !modelId}
+            disabled={documentEditingLocked || saving || !modelId}
             onClose={() => {
               setThemeGalleryOpen(false)
               setThemeGalleryInitialKey(null)
@@ -3910,15 +4144,17 @@ export default function EditorPage() {
       {wechatDraftOpen && (
         <Suspense fallback={null}>
           <WeChatDraftModal
+            key={`${docId}:${renderedDocumentEpoch}`}
             open
             documentId={docId}
-            disabled={streaming || saving || draftHtml !== html}
+            disabled={documentEditingLocked || saving || draftHtml !== html}
             onClose={() => setWechatDraftOpen(false)}
             onMetadataSaved={(_nextMetadata, nextTitle) => {
               setTitle(nextTitle)
               setVersionRefreshToken((value) => value + 1)
             }}
             onDocumentRefreshed={(document) => {
+              if (!ownsRenderedMutation() || documentEditingLockedRef.current) return
               applyExternalHtml(document.current_html)
               setTitle(document.title)
               setPreviewRevision((value) => value + 1)

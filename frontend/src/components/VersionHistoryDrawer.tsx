@@ -5,6 +5,7 @@ import { documentGroupsApi } from '../api/documentGroups'
 import { documentsApi } from '../api/documents'
 import type { DocumentVersionCopyPayload } from '../api/documents'
 import { ApiError } from '../api/client'
+import { useOperationScope } from '../hooks/useOperationScope'
 import type { DocumentDetail, DocumentGroup, DocumentVersionDetail, DocumentVersionSource, DocumentVersionSummary, VisibilitySettings, VisibilityTargets } from '../types'
 import { frameDocumentWithNewWindowLinks, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 
@@ -486,34 +487,44 @@ export default function VersionHistoryDrawer({
   const [comparisonOpen, setComparisonOpen] = useState(false)
   const [comparisonInitialIds, setComparisonInitialIds] = useState<{ left: number | null; right: number | null }>({ left: null, right: null })
   const versionCacheRef = useRef(new Map<number, DocumentVersionDetail>())
+  const ownsOperation = useOperationScope(`${documentId}:${open}`)
+  const listRequestRef = useRef(0)
+  const detailRequestRef = useRef(0)
 
   const loadVersions = useCallback(async () => {
     if (!documentId) return
+    const request = ++listRequestRef.current
+    const ownsRequest = () => ownsOperation() && request === listRequestRef.current
     setLoading(true)
     try {
       const result = await documentsApi.listVersions(documentId)
+      if (!ownsRequest()) return
       setVersions(result)
       setSelectedVersion((current) => {
         if (current && result.some((item) => item.id === current.id)) return current
         return null
       })
     } catch (err) {
+      if (!ownsRequest()) return
       message.error(err instanceof ApiError ? String(err.detail) : '加载版本历史失败')
     } finally {
-      setLoading(false)
+      if (ownsRequest()) setLoading(false)
     }
-  }, [documentId])
+  }, [documentId, ownsOperation])
 
   const loadVersionDetail = useCallback(async (versionId: number) => {
     if (!documentId) throw new Error('文档不存在')
     const cached = versionCacheRef.current.get(versionId)
     if (cached) return cached
     const detail = await documentsApi.getVersion(documentId, versionId)
+    if (!ownsOperation()) return detail
     versionCacheRef.current.set(versionId, detail)
     return detail
-  }, [documentId])
+  }, [documentId, ownsOperation])
 
   const selectVersion = useCallback(async (versionId: number, openCompactDetail = false) => {
+    const request = ++detailRequestRef.current
+    const ownsRequest = () => ownsOperation() && request === detailRequestRef.current
     if (selectedVersion?.id === versionId) {
       if (openCompactDetail) setMobileDetailOpen(true)
       return
@@ -521,22 +532,30 @@ export default function VersionHistoryDrawer({
     setDetailLoading(true)
     try {
       const detail = await loadVersionDetail(versionId)
-      if (detail) {
+      if (detail && ownsRequest()) {
         setSelectedVersion(detail)
         if (openCompactDetail) setMobileDetailOpen(true)
       }
     } catch (err) {
+      if (!ownsRequest()) return
       message.error(err instanceof ApiError ? String(err.detail) : '加载版本内容失败')
     } finally {
-      setDetailLoading(false)
+      if (ownsRequest()) setDetailLoading(false)
     }
-  }, [loadVersionDetail, selectedVersion?.id])
+  }, [loadVersionDetail, ownsOperation, selectedVersion?.id])
 
   useEffect(() => {
     versionCacheRef.current.clear()
+    listRequestRef.current += 1
+    detailRequestRef.current += 1
+    setVersions([])
     setSelectedVersion(null)
+    setDetailLoading(false)
+    setRestoringId(null)
+    setCopyingId(null)
+    setCopyVersion(null)
     setMobileDetailOpen(false)
-  }, [documentId])
+  }, [documentId, ownsOperation])
 
   useEffect(() => {
     if (!open || !isCompact) setMobileDetailOpen(false)
@@ -553,32 +572,38 @@ export default function VersionHistoryDrawer({
   }, [detailLoading, open, selectedVersion, selectVersion, versions])
 
   const restoreVersion = async (version: DocumentVersionSummary) => {
+    if (!ownsOperation() || restoreDisabled) return
     setRestoringId(version.id)
     try {
       const restored = await documentsApi.restoreVersion(documentId, version.id)
+      if (!ownsOperation()) return
       await onRestored(restored)
+      if (!ownsOperation()) return
       message.success(`已恢复到 v${version.version_number}，并创建新的恢复版本`)
       setSelectedVersion(null)
       await loadVersions()
     } catch (err) {
+      if (!ownsOperation()) return
       message.error(err instanceof ApiError ? String(err.detail) : '恢复版本失败')
     } finally {
-      setRestoringId(null)
+      if (ownsOperation()) setRestoringId(null)
     }
   }
 
   const createCopy = async (payload: DocumentVersionCopyPayload) => {
-    if (!copyVersion) return
+    if (!copyVersion || !ownsOperation() || copyDisabled) return
     setCopyingId(copyVersion.id)
     try {
       const copied = await documentsApi.copyVersion(documentId, copyVersion.id, payload)
+      if (!ownsOperation()) return
       message.success(`已从 v${copyVersion.version_number} 创建新文章`)
       setCopyVersion(null)
       await onCopied(copied)
     } catch (err) {
+      if (!ownsOperation()) return
       message.error(err instanceof ApiError ? String(err.detail) : '创建新文章失败')
     } finally {
-      setCopyingId(null)
+      if (ownsOperation()) setCopyingId(null)
     }
   }
 

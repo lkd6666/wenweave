@@ -75,6 +75,7 @@ from app.schemas.wechat import (
 )
 from app.schemas.layout_reference import LayoutCaptureSessionRead
 from app.schemas.chat import ChatRevertRequest
+from app.schemas.html_validation import HtmlValidationReportRead
 from app.services import local_uploads, oss_client
 from app.services.chat_sessions import ensure_default_chat_session
 from app.services.chat_reask import ChatReaskError, activate_reask
@@ -94,6 +95,7 @@ from app.services.document_image_localization import (
 )
 from app.services.external_fetch import PublicFetchError, fetch_public_image
 from app.services.image_localization import ImageLocalizationError, ImageLocalizationResult
+from app.services.html_validation import validate_html_structure
 from app.services.image_library import create_library_asset
 from app.services.chat_images import ChatImageError, delete_document_attachments
 from app.services.document_shares import revoke_document_shares
@@ -161,8 +163,15 @@ def _is_document_being_edited_by_ai(db: Session, document_id: int) -> bool:
     ).first() is not None
 
 
-def _ensure_document_not_being_edited_by_ai(db: Session, document_id: int) -> None:
-    if _is_document_being_edited_by_ai(db, document_id):
+def _ensure_document_not_being_edited_by_ai(db: Session, document_id: int, *, lock: bool = True) -> None:
+    if lock:
+        db.query(Document).filter(Document.id == document_id).with_for_update().first()
+    query = db.query(AgentRun.id).filter(
+        AgentRun.document_id == document_id,
+        AgentRun.status.in_(ACTIVE_AGENT_RUN_STATUSES),
+    )
+    active = (query.with_for_update() if lock else query).first()
+    if active is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="当前推文正在由 AI 编辑，完成或停止后才能执行此操作",
@@ -193,8 +202,11 @@ def _set_ai_editing_statuses(db: Session, documents: list[Document]) -> list[Doc
     return documents
 
 
-def _get_accessible_document(db: Session, document_id: int, user: User) -> Document:
-    document = db.get(Document, document_id)
+def _get_accessible_document(db: Session, document_id: int, user: User, *, for_update: bool = False) -> Document:
+    document = (
+        db.query(Document).filter(Document.id == document_id).populate_existing().with_for_update().first()
+        if for_update else db.get(Document, document_id)
+    )
     if not document or not can_access_document(user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
     return _set_ai_editing_status(db, document)
@@ -1259,7 +1271,7 @@ def update_document(
     payload: DocumentUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> Document:
+) -> Document | DocumentDetail:
     document = (
         db.query(Document)
         .filter(Document.id == document_id)
@@ -1268,6 +1280,9 @@ def update_document(
     )
     if not document or not can_access_document(current_user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    if (payload.title is not None or payload.wechat_metadata is not None
+            or (payload.current_html is not None and payload.current_html != document.current_html)):
+        _ensure_document_not_being_edited_by_ai(db, document.id)
     changed = False
     version_changed = False
     metadata_title = None
@@ -1317,6 +1332,12 @@ def update_document(
         db.rollback()
         raise
     db.refresh(document)
+    if payload.current_html is not None:
+        return DocumentDetail.model_validate(document).model_copy(update={
+            "html_validation": HtmlValidationReportRead.model_validate(
+                validate_html_structure(document.current_html).to_dict()
+            ),
+        })
     return document
 
 
@@ -1324,7 +1345,8 @@ def update_document(
 def delete_document(
     document_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> None:
-    document = _get_accessible_document(db, document_id, current_user)
+    document = _get_accessible_document(db, document_id, current_user, for_update=True)
+    _ensure_document_not_being_edited_by_ai(db, document.id)
     try:
         delete_document_attachments(db, document.id)
         revoke_document_shares(db, document, current_user)
@@ -1342,7 +1364,8 @@ def revert_last_ai_change(
     db: Session = Depends(get_db),
 ) -> Document:
     """恢复最近一次仍在当前文档上的 AI 修改，再由用户给出新的提问。"""
-    document = _get_accessible_document(db, document_id, current_user)
+    document = _get_accessible_document(db, document_id, current_user, for_update=True)
+    _ensure_document_not_being_edited_by_ai(db, document.id)
     message = (
         db.query(ChatMessage)
         .filter(
@@ -1403,6 +1426,7 @@ def patch_document_content(
     )
     if not document or not can_access_document(current_user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    _ensure_document_not_being_edited_by_ai(db, document.id)
     if content_checksum(document.current_html) != payload.base_checksum:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="文档已被其他修改更新，请刷新后再保存")
     try:
@@ -1420,7 +1444,11 @@ def patch_document_content(
         touch_document(document, current_user.id)
         create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "手动保存")
         db.commit()
-        return DocumentImageLocalizationResult(html=document.current_html, localized_count=localization.localized_count)
+        return DocumentImageLocalizationResult(
+            html=document.current_html,
+            localized_count=localization.localized_count,
+            html_validation=validate_html_structure(document.current_html).to_dict(),
+        )
     except Exception:
         cleanup_document_localization(db, localization)
         db.rollback()
@@ -1473,15 +1501,19 @@ async def localize_document_images(
 ) -> DocumentImageLocalizationResult:
     """Atomically copy every non-document image in the active article."""
     document = _get_accessible_document(db, document_id, current_user)
-    _ensure_document_not_being_edited_by_ai(db, document.id)
+    _ensure_document_not_being_edited_by_ai(db, document.id, lock=False)
+    source_html = document.current_html
     try:
-        result = await localize_document_html(db, document, document.current_html)
+        result = await localize_document_html(db, document, source_html)
     except ImageLocalizationError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-    if not result.localized_count:
-        return DocumentImageLocalizationResult(html=document.current_html, localized_count=0)
-
     try:
+        document = _get_accessible_document(db, document_id, current_user, for_update=True)
+        _ensure_document_not_being_edited_by_ai(db, document.id)
+        if document.current_html != source_html:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="转存期间文档已变化，请刷新后重试")
+        if not result.localized_count:
+            return DocumentImageLocalizationResult(html=document.current_html, localized_count=0)
         document.current_html = result.html
         touch_document(document, current_user.id)
         create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "转存外链图片")
@@ -1609,7 +1641,7 @@ async def _push_wechat_draft(
 
     await report("validating", 24, "正在确认文章、目标公众号和推送权限…")
     document = _get_accessible_document(db, document_id, current_user)
-    _ensure_document_not_being_edited_by_ai(db, document.id)
+    _ensure_document_not_being_edited_by_ai(db, document.id, lock=False)
     account = db.get(WeChatAccount, payload.account_id)
     if account is None or not account.is_active or not _can_push_wechat_draft(current_user, account):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="没有向该公众号推送草稿的权限")
@@ -1646,11 +1678,16 @@ async def _push_wechat_draft(
     try:
         await report("validating", 29, "正在检查正文图片，必要时自动转存…")
         try:
-            localization = await localize_document_html(db, document, document.current_html)
+            localization_source_html = document.current_html
+            localization = await localize_document_html(db, document, localization_source_html)
         except ImageLocalizationError as exc:
             raise WeChatApiError(f"同步前自动转存正文图片失败：{exc}") from exc
         if localization.localized_count:
             try:
+                document = _get_accessible_document(db, document_id, current_user, for_update=True)
+                _ensure_document_not_being_edited_by_ai(db, document.id)
+                if document.current_html != localization_source_html:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="转存期间文档已变化，请刷新后重试")
                 document.current_html = localization.html
                 touch_document(document, current_user.id)
                 create_document_version(db, document, current_user.id, DocumentVersionSource.MANUAL, "同步前自动转存图片")
@@ -2019,6 +2056,7 @@ def revert_to_message(
     document = db.query(Document).filter(Document.id == document_id).with_for_update().first()
     if not document or not can_access_document(current_user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    _ensure_document_not_being_edited_by_ai(db, document.id)
     target_message = (
         db.query(ChatMessage)
         .filter(
@@ -2105,6 +2143,7 @@ def restore_document_version(
     )
     if not document or not can_access_document(current_user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    _ensure_document_not_being_edited_by_ai(db, document.id)
     version = (
         db.query(DocumentVersion)
         .filter(DocumentVersion.id == version_id, DocumentVersion.document_id == document_id)

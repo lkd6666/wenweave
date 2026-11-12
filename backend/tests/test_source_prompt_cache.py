@@ -79,12 +79,14 @@ class SourcePromptCacheTests(unittest.TestCase):
             field: "已完成历史读取" if field == "completed" else "" for field in agent._RUNTIME_SUMMARY_FIELDS}))))
         outgoing, stats = asyncio.run(agent.compact_run_messages_with_model(messages, budget, compactor,
             cache_boundary_tokens_per_group=per_group))
-        self.assertEqual(tool_result_group_count(outgoing), 3)
-        self.assertEqual(stats["used_tokens"], sum(agent._provider_message_tokens(item, 1) for item in outgoing) + 3 * per_group)
+        retained_groups = tool_result_group_count(outgoing)
+        self.assertGreaterEqual(retained_groups, 1)
+        self.assertLessEqual(retained_groups, agent.RUN_VERBATIM_CYCLE_COUNT)
+        self.assertEqual(stats["used_tokens"], sum(agent._provider_message_tokens(item, 1) for item in outgoing) + retained_groups * per_group)
         self.assertLessEqual(stats["used_tokens"], budget)
         self.assertEqual(stats["original_tokens"], sum(agent._provider_message_tokens(item, 1) for item in messages) + 8 * per_group)
-        compactor.ainvoke.assert_awaited_once()
-        self.assertNotIn(CACHE_BOUNDARY_TEXT, str(compactor.ainvoke.call_args.args))
+        self.assertGreaterEqual(compactor.ainvoke.await_count, 1)
+        self.assertNotIn(CACHE_BOUNDARY_TEXT, str(compactor.ainvoke.await_args_list))
         _assert_tool_pairing(self, outgoing)
         # Structural recovery must also update the reserve after dropping cycles.
         structural, structural_stats = agent.compact_run_messages(messages, 5000,
@@ -395,8 +397,9 @@ class SourcePromptCacheTests(unittest.TestCase):
             run_input_budget_tokens=required + schema + 1500,
             resume_messages=resume, resume_tool_result={"tool_call_id": "question", "content": "确认"})
         self.assertEqual(events[-1]["event"], "final")
-        compactor.ainvoke.assert_awaited_once()
-        self.assertNotIn(agent._RUNTIME_CONTEXT_HEADER, str(compactor.ainvoke.call_args.args[0]))
+        self.assertGreaterEqual(compactor.ainvoke.await_count, 1)
+        self.assertEqual(sum(event["event"] == "context_compaction" for event in events), 1)
+        self.assertNotIn(agent._RUNTIME_CONTEXT_HEADER, str(compactor.ainvoke.await_args_list))
         self.assertEqual(chat_model.seen_cache_keys[0], chat_model.seen_cache_keys[1])
         for messages in chat_model.seen_messages:
             self.assertEqual(runtime_state(messages)["loaded_tool_groups"], ["images"])

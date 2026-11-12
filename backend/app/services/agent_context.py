@@ -29,9 +29,9 @@ from app.services.token_budget import estimate_tokens, truncate_to_tokens
 from app.services.tool_output_store import tool_output_stats
 from app.services.model_call_accounting import ModelCallTracker
 from app.services.openai_compatible_chat_model import CACHE_BOUNDARY_TEXT
+from app.services.retry_policy import RetryPolicy, retry_async
+from app.services.chat_texts import reference_text as text_attachment_reference_text
 
-COMPACTION_TARGET_TOKENS = 20_000
-DEFAULT_PRESERVE_RECENT_TOKENS = 20_000
 # Compaction is a small, single-purpose model turn. It uses an independent
 # client configuration with no SDK retry, so an upstream 5xx cannot turn into
 # several minutes of hidden retries before the run fails. Two explicit
@@ -332,12 +332,11 @@ class ContextRecord:
                 f"（含 {len(self.image_attachments)} 张图片；可用 read_session_detail({event_ref}) 取回图片引用）"
                 if self.image_attachments else ""
             )
-            return f"[{event_ref}] 用户：{_short(self.content, 700)}{suffix}"
+            return f"[{event_ref}] 用户：{self.content}{suffix}"
         if self.kind == ContextEventKind.ASSISTANT.value:
             calls = self.payload.get("tool_calls", [])
-            names = [str(call.get("name", "工具")) for call in calls if isinstance(call, dict)]
-            suffix = f"；调用工具：{'、'.join(names)}" if names else ""
-            return f"[{event_ref}] 助手：{_short(self.content, 700)}{suffix}"
+            suffix = f"；调用工具：{json.dumps(calls, ensure_ascii=False)}" if calls else ""
+            return f"[{event_ref}] 助手：{self.content}{suffix}"
         output_ref = ""
         try:
             parsed = json.loads(self.content)
@@ -346,7 +345,7 @@ class ContextRecord:
             output_ref = f" [{candidate}]" if SOURCE_REF_PATTERN.fullmatch(candidate) else ""
         except (TypeError, json.JSONDecodeError):
             pass
-        return f"[{event_ref}] 工具 {self.payload.get('name', 'unknown')}{output_ref}：{_short(self.content, 420)}"
+        return f"[{event_ref}] 工具 {self.payload.get('name', 'unknown')}{output_ref}：{self.content}"
 
 
 def context_prefix_hash(records: Sequence[ContextRecord], count: int | None = None) -> str:
@@ -439,8 +438,10 @@ class AgentContextBuilder:
         tool_schema_tokens: int = AGENT_TOOL_SCHEMA_RESERVE_TOKENS,
         current_image_attachments: Sequence[ChatImageAttachment] = (),
         runtime_context_factory: Callable[[dict[str, Any]], tuple[str, str]] | None = None,
+        retry_sink: Callable | None = None,
     ):
         self.db = db
+        self.retry_sink = retry_sink
         self.document_id = document_id
         self.session_id = session_id
         self.model = model
@@ -469,14 +470,12 @@ class AgentContextBuilder:
         # Normal requests trigger at the configured threshold. A lower
         # multiplier is reserved for retrying an actual provider limit error.
         self.trigger_budget = max(1, int(self.usable_budget * self.budget_multiplier))
-        # Keep a short, information-dense hot context after compaction. Larger
-        # model windows should increase the distance between compactions, not
-        # make each compacted transcript needlessly large.
-        self.target_budget = min(self.usable_budget, COMPACTION_TARGET_TOKENS)
+        # Compaction rebuilds a concise task state. Its bound is derived from
+        # required prompt state and summary capacity, never a window ratio.
+        self.target_budget = self.trigger_budget
         self.memory_target_tokens = min(
             COMPACTION_MODEL_MAX_OUTPUT_TOKENS,
             self.max_output_tokens,
-            max(1_024, self.target_budget // 4),
         )
         compactor_output_budget = min(self.max_output_tokens, COMPACTION_MODEL_MAX_OUTPUT_TOKENS)
         self.compaction_source_budget = max(
@@ -582,7 +581,7 @@ class AgentContextBuilder:
                     row.id,
                     row.id,
                     kind,
-                    {"content": row.content},
+                    {"content": row.content + (text_attachment_reference_text(getattr(row, "text_attachments", ())) if row.role == MessageRole.USER else "")},
                     is_legacy=True,
                     image_attachments=tuple(row.image_attachments),
                 )
@@ -882,40 +881,23 @@ class AgentContextBuilder:
     ) -> tuple[list[ContextRecord], list[ContextRecord]]:
         if not records:
             return [], []
-        # Cline applies its preserved-tail limit to message budget after system
-        # prompt and tool-schema overhead. Applying it to the whole request
-        # would make a small-window model impossible to compact.
-        fixed_overhead = (
-            sum(self._fixed_tokens().values())
-            + self._memory_context_tokens(memory)
-            + self.tool_schema_tokens
+        fixed_overhead = sum(self._fixed_tokens().values()) + self.tool_schema_tokens
+        memory_wrapper = self._memory_context_tokens({})
+        available = self.trigger_budget - fixed_overhead - memory_wrapper
+        self.memory_target_tokens = min(
+            self.memory_target_tokens,
+            max(1, int(available / self.token_estimate_multiplier)),
         )
-        preserve = min(
-            DEFAULT_PRESERVE_RECENT_TOKENS,
-            max(1, self.target_budget - fixed_overhead - self.memory_target_tokens),
+        # The new memory replaces the previous one. Reserve its provider cost,
+        # plus the empty schema/wrapper, rather than charging both memories.
+        memory_reserve = (
+            math.ceil(self.memory_target_tokens * self.token_estimate_multiplier)
+            + memory_wrapper
         )
-        # Select the longest suffix that fits, but only at a user-turn start.
-        # If even the newest historical turn is too large, summarize it too;
-        # retaining a partial turn would either overflow the provider or split
-        # a tool-call/result pair.
-        boundaries = [
-            index
-            for index, record in enumerate(records)
-            if index == 0 or record.kind == ContextEventKind.USER.value
-        ]
-        # The 20K target is deliberately soft. First prefer the longest
-        # complete suffix that fits it; if even the newest turn is larger,
-        # retain that legal turn when the actual input budget permits it.
-        suffix_tokens = [0] * (len(records) + 1)
-        for index in range(len(records) - 1, -1, -1):
-            suffix_tokens[index] = suffix_tokens[index + 1] + self._record_tokens(records[index])
-        for start in boundaries:
-            if suffix_tokens[start] <= preserve:
-                return list(records[:start]), list(records[start:])
-        maximum_preserve = max(1, self.trigger_budget - fixed_overhead - self.memory_target_tokens)
-        for start in reversed(boundaries):
-            if suffix_tokens[start] <= maximum_preserve:
-                return list(records[:start]), list(records[start:])
+        # All these turns precede the current request. Summarize their task
+        # state instead of filling spare capacity with already-consumed text.
+        # The current request and live workspace are injected separately.
+        self.target_budget = fixed_overhead + memory_reserve
         return list(records), []
 
     def _stats(
@@ -1091,10 +1073,16 @@ class AgentContextBuilder:
     ) -> dict[str, Any]:
         memory = previous
         offset = 0
-        while offset < len(older):
+        sources = [record.compact_line() for record in older]
+        while offset < len(sources):
             prefix = f"""将较早的排版 Agent 事件压缩为 JSON 工作记忆。当前 HTML、历史 block_id、revision、expected_hash 都不可靠，绝不能输出它们或源码。优先保留当前尚未完成的用户目标、不可违反的约束、已确认决策和下一步；与当前任务无关的旧主题、尝试过程和重复完成项应折叠或省略。
 
 只返回一个 JSON 对象。字段固定为 objective、important_details、user_preferences、completed_intents、active_work、pending_tasks、blocked、next_move、relevant_files、source_refs、narrative。objective 必须描述当前待续接的实际任务，不能写“压缩历史”之类的元任务；narrative 为当前状态结论；其余字段为短字符串数组。摘要最多约 {self.memory_target_tokens} tokens。
+额度是安全上限，不要为了填满额度复述历史。以能继续任务的最小工作状态为准，去重并省略无关旧任务和已解决的尝试过程。
+优先保留无法从文件恢复的决策和用户约束；可重读的信息只留精确路径、引用和必要结论。已失效或被新要求取代的旧记忆应删除；静态规则、工具说明与最新文档状态会重新提供，不要重复写进摘要。完成项只保留会影响下一步或防止重复操作的结果。
+
+本轮用户请求（有明确请求时以它作为当前目标；没有请求时续接已有任务）：
+{self.current_request or '无新增请求，继续已有任务'}
 
 source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行中明确出现的 tool:toolout-<uuid>；禁止写工具名称、block_id、revision、猜测的 ID。没有精确引用时返回空数组。
 若当前未完成任务仍需查看早期用户附图，请把对应 event:<id> 保留在 source_refs；图片画面不在摘要中，后续可读取该事件取得附件引用。
@@ -1106,59 +1094,62 @@ source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行
 """
             # Every covered event must reach the compactor. Carry the resulting
             # memory through bounded batches instead of discarding the tail.
-            used_tokens = self._provider_text_tokens(prefix) + 64
+            def source_cost(value: str) -> int:
+                return self._provider_text_tokens(prefix + value) + 64
+
             lines: list[str] = []
-            while offset < len(older):
-                line = older[offset].compact_line()
-                line_tokens = self._provider_text_tokens(line + "\n")
-                if used_tokens + line_tokens > self.compaction_source_budget:
+            while offset < len(sources):
+                line = sources[offset]
+                if source_cost("\n".join([*lines, line])) <= self.compaction_source_budget:
+                    lines.append(line)
+                    offset += 1
+                    continue
+                if lines:
                     break
-                lines.append(line)
-                used_tokens += line_tokens
-                offset += 1
+                # Large user requirements and tool args may carry important
+                # facts at the end. Split text losslessly instead of keeping
+                # only the former 700/420-character prefixes.
+                low, high = 0, len(line)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if source_cost(line[:middle]) <= self.compaction_source_budget:
+                        low = middle
+                    else:
+                        high = middle - 1
+                if low:
+                    lines.append(line[:low])
+                    sources[offset] = line[low:]
+                break
             if not lines:
                 raise ContextBudgetError("压缩模型的输入预算无法容纳工作记忆和一个完整事件；请使用更大上下文模型")
             prompt = prefix + "\n".join(lines)
-            last_error: Exception | None = None
-            for attempt in range(2):
-                tracker = self.model_call_tracker_factory() if self.model_call_tracker_factory else None
-                try:
-                    response = await asyncio.wait_for(
-                        chat_model.ainvoke(
-                            [SystemMessage(content="你是安全的会话压缩器，只输出 JSON。"), HumanMessage(content=prompt)]
-                        ),
-                        timeout=COMPACTION_MODEL_TIMEOUT_SECONDS,
-                    )
-                    if tracker:
-                        tracker.complete(response)
-                    text = _content_text(getattr(response, "content", ""))
-                    match = re.search(r"\{[\s\S]*\}", text)
-                    if not match:
-                        raise ValueError("压缩模型没有返回 JSON")
-                    try:
-                        value = json.loads(match.group(0))
-                    except json.JSONDecodeError as exc:
-                        raise ValueError("压缩模型返回了无效 JSON") from exc
-                    required = ("objective", "important_details", "user_preferences", "completed_intents", "active_work", "pending_tasks", "blocked", "next_move", "relevant_files", "source_refs", "narrative")
-                    if (
-                        not isinstance(value, dict)
-                        or any(key not in value for key in required)
+            async def invoke_batch():
+                return await asyncio.wait_for(chat_model.ainvoke([
+                    SystemMessage(content="你是安全的会话压缩器，只输出 JSON。"), HumanMessage(content=prompt),
+                ]), timeout=COMPACTION_MODEL_TIMEOUT_SECONDS)
+
+            def parse_batch(response):
+                text = _content_text(getattr(response, "content", ""))
+                match = re.search(r"\{[\s\S]*\}", text)
+                if not match:
+                    raise ValueError("压缩模型没有返回 JSON")
+                value = json.loads(match.group(0))
+                required = ("objective", "important_details", "user_preferences", "completed_intents", "active_work", "pending_tasks", "blocked", "next_move", "relevant_files", "source_refs", "narrative")
+                if (not isinstance(value, dict) or any(key not in value for key in required)
                         or any(not isinstance(value[key], list) for key in required[1:-1])
-                        or not isinstance(value["objective"], str)
-                        or not isinstance(value["narrative"], str)
-                    ):
-                        raise ValueError("压缩模型返回的记忆结构无效")
-                    memory = _fit_memory_to_budget(value, self.memory_target_tokens)
-                    break
-                except Exception as exc:  # Preserve the raw ledger and retry the model once.
-                    if tracker:
-                        tracker.fail(exc)
-                    last_error = exc
-                    if attempt == 0:
-                        await asyncio.sleep(0.25)
-            else:
-                # No checkpoint is written until every batch succeeds.
-                raise CompactionModelError(compaction_failure_detail(last_error)) from last_error
+                        or not isinstance(value["objective"], str) or not isinstance(value["narrative"], str)):
+                    raise ValueError("压缩模型返回的记忆结构无效")
+                return _fit_memory_to_budget(value, self.memory_target_tokens)
+
+            try:
+                memory = await retry_async(invoke_batch, validate=parse_batch, retry_invalid=True,
+                    sink=self.retry_sink,
+                    tracker_factory=self.model_call_tracker_factory,
+                    policy=RetryPolicy(max_elapsed_seconds=COMPACTION_MODEL_TIMEOUT_SECONDS * 2),
+                    metadata={"source_offset": offset, "source_count": len(sources)})
+            except Exception as exc:
+                # Only a complete successful batch sequence advances the ledger.
+                raise CompactionModelError(compaction_failure_detail(exc)) from exc
         return memory
 
     def _persist_snapshot(
@@ -1269,6 +1260,11 @@ source_refs 只能使用事件文本中明确出现的 event:<id>，或工具行
                 if compaction_model is None:
                     raise ContextBudgetError("当前上下文需要模型压缩，但压缩模型不可用")
                 memory = await self._model_memory(compaction_model, memory, older)
+                # Never advance a durable boundary for a projection that the
+                # selected model cannot send, even if summarization succeeded.
+                candidate_stats = self._stats(memory, retained, "compacted", checkpoint)
+                if candidate_stats["used_tokens"] > self.usable_budget:
+                    raise ContextBudgetError("压缩后必要上下文仍超过模型输入预算，请使用更大上下文模型")
                 checkpoint = self._persist_snapshot(
                     memory,
                     older,

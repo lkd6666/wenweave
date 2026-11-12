@@ -452,7 +452,8 @@ class RetryStreamTests(unittest.TestCase):
 
         self.assertEqual(chunks, ["chunk-1"])
         self.assertEqual(model.attempts, 2)
-        self.assertEqual([event["event"] for event in events], ["model_turn_retry"])
+        self.assertEqual([event["event"] for event in events], ["model_turn_retry"] + ["retry_status"] * 3)
+        self.assertEqual([event["data"]["phase"] for event in events[1:]], ["waiting", "attempting", "recovered"])
 
     def test_failure_after_output_retries_and_notifies_caller_to_discard_partial_turn(self) -> None:
         """调用方据此撤回 partial output，重放不会向最终时间线重复追加文本。"""
@@ -464,7 +465,8 @@ class RetryStreamTests(unittest.TestCase):
         self.assertEqual(chunks, ["chunk-1", "chunk-2"])
         self.assertEqual(model.attempts, 2)
         self.assertEqual(len(resets), 1)
-        self.assertEqual([event["event"] for event in events], ["model_turn_retry"])
+        self.assertEqual([event["event"] for event in events], ["model_turn_retry"] + ["retry_status"] * 3)
+        self.assertEqual(len({event["data"]["operation_id"] for event in events[1:]}), 1)
 
     def test_non_retryable_failure_raises_immediately(self) -> None:
         model = _FakeModel([_Status("invalid request", 400), "chunk-1"])

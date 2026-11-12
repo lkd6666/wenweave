@@ -12,6 +12,7 @@ from urllib.parse import parse_qs
 
 from fastapi import Request
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import get_settings
 from app.core.security import decode_access_token, decode_refresh_token
@@ -498,14 +499,20 @@ async def capture_request_context(
         except Exception:  # noqa: BLE001
             pass
     details = _safe_request_details(request)
-    actor_user_id, actor_username, actor_display_name = _actor_snapshot(request.headers.get("authorization", ""))
+    # Pool checkout and synchronous SQL can wait. Let the event loop continue
+    # running requests and dependency cleanup while these snapshots are read.
+    actor_user_id, actor_username, actor_display_name = await run_in_threadpool(
+        _actor_snapshot, request.headers.get("authorization", "")
+    )
     if route.action == "auth.login":
-        actor_user_id, actor_username, actor_display_name = _login_actor_snapshot(str(details.get("username", "")))
-    elif route.action == "auth.refresh":
-        actor_user_id, actor_username, actor_display_name = _refresh_actor_snapshot(
-            request.cookies.get("refresh_token", "")
+        actor_user_id, actor_username, actor_display_name = await run_in_threadpool(
+            _login_actor_snapshot, str(details.get("username", ""))
         )
-    resource_name = _target_snapshot(route)
+    elif route.action == "auth.refresh":
+        actor_user_id, actor_username, actor_display_name = await run_in_threadpool(
+            _refresh_actor_snapshot, request.cookies.get("refresh_token", "")
+        )
+    resource_name = await run_in_threadpool(_target_snapshot, route)
     if not resource_name:
         resource_name = _safe_text(
             details.get("title") or details.get("name") or details.get("display_name") or details.get("username")

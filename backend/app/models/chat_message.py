@@ -13,6 +13,7 @@ from app.db.types import ID_TYPE, LONG_TEXT
 from app.services.selected_elements import normalize_selected_elements
 
 if TYPE_CHECKING:
+    from app.models.chat_text_attachment import ChatTextAttachment
     from app.models.chat_image_attachment import ChatImageAttachment
     from app.models.user import User
 
@@ -68,6 +69,9 @@ class ChatMessage(Base):
     created_by: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
     image_attachments: Mapped[list["ChatImageAttachment"]] = relationship(
         "ChatImageAttachment", back_populates="message", cascade="all, delete-orphan", order_by="ChatImageAttachment.created_at"
+    )
+    text_attachments: Mapped[list["ChatTextAttachment"]] = relationship(
+        "ChatTextAttachment", back_populates="message", cascade="all, delete-orphan", order_by="ChatTextAttachment.created_at"
     )
 
     @property

@@ -57,6 +57,9 @@ class AgentRun(Base):
     # process-recovery paths preserve completed edits without waiting for a
     # final natural-language model response.
     checkpoint_html: Mapped[str] = mapped_column(LONG_TEXT, nullable=False, default="")
+    # Stored-document baseline for this candidate. None denotes legacy/no
+    # checkpoint; an empty candidate can therefore represent deleting all HTML.
+    checkpoint_document_html: Mapped[str | None] = mapped_column(LONG_TEXT, nullable=True)
     # A run can be owned by exactly one live worker.  The lease protects
     # cross-worker SSE, cancellation and restart recovery from interpreting
     # another worker's in-process task as a failed run.

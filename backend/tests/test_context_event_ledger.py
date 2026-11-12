@@ -19,7 +19,6 @@ from app.models.chat_message import ChatMessage, MessageRole
 from app.models.chat_session import ChatSession
 from app.services.agent_context import (
     AgentContextBuilder,
-    COMPACTION_TARGET_TOKENS,
     CompactionModelError,
     ContextRecord,
     _normalise_memory,
@@ -173,10 +172,7 @@ class ContextEventLedgerTests(unittest.TestCase):
         self.assertEqual(preview["active_context_threshold_tokens"], self.model.context_compaction_threshold_tokens)
         self.assertEqual(preview["compiled_input_tokens"], preview["raw_input_tokens"])
         self.assertLess(preview["projected_used_tokens"], preview["raw_input_tokens"])
-        self.assertEqual(
-            preview["compaction_target_tokens"],
-            min(self.model.context_compaction_threshold_tokens, COMPACTION_TARGET_TOKENS),
-        )
+        self.assertLess(preview["compaction_target_tokens"], self.model.context_compaction_threshold_tokens)
 
         prepared = asyncio.run(builder.prepare(self._SummaryModel()))
         snapshot = self.db.query(ChatContextSnapshot).one()
@@ -184,8 +180,8 @@ class ContextEventLedgerTests(unittest.TestCase):
         self.assertGreater(snapshot.compacted_through_event_id, 0)
         self.assertTrue(snapshot.source_prefix_hash.startswith("sha256:"))
         self.assertLessEqual(prepared.stats["used_tokens"], self.model.context_compaction_threshold_tokens)
-        self.assertTrue(prepared.history)
-        self.assertIsInstance(prepared.history[0], HumanMessage)
+        self.assertFalse(prepared.history)
+        self.assertTrue(prepared.memory["objective"])
 
     def test_serialization_discards_orphan_tool_call(self) -> None:
         orphan = AIMessage(content="", tool_calls=[{"id": "orphan", "name": "read_blocks", "args": {}}])

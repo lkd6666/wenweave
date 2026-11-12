@@ -11,6 +11,8 @@ deploy/searxng/.env
 # Node / Vite
 node_modules/
 dist/
+!/_third_party/verify-article-structure-spec/cli/dist/
+!/_third_party/verify-article-structure-spec/cli/dist/verify-article-structure.browser.js
 *.tsbuildinfo
 vite.config.*.timestamp-*
 

@@ -26,6 +26,7 @@ from app.schemas.document import (
     DocumentImportComplete,
     DocumentImportCreate,
     DocumentCreate,
+    DocumentDetail,
 )
 from tests.workspace_temp import WorkspaceTempDirectory
 
@@ -181,6 +182,30 @@ class DirectImportRouteTests(unittest.TestCase):
         )
         self.assertEqual(repeated.id, result.id)
         self.assertEqual(self.db.query(DocumentImport).filter_by(id=started.id).one().document_id, result.id)
+
+    def test_long_import_filename_remains_readable_after_completion(self) -> None:
+        title = (
+            "691e45c123fcc93bc9b91e4f9f8363ca_5286140369814751885_m_"
+            "关于做好西藏那曲市巴青县地震受灾学生临时困难补助工作的通知(1)"
+        )
+        content_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        started = documents.create_direct_import(
+            DocumentImportCreate(filename=f"{title}.docx", content_type=content_type, size=1024),
+            self.user,
+            self.db,
+        )
+        self.uploaded_objects[started.source_upload.object_key] = {
+            "size": 1024,
+            "content_type": content_type,
+        }
+        for _ in range(2):
+            # Completion is idempotent, including response validation on retries.
+            document = documents.complete_direct_import(
+                started.id, DocumentImportComplete(html="<p>正文</p>"), self.user, self.db,
+            )
+            detail = DocumentDetail.model_validate(document)
+            self.assertEqual(detail.title, title)
+            self.assertEqual(detail.wechat_metadata.title, title)
 
     def test_direct_import_replaces_crop_source_and_display_placeholders(self) -> None:
         started = documents.create_direct_import(

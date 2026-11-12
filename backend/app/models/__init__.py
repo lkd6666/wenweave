@@ -9,6 +9,7 @@ from app.models.document import Document
 from app.models.document_group import DocumentGroup
 from app.models.chat_message import ChatMessage
 from app.models.chat_image_attachment import ChatImageAttachment
+from app.models.chat_text_attachment import ChatTextAttachment
 from app.models.document_content_object import DocumentContentObject
 from app.models.document_version import DocumentVersion
 from app.models.agent_run import AgentRun
@@ -57,6 +58,7 @@ __all__ = [
     "DocumentGroup",
     "ChatMessage",
     "ChatImageAttachment",
+    "ChatTextAttachment",
     "DocumentContentObject",
     "DocumentVersion",
     "AgentRun",

@@ -1,6 +1,7 @@
 import ReactMarkdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
@@ -73,7 +74,8 @@ export default function MarkdownContent({ content, streaming = false }: Markdown
   return (
     <AiTextResponse><div className="markdown-content">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        // Support CJK punctuation at either emphasis boundary: 前文**“说明”** and **句末。**后文.
+        remarkPlugins={[remarkGfm, remarkCjkFriendly, remarkMath]}
         rehypePlugins={[rehypeKatex]}
         components={streaming ? streamingMarkdownComponents : markdownComponents}
       >

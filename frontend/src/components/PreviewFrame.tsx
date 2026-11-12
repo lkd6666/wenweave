@@ -40,6 +40,7 @@ import {
 } from '../utils/blockEditing'
 import { sanitizeSelectedElement } from '../utils/selectedElements'
 import { collectSvgImageLayers } from '../utils/svgImageLayers'
+import { normalizeSvgTextBreaks } from '../utils/svgTextEditing'
 import type { SvgImageLayer } from '../utils/svgImageLayers'
 import { frameDocumentWithNewWindowLinks, markLinksToOpenInNewWindow, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 import { ARTICLE_RENDER_CSS, ARTICLE_RENDER_ROOT_CLASS, ARTICLE_RENDER_VIEWPORT } from '../utils/articleFrame'
@@ -59,7 +60,7 @@ export interface PreviewFrameHandle {
   flushPendingChange: () => void
   copyArticle: () => Promise<'copied' | 'empty' | 'failed'>
   openImagePickerForInsert: () => void
-  insertTemplateHtml: (html: string, placement: 'append' | 'caret') => boolean
+  insertTemplateHtml: (html: string, placement: 'prepend' | 'append' | 'caret') => boolean
   insertImageAfter: (anchorPath: string, nextUrl: string, alt: string) => string | null
   replaceImageSource: (target: PreviewImageTarget, nextUrl: string) => string | null
   getImageApplicationTarget: () => 'image' | 'block' | 'caret' | null
@@ -874,6 +875,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
   const cleanClone = (element: Element) => {
     const clone = element.cloneNode(true) as HTMLElement
+    normalizeSvgTextBreaks(clone)
     clone.classList.remove('ai-element-selected')
     clone.querySelectorAll('.ai-element-selected').forEach((node) => node.classList.remove('ai-element-selected'))
     clone.classList.remove('ai-preview-image-selected')
@@ -884,6 +886,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
 
   const serialiseBody = (body: HTMLElement) => {
     const clone = body.cloneNode(true) as HTMLElement
+    normalizeSvgTextBreaks(clone)
     clone.querySelectorAll('.ai-element-selected').forEach((node) => node.classList.remove('ai-element-selected'))
     clone.querySelectorAll('.ai-preview-image-selected').forEach((node) => node.classList.remove('ai-preview-image-selected'))
     clone.querySelectorAll('[data-preview-image-action]').forEach((node) => node.remove())
@@ -2159,7 +2162,7 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
     }
   }
 
-  const insertTemplateHtml = (templateHtml: string, placement: 'append' | 'caret'): boolean => {
+  const insertTemplateHtml = (templateHtml: string, placement: 'prepend' | 'append' | 'caret'): boolean => {
     ensureRenderedHtml()
     const document = iframeRef.current?.contentDocument
     const body = document?.body
@@ -2186,8 +2189,9 @@ const PreviewFrame = forwardRef<PreviewFrameHandle, PreviewFrameProps>(function 
       selection?.removeAllRanges()
       selection?.addRange(after)
     } else {
-      if (body.innerHTML === EMPTY_PREVIEW_HTML) body.innerHTML = ''
-      body.append(fragment)
+      if (previousHtml.trim() === EMPTY_PREVIEW_HTML) body.innerHTML = ''
+      if (placement === 'prepend') body.prepend(fragment)
+      else body.append(fragment)
     }
     markLinksToOpenInNewWindow(body)
     recordEditChange(previousHtml)

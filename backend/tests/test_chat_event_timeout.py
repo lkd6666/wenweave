@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import anyio
 from langchain_core.messages import AIMessageChunk
 from pydantic import ValidationError
 from sqlalchemy import create_engine, inspect
@@ -467,6 +468,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         waiting_run = SimpleNamespace(status=AgentRunStatus.WAITING_FOR_INPUT)
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             def get(self, model, _identifier):
                 return answered_question if model is ChatUserQuestion else waiting_run
 
@@ -502,6 +506,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         database_now = datetime(2026, 7, 29, 18, 40, 0)
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             def query(self, _expression):
                 return SimpleNamespace(scalar=lambda: database_now)
 
@@ -555,6 +562,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             def filter(self, *_args):
                 return self
 
+            def populate_existing(self):
+                return self
+
             def with_for_update(self):
                 return self
 
@@ -562,6 +572,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return question
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             committed = False
 
             def query(self, _model):
@@ -615,6 +628,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             def filter(self, *_args):
                 return self
 
+            def populate_existing(self):
+                return self
+
             def with_for_update(self):
                 return self
 
@@ -622,6 +638,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return question
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             committed = False
 
             def query(self, _model):
@@ -689,6 +708,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return [(orphaned, failed_run), (valid, waiting_run)] if FakeQuery.calls == 1 else []
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             committed = False
 
             def query(self, *_models):
@@ -735,6 +757,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             def filter(self, *_args):
                 return self
 
+            def populate_existing(self):
+                return self
+
             def with_for_update(self):
                 return self
 
@@ -742,6 +767,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return self.value
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             committed = False
 
             def query(self, model):
@@ -1017,20 +1045,32 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_cooperative_stream_closure_is_a_terminal_cleanup_failure(self) -> None:
         release = asyncio.Event()
+        closed = asyncio.Event()
+        reading = False
+        close_count = 0
 
         class StubbornStream:
             def __aiter__(self):
                 return self
 
             async def __anext__(self):
+                nonlocal reading
+                reading = True
                 try:
-                    await release.wait()
-                except asyncio.CancelledError:
-                    await release.wait()
-                raise StopAsyncIteration
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        await release.wait()
+                    raise StopAsyncIteration
+                finally:
+                    reading = False
 
             async def aclose(self):
-                await release.wait()
+                nonlocal close_count
+                close_count += 1
+                if reading:
+                    raise RuntimeError("aclose(): asynchronous generator is already running")
+                closed.set()
 
         try:
             with (
@@ -1040,9 +1080,155 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ModelStreamCleanupError):
                     async for _ in _iterate_model_stream_with_idle_limits(StubbornStream()):
                         pass
+                self.assertEqual(close_count, 0)
         finally:
             release.set()
-            await asyncio.sleep(0)
+            await asyncio.wait_for(closed.wait(), timeout=1)
+        self.assertEqual(close_count, 1)
+
+    async def test_cancelled_model_stream_stops_pending_read_before_closing(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def stream():
+            try:
+                started.set()
+                await release.wait()
+                yield AIMessageChunk(content="late output")
+            finally:
+                stopped.set()
+
+        async def consume():
+            async for _ in _iterate_model_stream_with_idle_limits(stream()):
+                pass
+
+        task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            with patch("app.services.chat_agent.logger.warning") as warning:
+                task.cancel("user stopped the run")
+                with self.assertRaises(asyncio.CancelledError) as raised:
+                    await asyncio.wait_for(task, timeout=1)
+                self.assertEqual(raised.exception.args, ("user stopped the run",))
+                self.assertTrue(stopped.is_set())
+                warning.assert_not_called()
+        finally:
+            release.set()
+            await asyncio.wait_for(stopped.wait(), timeout=1)
+
+    async def test_stubborn_model_read_defers_close_and_preserves_cancellation(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        closed = asyncio.Event()
+        reading = False
+        close_count = 0
+
+        class StubbornStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                nonlocal reading
+                reading = True
+                started.set()
+                try:
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        await release.wait()
+                    raise StopAsyncIteration
+                finally:
+                    reading = False
+
+            async def aclose(self):
+                nonlocal close_count
+                close_count += 1
+                if reading:
+                    raise RuntimeError("aclose(): asynchronous generator is already running")
+                closed.set()
+
+        async def consume():
+            async for _ in _iterate_model_stream_with_idle_limits(StubbornStream()):
+                pass
+
+        with patch("app.services.chat_agent.MODEL_STREAM_CLEANUP_GRACE_SECONDS", 0.01):
+            task = asyncio.create_task(consume())
+            try:
+                await asyncio.wait_for(started.wait(), timeout=1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=1)
+                self.assertEqual(close_count, 0)
+            finally:
+                release.set()
+                await asyncio.wait_for(closed.wait(), timeout=1)
+            self.assertEqual(close_count, 1)
+
+    async def test_repeated_cancellation_does_not_interrupt_model_stream_cleanup(self) -> None:
+        started = asyncio.Event()
+        stopping = asyncio.Event()
+        release = asyncio.Event()
+        closed = asyncio.Event()
+
+        class Stream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopping.set()
+                    await release.wait()
+
+            async def aclose(self):
+                closed.set()
+
+        async def consume():
+            async for _ in _iterate_model_stream_with_idle_limits(Stream()):
+                pass
+
+        task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel("first cancellation")
+            await asyncio.wait_for(stopping.wait(), timeout=1)
+            task.cancel("second cancellation")
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+            self.assertFalse(closed.is_set())
+        finally:
+            release.set()
+            await asyncio.wait_for(closed.wait(), timeout=1)
+
+    async def test_anyio_scope_cancellation_still_cleans_up_model_stream(self) -> None:
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        scopes = []
+
+        async def stream():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield AIMessageChunk(content="late output")
+            finally:
+                stopped.set()
+
+        async def consume():
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                async for _ in _iterate_model_stream_with_idle_limits(stream()):
+                    pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        with patch("app.services.chat_agent.logger.warning") as warning:
+            scopes[0].cancel()
+            await asyncio.wait_for(task, timeout=1)
+            await asyncio.wait_for(stopped.wait(), timeout=1)
+            warning.assert_not_called()
 
     async def test_force_stuck_cancellation_persists_terminal_result(self) -> None:
         run = SimpleNamespace(
@@ -1057,6 +1243,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         document = SimpleNamespace(id=7, current_html="<p>draft</p>")
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             def __init__(self) -> None:
                 self.message = None
                 self.committed = False
@@ -1070,6 +1259,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def query(self, _model):
+                if _model is ChatUserQuestion:
+                    return SimpleNamespace(filter=lambda *_args: SimpleNamespace(
+                        order_by=lambda *_args: SimpleNamespace(first=lambda: None)))
                 result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
@@ -1134,6 +1326,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         request_message = SimpleNamespace(html_before=source_html)
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             def __init__(self) -> None:
                 self.message = None
 
@@ -1145,6 +1340,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def query(self, _model):
+                if _model is ChatUserQuestion:
+                    return SimpleNamespace(filter=lambda *_args: SimpleNamespace(
+                        order_by=lambda *_args: SimpleNamespace(first=lambda: None)))
                 result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
@@ -1178,8 +1376,8 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat_module, "SessionLocal", return_value=session),
             patch.object(chat_module, "agent_run_manager", manager),
             patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
-            patch.object(chat_module, "touch_document"),
-            patch.object(chat_module, "create_document_version"),
+            patch("app.services.agent_checkpoints.touch_document"),
+            patch("app.services.agent_checkpoints.create_document_version"),
             patch.object(manager, "publish"),
             patch.object(manager, "mark_terminal", side_effect=mark_terminal),
         ):
@@ -1208,6 +1406,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
         request_message = SimpleNamespace(html_before=source_html)
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             def __init__(self) -> None:
                 self.message = None
 
@@ -1219,6 +1420,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def query(self, _model):
+                if _model is ChatUserQuestion:
+                    return SimpleNamespace(filter=lambda *_args: SimpleNamespace(
+                        order_by=lambda *_args: SimpleNamespace(first=lambda: None)))
                 result = run if _model is AgentRun else document
                 return SimpleNamespace(
                     filter=lambda *_args: SimpleNamespace(
@@ -1252,7 +1456,7 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             patch.object(chat_module, "SessionLocal", return_value=session),
             patch.object(chat_module, "agent_run_manager", manager),
             patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
-            patch.object(chat_module, "create_document_version") as create_version,
+            patch("app.services.agent_checkpoints.create_document_version") as create_version,
             patch.object(manager, "publish"),
             patch.object(manager, "mark_terminal", side_effect=mark_terminal),
         ):
@@ -1299,6 +1503,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
             def scalar(self):
                 return getattr(self.rows[0], "sequence", None) if self.rows else None
 
+            def populate_existing(self):
+                return self
+
             def with_for_update(self):
                 return self
 
@@ -1309,6 +1516,9 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 return self.rows[0] if self.rows else None
 
         class FakeSession:
+            def rollback(self):
+                pass
+
             def __init__(self) -> None:
                 self.message = None
                 self.events = []
@@ -1334,8 +1544,8 @@ class AgentEventTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         session = FakeSession()
         with (
-            patch.object(bootstrap_module, "touch_document"),
-            patch.object(bootstrap_module, "create_document_version"),
+            patch("app.services.agent_checkpoints.touch_document"),
+            patch("app.services.agent_checkpoints.create_document_version"),
             patch("app.services.wechat_compliance.get_official_compliance_engine", side_effect=AssertionError("Unexpected automatic check")),
         ):
             recovered = bootstrap_module.recover_interrupted_agent_runs(session)

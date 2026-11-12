@@ -4,6 +4,10 @@ const blockEleTagName = ['P', 'DIV', 'SECTION', 'LI', 'H1', 'H2', 'H3', 'H4', 'H
 const canNotSplitEleClassName = ['js_product_container', 'js_blockquote_wrap'];
 const canNotSplitEleTagName = ['BLOCKQUOTE'];
 const selfTagName = ['HR', 'IMG'];
+// 非渲染元素（完整 HTML 文档粘贴时 head 内标签会成为容器直接子节点，
+// innerHTML 解析会剥掉 html/head/body 但保留其子元素）。它们没有布局
+// 意义，不应进入段落列表，否则零矩形会在溢出检测里被误判。
+const noRenderEleTagName = ['STYLE', 'SCRIPT', 'META', 'LINK', 'TITLE', 'HEAD', 'NOSCRIPT', 'TEMPLATE'];
 
 interface GetParaListOpts {
   getNestedStructure?: boolean;
@@ -42,7 +46,7 @@ function isNotSplitEle(ele: any, opts: GetParaListOpts): boolean {
 
 function getParaList(element: any, opts: GetParaListOpts, isRoot = true): any[] {
   const children = element.children;
-  if (!children.length) return Array.from(children);
+  if (!children.length) return children;
 
   let child: any;
   let paragraphList: any[] = [];
@@ -50,6 +54,7 @@ function getParaList(element: any, opts: GetParaListOpts, isRoot = true): any[] 
     child = children[i];
     child.isWrapper = undefined;
 
+    if (noRenderEleTagName.indexOf(child.tagName) !== -1) continue;
     if (opts && opts.isMarkNode && opts.isMarkNode(child)) continue;
 
     if (childNodesHasBlockEle(child, opts) && !isNotSplitEle(child, opts)) {

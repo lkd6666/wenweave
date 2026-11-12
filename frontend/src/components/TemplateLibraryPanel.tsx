@@ -14,6 +14,7 @@ import {
   PlusOutlined,
   ReadOutlined,
   SendOutlined,
+  VerticalAlignTopOutlined,
 } from '@ant-design/icons'
 import { templateLibraryApi, type TemplateWritePayload } from '../api/templateLibrary'
 import { gzhThemesApi } from '../api/gzhThemes'
@@ -43,9 +44,10 @@ interface TemplateLibraryPanelProps {
   canInsertAtCaret: boolean
   attachedTemplateIds: number[]
   themeContext: ChatSessionItem['theme_context']
+  onPrepend: (template: TemplateItem) => void | Promise<void>
   onAppend: (template: TemplateItem) => void | Promise<void>
   onInsertAtCaret: (template: TemplateItem) => void | Promise<void>
-  onToggleAttach: (template: TemplateItem) => void
+  onAttachToChat: (template: TemplateItem) => void
   onClearThemeContext: () => void
   onOpenThemeGallery: (themeKey?: string) => void
   collection: { id: number; html: string } | null
@@ -178,9 +180,10 @@ export default function TemplateLibraryPanel({
   canInsertAtCaret,
   attachedTemplateIds,
   themeContext,
+  onPrepend,
   onAppend,
   onInsertAtCaret,
-  onToggleAttach,
+  onAttachToChat,
   onClearThemeContext,
   onOpenThemeGallery,
   collection,
@@ -590,14 +593,17 @@ export default function TemplateLibraryPanel({
                         <span>{SOURCE_LABEL[template.source_type]}</span>
                       </div>
                       <div className="template-library-actions">
+                        <Tooltip title="添加到当前文章最开头">
+                          <Button aria-label={`添加 ${template.name} 到文首`} icon={<VerticalAlignTopOutlined />} disabled={disabled || localizingTemplateImages} onClick={() => { void onPrepend(template) }} />
+                        </Tooltip>
                         <Tooltip title="添加到当前文章文末">
                           <Button aria-label={`添加 ${template.name} 到文末`} icon={<FileAddOutlined />} disabled={disabled || localizingTemplateImages} onClick={() => { void onAppend(template) }} />
                         </Tooltip>
                         <Tooltip title={canInsertAtCaret ? '插入当前直接编辑光标处' : '仅直接编辑模式且画布有真实光标时可用'}>
                           <Button aria-label={`插入 ${template.name} 到光标处`} icon={<AppstoreAddOutlined />} disabled={disabled || localizingTemplateImages || !canInsertAtCaret} onClick={() => { void onInsertAtCaret(template) }} />
                         </Tooltip>
-                        <Tooltip title={attached ? '从 AI 对话移除' : attachedTemplateIds.length >= 6 ? '每次对话最多附加 6 个模板' : '附到 AI 对话'}>
-                          <Button aria-label={`${attached ? '移除' : '附加'}模板 ${template.name}`} icon={attached ? <CheckOutlined /> : <PaperClipOutlined />} type={attached ? 'primary' : 'default'} disabled={attachmentDisabled || (!attached && attachedTemplateIds.length >= 6)} onClick={() => onToggleAttach(template)} />
+                        <Tooltip title={attached ? '引用到输入框（已附到 AI 对话）' : attachedTemplateIds.length >= 6 ? '每次对话最多附加 6 个模板' : '附到 AI 对话并引用到输入框'}>
+                          <Button aria-label={attached ? `引用模板 ${template.name} 到输入框` : `附加模板 ${template.name}`} icon={attached ? <CheckOutlined /> : <PaperClipOutlined />} type={attached ? 'primary' : 'default'} disabled={attachmentDisabled || (!attached && attachedTemplateIds.length >= 6)} onClick={() => onAttachToChat(template)} />
                         </Tooltip>
                         <Tooltip title="编辑模板"><Button aria-label={`编辑模板 ${template.name}`} type="text" icon={<EditOutlined />} disabled={disabled} onClick={() => openEdit(template)} /></Tooltip>
                         <Popconfirm title={`删除「${template.name}」？`} description="已转存的模板图片也会清理。" okText="删除" cancelText="取消" onConfirm={() => deleteTemplate(template)}>

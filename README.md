@@ -1,4 +1,4 @@
-# 一版排版（YiBanPaiBan）
+# AI 公众号排版工作台
 
 面向微信公众号创作者的本地可部署 AI 排版系统。它将文档与文章链接导入、对话式 HTML 编辑、实时预览、微信兼容性检查、配图、主题模板和公众号草稿同步整合到一个工作台中；AI 模型、密钥与用户权限均由部署者自行管理。
 
@@ -48,12 +48,12 @@
 
 ## 技术栈
 
-| 层级 | 技术 |
-| --- | --- |
-| 前端 | React、TypeScript、Vite、Ant Design |
-| 后端 | Python 3.11+、FastAPI、SQLAlchemy、MySQL |
-| AI 编排 | LangGraph、OpenAI 兼容接口 / Responses API、Anthropic Claude、Google Gemini 原生 API |
-| 文档与存储 | PyMuPDF、python-docx、对象存储厂商 SDK |
+| 层级       | 技术                                                                                 |
+| ---------- | ------------------------------------------------------------------------------------ |
+| 前端       | React、TypeScript、Vite、Ant Design                                                  |
+| 后端       | Python 3.11+、FastAPI、SQLAlchemy、MySQL                                             |
+| AI 编排    | LangGraph、OpenAI 兼容接口 / Responses API、Anthropic Claude、Google Gemini 原生 API |
+| 文档与存储 | PyMuPDF、python-docx、对象存储厂商 SDK                                               |
 
 ```text
 浏览器（React + Vite）
@@ -78,10 +78,10 @@ FastAPI（鉴权、Agent、文档、同步、SSE）
 
 ### 1. 创建数据库
 
-使用有建库权限的 MySQL 账号创建数据库，并按实际账号密码修改后端环境变量：
+使用有建库权限的 MySQL 账号创建数据库（以下以 `article_editor` 为例），并在后端 `DATABASE_URL` 中填写一致的数据库名及实际账号密码：
 
 ```sql
-CREATE DATABASE yibanpaiban
+CREATE DATABASE article_editor
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 ```
@@ -119,7 +119,7 @@ npm ci
 npm run dev
 ```
 
-访问 <http://localhost:5173>。开发环境首次初始化且用户表为空时，会创建默认管理员账号 `admin` / `admin123`；请在首次登录后立即修改密码。生产环境必须在 `.env` 中设置自定义管理员账号和密码，不能使用这组默认凭据。
+访问 [http://localhost:5173](http://localhost:5173)。开发环境首次初始化且用户表为空时，会创建默认管理员账号 `admin` / `admin123`；请在首次登录后立即修改密码。生产环境必须在 `.env` 中设置自定义管理员账号和密码，不能使用这组默认凭据。
 
 ### 4. 完成初始配置
 
@@ -148,7 +148,7 @@ API Key、对象存储凭据、AppSecret、`.env`、数据库和 `backend/data/`
 3. 对照 `.env.example` 补齐新增配置，以单 worker 启动后端并等待自动迁移完成。本轮包含运行性能索引、图片共享引用与直接图片输入的兼容迁移，SQL 参考文件位于 `deploy/migrations/`。
 4. 验证登录、文章加载、AI 编辑、图片引用、历史任务恢复和手动合规检测；使用采集助手时同步升级浏览器扩展。
 
-源码工具默认使用 `CHAT_AGENT_TOOL_PROTOCOL=v2`；可设为 `v1` 后重启来回退**新运行**，已暂停任务继续沿用保存的协议。提示缓存由管理员按模型开启，应先验证对应网关；缓存命中不会增加上下文容量，也不保证响应更快。
+源码工具默认使用 `CHAT_AGENT_TOOL_PROTOCOL=v2`；可设为 `v1` 后重启来回退**新运行**，已暂停任务继续沿用保存的协议。提示缓存由管理员按模型开启，应先验证对应网关。
 
 ## 开发与测试
 
@@ -190,17 +190,21 @@ _third_party/       保留许可与来源记录的第三方快照
 
 ## 文档导航
 
-| 主题 | 文档 |
-| --- | --- |
-| 前端开发、代理与扩展构建 | [前端说明](frontend/README.md) |
-| Linux / 宝塔生产部署 | [Linux 部署](docs/DEPLOY_LINUX.md) · [宝塔部署](docs/DEPLOY_BAOTA.md) |
-| Chrome / Edge 排版采集助手 | [构建、安装与企业分发](deploy/layout-capture-extension.md) |
-| 源码工具、授权边界与旧协议回退 | [源码 Agent](docs/SOURCE_AGENT.md) · [历史验收记录](docs/SOURCE_AGENT_ACCEPTANCE.md) |
-| 上下文预算、压缩、图片与恢复 | [上下文管理](docs/CONTEXT_MANAGEMENT.md) · [预检性能](docs/CONTEXT_PERFORMANCE.md) |
-| 模型提示缓存与用量统计 | [提示缓存优化](docs/PROMPT_CACHE_OPTIMIZATION.md) |
-| 小内存资源配置与性能复测 | [2 核 2 GiB 部署](docs/PERFORMANCE_2G.md) |
-| 微信规范与生成提示约束 | [规则维护说明](docs/WECHAT_PROMPT_RULES.md) |
-| 搜图、贡献与第三方许可 | [SearXNG](deploy/searxng/README.md) · [贡献指南](CONTRIBUTING.md) · [第三方声明](THIRD_PARTY_NOTICES.md) |
+| 主题                           | 文档                                                                                                    |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| 前端开发、代理与扩展构建       | [前端说明](frontend/README.md)                                                                           |
+| Linux / 宝塔生产部署           | [Linux 部署](docs/DEPLOY_LINUX.md) · [宝塔部署](docs/DEPLOY_BAOTA.md)                                    |
+| Chrome / Edge 排版采集助手     | [构建、安装与企业分发](deploy/layout-capture-extension.md)                                               |
+| 源码工具、授权边界与旧协议回退 | [源码 Agent](docs/SOURCE_AGENT.md) · [历史验收记录](docs/SOURCE_AGENT_ACCEPTANCE.md)                     |
+| 上下文预算、压缩、图片与恢复   | [上下文管理](docs/CONTEXT_MANAGEMENT.md) · [预检性能](docs/CONTEXT_PERFORMANCE.md)                       |
+| 模型提示缓存与用量统计         | [提示缓存优化](docs/PROMPT_CACHE_OPTIMIZATION.md)                                                        |
+| 小内存资源配置与性能复测       | [2 核 2 GiB 部署](docs/PERFORMANCE_2G.md)                                                                |
+| 微信规范与生成提示约束         | [规则维护说明](docs/WECHAT_PROMPT_RULES.md)                                                              |
+| 搜图、贡献与第三方许可         | [SearXNG](deploy/searxng/README.md) · [贡献指南](CONTRIBUTING.md) · [第三方声明](THIRD_PARTY_NOTICES.md) |
+
+## 关于作者与维护
+
+作者并非计算机相关专业科班出身，本项目绝大部分代码由 AI 生成。由于需要兼顾学业，投入项目维护的时间和精力有限，项目更新、问题修复及 Issue / Pull Request 的处理可能不够及时，维护也可能有所疏漏，敬请理解。
 
 ## 贡献
 
@@ -219,6 +223,6 @@ _third_party/       保留许可与来源记录的第三方快照
 
 ## 赞赏
 
-如果一版排版对你有所帮助，欢迎赞赏支持项目持续维护与改进。
+如果本项目对你有所帮助，欢迎赞赏支持项目持续维护与改进。
 
 ![赞赏码](docs/images/reward.png)

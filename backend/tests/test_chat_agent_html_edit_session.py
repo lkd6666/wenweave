@@ -101,6 +101,15 @@ class HtmlEditSessionSafetyTests(unittest.TestCase):
 
         self.assertEqual(checkpoints, ["<p>new</p>"])
 
+    def test_persisted_image_is_synced_even_when_cancel_arrives_after_commit(self) -> None:
+        session = HtmlEditSession('<img src="/old.png">', cancel_requested=lambda: True)
+        revision = session.source_file().revision
+        with self.assertRaises(WorkspaceError):
+            session.apply_external_image_change(revision, '<img src="/new.png">')
+        session.apply_external_image_change(revision, '<img src="/new.png">', persisted=True)
+        self.assertEqual(session.html, '<img src="/new.png">')
+        self.assertTrue(session.edited)
+
     def test_cancellation_between_patch_and_checkpoint_does_not_persist_candidate(self) -> None:
         checkpoints: list[str] = []
         cancelled = False

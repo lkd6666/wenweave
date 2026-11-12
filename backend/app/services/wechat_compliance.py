@@ -22,8 +22,8 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-OFFICIAL_ENGINE_VERSION = "0.2.16"
-OFFICIAL_ENGINE_COMMIT = "fa69e37341c86bfec4c8c533845910511e534c0c"
+OFFICIAL_ENGINE_VERSION = "0.2.28"
+OFFICIAL_ENGINE_COMMIT = "4a3daa63774df71683f41587b4f0b8009e9cb33f"
 OFFICIAL_ENGINE_REPOSITORY = "https://github.com/wechatjs/verify-article-structure-spec"
 _BUNDLE_PATH = (
     Path(__file__).resolve().parents[3]

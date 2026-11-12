@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 
 from app.services import local_uploads
+from app.services.retry_policy import retry_safe_read
 
 
 FETCH_TIMEOUT_SECONDS = 10.0
@@ -37,6 +38,11 @@ _DATA_IMAGE_URL_RE = re.compile(
 
 class PublicFetchError(ValueError):
     """A requested public resource is unsafe or cannot be retrieved."""
+
+    def __init__(self, message: str, *, response=None):
+        super().__init__(message)
+        self.status_code = getattr(response, "status_code", None)
+        self.headers = getattr(response, "headers", {})
 
 
 def browser_headers() -> dict[str, str]:
@@ -131,6 +137,10 @@ async def ensure_public_host(url: str, *, trusted_proxy_hosts: frozenset[str] = 
 
 
 async def fetch_public_html(raw_url: str) -> tuple[str, str]:
+    return await retry_safe_read(lambda: _fetch_public_html_once(raw_url), tool="fetch_article")
+
+
+async def _fetch_public_html_once(raw_url: str) -> tuple[str, str]:
     current_url = normalize_public_https_url(raw_url)
     headers = {
         **browser_headers(),
@@ -154,7 +164,7 @@ async def fetch_public_html(raw_url: str) -> tuple[str, str]:
                         current_url = normalize_public_https_url(urljoin(current_url, location))
                         continue
                     if response.status_code >= 400:
-                        raise PublicFetchError(f"页面无法访问（HTTP {response.status_code}）")
+                        raise PublicFetchError(f"页面无法访问（HTTP {response.status_code}）", response=response)
                     content_type = response.headers.get("content-type", "").lower()
                     if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
                         raise PublicFetchError("链接不是 HTML 页面")
@@ -197,6 +207,18 @@ async def fetch_public_image(
     trusted_proxy_hosts: set[str] | frozenset[str] | None = None,
     allow_http: bool = False,
 ) -> tuple[bytes, local_uploads.ImageInfo]:
+    return await retry_safe_read(lambda: _fetch_public_image_once(client, source, canonical_url,
+        trusted_proxy_hosts=trusted_proxy_hosts, allow_http=allow_http), tool="fetch_image")
+
+
+async def _fetch_public_image_once(
+    client: httpx.AsyncClient,
+    source: str,
+    canonical_url: str | None = None,
+    *,
+    trusted_proxy_hosts: set[str] | frozenset[str] | None = None,
+    allow_http: bool = False,
+) -> tuple[bytes, local_uploads.ImageInfo]:
     if source.lower().startswith("data:"):
         return _decode_data_image(source)
     trusted_hosts = frozenset(
@@ -220,7 +242,7 @@ async def fetch_public_image(
                     current_url = normalize_public_https_url(urljoin(current_url, location), allow_http=allow_http)
                     continue
                 if response.status_code >= 400:
-                    raise PublicFetchError(f"图片无法访问（HTTP {response.status_code}）")
+                    raise PublicFetchError(f"图片无法访问（HTTP {response.status_code}）", response=response)
                 data = bytearray()
                 async for chunk in response.aiter_bytes():
                     data.extend(chunk)

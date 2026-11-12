@@ -21,11 +21,13 @@ function apiErrorMessage(detail: unknown): string {
 export class ApiError extends Error {
   status: number
   detail: unknown
+  headers: Headers
 
-  constructor(status: number, detail: unknown) {
+  constructor(status: number, detail: unknown, headers?: HeadersInit) {
     super(apiErrorMessage(detail))
     this.status = status
     this.detail = detail
+    this.headers = new Headers(headers)
   }
 }
 
@@ -146,7 +148,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     } catch {
       // 响应体不是 JSON，忽略解析错误
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
 
   if (res.status === 204) {
@@ -214,7 +216,7 @@ export async function apiUpload<T>(path: string, body: FormData, options: Upload
     } catch {
       // Reverse proxies may return a non-JSON upload error.
     }
-    throw new ApiError(response.status, detail)
+    throw new ApiError(response.status, detail, response.headers)
   }
   return response.status === 204 ? undefined as T : await response.json() as T
 }
@@ -233,7 +235,7 @@ export async function apiBlob(path: string, options: Pick<RequestOptions, 'signa
     } catch {
       // Image proxy failures may return an empty or non-JSON body.
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   return res.blob()
 }
@@ -257,7 +259,7 @@ export async function apiEventStream(path: string, options: EventStreamOptions):
     } catch {
       // Event streams can fail before the response body is established.
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   if (!res.body) throw new ApiError(res.status, '推送进度连接未建立')
 

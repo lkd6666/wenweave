@@ -115,13 +115,18 @@ async function waitForImagesToLoad(sandbox: HTMLElement, timeoutMs = 5000): Prom
     if (cls.includes('ProseMirror-separator')) return false;
     // data-w 占位的图用下方 fallback 直接定宽，无需等待真实加载。
     if (img.getAttribute && Number.isFinite(parseFloat(img.getAttribute('data-w')))) return false;
+    // 无 src（含空字符串）的 img 不会发起加载，永远不会触发 load/error 事件，
+    // 不过滤会死等到 5s 超时（编辑器占位 <img /> 是常见形态，见 #45 用例）。
+    if (!img.getAttribute('src')) return false;
     return true;
   });
   if (!imgs.length) return;
 
   const settled: Promise<void>[] = imgs.map((img: any) => {
-    // Already complete (cached / no src) → no need to wait.
-    if (img.complete && img.naturalWidth !== 0) return Promise.resolve();
+    // complete=true 的 img 不会再触发 load 事件；若 naturalWidth=0 说明
+    // 加载失败（error 在监听前已触发、不会再有），两种情况都无需等待，
+    // 否则会死等到超时。
+    if (img.complete) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const done = () => resolve();
       img.addEventListener('load', done, { once: true });
@@ -287,8 +292,34 @@ function detectLineHeightOverlap(node: any): {
 
   const range = document.createRange();
   range.selectNodeContents(node);
-  const rects = Array.from(range.getClientRects()).filter((r: any) => r.height > 0);
-  const lineCount = rects.length;
+  // 过滤零宽 rect（空 inline 元素边界如 <b></b> 不占可见行）。
+  const rects = Array.from(range.getClientRects()).filter(
+    (r: any) => r.height > 0 && r.width > 0,
+  );
+  // getClientRects() 返回的是「每个行内片段每行一个 rect」：同一段落混排多个
+  // 文本节点 / span 边界时，同一行会出多个 rect。直接拿 length 当行数会把
+  // lineCount 数虚、avgLineHeight 压低，造成正常段落被误报叠字。
+  // 归并方式：按「垂直区间重叠」聚类 —— 两个 rect 的 y 区间重叠超过较小高度的
+  // 50% 即视为同一行。不能按 top 等值聚类：基线对齐的排版里，同一行内的大字号
+  // 片段、sub/sup 上下标的 top 本来就与正文不同；而相邻两行的区间重叠
+  // （仅存在于行高 < 字号时）远达不到 50%，两者可稳定区分。
+  const lines: Array<{ top: number; bottom: number }> = [];
+  for (const r of rects) {
+    const top = (r as any).top as number;
+    const bottom = top + (r as any).height;
+    const hit = lines.find((l) => {
+      const overlap = Math.min(l.bottom, bottom) - Math.max(l.top, top);
+      const minH = Math.min(l.bottom - l.top, bottom - top);
+      return overlap > minH * 0.5;
+    });
+    if (hit) {
+      hit.top = Math.min(hit.top, top);
+      hit.bottom = Math.max(hit.bottom, bottom);
+    } else {
+      lines.push({ top, bottom });
+    }
+  }
+  const lineCount = lines.length;
   const contentHeight = range.getBoundingClientRect().height;
 
   let overlapping = false;
@@ -446,8 +477,14 @@ async function detectLayoutIssues(
       const horizontalCenterDiff = Math.abs(leftDistance - rightDistance);
       const isHorizontallyCentered = horizontalCenterDiff <= 1;
 
+      // 零尺寸矩形（display:none 等未渲染元素）落在视口原点 (0,0)，在离屏
+      // 沙箱坐标系里恒为"溢出"，必须跳过。真实溢出的元素必有非零宽或高。
+      const isNotRendered = rect.width === 0 && rect.height === 0;
+
       // +1px sub-pixel tolerance; exclude symmetric centered overflow (deliberate visual effect).
-      const isOverflowing = (rect.left < pRect.left - 1 || rect.right > pRect.right + 1) && !isHorizontallyCentered;
+      const isOverflowing = !isNotRendered
+        && (rect.left < pRect.left - 1 || rect.right > pRect.right + 1)
+        && !isHorizontallyCentered;
 
       const finding: WidthFinding = {
         violationId,
@@ -482,8 +519,10 @@ async function detectLayoutIssues(
       if (!violationId) return;
       const cloned = sandbox.querySelector(`[data-violation-id="${violationId}"]`);
       if (!cloned) return;
+      const overflowX = getComputedStyle(cloned).overflowX;
+      const canScrollX = overflowX === 'auto' || overflowX === 'scroll';
       // +1px cross-browser tolerance.
-      const isOverflowing = cloned.scrollWidth > cloned.clientWidth + 1;
+      const isOverflowing = cloned.scrollWidth > cloned.clientWidth + 1 && !canScrollX;
       if (!allScreenFindings[violationId]) allScreenFindings[violationId] = { width: [], 'line-height': [] };
       if (!allScreenFindings[violationId].pre) allScreenFindings[violationId].pre = [];
       const finding: PreFinding = { violationId, isOverflowing, screenWidth: config.width };

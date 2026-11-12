@@ -101,8 +101,8 @@ describe('mergeContextStats', () => {
 describe('official compliance report state', () => {
   const report = (overrides: Partial<ComplianceReport> = {}): ComplianceReport => ({
     engine: {
-      version: '0.2.16',
-      commit: 'fa69e373',
+      version: '0.2.28',
+      commit: '4a3daa63',
       repository: 'https://github.com/wechatjs/verify-article-structure-spec',
       available: true,
       detail: '',
@@ -164,8 +164,8 @@ describe('AI editing read-only actions', () => {
     expect(source).not.toMatch(/aria-label="打开原文校审"[\s\S]{0,180}disabled=\{streaming\}/)
     expect(source).not.toMatch(/aria-label="分享只读预览"[\s\S]{0,180}disabled=\{streaming \|\| saving\}/)
     expect(source).not.toContain('checkDisabled={streaming}')
-    expect(source).toContain('restoreDisabled={streaming || saving || draftHtml !== html}')
-    expect(source).toContain('disabled={streaming || saving || draftHtml === html}')
+    expect(source).toContain('restoreDisabled={documentEditingLocked || saving || draftHtml !== html}')
+    expect(source).toContain('disabled={documentEditingLocked || saving || draftHtml === html}')
   })
 
   it('recovers a durable waiting question when its SSE frame is lost', () => {

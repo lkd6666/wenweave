@@ -275,6 +275,7 @@ export interface DocumentSummary extends VisibilitySettings {
 export interface DocumentDetail extends DocumentSummary {
   current_html: string
   wechat_metadata: WeChatArticleMetadata
+  html_validation?: HtmlValidationReport | null
   messages?: ChatMessageItem[]
 }
 
@@ -672,6 +673,7 @@ export interface ChatMessageItem {
   created_by: UserReference | null
   model_usage: ChatMessageModelUsage | null
   image_attachments: ChatImageAttachment[]
+  text_attachments?: ChatTextAttachment[]
   tool_calls: ToolExecution[]
   reasoning_trace: ReasoningTrace
   turn_blocks: AssistantTurnBlock[]
@@ -1083,4 +1085,22 @@ export interface ComplianceDiagnostic {
   message: string
   consequence: string
   suggestion: string
+}
+export interface ChatTextAttachment {
+  id: string
+  document_id: number
+  session_id: number
+  message_id: number | null
+  filename: string
+  size: number
+  characters: number
+  lines: number
+  sha256: string
+}
+
+export interface ChatTextAttachmentDraft extends ChatTextAttachment {
+  status?: 'uploading' | 'ready' | 'error'
+  error?: string
+  /** Present only during upload or a retryable failure; never sent in chat JSON. */
+  pendingText?: string
 }

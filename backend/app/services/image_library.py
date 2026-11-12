@@ -249,6 +249,15 @@ def _promote_temporary_library_asset(
     """Copy a direct-import object into durable image storage exactly once."""
     if not _is_temporary_import_key(asset.object_key):
         return False
+    if document is not None:
+        from app.models.agent_run import AgentRun, AgentRunStatus
+        document = db.query(Document).filter(Document.id == document.id).populate_existing().with_for_update().first()
+        if document is not None and db.query(AgentRun.id).filter(
+            AgentRun.document_id == document.id,
+            AgentRun.status.in_([AgentRunStatus.PENDING, AgentRunStatus.RUNNING,
+                                AgentRunStatus.WAITING_FOR_INPUT, AgentRunStatus.CANCELLING]),
+        ).with_for_update().first() is not None:
+            return False
     if asset.storage_mode == "oss":
         if storage is None:
             return False

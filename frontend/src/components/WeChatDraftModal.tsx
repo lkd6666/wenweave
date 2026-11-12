@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useOperationScope } from '../hooks/useOperationScope'
 import ReactCrop, { centerCrop, makeAspectCrop, type PercentCrop } from 'react-image-crop'
 import 'react-image-crop/dist/ReactCrop.css'
 import {
@@ -213,6 +214,13 @@ export default function WeChatDraftModal({
   const [cropMode, setCropMode] = useState<CropMode>('pic_crop_235_1')
   const [crop, setCrop] = useState<PercentCrop | undefined>()
   const pushInFlightRef = useRef(false)
+  const ownsOperation = useOperationScope(`${documentId}:${open}:${disabled}`)
+  useEffect(() => {
+    pushInFlightRef.current = false
+    setSaving(false)
+    setSending(false)
+    setUploadingCover(false)
+  }, [ownsOperation])
   const coverImageRef = useRef<HTMLImageElement>(null)
   const coverImageDimensionsRef = useRef<{ width: number; height: number } | null>(null)
   const progressRef = useRef<HTMLElement>(null)
@@ -227,16 +235,18 @@ export default function WeChatDraftModal({
   const loadHistory = useCallback(async () => {
     setLoadingHistory(true)
     try {
-      setHistory(await documentsApi.listWeChatDrafts(documentId))
+      const result = await documentsApi.listWeChatDrafts(documentId)
+      if (ownsOperation()) setHistory(result)
     } catch (err) {
+      if (!ownsOperation()) return
       message.error(err instanceof ApiError ? String(err.detail) : '加载草稿记录失败')
     } finally {
-      setLoadingHistory(false)
+      if (ownsOperation()) setLoadingHistory(false)
     }
-  }, [documentId])
+  }, [documentId, ownsOperation])
 
   useEffect(() => {
-    if (!open || pushInFlightRef.current) return
+    if (!open || disabled || pushInFlightRef.current) return
     let cancelled = false
 
     setCropMode('pic_crop_235_1')
@@ -280,7 +290,7 @@ export default function WeChatDraftModal({
     return () => {
       cancelled = true
     }
-  }, [documentId, form, open, refreshKey])
+  }, [disabled, documentId, form, open, refreshKey])
 
   useEffect(() => {
     if (!draftPushProgress || hasAutoScrolledProgressRef.current) return
@@ -319,24 +329,27 @@ export default function WeChatDraftModal({
   }
 
   const saveMetadata = async (): Promise<WeChatArticleMetadata | null> => {
-    if (interactionDisabled) return null
+    if (!ownsOperation() || interactionDisabled) return null
     try {
       setSaving(true)
       const next = await collectMetadata()
+      if (!ownsOperation()) return null
       const updated = await documentsApi.update(documentId, { title: next.title, wechat_metadata: next })
+      if (!ownsOperation()) return null
       onMetadataSaved(updated.wechat_metadata, updated.title)
       message.success('公众号草稿信息已保存')
       return updated.wechat_metadata
     } catch (err) {
+      if (!ownsOperation()) return null
       if (err instanceof ApiError) message.error(String(err.detail))
       return null
     } finally {
-      setSaving(false)
+      if (ownsOperation()) setSaving(false)
     }
   }
 
   const send = async (syncMode: DraftSyncMode) => {
-    if (interactionDisabled) return
+    if (!ownsOperation() || interactionDisabled) return
     let progress: DraftPushProgress = {
       stage: 'validating',
       percent: 3,
@@ -344,6 +357,7 @@ export default function WeChatDraftModal({
       status: 'active',
     }
     const updateProgress = (next: Omit<DraftPushProgress, 'status'> & { status?: DraftPushProgress['status'] }) => {
+      if (!ownsOperation()) return
       progress = { ...next, status: next.status ?? 'active' }
       setDraftPushProgress(progress)
       setDraftPushActivities((activities) => [
@@ -357,9 +371,11 @@ export default function WeChatDraftModal({
       setDraftPushProgress(progress)
       setDraftPushActivities([{ ...progress, id: ++progressActivityIdRef.current }])
       const syncValues = await form.validateFields(['account_id'])
+      if (!ownsOperation()) return
       const accountId = Number(syncValues.account_id)
       updateProgress({ stage: 'metadata', percent: 9, detail: '目标公众号已确认，正在保存微信标题、封面与评论设置…' })
       const next = await saveMetadata()
+      if (!ownsOperation()) return
       if (!next) {
         updateProgress({ stage: 'metadata', percent: 9, detail: '草稿信息保存失败，请检查表单内容后重试', status: 'exception' })
         return
@@ -377,19 +393,23 @@ export default function WeChatDraftModal({
       const completedVerb = result.sync_mode === 'update' ? '草稿已覆盖' : '草稿已创建'
       updateProgress({ stage: 'history', percent: 99, detail: `${completedVerb}，正在刷新文章和本篇推送记录…` })
       const [refreshedDocument] = await Promise.all([documentsApi.get(documentId), loadHistory()])
+      if (!ownsOperation()) return
       onDocumentRefreshed(refreshedDocument)
       updateProgress({ stage: 'completed', percent: 100, detail: `${completedVerb}，推送记录已刷新`, status: 'success' })
       message.success(result.sync_mode === 'update'
         ? `已覆盖「${result.account_name}」草稿箱中的目标图文`
         : `已创建草稿，可在「${result.account_name}」草稿箱查看`)
     } catch (err) {
+      if (!ownsOperation()) return
       const detail = err instanceof ApiError ? String(err.detail) : err instanceof Error ? err.message : '创建公众号草稿失败'
       updateProgress({ ...progress, detail: `同步失败：${detail}`, status: 'exception' })
       await loadHistory()
       message.error(detail)
     } finally {
-      setSending(false)
-      pushInFlightRef.current = false
+      if (ownsOperation()) {
+        setSending(false)
+        pushInFlightRef.current = false
+      }
     }
   }
 
@@ -397,6 +417,7 @@ export default function WeChatDraftModal({
     setUploadingCover(true)
     try {
       const result = await documentsApi.uploadWeChatCover(documentId, file)
+      if (!ownsOperation()) return
       form.setFieldsValue({
         cover_url: result.url,
         pic_crop_235_1: '',
@@ -406,9 +427,10 @@ export default function WeChatDraftModal({
       setCrop(undefined)
       message.success('封面已上传')
     } catch (err) {
+      if (!ownsOperation()) return
       message.error(err instanceof ApiError ? String(err.detail) : '封面上传失败')
     } finally {
-      setUploadingCover(false)
+      if (ownsOperation()) setUploadingCover(false)
     }
   }
 

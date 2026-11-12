@@ -1316,7 +1316,7 @@ export default function AdminModelsPage() {
                 <Space size={[8, 8]} wrap className="model-editor-automatic-budget" aria-label="自动配置">
                   <Text type="secondary">自动配置</Text>
                   <Tag>压缩阈值 {formatKTokens(automaticTokenBudget.context_compaction_threshold_tokens)}</Tag>
-                  <Tag>压缩目标约 {formatKTokens(Math.min(automaticTokenBudget.context_compaction_threshold_tokens, 20_000))}</Tag>
+                  <Tag>触发后整理为精简任务记忆，按需读取历史</Tag>
                   <Tag>工具预览 {formatKTokens(automaticTokenBudget.tool_result_max_tokens)}</Tag>
                 </Space>
               )}

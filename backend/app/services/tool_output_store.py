@@ -35,6 +35,7 @@ class ToolOutputBinding:
     stored: bool = False
     original_tokens: int = 0
     original_bytes: int = 0
+    expires_at: str = ""
 
 
 def _now() -> datetime:
@@ -134,6 +135,7 @@ class ToolOutputStore:
         content: str,
         max_preview_tokens: int,
         force_store: bool = False,
+        inline_when_fits: bool = False,
     ) -> ToolOutputBinding:
         """Persist an oversized result and return provider-safe content.
 
@@ -148,37 +150,21 @@ class ToolOutputStore:
         if original_tokens <= preview_limit and not force_store:
             return ToolOutputBinding(content=content, original_tokens=original_tokens, original_bytes=original_bytes)
 
+        def failed_binding(reason: str) -> ToolOutputBinding:
+            return ToolOutputBinding(
+                content=(content if inline_when_fits and original_tokens <= preview_limit else
+                         self._preview(content, preview_limit, output_id=None, expires_at=None, storage_error=reason)),
+                original_tokens=original_tokens, original_bytes=original_bytes,
+            )
+
         # LangGraph normally guarantees a call ID. Do not associate a payload
         # with an invented ID if a non-standard provider omitted one: that
         # could make two concurrent calls overwrite each other's continuation.
         if not tool_call_id.strip():
-            return ToolOutputBinding(
-                content=self._preview(
-                    content,
-                    preview_limit,
-                    output_id=None,
-                    expires_at=None,
-                    storage_error="工具调用缺少 ID，完整结果无法安全暂存",
-                ),
-                original_tokens=original_tokens,
-                original_bytes=original_bytes,
-            )
+            return failed_binding("工具调用缺少 ID，完整结果无法安全暂存")
 
         if original_bytes > self.storage_max_bytes:
-            return ToolOutputBinding(
-                content=self._preview(
-                    content,
-                    preview_limit,
-                    output_id=None,
-                    expires_at=None,
-                    storage_error=(
-                        f"原始结果超过服务器可保存上限 {self.storage_max_bytes // (1024 * 1024)} MiB；"
-                        "请用更具体的源工具查询。"
-                    ),
-                ),
-                original_tokens=original_tokens,
-                original_bytes=original_bytes,
-            )
+            return failed_binding(f"原始结果超过服务器可保存上限 {self.storage_max_bytes // (1024 * 1024)} MiB；请用更具体的源工具查询。")
 
         output_id = f"{OUTPUT_ID_PREFIX}{uuid4()}"
         expires_at = _now() + timedelta(days=self.retention_days)
@@ -209,27 +195,23 @@ class ToolOutputStore:
                     ChatToolOutput.run_id == self.run_id,
                     ChatToolOutput.tool_call_id == tool_call_id,
                 ).first()
-                if existing is None:
-                    return ToolOutputBinding(
-                        content=self._preview(content, preview_limit, output_id=None, expires_at=None, storage_error="完整结果暂存失败"),
-                        original_tokens=original_tokens,
-                        original_bytes=original_bytes,
-                    )
+                if (existing is None or existing.document_id != self.document_id
+                        or existing.session_id != self.session_id or existing.tool_name != tool_name
+                        or existing.checksum != row.checksum or _is_expired(existing.expires_at)):
+                    return failed_binding("完整结果暂存冲突或已过期，请重新查询源工具")
                 output_id = existing.output_id
                 expires_at = existing.expires_at
         except SQLAlchemyError:
-            return ToolOutputBinding(
-                content=self._preview(content, preview_limit, output_id=None, expires_at=None, storage_error="完整结果暂存失败"),
-                original_tokens=original_tokens,
-                original_bytes=original_bytes,
-            )
+            return failed_binding("完整结果暂存失败")
 
         return ToolOutputBinding(
-            content=self._preview(content, preview_limit, output_id=output_id, expires_at=expires_at),
+            content=(content if inline_when_fits and original_tokens <= preview_limit else
+                     self._preview(content, preview_limit, output_id=output_id, expires_at=expires_at)),
             output_id=output_id,
             stored=True,
             original_tokens=original_tokens,
             original_bytes=original_bytes,
+            expires_at=expires_at.isoformat(),
         )
 
     @classmethod

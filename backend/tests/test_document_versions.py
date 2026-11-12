@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401
@@ -93,6 +93,17 @@ class DocumentVersionStorageTests(unittest.TestCase):
                 self.assertEqual(migrated.content_object_id, object_id)
                 self.assertEqual(materialize_document_version(verification_db, migrated), original_html)
                 self.assertEqual(verification_db.query(DocumentContentObject).count(), object_count)
+
+    def test_startup_adds_checkpoint_baseline_to_legacy_run_table_idempotently(self) -> None:
+        self.db.close()
+        with self.engine.begin() as connection:
+            connection.execute(text('ALTER TABLE agent_runs DROP COLUMN checkpoint_document_html'))
+        with patch.object(bootstrap, 'engine', self.engine):
+            bootstrap.migrate_schema()
+            bootstrap.migrate_schema()
+        column = next(item for item in inspect(self.engine).get_columns('agent_runs')
+                      if item['name'] == 'checkpoint_document_html')
+        self.assertTrue(column['nullable'])
 
     def test_version_migration_still_rolls_back_with_outer_transaction(self) -> None:
         original_html = "<p>迁移失败时保留原始版本</p>"

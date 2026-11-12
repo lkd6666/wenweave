@@ -1453,3 +1453,96 @@ async def create_layout_reference(raw_url: str, user_id: int, db: Session) -> La
     persist_layout_reference(db, reference)
     layout_reference_cache.put(reference)
     return reference
+
+
+async def _fetch_pasted_remote_assets(
+    sources: list[_AssetSource], embedded_bytes: int,
+) -> list[tuple[_AssetSource, bytes, local_uploads.ImageInfo]]:
+    """Download opted-in public images; omit unavailable images independently."""
+    timeout = httpx.Timeout(FETCH_TIMEOUT_SECONDS, connect=FETCH_TIMEOUT_SECONDS)
+    semaphore = asyncio.Semaphore(REFERENCE_IMAGE_FETCH_CONCURRENCY)
+    total_size = embedded_bytes
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+        async def fetch_one(source: _AssetSource) -> tuple[_AssetSource, bytes, local_uploads.ImageInfo] | None:
+            nonlocal total_size
+            async with semaphore:
+                # Clipboard fragments lack an origin. Protocol-relative URLs
+                # can use HTTPS; other relative paths cannot be resolved.
+                url = "https:" + source.source if source.source.startswith("//") else source.source
+                try:
+                    data, image = await fetch_public_image(client, url, allow_http=True)
+                except PublicFetchError:
+                    return None
+                total_size += len(data)
+                if total_size > MAX_REFERENCE_IMAGE_TOTAL_BYTES:
+                    raise LayoutReferenceError("参考图片总大小超过 50MB 限制")
+                return source, data, image
+
+        tasks = [asyncio.create_task(fetch_one(source)) for source in sources]
+        try:
+            results = await asyncio.gather(*tasks)
+        finally:
+            # A size-limit failure or request cancellation must also stop
+            # queued downloads before their shared HTTP client is closed.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    return [item for item in results if item is not None]
+
+
+async def create_pasted_layout_reference(content: str, content_format: str, title: str,
+                                         user_id: int, db: Session, *,
+                                         download_external_images: bool = False) -> LayoutReference:
+    """Parse locally by default; fetch public images only with explicit opt-in."""
+    if not content.strip() or len(content.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise LayoutReferenceError("粘贴内容不能为空且不能超过 5MB")
+    if content_format not in {"text", "html"}:
+        raise LayoutReferenceError("不支持的粘贴格式")
+    if content_format == "text":
+        body = "".join(f"<p>{html.escape(line) or '<br>'}</p>" for line in content.replace("\r\n", "\n").split("\n"))
+        source = f"<html><body>{body}</body></html>"
+    else:
+        # Clipboard fragments often omit body/article wrappers.
+        source = content if re.search(r"<\s*(?:html|body|article|main)\b", content, re.I) else f"<body>{content}</body>"
+    rendered, blocks, slots, asset_sources, _, warning = _extract_layout_reference_with_assets(source, "", truncate=False)
+    reference = LayoutReference(reference_id=str(uuid4()), user_id=user_id, canonical_url="",
+        title=re.sub(r"\s+", " ", title).strip()[:200] or _extract_title(source) or "粘贴的排版参考",
+        site_name="粘贴内容", html_template=rendered, block_count=blocks, image_slots=slots,
+        extracted_from="粘贴的 HTML" if content_format == "html" else "粘贴的原文",
+        warning=warning, expires_at=time.monotonic() + REFERENCE_TTL_SECONDS, preview_token=token_urlsafe(32))
+    # Embedded images do not need a network request. External images only
+    # enter the bounded public fetcher after the user's explicit opt-in.
+    assets = []
+    external_sources = []
+    total = 0
+    for item in asset_sources:
+        if not item.source.lower().startswith("data:"):
+            external_sources.append(item)
+            continue
+        try:
+            data, info = _decode_data_image(item.source)
+            total += len(data)
+            if len(assets) >= MAX_REFERENCE_IMAGES or total > MAX_REFERENCE_IMAGE_TOTAL_BYTES:
+                raise LayoutReferenceError("粘贴的内嵌图片超过总大小或数量限制")
+            assets.append((item, data, info))
+        except local_uploads.LocalUploadError as exc:
+            raise LayoutReferenceError(str(exc)) from exc
+    remote_assets = await _fetch_pasted_remote_assets(external_sources, total) if download_external_images and external_sources else []
+    assets.extend(remote_assets)
+    _store_reference_assets(reference, assets)
+    if content_format == "html" and re.search(r"<\s*(?:style|link)\b", content, re.I):
+        reference.warning = "；".join(filter(None, [reference.warning, "已保留内联样式；样式表和动态脚本不参与粘贴解析，建议从浏览器复制正文以保留内联排版"]))
+    reference.html_template = reference._remove_unselected_assets(reference.html_template, {asset.asset_id for asset in reference.assets})
+    omitted = len(external_sources) - len(remote_assets)
+    if omitted:
+        if download_external_images:
+            image_notice = f"已转存 {len(remote_assets)} 个外部图片素材"
+            if omitted:
+                image_notice += f"，{omitted} 个地址不可访问、不安全或格式不支持，已跳过；需要登录或防盗链的图片可使用浏览器采集"
+        else:
+            image_notice = f"已跳过 {omitted} 个外部图片地址；如需保留，可勾选“转存外部图片”后重新解析"
+        reference.warning = "；".join(filter(None, [reference.warning, image_notice]))
+    persist_layout_reference(db, reference)
+    layout_reference_cache.put(reference)
+    return reference

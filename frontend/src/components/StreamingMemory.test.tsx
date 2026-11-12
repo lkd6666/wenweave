@@ -56,7 +56,7 @@ describe('streaming render resource lifetime', () => {
     const parse = vi.spyOn(DOMParser.prototype, 'parseFromString')
     const render = () => <TemplateLibraryPanel
       modelId={null} models={[]} disabled canInsertAtCaret={false} attachedTemplateIds={[]}
-      themeContext={null} onAppend={noop} onInsertAtCaret={noop} onToggleAttach={noop}
+      themeContext={null} onPrepend={noop} onAppend={noop} onInsertAtCaret={noop} onAttachToChat={noop}
       onClearThemeContext={noop} onOpenThemeGallery={noop} collection={null}
       onCollectionHandled={noop} activeResourceTab={tab} onResourceTabChange={noop} imagePanel={null}
     />

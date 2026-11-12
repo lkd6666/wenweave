@@ -1421,6 +1421,9 @@ def migrate_schema() -> None:
             connection.execute(text(f"ALTER TABLE agent_runs ADD COLUMN checkpoint_html {checkpoint_column}"))
             if not is_sqlite:
                 connection.execute(text("UPDATE agent_runs SET checkpoint_html = '' WHERE checkpoint_html IS NULL"))
+        if "checkpoint_document_html" not in run_columns:
+            checkpoint_base_type = "TEXT" if is_sqlite else "LONGTEXT"
+            connection.execute(text(f"ALTER TABLE agent_runs ADD COLUMN checkpoint_document_html {checkpoint_base_type} NULL"))
         run_column_definitions = (
             {
                 "owner_id": "TEXT NOT NULL DEFAULT ''",
@@ -1965,9 +1968,12 @@ def recover_expired_agent_runs(db: Session) -> int:
     )
     recovered = 0
     for candidate in active_runs:
-        # The query above discovers candidates. Re-lock the run itself before
-        # editing its document so two workers cannot recover the same lease.
-        run = db.query(AgentRun).filter(AgentRun.id == candidate.id).with_for_update().first()
+        # All writers acquire document before run; refresh discovery snapshots.
+        document = (
+            db.query(Document).filter(Document.id == candidate.document_id)
+            .populate_existing().with_for_update().first()
+        )
+        run = db.query(AgentRun).filter(AgentRun.id == candidate.id).populate_existing().with_for_update().first()
         if run is None:
             continue
         lease_expires_at = getattr(run, "lease_expires_at", None)
@@ -1982,33 +1988,17 @@ def recover_expired_agent_runs(db: Session) -> int:
             or (getattr(run, "owner_id", "") and lease_expires_at is not None and lease_expires_at > now)
         ):
             continue
-        document = (
-            db.query(Document)
-            .filter(Document.id == run.document_id)
-            .with_for_update()
-            .first()
-        )
+        from app.services.agent_checkpoints import checkpoint_save_state
         request_message = db.get(ChatMessage, run.user_message_id)
-        checkpoint = str(run.checkpoint_html or "")
         source_html = request_message.html_before if request_message else None
-        partial_saved = False
-        if document and checkpoint and source_html is not None and document.current_html == source_html:
-            document.current_html = checkpoint
-            touch_document(document, run.user_id)
-            if document.group:
-                touch_group(document.group, run.user_id)
-            create_document_version(
-                db,
-                document,
-                run.user_id,
-                DocumentVersionSource.AI,
-                "AI 编辑（Agent 工作进程恢复）",
-            )
-            partial_saved = True
-
+        checkpoint = str(run.checkpoint_html or "")
+        save_state, report_html, partial_saved = (
+            checkpoint_save_state(db, run, document, label="AI 编辑（Agent 工作进程恢复）")
+            if document else ("none", "", False)
+        )
         if partial_saved:
             detail = "Agent 工作进程心跳已超时，未完成的操作已停止；已保留已完成的排版修改。"
-        elif checkpoint:
+        elif save_state == "conflict":
             detail = "Agent 工作进程心跳已超时，未完成的操作已停止；文档已被其他修改更新，候选排版未自动覆盖。"
         else:
             detail = "Agent 工作进程心跳已超时，未完成的操作已停止；请重新执行本轮操作。"
@@ -2080,7 +2070,7 @@ def recover_expired_agent_runs(db: Session) -> int:
                 reasoning_trace_json=json.dumps(recovered_turn.reasoning_trace, ensure_ascii=False),
                 turn_blocks_json=json.dumps(recovered_turn.turn_blocks, ensure_ascii=False),
                 html_before=source_html,
-                html_after=checkpoint if partial_saved else None,
+                html_after=report_html if partial_saved else None,
             )
             db.add(assistant_message)
             db.flush()
@@ -2104,7 +2094,6 @@ def recover_expired_agent_runs(db: Session) -> int:
         )
         run.event_sequence = max(int(getattr(run, "event_sequence", 0) or 0), int(durable_sequence or 0)) + 1
         report_html = document.current_html if document else checkpoint
-        save_state = "preserved" if partial_saved else "conflict" if checkpoint else "none"
         db.add(
             AgentRunEvent(
                 run_id=run.id,

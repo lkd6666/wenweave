@@ -13,6 +13,7 @@ from app.core.security import create_scoped_token, decode_access_token
 from app.db.session import get_db
 from app.models.storage_config import StorageConfig
 from app.models.document import Document
+from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.user import User, UserRole
 from app.schemas.storage import (
     StorageConfigRead,
@@ -292,25 +293,42 @@ def repair_image_access(
     if config is None:
         return StorageImageRepairResult(repaired_count=0, message="当前使用本地存储，无需修复对象存储图片链接")
     try:
-        documents = db.query(Document).all()
-        refreshed_htmls, repaired_count = oss_client.refresh_document_image_urls(
-            config,
-            [document.current_html for document in documents],
-        )
-        for document, refreshed_html in zip(documents, refreshed_htmls):
+        snapshots = db.query(Document.id, Document.current_html).order_by(Document.id).all()
+        active_statuses = [AgentRunStatus.PENDING, AgentRunStatus.RUNNING,
+                           AgentRunStatus.WAITING_FOR_INPUT, AgentRunStatus.CANCELLING]
+        repaired_count = skipped_count = 0
+        for document_id, source_html in snapshots:
+            active_query = db.query(AgentRun.id).filter(
+                AgentRun.document_id == document_id, AgentRun.status.in_(active_statuses),
+            )
+            if active_query.first() is not None:
+                skipped_count += 1
+                continue
+            refreshed_htmls, count = oss_client.refresh_document_image_urls(config, [source_html])
+            refreshed_html = refreshed_htmls[0]
+            document = (db.query(Document).filter(Document.id == document_id)
+                        .populate_existing().with_for_update().first())
+            if (document is None or document.current_html != source_html
+                    or active_query.with_for_update().first() is not None):
+                skipped_count += 1
+                continue
             if document.current_html != refreshed_html:
                 document.current_html = refreshed_html
+                repaired_count += count
                 touch_document(document, current_user.id)
                 if document.group:
                     touch_group(document.group, current_user.id)
         db.commit()
         return StorageImageRepairResult(
             repaired_count=repaired_count,
-            message=f"已更新 {repaired_count} 张已导入图片的访问链接",
+            message=(f"已更新 {repaired_count} 张已导入图片的访问链接"
+                     + (f"；已跳过 {skipped_count} 篇正在编辑或已变化的文档" if skipped_count else "")),
         )
     except (oss_client.OSSNotConfiguredError, oss_client.ObjectStorageError, ValueError) as e:
+        db.rollback()
         return StorageImageRepairResult(repaired_count=0, message=str(e))
     except Exception:  # noqa: BLE001 将未知上传/网络错误转为可见结果
+        db.rollback()
         return StorageImageRepairResult(repaired_count=0, message="修复失败，请检查对象存储配置与网络")
 
 

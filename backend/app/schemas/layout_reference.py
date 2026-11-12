@@ -8,6 +8,13 @@ class LayoutReferencePreviewRequest(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
 
 
+class LayoutReferencePasteRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=5 * 1024 * 1024)
+    format: Literal["text", "html"] = "html"
+    title: str = Field(default="", max_length=200)
+    download_external_images: bool = False
+
+
 class LayoutCaptureSessionRead(BaseModel):
     id: str
     token: str

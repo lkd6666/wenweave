@@ -11,6 +11,7 @@ import { ApiError } from '../api/client'
 import ImageUploadProgress from './ImageUploadProgress'
 import { runImageUploads } from '../utils/imageUpload'
 import useImageUploadProgress from '../hooks/useImageUploadProgress'
+import { useOperationScope } from '../hooks/useOperationScope'
 import type { AIImageModelItem, ImageGenerationItem, ImageLibraryAsset, ImageLibrarySource, ImageSearchCandidate, ImageSearchOrientation, ImageSearchResult, PreviewImageTarget } from '../types'
 
 const { Text } = Typography
@@ -85,6 +86,8 @@ function MobileImageActions({ onRename, onRemove }: {
 }
 
 export default function ImageLibraryPanel({ documentId, sessionId, initialModelId = null, disabled, uploadDisabled = false, applicationTarget, selectedImage, onApply, onSetCover, onReference, referenceDisabled, command = null }: Props) {
+  const ownsApplication = useOperationScope(`${documentId}:${Boolean(disabled)}`)
+  useEffect(() => { setApplyingSearchId('') }, [ownsApplication])
   const [tab, setTab] = useState<'library' | 'search' | 'generate'>('library')
   const [assets, setAssets] = useState<ImageLibraryAsset[]>([])
   const [total, setTotal] = useState(0)
@@ -214,6 +217,7 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   const selectedModel = models.find((item) => item.id === modelId) ?? null
   const allGenerated = useMemo(() => generations.flatMap((generation) => generation.assets.map((asset) => ({ generation, asset }))), [generations])
   const apply = (url: string, alt: string) => {
+    if (!ownsApplication() || disabled) return false
     if (!applicationTarget || !onApply(url, alt)) {
       message.warning('请先在画布中放置光标、选择一个块或点击现有图片')
       return false
@@ -360,10 +364,12 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
   }
 
   const applySearch = async (candidate: ImageSearchCandidate) => {
+    if (!ownsApplication() || disabled) return
     if (!applicationTarget) { message.warning('请先在画布中选择图片位置'); return }
     setApplyingSearchId(candidate.id)
     try {
       const asset = await imageLibraryApi.importSearch(documentId, candidate.token)
+      if (!ownsApplication()) return
       if (apply(asset.url, asset.name)) {
         setPage(1)
         await loadLibrary(1)
@@ -371,27 +377,32 @@ export default function ImageLibraryPanel({ documentId, sessionId, initialModelI
         await imageLibraryApi.remove(asset.id).catch(() => undefined)
       }
     } catch (error) {
+      if (!ownsApplication()) return
       message.error(errorMessage(error, '保存搜索图片失败'))
     } finally {
-      setApplyingSearchId('')
+      if (ownsApplication()) setApplyingSearchId('')
     }
   }
 
   const setSearchCover = async (candidate: ImageSearchCandidate) => {
+    if (!ownsApplication() || disabled) return
     setApplyingSearchId(candidate.id)
     let asset: ImageLibraryAsset | null = null
     try {
       asset = await imageLibraryApi.importSearch(documentId, candidate.token)
+      if (!ownsApplication()) return
       await onSetCover(asset.id)
+      if (!ownsApplication()) return
       setPage(1)
       await loadLibrary(1)
     } catch (error) {
+      if (!ownsApplication()) return
       if (asset) await imageLibraryApi.remove(asset.id).catch(() => undefined)
       if (!asset) {
         message.error(errorMessage(error, '设置搜索图片为封面失败'))
       }
     } finally {
-      setApplyingSearchId('')
+      if (ownsApplication()) setApplyingSearchId('')
     }
   }
 

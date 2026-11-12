@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -21,6 +22,7 @@ from app.services.chat_agent import (
     _effective_run_input_budget,
     _message_tokens,
     _provider_message_tokens,
+    _run_message_tokens,
     _should_publish_runtime_compaction,
     _split_run_cycles,
     build_compaction_model,
@@ -229,6 +231,164 @@ class RunCompactionTests(unittest.TestCase):
         _assert_tool_pairing(self, compacted)
         self.assertIsInstance(compacted[1], SystemMessage)
 
+    def test_compaction_leaves_room_for_another_tool_cycle(self) -> None:
+        messages = _conversation(5)
+        budget = _run_message_tokens(messages, 1.6, 12)
+        compactor = self._Compactor()
+        compactor.ainvoke = AsyncMock(wraps=compactor.ainvoke)
+
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(
+            messages, budget, compactor, token_estimate_multiplier=1.6,
+            cache_boundary_tokens_per_group=12,
+        ))
+
+        self.assertLessEqual(stats["used_tokens"], stats["compaction_target_tokens"])
+        self.assertEqual(outgoing[-1], messages[-1])
+        self.assertEqual(stats["used_tokens"], _run_message_tokens(outgoing, 1.6, 12))
+        calls = compactor.ainvoke.await_count
+        next_outgoing, next_stats = asyncio.run(compact_run_messages_with_model(
+            [*outgoing, *_cycle(99)], budget, compactor, token_estimate_multiplier=1.6,
+            cache_boundary_tokens_per_group=12,
+        ))
+        self.assertFalse(next_stats["compacted"])
+        self.assertEqual(compactor.ainvoke.await_count, calls)
+        _assert_tool_pairing(self, next_outgoing)
+
+    def test_history_is_replaced_by_summary_without_changing_current_request(self) -> None:
+        messages = _conversation(5)
+        messages[1] = HumanMessage(content="历史约束：蓝色标题。" + "earlier " * 8000)
+        budget = _run_message_tokens(messages, 1.6, 0) * 2 // 3
+        compactor = self._Compactor()
+        compactor.ainvoke = AsyncMock(wraps=compactor.ainvoke)
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(
+            messages, budget, compactor, token_estimate_multiplier=1.6,
+        ))
+
+        self.assertFalse(any(item is messages[1] or item is messages[2] for item in outgoing))
+        self.assertIn(messages[3], outgoing)
+        self.assertEqual(outgoing[0], messages[0])
+        self.assertTrue(any("历史约束：蓝色标题。" in str(call.args[0])
+                            for call in compactor.ainvoke.await_args_list))
+        self.assertLessEqual(stats["used_tokens"], stats["compaction_target_tokens"])
+        _assert_tool_pairing(self, outgoing)
+
+    def test_compactor_sees_every_summarized_cycle(self) -> None:
+        messages = _conversation(8)
+        budget = _tokens(_conversation(3)) + 1000
+        compactor = self._Compactor()
+        compactor.ainvoke = AsyncMock(wraps=compactor.ainvoke)
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(messages, budget, compactor))
+
+        prompts = "\n".join(str(call.args[0]) for call in compactor.ainvoke.await_args_list)
+        for index in range(stats["summarized_cycles"]):
+            self.assertIn(f"call-{index}", prompts)
+        self.assertTrue(stats["durable_snapshot"])
+        self.assertEqual(outgoing[-1], messages[-1])
+        for call in compactor.ainvoke.await_args_list:
+            self.assertLessEqual(_run_message_tokens(call.args[0], 1.0, 0) + 64, budget)
+
+    def test_later_summary_batch_failure_does_not_mutate_the_projection(self) -> None:
+        messages = _conversation(8)
+        original = [item.model_dump() for item in messages]
+        response = asyncio.run(self._Compactor().ainvoke([]))
+        compactor = SimpleNamespace(ainvoke=AsyncMock(side_effect=[
+            response, RuntimeError("provider unavailable"), RuntimeError("provider unavailable"),
+        ]))
+
+        with self.assertRaisesRegex(RuntimeCompactionError, "运行中上下文压缩失败"):
+            asyncio.run(compact_run_messages_with_model(messages, _tokens(_conversation(3)) + 1000, compactor))
+        self.assertEqual([item.model_dump() for item in messages], original)
+
+    def test_oversized_source_is_split_without_losing_its_middle_or_end(self) -> None:
+        messages = _conversation(6)
+        source = "BEGIN_MARKER " + "chunk " * 12_000 + "MIDDLE_MARKER " + "more " * 12_000 + "END_MARKER"
+        messages[4] = AIMessage(content=source)
+        compactor = self._Compactor()
+        compactor.ainvoke = AsyncMock(wraps=compactor.ainvoke)
+        budget = 18_000
+
+        _, stats = asyncio.run(compact_run_messages_with_model(messages, budget, compactor))
+        prompts = "".join(str(call.args[0][-1].content).split("待压缩历史与工具循环资料：\n", 1)[-1]
+                          for call in compactor.ainvoke.await_args_list)
+        self.assertIn(source, prompts)
+        self.assertGreater(stats["source_batch_count"], 1)
+
+    def test_runtime_target_includes_reserved_schema_and_live_state(self) -> None:
+        messages = _conversation(5)
+        budget = _run_message_tokens(messages, 1.6, 0)
+        _, stats = asyncio.run(compact_run_messages_with_model(
+            messages, budget, self._Compactor(), token_estimate_multiplier=1.6, reserved_tokens=8000,
+        ))
+        required = _run_message_tokens([messages[0], messages[3], *messages[-2:]], 1.6, 0) + 8000
+        self.assertEqual(stats["required_context_tokens"], required)
+        self.assertLessEqual(stats["used_tokens"] + 8000, budget + 8000)
+
+    def test_history_only_compaction_keeps_the_current_request(self) -> None:
+        messages = _conversation(0)
+        messages[1] = HumanMessage(content="历史事实 " * 6000)
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(messages, 12_000, self._Compactor()))
+        self.assertTrue(stats["head_compacted"])
+        self.assertFalse(stats["durable_snapshot"])
+        self.assertTrue(_should_publish_runtime_compaction(stats, {}))
+        self.assertEqual(outgoing[-1], messages[-1])
+        self.assertEqual(outgoing[0], messages[0])
+        self.assertLessEqual(stats["used_tokens"], 6000)
+
+    def test_context_bound_tracks_required_tool_results_not_a_fixed_ratio(self) -> None:
+        targets = []
+        for blocks in (3, 40):
+            messages = _conversation(10)
+            messages[-4:] = [*_cycle(98, blocks), *_cycle(99, blocks)]
+            outgoing, stats = asyncio.run(compact_run_messages_with_model(
+                messages, 30_000, self._Compactor(), token_estimate_multiplier=1.6,
+            ))
+            targets.append(stats["compaction_target_tokens"])
+            self.assertLessEqual(stats["used_tokens"], stats["compaction_target_tokens"])
+            _assert_tool_pairing(self, outgoing)
+        self.assertLess(targets[0], targets[1])
+
+    def test_even_small_consumed_cycles_are_replaced_instead_of_filling_the_window(self) -> None:
+        messages = _conversation(5)
+        for index in range(10, 15):
+            messages.extend(_cycle(index, payload_blocks=1))
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(messages, 20_000, self._Compactor()))
+        self.assertEqual(sum(isinstance(item, ToolMessage) for item in outgoing), 1)
+        self.assertEqual(outgoing[-1], messages[-1])
+        self.assertLessEqual(stats["used_tokens"], stats["compaction_target_tokens"])
+        _assert_tool_pairing(self, outgoing)
+
+    def test_large_required_cycle_may_exceed_target_but_keeps_tool_pairing(self) -> None:
+        messages = _conversation(5)
+        required = _cycle(99, payload_blocks=140)
+        messages.extend(required)
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(messages, 30_000, self._Compactor()))
+        self.assertGreater(stats["required_context_tokens"], 15_000)
+        self.assertLess(stats["used_tokens"], 30_000)
+        self.assertEqual(outgoing[-2:], required)
+        _assert_tool_pairing(self, outgoing)
+
+    def test_summary_budget_accounts_for_provider_multiplier_and_wrapper(self) -> None:
+        class FullBudgetCompactor:
+            async def ainvoke(self, messages):
+                limit = int(re.search(r"工作摘要最多约 (\d+) tokens", str(messages[-1].content))[1])
+                payload = {key: "" for key in (
+                    "objective", "constraints", "decisions", "completed", "active_work",
+                    "blockers", "next_steps", "source_refs",
+                )}
+                payload["objective"] = "保留当前目标"
+                payload["completed"] = "done " * max(0, limit - 50)
+                return AIMessage(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+        messages = _conversation(6)
+        budget = _run_message_tokens(messages, 1.6, 0) // 2
+        outgoing, stats = asyncio.run(compact_run_messages_with_model(
+            messages, budget, FullBudgetCompactor(), token_estimate_multiplier=1.6,
+        ))
+
+        self.assertLessEqual(stats["used_tokens"], stats["compaction_target_tokens"])
+        self.assertEqual(stats["used_tokens"], _run_message_tokens(outgoing, 1.6, 0))
+        _assert_tool_pairing(self, outgoing)
+
     def test_new_work_over_budget_is_summarized_instead_of_silently_dropped(self) -> None:
         messages = _conversation(8)
         head, cycles = _split_run_cycles(messages)
@@ -242,11 +402,17 @@ class RunCompactionTests(unittest.TestCase):
         first_projection, _ = asyncio.run(
             compact_run_messages_with_model(messages, budget, compactor)
         )
+        previous_calls = compactor.ainvoke.await_count
+        new_work = list(first_projection)
+        index = 99
+        while _tokens(new_work) < budget:
+            new_work.extend(_cycle(index))
+            index += 1
         next_projection, next_stats = asyncio.run(
-            compact_run_messages_with_model([*first_projection, *_cycle(99)], budget, compactor)
+            compact_run_messages_with_model(new_work, budget, compactor)
         )
 
-        self.assertEqual(compactor.ainvoke.await_count, 2)
+        self.assertGreater(compactor.ainvoke.await_count, previous_calls)
         self.assertGreater(next_stats["summarized_cycles"], 0)
         self.assertEqual(next_stats["dropped_cycles"], 0)
         self.assertEqual(sum(isinstance(m, SystemMessage) and str(m.content).startswith("以下是较早工具循环") for m in next_projection), 1)
@@ -280,11 +446,17 @@ class RunCompactionTests(unittest.TestCase):
         ]) + 1_000
         compactor = MergingCompactor()
         first, _ = asyncio.run(compact_run_messages_with_model(messages, budget, compactor))
-        second, stats = asyncio.run(compact_run_messages_with_model([*first, *_cycle(99)], budget, compactor))
+        previous_calls = len(compactor.prompts)
+        new_work = list(first)
+        index = 99
+        while _tokens(new_work) < budget:
+            new_work.extend(_cycle(index))
+            index += 1
+        second, stats = asyncio.run(compact_run_messages_with_model(new_work, budget, compactor))
 
-        self.assertEqual(len(compactor.prompts), 2)
-        self.assertIn(marker, compactor.prompts[1])
-        self.assertIn("已有本轮运行工作摘要", compactor.prompts[1])
+        self.assertGreater(len(compactor.prompts), previous_calls)
+        self.assertIn(marker, compactor.prompts[previous_calls])
+        self.assertIn("已有本轮运行工作摘要", compactor.prompts[previous_calls])
         self.assertIn(marker, second[1].content)
         self.assertGreater(stats["summarized_cycles"], 0)
         self.assertEqual(stats["dropped_cycles"], 0)

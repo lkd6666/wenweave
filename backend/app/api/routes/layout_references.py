@@ -12,6 +12,7 @@ from app.schemas.layout_reference import (
     LayoutCaptureSessionRead,
     LayoutReferencePreview,
     LayoutReferencePreviewRequest,
+    LayoutReferencePasteRequest,
 )
 from app.services.layout_reference import (
     LayoutReferenceExpiredError,
@@ -20,12 +21,28 @@ from app.services.layout_reference import (
     complete_layout_capture_session,
     create_layout_capture_session,
     create_layout_reference,
+    create_pasted_layout_reference,
     get_layout_reference_preview_asset,
 )
 from app.services.operation_logs import set_request_audit_actor
 
 router = APIRouter(prefix="/api/layout-references", tags=["layout-references"])
 logger = logging.getLogger(__name__)
+
+
+@router.post("/paste", response_model=LayoutReferencePreview)
+async def paste_layout_reference(payload: LayoutReferencePasteRequest,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    try:
+        reference = await create_pasted_layout_reference(
+            payload.content, payload.format, payload.title, current_user.id, db,
+            download_external_images=payload.download_external_images,
+        )
+        db.commit()
+        return reference.preview_payload()
+    except LayoutReferenceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/preview", response_model=LayoutReferencePreview)

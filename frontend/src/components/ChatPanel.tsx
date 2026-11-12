@@ -49,6 +49,9 @@ import ModelSelector from './ModelSelector'
 import type { AIModelItem } from '../types'
 import MarkdownContent from './MarkdownContent'
 import PromptComposer from './PromptComposer'
+import TextAttachmentList from './TextAttachmentList'
+import type { ChatTextAttachment, ChatTextAttachmentDraft } from '../types'
+import { shouldAttachPastedText } from '../utils/textAttachments'
 import { resolveOutgoingReferences } from './PromptComposer'
 import type { PromptComposerHandle } from './PromptComposer'
 import ElementRenderPreview from './ElementRenderPreview'
@@ -79,6 +82,8 @@ export interface ChatRunNotice {
   detail: string
   attempt?: number
   maxAttempts?: number
+  operationId?: string
+  phase?: 'waiting' | 'attempting' | 'recovered' | 'exhausted'
   /** The retry wait window, anchored to the event's server-side timestamp. */
   retryDelaySeconds?: number
   retryStartedAtMs?: number
@@ -92,6 +97,7 @@ export interface QueuedChatMessage {
   id: string
   content: string
   images: ChatImageAttachment[]
+  texts?: ChatTextAttachment[]
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -104,6 +110,8 @@ const TOOL_LABELS: Record<string, string> = {
   enable_tool_groups: '加载专用工具',
   preparing_tool: '准备工具调用',
   ask_user: '确认排版偏好',
+  read_text_attachment: '分页读取文本附件',
+  search_text_attachment: '检索文本附件',
   get_document_map: '读取文档地图',
   search_html: '查找排版块',
   read_blocks: '读取排版块',
@@ -608,9 +616,12 @@ interface ChatPanelProps {
   reasoningTrace: ReasoningTrace
   streamBlocks: AssistantTurnBlock[]
   streamNotice: ChatRunNotice | null
+  recoveryNotice?: ChatRunNotice | null
+  onRetryRecovery?: () => void
   conversationError: string | null
   composerDraft: string
   submitting: boolean
+  starting?: boolean
   pendingUserQuestion: ChatUserQuestion | null
   questionSubmitting: boolean
   reaskConflict: ReaskConflictNotice | null
@@ -620,6 +631,12 @@ interface ChatPanelProps {
   composerTemplates: TemplateItem[]
   imageAttachments: ChatImageAttachment[]
   imageUploading: boolean
+  textAttachmentLoadError?: string
+  onReloadTexts?: () => void
+  textAttachments?: ChatTextAttachmentDraft[]
+  onPasteText?: (text: string) => boolean | void
+  onRemoveText?: (item: ChatTextAttachmentDraft) => void
+  onRetryText?: (item: ChatTextAttachmentDraft) => void
   imageUploadProgress?: UploadState | null
   onRemoveSelectedElement: (index: number) => void
   onDuplicateSelectedElement: (index: number) => void
@@ -627,11 +644,11 @@ interface ChatPanelProps {
   onRemoveAttachedTemplate: (templateId: number) => void
   onRemoveComposerTemplate: (templateId: number) => void
   onRemoveQueuedMessage: (id: string) => void
-  onUpdateQueuedMessage: (id: string, content: string) => void
+  onUpdateQueuedMessage: (id: string, content: string, texts?: ChatTextAttachment[]) => void
   onMoveQueuedMessage: (fromIndex: number, toIndex: number) => void
   onResumeQueuedMessages: () => void
   onEditRequest: (message: ChatMessageItem) => void
-  onSend: (text: string, references: SelectedElementContext[], images: ChatImageAttachment[]) => void
+  onSend: (text: string, references: SelectedElementContext[], images: ChatImageAttachment[], texts?: ChatTextAttachment[], templateIds?: number[]) => void
   onAnswerUserQuestion: (answer: UserQuestionAnswer) => void
   onUserQuestionActivity: () => void
   onUserQuestionTimeoutElapsed: () => void
@@ -684,9 +701,12 @@ export default function ChatPanel({
   reasoningTrace,
   streamBlocks,
   streamNotice,
+  recoveryNotice,
+  onRetryRecovery,
   conversationError,
   composerDraft,
   submitting,
+  starting = false,
   pendingUserQuestion,
   questionSubmitting,
   reaskConflict,
@@ -696,6 +716,12 @@ export default function ChatPanel({
   composerTemplates,
   imageAttachments,
   imageUploading,
+  textAttachmentLoadError,
+  onReloadTexts,
+  textAttachments = [],
+  onPasteText,
+  onRemoveText,
+  onRetryText,
   imageUploadProgress,
   onRemoveSelectedElement,
   onDuplicateSelectedElement,
@@ -829,6 +855,7 @@ export default function ChatPanel({
   }, [activeChatSession?.id, messages, resumeChatAutoFollow])
 
   const handleSend = () => {
+    if (textAttachments.some(item => item.status === 'uploading' || item.status === 'error')) return
     if (imageUploading || submitting || stopping || pendingUserQuestion || !activeChatSession || activeChatSession.is_archived) return
     const composerPayload = composerRef.current?.getPayload() ?? {
       message: composerDraft.trim(),
@@ -840,6 +867,11 @@ export default function ChatPanel({
       ...composerPayload,
       references: resolveOutgoingReferences(composerPayload.references, selectedElements),
     }
+    if (onPasteText && shouldAttachPastedText(payload.message, maxInlineTextTokens)) {
+      if (onPasteText(payload.message) === false) return
+      onContextDraftChange('')
+      return
+    }
     if (editingQueuedMessageId) {
       saveQueuedMessageEdit()
       return
@@ -850,7 +882,7 @@ export default function ChatPanel({
         ? '请分析所附图片，并继续处理当前推文。'
         : payload.templateIds.length > 0
           ? '请依据已附组件库处理当前推文。'
-          : '')
+          : textAttachments.length > 0 ? '请按当前对话要求读取并处理所附文本。' : '')
     if (!text) return
     if (!modelId) {
       message.warning('请先选择 AI 模型')
@@ -866,7 +898,7 @@ export default function ChatPanel({
       imageById.delete(id)
       return image ? [image] : []
     })
-    onSend(text, payload.references, [...orderedImages, ...imageById.values()])
+    onSend(text, payload.references, [...orderedImages, ...imageById.values()], textAttachments, payload.templateIds)
     resumeAllChatAutoFollow()
     void scrollToBottom({ animation: 'instant', ignoreEscapes: true })
   }
@@ -880,7 +912,9 @@ export default function ChatPanel({
     onContextDraftChange(message.content)
   }, [onContextDraftChange, onEditRequest])
 
+  const queuedEditPreviousTextIdsRef = useRef(new Set<string>())
   const beginQueuedMessageEdit = (queuedMessage: QueuedChatMessage) => {
+    queuedEditPreviousTextIdsRef.current = new Set(textAttachments.map(item => item.id))
     queuedEditPreviousDraftRef.current = composerDraft
     setEditingQueuedMessageId(queuedMessage.id)
     onContextDraftChange(queuedMessage.content)
@@ -901,11 +935,14 @@ export default function ChatPanel({
   const saveQueuedMessageEdit = () => {
     if (!editingQueuedMessageId) return
     const content = composerDraft.trim()
-    if (!content) {
+    const additions = textAttachments.filter(item => !queuedEditPreviousTextIdsRef.current.has(item.id))
+    if (!content && !additions.length) {
       message.warning('待处理内容不能为空')
       return
     }
-    onUpdateQueuedMessage(editingQueuedMessageId, content)
+    const queued = queuedMessages.find(item => item.id === editingQueuedMessageId)
+    if ((queued?.texts?.length ?? 0) + additions.length > 8) { message.warning('每条任务最多 8 份文本附件'); return }
+    onUpdateQueuedMessage(editingQueuedMessageId, content || '请按当前对话要求读取并处理所附文本。', additions)
     finishQueuedMessageEdit(true)
   }
 
@@ -926,20 +963,25 @@ export default function ChatPanel({
   }, [cancelQueuedMessageEdit, editingQueuedMessageId, queuedMessages])
 
   const selectedModel = models.find((model) => model.id === modelId)
+  const maxInlineTextTokens = Math.min(2000, Math.max(128, Math.floor(
+    ((contextStats?.active_context_threshold_tokens ?? selectedModel?.context_window_tokens ?? 16000) - (contextStats?.used_tokens ?? 0)) / 8)))
   const isMultimodal = Boolean(selectedModel?.is_multimodal)
   const contextCannotFit = contextStats?.can_fit_after_compaction === false
   const conversationControlsDisabled = streaming || stopping || submitting || Boolean(pendingUserQuestion)
-  const composerDisabled = stopping || submitting || Boolean(pendingUserQuestion)
+  const manualCompacting = !streaming && contextStats?.state === 'compacting'
+  const composerDisabled = stopping || submitting || manualCompacting || Boolean(pendingUserQuestion)
   const canSend = Boolean(
     activeChatSession
     && !activeChatSession.is_archived
     && !imageUploading
+    && !textAttachments.some(item => item.status === 'uploading' || item.status === 'error')
     && !submitting
+    && !manualCompacting
     && (editingQueuedMessageId
-      ? composerDraft.trim()
+      ? composerDraft.trim() || textAttachments.some(item => !queuedEditPreviousTextIdsRef.current.has(item.id))
       : modelId
         && (!contextCannotFit || streaming)
-        && (composerDraft.trim() || selectedElements.length > 0 || imageAttachments.length > 0 || composerTemplates.length > 0)),
+        && (composerDraft.trim() || selectedElements.length > 0 || imageAttachments.length > 0 || textAttachments.length > 0 || composerTemplates.length > 0)),
   )
   const effortConfig = selectedModel?.thinking_config?.efforts
   const effortOptions = effortConfig && typeof effortConfig === 'object' && !Array.isArray(effortConfig)
@@ -1023,6 +1065,8 @@ export default function ChatPanel({
   const runtimeContextCompacting = isRuntimeContextCompacting(contextStats, streaming)
   const liveLabel = stopping
     ? '正在停止 Agent'
+    : starting
+      ? '正在创建任务'
     : runtimeContextCompacting
       ? '正在压缩上下文'
     : thinkingStatus?.includes('工具参数')
@@ -1352,6 +1396,12 @@ export default function ChatPanel({
           </article>
         )}
 
+        {recoveryNotice && <div className="chat-recovery-notice">
+          <AgentRunNotice notice={recoveryNotice} />
+          {recoveryNotice.phase === 'exhausted' && onRetryRecovery && <Button size="small" onClick={onRetryRecovery}>重新检查并同步</Button>}
+        </div>}
+
+        {!showActiveAssistantTurn && streamNotice && <AgentRunNotice notice={streamNotice} />}
         {showActiveAssistantTurn && (
           <article className="chat-turn chat-turn-assistant chat-turn-streaming">
               <div className="chat-turn-body">
@@ -1383,7 +1433,9 @@ export default function ChatPanel({
                     </div>
                   </div>
                 ) : streaming && streamBlocks.length === 0 && !streamText && reasoningTrace.status === 'idle' && toolActivities.length === 0 ? (
-                  <div className="chat-streaming-placeholder">正在准备排版方案…</div>
+                  <div className="chat-streaming-placeholder">{starting
+                    ? '正在准备文档、资源与对话上下文，较长文章可能需要更多时间，请稍候…'
+                    : '正在准备排版方案…'}</div>
                 ) : null}
                 {streamNotice && <AgentRunNotice notice={streamNotice} />}
               </div>
@@ -1470,6 +1522,7 @@ export default function ChatPanel({
                             </Image.PreviewGroup>
                           </div>
                         )}
+                        {Boolean(queuedMessage.texts?.length) && <TextAttachmentList items={queuedMessage.texts ?? []} />}
                         <div className="chat-queue-message">{queuedMessage.content}</div>
                       </div>
                     </div>
@@ -1569,7 +1622,11 @@ export default function ChatPanel({
             onMoveImage={onMoveImage}
             acceptImages={isMultimodal && !editingQueuedMessageId}
             onPasteImages={onUploadImages}
+            onPasteText={onPasteText}
+            maxInlineTextTokens={maxInlineTextTokens}
           />
+          {textAttachmentLoadError && <Alert type="warning" message={textAttachmentLoadError} action={<Button size="small" onClick={onReloadTexts}>重试加载附件</Button>} />}
+          {textAttachments.length > 0 && <TextAttachmentList items={editingQueuedMessageId ? textAttachments.filter(item => !queuedEditPreviousTextIdsRef.current.has(item.id)) : textAttachments} onRemove={onRemoveText} onRetry={onRetryText} />}
           <div className="chat-input-actions">
             <div className="chat-input-actions-start">
               <Tooltip title="模仿排版">
@@ -1595,7 +1652,7 @@ export default function ChatPanel({
             <div className="chat-input-actions-submit">
               {chatSettingsTrigger}
               {contextStats && <ContextUsage stats={contextStats} onCompactContext={onCompactContext} />}
-              {streaming && (
+              {(streaming || manualCompacting) && (
                 <Tooltip title="停止生成">
                   <Button aria-label="停止生成" danger icon={<StopOutlined />} loading={stopping} disabled={stopping} onClick={onStop} />
                 </Tooltip>
@@ -1757,6 +1814,7 @@ const ChatHistoryTurn = memo(function ChatHistoryTurn({
                 elements={messageItem.selected_elements ?? []}
                 templates={messageItem.template_refs ?? []}
                 images={messageItem.image_attachments ?? []}
+                texts={messageItem.text_attachments ?? []}
               /></CollapsibleMessage>
             </div>
           )}
@@ -1956,11 +2014,11 @@ function isTaskPlanTool(tool: ToolExecution | null | undefined): tool is ToolExe
   return tool?.name === 'update_task_plan' && tool.activity?.kind === 'plan'
 }
 
-function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
+export function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
   const [detailExpanded, setDetailExpanded] = useState(false)
   const [retryRemainingSeconds, setRetryRemainingSeconds] = useState<number | null>(null)
   const retryLabel = notice.kind === 'retrying' && notice.attempt && notice.maxAttempts
-    ? `第 ${notice.attempt}/${notice.maxAttempts} 次`
+    ? `第 ${notice.attempt}/${notice.maxAttempts} 次请求`
     : ''
   const detail = notice.detail.trim()
 
@@ -1977,6 +2035,7 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
     const update = () => {
       const remaining = Math.max(0, deadline - Date.now()) / 1000
       setRetryRemainingSeconds(Math.ceil(remaining * 100) / 100)
+      if (remaining <= 0) stopTimer()
     }
     let timer: number | null = null
     const stopTimer = () => {
@@ -1988,7 +2047,7 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
     const syncTimer = () => {
       stopTimer()
       update()
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && deadline > Date.now()) {
         timer = window.setInterval(update, 100)
       }
     }
@@ -2003,9 +2062,9 @@ function AgentRunNotice({ notice }: { notice: ChatRunNotice }) {
   }, [notice.kind, notice.retryDelaySeconds, notice.retryStartedAtMs])
 
   const formattedRetryRemaining = retryRemainingSeconds === null
-    ? ''
-    : `${retryRemainingSeconds.toFixed(2).replace(/\.?(0+)$/, '')} 秒后重试${notice.attempt && notice.maxAttempts ? `（剩余 ${Math.max(0, notice.maxAttempts - notice.attempt)} 次）` : ''}`
-  const fullDetail = formattedRetryRemaining ? `${detail}；${formattedRetryRemaining}。` : detail
+    ? notice.phase === 'attempting' ? '正在请求，等待响应' : ''
+    : retryRemainingSeconds <= 0 ? '等待时间已到，正在确认请求进度' : `${retryRemainingSeconds.toFixed(2).replace(/\.?(0+)$/, '')} 秒后重试`
+  const fullDetail = formattedRetryRemaining ? `${detail.replace(/[。；;]+$/u, '')}；${formattedRetryRemaining}。` : detail
   const collapsible = fullDetail.length > 220
   const displayedDetail = collapsible && !detailExpanded
     ? `${fullDetail.slice(0, 220).trimEnd()}…`
@@ -2150,11 +2209,13 @@ function UserMessageContent({
   elements = [],
   templates = [],
   images = [],
+  texts = [],
 }: {
   content: string
   elements?: SelectedElementContext[]
   templates?: Array<{ id: number; name: string }>
   images?: ChatImageAttachment[]
+  texts?: ChatTextAttachment[]
 }) {
   const referencedElements = new Set<number>()
   const referencedTemplates = visibleTemplateReferenceIndexes(content, templates.length)
@@ -2202,6 +2263,7 @@ function UserMessageContent({
           </Image.PreviewGroup>
         </span>
       )}
+      {texts.length > 0 && <TextAttachmentList items={texts} />}
     </>
   )
 }

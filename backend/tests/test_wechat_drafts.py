@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from bs4 import BeautifulSoup
+from fastapi import HTTPException
 from PIL import Image
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
@@ -35,7 +36,7 @@ from app.models.wechat_account import (
     WeChatDraftStatus,
     WeChatDraftSyncMode,
 )
-from app.schemas.document import DocumentUpdate
+from app.schemas.document import DocumentDetail, DocumentUpdate
 from app.schemas.wechat import WeChatAccountCreate, WeChatAccountUpdate, WeChatArticleMetadata, WeChatDraftCreate
 from app.services.wechat_official_account import (
     BodyImageCacheEntry,
@@ -224,6 +225,37 @@ class WeChatAccountAndDraftTests(unittest.TestCase):
         self.db.refresh(self.document)
         self.assertEqual(self.document.title, "文章标题")
         self.assertEqual(self.document.wechat_title, "文章标题")
+
+    def test_long_document_title_allows_metadata_updates_but_blocks_wechat_sync(self) -> None:
+        for length in (65, 256):
+            with self.subTest(length=length):
+                title = "长" * length
+                document = documents.update_document(
+                    self.document.id, DocumentUpdate(title=title), self.user, self.db,
+                )
+                detail = DocumentDetail.model_validate(document)
+                self.assertEqual(detail.wechat_metadata.title, title)
+                metadata = detail.wechat_metadata.model_copy(update={"author": "作者"})
+                updated = documents.update_document(
+                    self.document.id,
+                    DocumentUpdate.model_validate({"wechat_metadata": metadata.model_dump()}),
+                    self.user,
+                    self.db,
+                )
+                self.assertEqual(DocumentDetail.model_validate(updated).wechat_metadata.title, title)
+                self.assertEqual(updated.wechat_author, "作者")
+
+                account = self.make_account([self.user])
+                with (
+                    patch("app.api.routes.documents.WeChatOfficialAccountClient") as client,
+                    self.assertRaises(HTTPException) as raised,
+                ):
+                    asyncio.run(documents.create_wechat_draft(
+                        self.document.id, WeChatDraftCreate(account_id=account.id), self.user, self.db,
+                    ))
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertIn("64", raised.exception.detail)
+                client.assert_not_called()
 
     def test_active_agent_run_blocks_wechat_draft_push(self) -> None:
         self.db.add(
@@ -688,6 +720,13 @@ class WeChatHttpClientTests(unittest.TestCase):
             WeChatArticleMetadata(title=title, cover_url="https://images.example.com/cover.png"),
             "<p>正文</p>",
         )
+
+    def test_rejects_long_title_before_sending_to_wechat(self) -> None:
+        with self.assertRaisesRegex(WeChatApiError, "64"):
+            WeChatOfficialAccountClient.validate_draft_input(
+                WeChatArticleMetadata(title="长" * 65, cover_url="https://images.example.com/cover.png"),
+                "<p>正文</p>",
+            )
 
     def test_allows_browser_recoverable_p_section_nesting(self) -> None:
         WeChatOfficialAccountClient.validate_draft_input(

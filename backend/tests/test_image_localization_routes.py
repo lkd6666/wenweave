@@ -15,6 +15,9 @@ import app.models  # noqa: F401 - register the full metadata graph for SQLite.
 from app.api.routes import documents, template_library
 from app.db.base import Base
 from app.models.document import Document
+from app.models.agent_run import AgentRun, AgentRunStatus
+from app.models.chat_message import ChatMessage, MessageRole
+from app.models.chat_session import ChatSession
 from app.models.document_version import DocumentVersion, DocumentVersionSource
 from app.models.template_library import TemplateImageAsset, TemplateLibraryItem, TemplateSourceType
 from app.models.user import User, UserRole
@@ -204,6 +207,55 @@ class ImageLocalizationRouteTests(unittest.TestCase):
         self.db.refresh(self.document)
         self.assertIn("images.example.test", self.document.current_html)
         self.assertEqual(self.db.query(DocumentVersion).count(), 0)
+
+    def test_localization_does_not_overwrite_edits_made_during_download(self) -> None:
+        result = ImageLocalizationResult(html='<img src="/copied.png">', localized_count=1, replacements={})
+        document_id = self.document.id
+
+        async def download(*_args):
+            with Session(self.engine) as other:
+                other.get(Document, document_id).current_html = '<p>newer external edit</p>'
+                other.commit()
+            return result
+
+        with (patch.object(documents, 'localize_document_html', side_effect=download),
+              patch.object(documents, 'cleanup_document_localization') as cleanup):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(documents.localize_document_images(document_id, self.user, self.db))
+        self.assertEqual(caught.exception.status_code, 409)
+        cleanup.assert_called_once_with(self.db, result)
+        self.db.refresh(self.document)
+        self.assertEqual(self.document.current_html, '<p>newer external edit</p>')
+        self.assertEqual(self.db.query(DocumentVersion).count(), 0)
+
+    def test_localization_rejects_run_started_during_download(self) -> None:
+        original = self.document.current_html
+        result = ImageLocalizationResult(html='<img src="/copied.png">', localized_count=1, replacements={})
+        document_id, user_id = self.document.id, self.user.id
+
+        async def download(*_args):
+            with Session(self.engine) as other:
+                session = ChatSession(document_id=document_id, title='test')
+                other.add(session)
+                other.flush()
+                message = ChatMessage(document_id=document_id, session_id=session.id,
+                                      role=MessageRole.USER, content='test')
+                other.add(message)
+                other.flush()
+                other.add(AgentRun(id='new-run', document_id=document_id, user_id=user_id,
+                                   session_id=session.id, user_message_id=message.id,
+                                   client_request_id='new-run', status=AgentRunStatus.RUNNING))
+                other.commit()
+            return result
+
+        with (patch.object(documents, 'localize_document_html', side_effect=download),
+              patch.object(documents, 'cleanup_document_localization') as cleanup):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(documents.localize_document_images(document_id, self.user, self.db))
+        self.assertEqual(caught.exception.status_code, 409)
+        cleanup.assert_called_once()
+        self.db.refresh(self.document)
+        self.assertEqual(self.document.current_html, original)
 
     def test_template_batch_commits_successful_components_and_keeps_failures(self) -> None:
         good = TemplateLibraryItem(name="正常组件", html='<img src="https://images.example.test/good.png">', source_type=TemplateSourceType.SOURCE)

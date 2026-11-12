@@ -15,6 +15,7 @@ import {
 } from '../utils/layoutCaptureBridge'
 import { frameDocumentWithNewWindowLinks, SANDBOX_SAME_ORIGIN_ALLOW_NEW_WINDOW } from '../utils/frameLinks'
 import { WechatCaptureFallback, type CaptureUiState } from './WechatCaptureFallback'
+import LayoutPasteEditor from './LayoutPasteEditor'
 
 export { LayoutCaptureInstallGuide } from './WechatCaptureFallback'
 
@@ -60,6 +61,10 @@ export default function LayoutImitationModal({
   onConfirm,
 }: LayoutImitationModalProps) {
   const [url, setUrl] = useState('')
+  const [inputMode, setInputMode] = useState<'url' | 'text' | 'html'>('url')
+  const [pastedContent, setPastedContent] = useState('')
+  const [clipboardHtml, setClipboardHtml] = useState('')
+  const [downloadExternalImages, setDownloadExternalImages] = useState(false)
   const [reference, setReference] = useState<LayoutReferencePreview | null>(null)
   const [parsing, setParsing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -103,6 +108,10 @@ export default function LayoutImitationModal({
     }
 
     setUrl('')
+    setInputMode('url')
+    setPastedContent('')
+    setClipboardHtml('')
+    setDownloadExternalImages(false)
     setReference(null)
     setError(null)
     setWechatFallback(null)
@@ -117,9 +126,9 @@ export default function LayoutImitationModal({
   const srcDoc = useMemo(() => reference ? previewDocument(reference.preview_html) : '', [reference])
 
   const parseReference = async () => {
-    const value = url.trim()
+    const value = (inputMode === 'url' ? url : inputMode === 'text' ? clipboardHtml || pastedContent : pastedContent).trim()
     if (!value) {
-      setError('请输入公开文章链接')
+      setError(inputMode === 'url' ? '请输入公开文章链接' : '请粘贴参考原文或 HTML 源码')
       return
     }
     const requestVersion = requestVersionRef.current + 1
@@ -134,7 +143,8 @@ export default function LayoutImitationModal({
     setAssetsConfirmed(false)
     setSelectedAssetIds([])
     try {
-      const parsed = await layoutReferencesApi.preview(value)
+      const parsed = inputMode === 'url' ? await layoutReferencesApi.preview(value)
+        : await layoutReferencesApi.paste(clipboardHtml || value, clipboardHtml || inputMode === 'html' ? 'html' : 'text', '', downloadExternalImages)
       if (requestVersionRef.current !== requestVersion) return
       setReference(parsed)
       setSelectedAssetIds(parsed.assets.filter((asset) => asset.default_selected).map((asset) => asset.asset_id))
@@ -216,6 +226,17 @@ export default function LayoutImitationModal({
       )}
     >
       <div className="layout-imitation-modal-content">
+        <Segmented block aria-label="参考输入方式" value={inputMode}
+          options={[{ label: '文章链接', value: 'url' }, { label: '粘贴原文', value: 'text' }, { label: 'HTML 源码', value: 'html' }]}
+          onChange={(value) => {
+            requestVersionRef.current += 1
+            bridgeRef.current?.cancel()
+            setInputMode(value as 'url' | 'text' | 'html')
+            setReference(null); setError(null); setWechatFallback(null); setParsing(false)
+            setClipboardHtml(''); setPastedContent('')
+            setDownloadExternalImages(false)
+          }} />
+        {inputMode === 'url' ? (
         <div className="layout-imitation-url-row">
           <Input
             value={url}
@@ -238,9 +259,35 @@ export default function LayoutImitationModal({
             解析
           </Button>
         </div>
+        ) : <>
+          {inputMode === 'text' ? <LayoutPasteEditor value={clipboardHtml} disabled={parsing}
+            onChange={(html, text) => {
+              setClipboardHtml(html)
+              setPastedContent(text)
+              setReference(null)
+              setError(null)
+            }} onError={setError} /> : <Input.TextArea aria-label="参考 HTML 源码"
+            value={pastedContent} disabled={parsing} autoSize={{ minRows: 8, maxRows: 16 }}
+            placeholder="粘贴完整 HTML 或正文片段…"
+            onChange={(event) => { setPastedContent(event.target.value); setClipboardHtml(''); setReference(null) }}
+            />}
+          <small>{inputMode === 'text' ? '粘贴后直接显示排版，可继续编辑并保留样式。支持最多 5MB 内容。' : '支持最多 5MB 内容，解析后预览。'}</small>
+          <Checkbox checked={downloadExternalImages} disabled={parsing}
+            onChange={(event) => {
+              requestVersionRef.current += 1
+              setDownloadExternalImages(event.target.checked)
+              setReference(null)
+              setAssetsConfirmed(false)
+              setSelectedAssetIds([])
+            }}>
+            转存外部图片
+          </Checkbox>
+          <small>勾选后，解析时下载可访问的公网图片；预览后可选择要用于排版的素材。未勾选时仅保留内嵌图片。</small>
+          <Button loading={parsing} icon={<ReloadOutlined />} onClick={() => { void parseReference() }}>解析粘贴内容</Button>
+        </>}
         {!modelAvailable && <Alert type="warning" showIcon message="请先在排版助手中选择可用模型" />}
         {error && <Alert type="error" showIcon message={error} />}
-        {parsing && <div className="layout-imitation-loading"><Spin tip="正在提取参考排版…" /></div>}
+        {parsing && <div className="layout-imitation-loading"><Spin tip={inputMode !== 'url' && downloadExternalImages ? '正在转存外部图片并提取参考排版…' : '正在提取参考排版…'} /></div>}
         {wechatFallback && !parsing && (
           <WechatCaptureFallback
             verification={wechatFallback}

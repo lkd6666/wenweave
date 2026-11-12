@@ -13,7 +13,7 @@ from typing import Annotated, AsyncIterator
 from uuid import uuid4
 
 import jwt
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -34,6 +34,9 @@ from app.models.ai_image_model import AIImageModel
 from app.models.image_generation import GeneratedImageAsset, ImageGeneration
 from app.models.chat_message import ChatMessage, MessageRole
 from app.models.chat_image_attachment import ChatImageAttachment
+from app.models.chat_text_attachment import ChatTextAttachment
+from app.schemas.chat_texts import ChatTextAttachmentRead
+from app.services import chat_texts
 from app.models.chat_context_event import ChatContextEvent, ContextEventKind
 from app.models.chat_context_snapshot import ChatContextSnapshot
 from app.models.chat_history_archive import ChatHistoryArchive
@@ -82,6 +85,7 @@ from app.services.agent_run_recovery import recover_interrupted_turn, replay_age
 from app.services.context_recovery import persist_recovered_context, recovered_context_events
 from app.services.token_budget import estimate_tokens
 from app.services.agent_context import AgentContextBuilder, ContextBudgetError, ContextRecord, context_prefix_hash
+from app.services.retry_policy import retry_event_sink
 from app.services.chat_agent import (
     HtmlEditSession,
     build_chat_model,
@@ -109,6 +113,7 @@ from app.services.chat_session_context import (
 )
 from app.services.document_activity import touch_document, touch_group
 from app.services.document_access import can_access_document
+from app.services.document_html import same_document_html
 from app.services.document_versions import create_document_version
 from app.services.document_history_workspace import DocumentHistoryWorkspace
 from app.services.source_agent import create_source_workspace
@@ -240,6 +245,63 @@ from app.services.chat_images import (
 router = APIRouter(prefix="/api/documents", tags=["chat"])
 user_question_router = APIRouter(prefix="/api/chat-user-questions", tags=["chat"])
 logger = logging.getLogger(__name__)
+
+
+@router.post("/{document_id}/chat-texts", response_model=ChatTextAttachmentRead, status_code=201)
+async def upload_chat_text(document_id: int, session_id: int = Form(...), file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _get_accessible_document(db, document_id, current_user)
+    _get_chat_session(db, document_id, session_id, allow_archived=False)
+    try:
+        data = await file.read(chat_texts.MAX_TEXT_BYTES + 1)
+        item = chat_texts.create_text(db, document_id=document_id, session_id=session_id,
+            uploader_id=current_user.id, filename=file.filename or '粘贴文本.txt', data=data)
+        db.commit()
+        return chat_texts.metadata(item)
+    except chat_texts.WorkspaceError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        await file.close()
+
+
+@router.get("/{document_id}/chat-texts", response_model=list[ChatTextAttachmentRead])
+def list_chat_text_drafts(document_id: int, session_id: int,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _get_accessible_document(db, document_id, current_user)
+    _get_chat_session(db, document_id, session_id, allow_archived=False)
+    return db.query(ChatTextAttachment).filter_by(document_id=document_id, session_id=session_id,
+        uploader_id=current_user.id, message_id=None).order_by(ChatTextAttachment.created_at).limit(32).all()
+
+
+@router.get("/{document_id}/chat-texts/{attachment_id}")
+def view_chat_text(document_id: int, attachment_id: str, start: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _get_accessible_document(db, document_id, current_user)
+    item = db.get(ChatTextAttachment, attachment_id)
+    if not item or item.document_id != document_id or (item.message_id is None and item.uploader_id != current_user.id):
+        raise HTTPException(status_code=404, detail='文本附件不存在')
+    try:
+        page = chat_texts.read_text(item, start=start, end=min(item.characters, start + 8000), budget=4096)
+        # The UI page boundary is independent of the full attachment boundary.
+        page.update(complete=page["end"] == item.characters,
+            next_cursor=page["end"] if page["end"] < item.characters else None)
+        return {**chat_texts.metadata(item), **page}
+    except chat_texts.WorkspaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/{document_id}/chat-texts/{attachment_id}", status_code=204)
+def delete_chat_text(document_id: int, attachment_id: str,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _get_accessible_document(db, document_id, current_user)
+    item = db.get(ChatTextAttachment, attachment_id)
+    if not item or item.document_id != document_id or item.uploader_id != current_user.id:
+        raise HTTPException(status_code=404, detail='文本附件不存在')
+    if item.message_id is not None:
+        raise HTTPException(status_code=409, detail='已发送文本附件不能单独删除')
+    db.delete(item)
+    db.commit()
 
 EXECUTING_RUN_STATUSES = {
     AgentRunStatus.PENDING,
@@ -489,13 +551,31 @@ def _commit_waiting_user_question(
     question: ChatUserQuestion,
     *,
     now: datetime | None = None,
+    source_html: str | None = None,
+    agent_checkpoint_htmls: set[str] | None = None,
 ) -> tuple[ChatUserQuestion, int, dict, datetime]:
     """Publish the question row, replay event, and paused run atomically."""
     committed_at = now or datetime.now(timezone.utc)
+    question.created_at = committed_at
+    document = db.query(Document).filter(Document.id == question.document_id).with_for_update().one_or_none()
     run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().one_or_none()
     if not run or run.status not in {AgentRunStatus.RUNNING, AgentRunStatus.PENDING}:
         raise RuntimeError("Agent 运行已不再可等待用户回答")
-
+    if source_html is not None:
+        execution_context = _json_dict(question.execution_context_json)
+        if document is None or _has_external_document_conflict(
+            source_html,
+            str(execution_context.get("current_html") or ""),
+            document.current_html,
+            agent_checkpoint_htmls or set(),
+        ):
+            raise RuntimeError("运行期间文档已被手动或外部修改，无法暂停本轮排版")
+        # Completed tools can have an unsaved candidate or a directly saved
+        # image checkpoint. Neither is an external edit while the user waits.
+        execution_context["document_html"] = document.current_html
+        question.execution_context_json = json.dumps(execution_context, ensure_ascii=False)
+        run.checkpoint_html = str(execution_context.get("current_html") or "")
+        run.checkpoint_document_html = document.current_html
     db.add(question)
     db.flush()
     durable_sequence = (
@@ -1163,6 +1243,7 @@ def _active_run_for_document(db: Session, document_id: int) -> AgentRun | None:
         db.query(AgentRun)
         .filter(AgentRun.document_id == document_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES))
         .order_by(AgentRun.created_at.desc())
+        .with_for_update()
         .first()
     )
 
@@ -1217,7 +1298,11 @@ def _require_agent_capacity(db: Session, user_id: int) -> None:
 
 
 def _require_idle_document(db: Session, document_id: int) -> None:
-    if _active_run_for_document(db, document_id):
+    db.query(Document).filter(Document.id == document_id).with_for_update().first()
+    active = db.query(AgentRun).filter(
+        AgentRun.document_id == document_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+    ).with_for_update().first()
+    if active is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前推文有正在执行的 Agent，完成或停止后才能管理对话")
 
 
@@ -1586,6 +1671,8 @@ def _settle_persisted_assistant_message(message: ChatMessage) -> bool:
 
 def _persist_restart_failure(db: Session, run: AgentRun, document: Document) -> str:
     """Finish an abandoned run while retaining its durable edit candidate."""
+    document = db.query(Document).filter(Document.id == document.id).populate_existing().with_for_update().first() or document
+    run = db.query(AgentRun).filter(AgentRun.id == run.id).populate_existing().with_for_update().first() or run
     if run.assistant_message_id:
         message = db.get(ChatMessage, run.assistant_message_id)
         if message and message.html_after:
@@ -1596,16 +1683,10 @@ def _persist_restart_failure(db: Session, run: AgentRun, document: Document) -> 
             return "conflict"
         return "unavailable" if checkpoint else "none"
 
-    locked_document = (
-        db.query(Document)
-        .filter(Document.id == document.id)
-        .with_for_update()
-        .first()
-    ) or document
     save_state, report_html, html_changed = _checkpoint_save_state(
         db,
         run,
-        locked_document,
+        document,
         label="AI 编辑（服务恢复）",
     )
     if save_state == "preserved":
@@ -1623,7 +1704,7 @@ def _persist_restart_failure(db: Session, run: AgentRun, document: Document) -> 
     )
     recovered_turn = recover_interrupted_turn(events, content)
     assistant_message = ChatMessage(
-        document_id=locked_document.id,
+        document_id=document.id,
         session_id=run.session_id,
         role=MessageRole.ASSISTANT,
         content=recovered_turn.content,
@@ -1646,8 +1727,8 @@ def _persist_restart_failure(db: Session, run: AgentRun, document: Document) -> 
         action="chat.run",
         resource_type="chat_run",
         resource_id=run.id,
-        resource_name=locked_document.title,
-        document_id=locked_document.id,
+        resource_name=document.title,
+        document_id=document.id,
         session_id=run.session_id,
         status=OperationLogStatus.FAILED,
         summary="AI 对话执行失败",
@@ -1867,22 +1948,8 @@ def _checkpoint_save_state(
     *,
     label: str,
 ) -> tuple[str, str, bool]:
-    """Apply a durable write-tool candidate only when the base document is intact."""
-    checkpoint = str(getattr(run, "checkpoint_html", "") or "")
-    request_message = db.get(ChatMessage, run.user_message_id)
-    source_html = request_message.html_before if request_message else None
-    if not checkpoint or source_html is None:
-        return "none", document.current_html, False
-    if document.current_html != source_html:
-        return "conflict", document.current_html, False
-    if document.current_html == checkpoint:
-        return "preserved", document.current_html, False
-    document.current_html = checkpoint
-    touch_document(document, run.user_id)
-    if document.group:
-        touch_group(document.group, run.user_id)
-    create_document_version(db, document, run.user_id, DocumentVersionSource.AI, label)
-    return "preserved", checkpoint, True
+    from app.services.agent_checkpoints import checkpoint_save_state
+    return checkpoint_save_state(db, run, document, label=label)
 
 
 def _has_external_document_conflict(
@@ -1896,13 +1963,11 @@ def _has_external_document_conflict(
         return False
     # A later tool can restore the original HTML after an image tool has
     # already committed an intermediate snapshot. That is still our own write.
-    return stored_html not in agent_checkpoint_htmls
+    return stored_html not in agent_checkpoint_htmls and not same_document_html(source_html, stored_html)
 
 
 def _persist_run_checkpoint(run_id: str, html: str) -> None:
     """Make completed edit-tool work recoverable before asking the model again."""
-    if not html:
-        return
     db = SessionLocal()
     try:
         run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().first()
@@ -1914,6 +1979,9 @@ def _persist_run_checkpoint(run_id: str, html: str) -> None:
         ):
             return
         run.checkpoint_html = html
+        if run.checkpoint_document_html is None:
+            request = db.get(ChatMessage, run.user_message_id)
+            run.checkpoint_document_html = request.html_before if request else None
         db.commit()
         logger.warning("agent_trace run=%s checkpoint_persisted html_chars=%s", run_id, len(html))
     finally:
@@ -1924,8 +1992,10 @@ def _clear_run_checkpoint(run_id: str) -> None:
     db = SessionLocal()
     try:
         run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().first()
-        if run and run.status == AgentRunStatus.RUNNING and run.cancel_requested_at is None and run.checkpoint_html:
+        if (run and run.status == AgentRunStatus.RUNNING and run.cancel_requested_at is None
+                and run.owner_id == agent_run_manager.worker_id):
             run.checkpoint_html = ""
+            run.checkpoint_document_html = None
             db.commit()
     finally:
         db.close()
@@ -1943,16 +2013,9 @@ async def _force_stuck_cancellation(run_id: str, document_id: int) -> None:
     agent_run_manager.request_cancel(run_id)
     db = SessionLocal()
     try:
-        # Fence the executing worker before saving a forced terminal result.
-        # This lock is acquired before the document lock, matching normal
-        # terminal persistence and lease recovery.
+        # Lock document before run, as admission, pause and answer do.
+        document = db.query(Document).filter(Document.id == document_id).with_for_update().first()
         run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().first()
-        document = (
-            db.query(Document)
-            .filter(Document.id == document_id)
-            .with_for_update()
-            .first()
-        )
         if not run or not document or run.status != AgentRunStatus.CANCELLING:
             return
 
@@ -2504,6 +2567,14 @@ def preview_chat_context(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="模型不存在")
     if not can_access_model(current_user, model):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="你没有使用该模型的权限")
+    try:
+        text_attachments = chat_texts.select_for_send(db, document.id, session.id, current_user.id, payload.text_attachment_ids, lock=False)
+    except chat_texts.WorkspaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    preview_message = payload.message
+    if chat_texts.should_attach_message(preview_message, int(model.context_compaction_threshold_tokens or model.context_window_tokens or 32768)):
+        preview_message = '较长输入将在发送时转换为只读文本附件，按需检索和分页读取。'
+    preview_message += chat_texts.reference_text(text_attachments)
     preview_attachments = _pending_attachments(db, document.id, current_user.id, payload.image_attachment_ids, require_unbound=False)
     if preview_attachments and not model.is_multimodal:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前模型未启用图片交互，请切换多模态模型")
@@ -2533,7 +2604,7 @@ def preview_chat_context(
         )
         + _attached_template_prompt(attached_templates)
         + _theme_reference_prompt(theme_reference),
-        payload.message,
+        preview_message,
         selection_context,
         runtime_context_factory=runtime_context_budget_factory(
             model, document.title, document.current_html,
@@ -2562,8 +2633,41 @@ async def compact_chat_context(
     payload: ChatContextCompactRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    stream: bool = Query(False),
 ) -> dict:
     """Create a durable snapshot without altering the immutable event ledger."""
+    if stream is True:
+        # Own the session for the whole stream, including client disconnect.
+        user_id = current_user.id
+
+        async def events():
+            queue = asyncio.Queue()
+
+            async def compact():
+                with SessionLocal() as compact_db:
+                    try:
+                        user = compact_db.get(User, user_id)
+                        with retry_event_sink(queue.put_nowait):
+                            result = await compact_chat_context(document_id, payload, user, compact_db, False)
+                        await queue.put({"event": "context_stats", "data": result})
+                    except HTTPException as exc:
+                        await queue.put({"event": "error", "data": {"message": str(exc.detail), "status": exc.status_code}})
+                    except Exception:
+                        logger.exception("stream_context_compaction_failed document_id=%s", document_id)
+                        await queue.put({"event": "error", "data": {"message": "上下文压缩失败，可稍后重试", "status": 502}})
+
+            producer = asyncio.create_task(compact())
+            try:
+                while True:
+                    evt = await queue.get()
+                    yield {"event": evt["event"], "data": json.dumps(evt["data"], ensure_ascii=False)}
+                    if evt["event"] in {"context_stats", "error"}:
+                        break
+            finally:
+                producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
+
+        return EventSourceResponse(events(), headers=SSE_RESPONSE_HEADERS, ping=10)
     document = _get_accessible_document(db, document_id, current_user)
     _require_idle_document(db, document_id)
     session = _get_chat_session(db, document_id, payload.session_id, allow_archived=False)
@@ -2691,6 +2795,7 @@ def get_chat_run(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AgentRunRead:
+    db.query(Document).filter(Document.id == document_id).with_for_update().first()
     document = _get_accessible_document(db, document_id, current_user)
     run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().one_or_none()
     if not run or run.document_id != document_id:
@@ -2753,9 +2858,21 @@ async def start_chat_run(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="聊天图片属于其他对话")
     if attachments and not model.is_multimodal:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前模型未启用图片交互，请切换多模态模型")
-    if not payload.message.strip() and not attachments:
+    try:
+        text_attachments = chat_texts.select_for_send(db, document.id, chat_session.id, current_user.id, payload.text_attachment_ids)
+        input_budget = int(model.context_compaction_threshold_tokens or model.context_window_tokens or 32768)
+        if chat_texts.should_attach_message(payload.message, input_budget):
+            if len(text_attachments) >= chat_texts.MAX_TEXT_ATTACHMENTS:
+                raise chat_texts.WorkspaceError('较长输入需转为文本附件，请先减少附件数量')
+            text_attachments.append(chat_texts.create_text(db, document_id=document.id, session_id=chat_session.id,
+                uploader_id=current_user.id, filename='较长输入.txt', data=payload.message.encode('utf-8')))
+            payload.message = '请按当前对话要求读取并处理所附文本。'
+    except chat_texts.WorkspaceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not payload.message.strip() and not attachments and not text_attachments:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="消息内容不能为空")
-    effective_message = payload.message.strip() or "请分析所附图片，并继续处理当前推文。"
+    effective_message = payload.message.strip() or ("请按当前对话要求读取并处理所附文本。" if text_attachments else "请分析所附图片，并继续处理当前推文。")
+    effective_message += chat_texts.reference_text(text_attachments)
     # A queued request can carry older references without replacing the next draft's attachments.
     attached_templates = (
         _attached_template_payload(db, payload.template_ids)
@@ -2888,7 +3005,7 @@ async def start_chat_run(
         _agent_context_workspace(HtmlEditSession(document.current_html, model.tool_result_max_tokens)),
         history_rows,
         reference_budget_prompt,
-        payload.message,
+        effective_message,
         selection_budget_context,
         runtime_context_factory=runtime_context_budget_factory(
             model, document.title, document.current_html, selected_elements=selected_elements,
@@ -2937,6 +3054,8 @@ async def start_chat_run(
     ]
     for attachment in attachments:
         attachment.message_id = user_message.id
+    text_attachments = chat_texts.bind_texts(db, text_attachments, user_message.id, current_user.id)
+    effective_message = (payload.message.strip() or ("请按当前对话要求读取并处理所附文本。" if text_attachments else "请分析所附图片，并继续处理当前推文。")) + chat_texts.reference_text(text_attachments)
     if chat_session.title == "新对话":
         generated_title = re.sub(r"\s+", " ", payload.message).strip()
         chat_session.title = generated_title[:48] or ("图片排版请求" if attachments else "新对话")
@@ -3071,14 +3190,36 @@ def _cancel_waiting_questions_for_terminal_run(db: Session, run: AgentRun) -> No
         _cancel_inconsistent_waiting_question(db, question, run)
 
 
+async def _settle_timeout_resume_failure(
+    db: Session, document_id: int, run_id: str, question_id: str, detail: str,
+) -> bool:
+    db.rollback()
+    document = db.query(Document).filter(Document.id == document_id).populate_existing().with_for_update().first()
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).populate_existing().with_for_update().first()
+    question = db.query(ChatUserQuestion).filter(ChatUserQuestion.id == question_id).populate_existing().with_for_update().one_or_none()
+    if question is None or question.status != ChatUserQuestionStatus.WAITING:
+        return True
+    if _utc_question_deadline(question) > datetime.now(timezone.utc):
+        return False
+    if run is not None and document is not None and run.status == AgentRunStatus.WAITING_FOR_INPUT:
+        await _finish_waiting_user_question(
+            db, run, document, terminal_status=AgentRunStatus.FAILED,
+            reason=f"提问超时后无法恢复，本轮已结束：{detail}。",
+        )
+    else:
+        _cancel_inconsistent_waiting_question(db, question, run)
+        db.commit()
+    return True
+
+
 async def _auto_answer_timed_out_user_question(question_id: str) -> bool:
     """Resume a due question as its original user after an atomic deadline check."""
     db = SessionLocal()
+    document_id = run_id = None
     try:
         question = (
             db.query(ChatUserQuestion)
             .filter(ChatUserQuestion.id == question_id)
-            .with_for_update()
             .one_or_none()
         )
         if question is None or question.status != ChatUserQuestionStatus.WAITING:
@@ -3096,6 +3237,8 @@ async def _auto_answer_timed_out_user_question(question_id: str) -> bool:
             _cancel_inconsistent_waiting_question(db, question, run)
             db.commit()
             return True
+        document_id, run_id = question.document_id, question.run_id
+        db.rollback()
         try:
             await answer_chat_user_question(
                 question.document_id,
@@ -3112,14 +3255,18 @@ async def _auto_answer_timed_out_user_question(question_id: str) -> bool:
             # An interaction can extend the deadline between this read and
             # the row lock in the answer endpoint. Re-check rather than
             # turning an active user into a timeout answer.
-            if exc.status_code == status.HTTP_409_CONFLICT:
-                return False
-            logger.warning("user_question_timeout_resume_rejected question=%s detail=%s", question_id, exc.detail)
-            return True
+            return await _settle_timeout_resume_failure(db, document_id, run_id, question_id, str(exc.detail))
         return True
-    except Exception:  # noqa: BLE001 - a later restart can safely reschedule the durable question.
+    except Exception:  # noqa: BLE001 - fail permanent resume errors and retry database outages.
         logger.exception("user_question_timeout_resume_failed question=%s", question_id)
-        return True
+        if document_id is not None and run_id is not None:
+            try:
+                return await _settle_timeout_resume_failure(
+                    db, document_id, run_id, question_id, "恢复执行失败，请检查模型配置后重新发起排版",
+                )
+            except Exception:
+                logger.exception("user_question_timeout_settlement_failed question=%s", question_id)
+        return False
     finally:
         db.close()
 
@@ -3212,14 +3359,37 @@ async def restore_waiting_user_question_timeouts() -> None:
         schedule_user_question_timeout(question_id)
 
 
-def _user_question_source_html(execution_context: dict, current_html: str) -> str:
+def _user_question_source_html(
+    execution_context: dict,
+    current_html: str,
+    *,
+    legacy_document_html: str | None = None,
+) -> str:
     """Verify the persisted pause snapshot while accepting legacy records."""
     from app.services.html_workspace import HtmlWorkspace
     source_html = str(execution_context.get("current_html") or "")
     expected_revision = execution_context.get("source_revision")
     if expected_revision and expected_revision != HtmlWorkspace.revision_for(source_html):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="恢复源码 revision 与暂停快照不一致")
-    if current_html != source_html:
+    document_html = execution_context.get("document_html", source_html)
+    matches_document = isinstance(document_html, str) and same_document_html(document_html, current_html)
+    # Older pauses stored only the Agent candidate. The original request is
+    # also a safe baseline when no document snapshot was persisted at pause.
+    if not matches_document and "document_html" not in execution_context and legacy_document_html is not None:
+        matches_document = same_document_html(legacy_document_html, current_html)
+    if not matches_document:
+        first_difference = next(
+            (index for index, (before, after) in enumerate(zip(str(document_html), current_html)) if before != after),
+            min(len(str(document_html)), len(current_html)),
+        )
+        logger.warning(
+            "user_question_document_conflict expected_revision=%s actual_revision=%s expected_chars=%s actual_chars=%s first_difference=%s",
+            HtmlWorkspace.revision_for(str(document_html)),
+            HtmlWorkspace.revision_for(current_html),
+            len(str(document_html)),
+            len(current_html),
+            first_difference,
+        )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="等待回答期间文档已变化，不能安全恢复本轮排版")
     return source_html
 
@@ -3241,13 +3411,13 @@ async def answer_chat_user_question(
     document = (
         db.query(Document)
         .filter(Document.id == document_id)
-        .with_for_update()
+        .populate_existing().with_for_update()
         .first()
     )
     if not document or not can_access_document(current_user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
-    run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().one_or_none()
-    question = db.query(ChatUserQuestion).filter(ChatUserQuestion.id == question_id).with_for_update().one_or_none()
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).populate_existing().with_for_update().one_or_none()
+    question = db.query(ChatUserQuestion).filter(ChatUserQuestion.id == question_id).populate_existing().with_for_update().one_or_none()
     if not run or not question or run.document_id != document_id or question.run_id != run.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="待答问题不存在")
     if run.user_id != current_user.id or question.user_id != current_user.id:
@@ -3308,7 +3478,16 @@ async def answer_chat_user_question(
         }
 
     execution_context = _json_dict(question.execution_context_json)
-    source_html = _user_question_source_html(execution_context, document.current_html)
+    user_message = db.get(ChatMessage, run.user_message_id)
+    if user_message is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本轮原始请求不存在，无法继续")
+    request_source_html = user_message.html_before or ""
+    document_source_html = document.current_html
+    source_html = _user_question_source_html(
+        execution_context,
+        document_source_html,
+        legacy_document_html=request_source_html,
+    )
     model = db.get(AIModel, question.model_id)
     if not model:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本轮使用的模型已被删除，无法继续")
@@ -3318,7 +3497,10 @@ async def answer_chat_user_question(
         resume_messages = restore_resume_messages(json.loads(question.resume_messages_json or "[]"))
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"待答问题的恢复上下文已损坏：{exc}") from exc
-    completed_context_events = json.loads(question.completed_context_events_json or "[]")
+    try:
+        completed_context_events = json.loads(question.completed_context_events_json or "[]")
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="待答问题的历史上下文已损坏") from exc
     if not isinstance(completed_context_events, list):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="待答问题的历史上下文已损坏")
     timeline = _json_dict(question.timeline_json)
@@ -3335,10 +3517,6 @@ async def answer_chat_user_question(
         timeline["tool_calls"] = timeline_tools
         timeline["turn_blocks"] = timeline_blocks
         question.timeline_json = json.dumps(timeline, ensure_ascii=False)
-    user_message = db.get(ChatMessage, run.user_message_id)
-    if user_message is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="本轮原始请求不存在，无法继续")
-
     thinking_mode = str(execution_context.get("thinking_mode") or "auto")
     if thinking_mode not in {"auto", "enabled", "disabled"}:
         thinking_mode = "auto"
@@ -3383,6 +3561,8 @@ async def answer_chat_user_question(
     _pending_question_broker.invalidate(current_user.id)
 
     resume_state = {
+        "document_html": document_source_html,
+        "request_html": request_source_html,
         "tool_protocol": execution_context.get("tool_protocol", "v1"),
         "loaded_tool_groups": execution_context.get("loaded_tool_groups", []),
         "messages": resume_messages,
@@ -3405,7 +3585,7 @@ async def answer_chat_user_question(
             thinking_effort=thinking_effort,
             document_title=str(execution_context.get("document_title") or document.title),
             current_html=source_html,
-            user_message=user_message.content,
+            user_message=user_message.content + chat_texts.reference_text(user_message.text_attachments),
             user_message_id=user_message.id,
             model_id=model.id,
             compaction_model=compaction_model,
@@ -3455,6 +3635,81 @@ def record_chat_user_question_activity(
     )
 
 
+async def _finish_waiting_user_question(
+    db: Session, run: AgentRun, document: Document, *,
+    terminal_status: AgentRunStatus = AgentRunStatus.CANCELLED,
+    reason: str = "",
+) -> AgentRunRead:
+    """Caller holds document and run locks, then this settles the question."""
+    document_id, run_id = document.id, run.id
+    question = (
+        db.query(ChatUserQuestion)
+        .filter(ChatUserQuestion.run_id == run.id, ChatUserQuestion.status == ChatUserQuestionStatus.WAITING)
+        .with_for_update()
+        .one_or_none()
+    )
+    save_state, report_html, html_changed = _checkpoint_save_state(
+        db, run, document, label="AI 编辑（等待回答时停止）",
+    )
+    timeline = _json_dict(question.timeline_json) if question else {}
+    tool_calls = timeline.get("tool_calls") if isinstance(timeline.get("tool_calls"), list) else []
+    turn_blocks = timeline.get("turn_blocks") if isinstance(timeline.get("turn_blocks"), list) else []
+    if question:
+        _settle_user_question_timeline(
+            tool_calls,
+            turn_blocks,
+            question.tool_call_id,
+            {"action": "cancelled"},
+        )
+        question.status = ChatUserQuestionStatus.CANCELLED
+    _settle_terminal_timeline(tool_calls, turn_blocks)
+    terminal_message = reason or "已停止本轮操作，未继续等待用户回答。"
+    if save_state == "preserved":
+        terminal_message += "已保留已完成的排版修改。"
+    elif save_state == "conflict":
+        terminal_message += "文档或恢复快照已变化，候选排版未自动覆盖。"
+    request_message = db.get(ChatMessage, run.user_message_id)
+    assistant_message = ChatMessage(
+        document_id=document_id,
+        session_id=run.session_id,
+        role=MessageRole.ASSISTANT,
+        content=terminal_message,
+        tool_calls_json=json.dumps(tool_calls, ensure_ascii=False),
+        turn_blocks_json=json.dumps(turn_blocks, ensure_ascii=False),
+        html_before=request_message.html_before if request_message else None,
+        html_after=report_html if html_changed else None,
+    )
+    db.add(assistant_message)
+    db.flush()
+    run.assistant_message_id = assistant_message.id
+    run.status = terminal_status
+    run.error_message = terminal_message
+    run.finished_at = datetime.now(timezone.utc)
+    run.owner_id = ""
+    run.lease_expires_at = None
+    run.last_phase = "cancelled_waiting_for_input" if terminal_status == AgentRunStatus.CANCELLED else "failed_waiting_for_input"
+    run.last_progress_at = run.finished_at
+    db.commit()
+    if question:
+        cancel_user_question_timeout(question.id)
+    _pending_question_broker.invalidate(run.user_id)
+    terminal_data = {
+        "content": terminal_message,
+        "html": report_html,
+        "html_changed": html_changed,
+        "compliance": None,
+        "cancelled": terminal_status == AgentRunStatus.CANCELLED,
+        "partial": True,
+        "partial_save_state": save_state,
+        "run_status": terminal_status.value,
+        "error_message": terminal_message,
+    }
+    await agent_run_manager.publish(run_id, "final", terminal_data, force=True)
+    await agent_run_manager.mark_terminal(run_id, terminal_status.value)
+    return _run_read(run)
+
+
+
 @router.post("/{document_id}/chat-runs/{run_id}/cancel", response_model=AgentRunRead)
 async def cancel_chat_run(
     document_id: int,
@@ -3462,6 +3717,7 @@ async def cancel_chat_run(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AgentRunRead:
+    db.query(Document).filter(Document.id == document_id).populate_existing().with_for_update().first()
     document = _get_accessible_document(db, document_id, current_user)
     run = db.query(AgentRun).filter(AgentRun.id == run_id).with_for_update().one_or_none()
     if not run or run.document_id != document_id:
@@ -3470,61 +3726,7 @@ async def cancel_chat_run(
         return _run_read(run)
 
     if run.status == AgentRunStatus.WAITING_FOR_INPUT:
-        question = (
-            db.query(ChatUserQuestion)
-            .filter(ChatUserQuestion.run_id == run.id, ChatUserQuestion.status == ChatUserQuestionStatus.WAITING)
-            .with_for_update()
-            .one_or_none()
-        )
-        timeline = _json_dict(question.timeline_json) if question else {}
-        tool_calls = timeline.get("tool_calls") if isinstance(timeline.get("tool_calls"), list) else []
-        turn_blocks = timeline.get("turn_blocks") if isinstance(timeline.get("turn_blocks"), list) else []
-        if question:
-            _settle_user_question_timeline(
-                tool_calls,
-                turn_blocks,
-                question.tool_call_id,
-                {"action": "cancelled"},
-            )
-            question.status = ChatUserQuestionStatus.CANCELLED
-        _settle_terminal_timeline(tool_calls, turn_blocks)
-        terminal_message = "已停止本轮操作，未继续等待用户回答。"
-        assistant_message = ChatMessage(
-            document_id=document_id,
-            session_id=run.session_id,
-            role=MessageRole.ASSISTANT,
-            content=terminal_message,
-            tool_calls_json=json.dumps(tool_calls, ensure_ascii=False),
-            turn_blocks_json=json.dumps(turn_blocks, ensure_ascii=False),
-        )
-        db.add(assistant_message)
-        db.flush()
-        run.assistant_message_id = assistant_message.id
-        run.status = AgentRunStatus.CANCELLED
-        run.error_message = terminal_message
-        run.finished_at = datetime.now(timezone.utc)
-        run.owner_id = ""
-        run.lease_expires_at = None
-        run.last_phase = "cancelled_waiting_for_input"
-        run.last_progress_at = run.finished_at
-        db.commit()
-        if question:
-            cancel_user_question_timeout(question.id)
-        _pending_question_broker.invalidate(run.user_id)
-        terminal_data = {
-            "content": terminal_message,
-            "html": document.current_html,
-            "html_changed": False,
-            "compliance": None,
-            "cancelled": True,
-            "partial": True,
-            "partial_save_state": "none",
-            "run_status": AgentRunStatus.CANCELLED.value,
-            "error_message": terminal_message,
-        }
-        await agent_run_manager.publish(run_id, "final", terminal_data, force=True)
-        await agent_run_manager.mark_terminal(run_id, AgentRunStatus.CANCELLED.value)
-        return _run_read(run)
+        return await _finish_waiting_user_question(db, run, document)
 
     run.status = AgentRunStatus.CANCELLING
     run.cancel_requested_at = datetime.now(timezone.utc)
@@ -3705,6 +3907,8 @@ async def _execute_agent_run(
     reasoning_status = str(persisted_reasoning.get("status", "idle"))
     reasoning_detail = str(persisted_reasoning.get("detail", ""))
     latest_html = current_html
+    document_source_html = str(resume_state.get("document_html", current_html)) if resume_state else current_html
+    request_source_html = str(resume_state.get("request_html", current_html)) if resume_state else current_html
     # Some image application tools commit their replacement immediately so
     # the stored object and document stay in sync while the Agent continues.
     # Keep the checkpoint snapshots produced by this run so terminal save does
@@ -3815,6 +4019,25 @@ async def _execute_agent_run(
             "error_message": error_message,
         }
 
+    committed_final: tuple[int, dict, datetime] | None = None
+
+    async def flush_before_terminal() -> None:
+        # Drain coalesced deltas while the durable run still accepts them.
+        # Even if the transport ledger fails, saving completed edits takes priority.
+        try:
+            await agent_run_manager.flush(run_id)
+        except Exception:
+            logger.warning("agent_terminal_prefix_flush_failed run=%s", run_id, exc_info=True)
+
+    async def publish_final(data: dict) -> None:
+        if committed_final is not None:
+            sequence, payload, occurred_at = committed_final
+            await agent_run_manager.notify_persisted_event(
+                run_id, sequence, "final", payload, occurred_at=occurred_at,
+            )
+        else:
+            await agent_run_manager.publish(run_id, "final", data)
+
     def persist_terminal(
         terminal_status: AgentRunStatus,
         content: str,
@@ -3845,7 +4068,7 @@ async def _execute_agent_run(
         if terminal_status == AgentRunStatus.COMPLETED and unresolved_edit_failure:
             content, error_message = unresolved_edit_failure
             terminal_status = AgentRunStatus.FAILED
-        nonlocal reasoning_status, reasoning_detail
+        nonlocal reasoning_status, reasoning_detail, committed_final
         if reasoning_parts:
             reasoning_status = "complete"
         elif thinking_status.requested == "enabled" and not thinking_status.applied:
@@ -3867,6 +4090,10 @@ async def _execute_agent_run(
                 # message while a provider call was unwinding. Never overwrite
                 # that forced terminal result with late model output.
                 terminal_db.expire_all()
+                document = (
+                    terminal_db.query(Document).filter(Document.id == document_id)
+                    .populate_existing().with_for_update().first()
+                )
                 previous_run = (
                     terminal_db.query(AgentRun)
                     .filter(AgentRun.id == run_id)
@@ -3879,6 +4106,13 @@ async def _execute_agent_run(
                     in {AgentRunStatus.COMPLETED, AgentRunStatus.CANCELLED, AgentRunStatus.FAILED}
                     and previous_run.assistant_message_id
                 ):
+                    final_event = (terminal_db.query(AgentRunEvent)
+                        .filter(AgentRunEvent.run_id == run_id, AgentRunEvent.event == "final")
+                        .order_by(AgentRunEvent.sequence.desc()).first())
+                    if final_event is not None:
+                        payload = _json_dict(final_event.payload_json)
+                        committed_final = (final_event.sequence, payload, _utc_datetime(final_event.created_at))
+                        return payload
                     previous_message = terminal_db.get(ChatMessage, previous_run.assistant_message_id)
                     document = terminal_db.get(Document, document_id)
                     content = previous_message.content if previous_message else content
@@ -3939,19 +4173,13 @@ async def _execute_agent_run(
                     error_message = previous_run.error_message or "已停止本轮操作。"
                     content = partial_content("已停止本轮操作。")
 
-                document = (
-                    terminal_db.query(Document)
-                    .filter(Document.id == document_id)
-                    .with_for_update()
-                    .first()
-                )
                 document_conflict = bool(document) and _has_external_document_conflict(
-                    current_html,
+                    document_source_html,
                     latest_html,
                     document.current_html,
                     agent_checkpoint_htmls,
                 )
-                candidate_exists = latest_html != current_html
+                candidate_exists = latest_html != request_source_html
                 document_already_at_candidate = bool(document and document.current_html == latest_html)
                 document_write_needed = bool(document) and not document_conflict and not document_already_at_candidate
                 if document_conflict:
@@ -3967,7 +4195,7 @@ async def _execute_agent_run(
                     if failure_summary not in content:
                         content = f"{content.rstrip()}\n\n{failure_summary}"
 
-                html_changed = latest_html != current_html and not document_conflict
+                html_changed = latest_html != request_source_html and not document_conflict
                 # The net change from the request baseline controls undo/UI
                 # metadata. The stored document can still need a write when
                 # the final candidate restores that baseline after an image
@@ -4003,7 +4231,7 @@ async def _execute_agent_run(
                         ensure_ascii=False,
                     ),
                     turn_blocks_json=json.dumps(turn_blocks, ensure_ascii=False),
-                    html_before=current_html if html_changed else None,
+                    html_before=request_source_html if html_changed else None,
                     html_after=latest_html if html_changed else None,
                 )
                 terminal_db.add(assistant_message)
@@ -4086,17 +4314,40 @@ async def _execute_agent_run(
                         client_ip=run.origin_client_ip,
                         user_agent=run.origin_user_agent,
                     )
+                report_html = document.current_html if document_conflict and document else latest_html
+                save_state = "conflict" if document_conflict else ("preserved" if html_changed else "none")
+                terminal_payload = {
+                    "content": content, "html": report_html, "html_changed": html_changed,
+                    "compliance": compliance if not document_conflict else None,
+                    "cancelled": terminal_status == AgentRunStatus.CANCELLED,
+                    "partial": terminal_status != AgentRunStatus.COMPLETED,
+                    "partial_save_state": save_state, "run_status": terminal_status.value,
+                    "error_message": error_message,
+                }
+                # The run row is locked above. Commit the replayable final event
+                # with the message/document/status, so any worker observing a
+                # terminal run can also deliver its final frame immediately.
+                if run is not None:
+                    high_water = (terminal_db.query(AgentRunEvent.sequence)
+                        .filter(AgentRunEvent.run_id == run_id)
+                        .order_by(AgentRunEvent.sequence.desc()).limit(1).scalar())
+                    final_sequence = max(int(run.event_sequence or 0), int(high_water or 0)) + 1
+                    final_at = run.finished_at
+                    terminal_db.add(AgentRunEvent(run_id=run_id, sequence=final_sequence,
+                        event="final", payload_json=json.dumps(terminal_payload, ensure_ascii=False, separators=(",", ":")),
+                        created_at=final_at))
+                    run.event_sequence = final_sequence
+                    run.last_phase = "final"
+                    run.last_progress_at = final_at
                 terminal_db.commit()
+                if run is not None:
+                    committed_final = (final_sequence, terminal_payload, final_at)
                 logger.warning(
                     "agent_trace run=%s persist_committed status=%s assistant_message_id=%s attempt=%s",
                     run_id,
                     terminal_status.value,
                     assistant_message.id,
                     attempt + 1,
-                )
-                report_html = document.current_html if document_conflict and document else latest_html
-                save_state = "conflict" if document_conflict else (
-                    "preserved" if html_changed else "none"
                 )
                 logger.warning(
                     "agent_trace run=%s terminal_save_result state=%s partial=%s html_changed=%s",
@@ -4112,17 +4363,7 @@ async def _execute_agent_run(
                     run_id=run_id,
                     status=terminal_status.value,
                 )
-                return {
-                    "content": content,
-                    "html": report_html,
-                    "html_changed": html_changed,
-                    "compliance": compliance if not document_conflict else None,
-                    "cancelled": terminal_status == AgentRunStatus.CANCELLED,
-                    "partial": terminal_status != AgentRunStatus.COMPLETED,
-                    "partial_save_state": save_state,
-                    "run_status": terminal_status.value,
-                    "error_message": error_message,
-                }
+                return terminal_payload
             except DBAPIError as exc:
                 terminal_db.rollback()
                 if attempt == 0 and _is_retryable_db_disconnect(exc):
@@ -4210,6 +4451,8 @@ async def _execute_agent_run(
                 run_id,
                 question,
                 now=now,
+                source_html=document_source_html,
+                agent_checkpoint_htmls=agent_checkpoint_htmls,
             )
         except Exception:
             waiting_db.rollback()
@@ -4228,11 +4471,12 @@ async def _execute_agent_run(
             run.status = AgentRunStatus.CANCELLING if cancelled_before_start else AgentRunStatus.RUNNING
             stream_db.commit()
         if cancelled_before_start:
+            await flush_before_terminal()
             terminal_data = persist_terminal(
                 AgentRunStatus.CANCELLED, "已停止本轮操作，未执行任何修改。"
             )
+            await publish_final(terminal_data)
             await publish_terminal_context()
-            await agent_run_manager.publish(run_id, "final", terminal_data)
             await agent_run_manager.mark_terminal(run_id, "cancelled")
             return
 
@@ -4252,10 +4496,25 @@ async def _execute_agent_run(
                 agent_checkpoint_htmls.add(html)
             _persist_run_checkpoint(run_id, html)
 
+        def guard_document_write(db: Session, document: Document, body: bool, next_html: str | None) -> None:
+            from app.services.html_workspace import WorkspaceError
+            run = db.query(AgentRun).filter(AgentRun.id == run_id).populate_existing().with_for_update().first()
+            if (not run or run.owner_id != agent_run_manager.worker_id
+                    or run.status != AgentRunStatus.RUNNING or run.cancel_requested_at is not None):
+                raise WorkspaceError("本轮已停止或运行所有权已失效，不能继续修改文档")
+            if body and _has_external_document_conflict(
+                document_source_html, edit_session.html, document.current_html, agent_checkpoint_htmls,
+            ):
+                raise WorkspaceError("图片处理期间正文已变化，不能覆盖现有修改")
+            if body and next_html is not None:
+                run.checkpoint_html = next_html
+                run.checkpoint_document_html = next_html
+
         edit_session = HtmlEditSession(
             current_html,
             stream_model.tool_result_max_tokens,
             checkpoint_callback=persist_agent_checkpoint,
+            document_write_guard=guard_document_write,
             cancel_requested=lambda: agent_run_manager.is_cancel_requested(run_id),
             candidate_validator=validate_gzh_theme_candidate if theme_application else None,
         )
@@ -4323,6 +4582,7 @@ async def _execute_agent_run(
                     "compaction_location": "新分支请求前" if reask_activated else "初始推理前",
                 },
             )
+        context_builder.retry_sink = lambda evt: agent_run_manager.publish(run_id, evt["event"], evt["data"])
         prepared_context = await context_builder.prepare(compaction_model)
         if preflight_stats.get("requires_compaction") and prepared_context.stats.get("state") == "compacted":
             await publish_context_compaction(_context_compaction_event_data(preflight_stats, prepared_context.stats, prepared_context.memory))
@@ -4728,6 +4988,7 @@ async def _execute_agent_run(
                 elif event == "final":
                     latest_html = data.get("html") or latest_html
                     logger.warning("agent_trace run=%s final_received_from_graph", run_id)
+                    await flush_before_terminal()
                     terminal_data = persist_terminal(
                         AgentRunStatus.COMPLETED,
                         data.get("content") or "已完成本轮编辑。",
@@ -4736,8 +4997,8 @@ async def _execute_agent_run(
                         runtime_compaction=data.get("runtime_compaction") if isinstance(data.get("runtime_compaction"), dict) else None,
                     )
                     logger.warning("agent_trace run=%s final_publish_start", run_id)
+                    await publish_final(terminal_data)
                     await publish_terminal_context()
-                    await agent_run_manager.publish(run_id, "final", terminal_data)
                     await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
                     logger.warning("agent_trace run=%s terminal_marked status=%s", run_id, terminal_data["run_status"])
                     completed = True
@@ -4789,6 +5050,7 @@ async def _execute_agent_run(
                     {**retry_builder.snapshot(), "state": "retrying_after_provider_limit"},
                 )
                 retry_preflight_stats = retry_builder.snapshot()
+                retry_builder.retry_sink = lambda evt: agent_run_manager.publish(run_id, evt["event"], evt["data"])
                 prepared_context = await retry_builder.prepare(compaction_model)
                 current_user_content = user_message_content(
                     stream_db, user_message, current_image_attachments,
@@ -4813,6 +5075,7 @@ async def _execute_agent_run(
     except asyncio.CancelledError:
         logger.warning("agent_trace run=%s execution_cancelled", run_id)
         try:
+            await flush_before_terminal()
             terminal_data = persist_terminal(
                 AgentRunStatus.CANCELLED,
                 partial_content("已停止本轮操作。"),
@@ -4826,14 +5089,15 @@ async def _execute_agent_run(
                 partial_content("已停止本轮操作，终态保存暂时不可用，未能确认修改是否已保存。"),
                 str(persist_exc),
             )
+        await publish_final(terminal_data)
         await publish_terminal_context()
-        await agent_run_manager.publish(run_id, "final", terminal_data)
         await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
     except Exception as exc:  # noqa: BLE001
         message = str(exc) or "Agent 执行失败"
         public_message = _agent_execution_error_message(message)
         logger.exception("agent_trace run=%s execution_failed detail=%s", run_id, message)
         try:
+            await flush_before_terminal()
             terminal_data = persist_terminal(
                 AgentRunStatus.FAILED,
                 partial_content(public_message),
@@ -4849,9 +5113,9 @@ async def _execute_agent_run(
                 partial_content("本轮执行未完成，终态保存暂时不可用，未能确认修改是否已保存。"),
                 f"{message}; 终态保存失败: {persist_exc}",
             )
+        await publish_final(terminal_data)
         await agent_run_manager.publish(run_id, "error", {"message": public_message})
         await publish_terminal_context()
-        await agent_run_manager.publish(run_id, "final", terminal_data)
         await agent_run_manager.mark_terminal(run_id, terminal_data["run_status"])
         logger.warning("agent_trace run=%s failure_terminal_marked status=%s", run_id, terminal_data["run_status"])
     finally:

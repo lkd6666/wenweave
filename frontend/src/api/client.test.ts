@@ -124,7 +124,7 @@ describe('authenticated upload progress', () => {
     const body = setup()
     const pending = api.upload('/images', body, { onProgress: vi.fn() })
     UploadRequestMock.requests[0]!.respond(413, { detail: '单张图片不能超过 10MB' })
-    await expect(pending).rejects.toEqual(new ApiError(413, '单张图片不能超过 10MB'))
+    await expect(pending).rejects.toMatchObject({ status: 413, detail: '单张图片不能超过 10MB' })
     const controller = new AbortController()
     const cancelled = api.upload('/images', body, { onProgress: vi.fn(), signal: controller.signal })
     controller.abort()

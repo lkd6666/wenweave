@@ -9,6 +9,8 @@ from app.models.agent_run import AgentRunStatus
 from app.models.chat_message import MessageRole
 from app.schemas.document import UserReference
 from app.schemas.chat_images import ChatImageAttachmentRead
+from app.schemas.chat_texts import ChatTextAttachmentRead
+from app.services.chat_texts import MAX_TEXT_BYTES
 from app.services.selected_elements import (
     MAX_SELECTED_ELEMENT_HTML_CHARS,
     MAX_SELECTED_ELEMENT_TEXT_CHARS,
@@ -221,6 +223,7 @@ class ChatMessageRead(BaseModel):
     created_by: UserReference | None = None
     model_usage: ChatMessageModelUsageRead | None = None
     image_attachments: list["ChatImageAttachmentRead"] = Field(default_factory=list)
+    text_attachments: list[ChatTextAttachmentRead] = Field(default_factory=list)
     tool_calls: list[ToolExecutionRead] = Field(default_factory=list)
     reasoning_trace: ReasoningTraceRead = Field(default_factory=ReasoningTraceRead)
     turn_blocks: list[AssistantTurnBlockRead] = Field(default_factory=list)
@@ -315,7 +318,7 @@ class ChatSessionTemplateAttachmentsUpdate(BaseModel):
 
 
 class ChatSendRequest(BaseModel):
-    message: str = Field(max_length=get_settings().MAX_CHAT_MESSAGE_CHARS)
+    message: str = Field(max_length=max(MAX_TEXT_BYTES, get_settings().MAX_CHAT_MESSAGE_CHARS))
     model_id: int
     session_id: int = Field(gt=0)
     client_request_id: str = Field(min_length=8, max_length=96)
@@ -326,6 +329,7 @@ class ChatSendRequest(BaseModel):
     # is the requested persistent session selection/order.
     template_ids: list[int] | None = Field(default=None, max_length=6)
     image_attachment_ids: list[str] = Field(default_factory=list, max_length=100)
+    text_attachment_ids: list[str] = Field(default_factory=list, max_length=8)
     layout_reference_id: str | None = Field(default=None, min_length=36, max_length=36)
     layout_reference_assets_confirmed: bool = False
     layout_reference_selected_asset_ids: list[str] = Field(default_factory=list, max_length=200)
@@ -355,10 +359,11 @@ class ChatContextPreviewRequest(BaseModel):
 
     model_id: int
     session_id: int = Field(gt=0)
-    message: str = Field(default="", max_length=get_settings().MAX_CHAT_MESSAGE_CHARS)
+    message: str = Field(default="", max_length=max(MAX_TEXT_BYTES, get_settings().MAX_CHAT_MESSAGE_CHARS))
     selected_elements: list[SelectedElementInput] = Field(default_factory=list, max_length=12)
     template_ids: list[int] | None = Field(default=None, max_length=6)
     image_attachment_ids: list[str] = Field(default_factory=list, max_length=100)
+    text_attachment_ids: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def limit_selected_context(self):

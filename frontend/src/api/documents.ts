@@ -1,5 +1,5 @@
 import { ApiError, api, apiEventStream } from './client'
-import type { DocumentDetail, DocumentShareRecord, DocumentShareVisitList, DocumentSummary, DocumentVersionDetail, DocumentVersionSummary, LayoutCaptureSession, VisibilitySettings, VisibilityTargets, WeChatArticleMetadata, WeChatDraftRecord, WeChatDraftTarget } from '../types'
+import type { DocumentDetail, DocumentShareRecord, DocumentShareVisitList, DocumentSummary, DocumentVersionDetail, DocumentVersionSummary, HtmlValidationReport, LayoutCaptureSession, VisibilitySettings, VisibilityTargets, WeChatArticleMetadata, WeChatDraftRecord, WeChatDraftTarget } from '../types'
 import { useAuthStore } from '../store/authStore'
 
 export interface DirectUploadTarget {
@@ -86,6 +86,7 @@ export interface DocumentHtmlPatch {
 export interface DocumentImageLocalizationResult {
   html: string
   localized_count: number
+  html_validation?: HtmlValidationReport | null
 }
 
 export interface WeChatDraftPushProgressEvent {

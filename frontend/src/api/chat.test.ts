@@ -4,6 +4,7 @@ import { ApiError } from './client'
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('chat message pagination', () => {
@@ -58,8 +59,10 @@ describe('startChatRun', () => {
   })
 
   it('retries a transient backend failure with the same idempotency key', async () => {
+    vi.useFakeTimers()
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ detail: '服务正在启动' }), { status: 503 }))
+      .mockResolvedValueOnce(new Response('null'))
       .mockResolvedValueOnce(new Response(JSON.stringify({ run_id: 'run-1' }), {
         status: 202,
         headers: { 'Content-Type': 'application/json' },
@@ -67,11 +70,14 @@ describe('startChatRun', () => {
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('window', { setTimeout, clearTimeout })
 
-    await startChatRun(12, 3, '首条请求', 4, 'enabled', 'auto', 'stable-client-request')
+    const pending = startChatRun(12, 3, '首条请求', 4, 'enabled', 'auto', 'stable-client-request')
+    await vi.runAllTimersAsync()
+    await pending
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     const [, firstRequest] = fetchMock.mock.calls[0] as [string, RequestInit]
-    const [, secondRequest] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(fetchMock.mock.calls[1][0]).toContain('/chat-runs/by-client-request/stable-client-request')
+    const [, secondRequest] = fetchMock.mock.calls[2] as [string, RequestInit]
     expect(JSON.parse(String(firstRequest.body)).client_request_id).toBe('stable-client-request')
     expect(JSON.parse(String(secondRequest.body)).client_request_id).toBe('stable-client-request')
   })

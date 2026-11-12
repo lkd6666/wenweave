@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import app.models  # noqa: F401  确保所有模型被注册到 Base.metadata，创建表时不会遗漏
@@ -476,12 +477,12 @@ async def operation_audit(request: Request, call_next):
         except Exception:
             context = with_request_audit_actor(context, request)
             context = with_request_id(context, str(getattr(request.state, "request_id", "")))
-            persist_request_audit(context, 500, exception=True)
+            await run_in_threadpool(persist_request_audit, context, 500, exception=True)
             raise
         context = with_request_audit_actor(context, request)
         context = with_request_id(context, str(getattr(request.state, "request_id", "")))
         if not context.route.deferred_terminal or response.status_code >= 400:
-            persist_request_audit(context, response.status_code)
+            await run_in_threadpool(persist_request_audit, context, response.status_code)
         return response
     finally:
         reset_operation_request_metadata(metadata_token)

@@ -471,6 +471,8 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                 self.value = value
             def filter(self, *args: Any, **kwargs: Any) -> "_Query":
                 return self
+            def populate_existing(self) -> "_Query":
+                return self
             def with_for_update(self) -> "_Query":
                 return self
             def first(self) -> Any:
@@ -678,7 +680,14 @@ class ImageGenerationApplicationTests(unittest.TestCase):
             wechat_pic_crop_1_1="stale-square-crop",
         )
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = generation
+        def query(model):
+            result = MagicMock()
+            result.filter.return_value = result
+            result.populate_existing.return_value = result
+            result.with_for_update.return_value = result
+            result.first.return_value = document if model is Document else generation
+            return result
+        db.query.side_effect = query
 
         def get_item(model: Any, item_id: Any) -> Any:
             if model is GeneratedImageAsset and item_id == asset.id:
@@ -817,7 +826,14 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         )
         document = SimpleNamespace(id=1, current_html=source_html)
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = generation
+        def query(model):
+            result = MagicMock()
+            result.filter.return_value = result
+            result.populate_existing.return_value = result
+            result.with_for_update.return_value = result
+            result.first.return_value = document if model is Document else generation
+            return result
+        db.query.side_effect = query
 
         def get_item(model: Any, item_id: Any) -> Any:
             if model is GeneratedImageAsset and item_id == asset.id:
@@ -905,6 +921,8 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                 self.value = value
             def filter(self, *args: Any, **kwargs: Any) -> "_Query":
                 return self
+            def populate_existing(self) -> "_Query":
+                return self
             def with_for_update(self) -> "_Query":
                 return self
             def first(self) -> Any:
@@ -986,6 +1004,27 @@ class ImageGenerationApplicationTests(unittest.TestCase):
         db.commit.assert_called_once()
         self.assertIn("transform_document_image", model.bound_tool_names)
 
+        from app.services.html_workspace import WorkspaceError
+        document.current_html = source_html
+        def reject_write(*_args):
+            raise WorkspaceError("run ownership lost")
+        session = HtmlEditSession(source_html, document_write_guard=reject_write)
+        model.seen_messages.clear()
+        with (
+            patch("app.services.chat_agent.SessionLocal", return_value=db),
+            patch("app.services.chat_agent.tool_output_stats", return_value={"count": 0, "total_bytes": 0, "total_tokens": 0}),
+            patch("app.services.image_generation.materialize_source_image", new=AsyncMock(return_value=(b"source-png", "image/png"))),
+            patch("app.services.document_image_transform.transform_document_image", return_value=transformed),
+            patch("app.services.document_images.store_tracked_document_image") as late_store,
+        ):
+            late_events = asyncio.run(run())
+        late = next(event["data"] for event in late_events if event["event"] == "tool_result" and event["data"]["name"] == "transform_document_image")
+        self.assertEqual(late["activity"]["kind"], "error")
+        self.assertIn("run ownership lost", late["result"])
+        self.assertEqual(document.current_html, source_html)
+        self.assertEqual(session.html, source_html)
+        late_store.assert_not_called()
+
     def test_agent_bakes_cover_transform_and_resets_wechat_crops(self) -> None:
         source_html = "<section><p>正文保持不变</p></section>"
         source_url = "https://cdn.example.test/original-cover.png"
@@ -1007,6 +1046,8 @@ class ImageGenerationApplicationTests(unittest.TestCase):
             def __init__(self, value: Any) -> None:
                 self.value = value
             def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def populate_existing(self) -> "_Query":
                 return self
             def with_for_update(self) -> "_Query":
                 return self
@@ -1162,6 +1203,8 @@ class ImageGenerationApplicationTests(unittest.TestCase):
                 self.value = value
             def filter(self, *args: Any, **kwargs: Any) -> "_Query":
                 return self
+            def populate_existing(self) -> "_Query":
+                return self
             def with_for_update(self) -> "_Query":
                 return self
             def first(self) -> Any:
@@ -1226,6 +1269,8 @@ class ImageGenerationApplicationTests(unittest.TestCase):
 
         class _Query:
             def filter(self, *args: Any, **kwargs: Any) -> "_Query":
+                return self
+            def populate_existing(self) -> "_Query":
                 return self
             def with_for_update(self) -> "_Query":
                 return self

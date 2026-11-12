@@ -1,5 +1,7 @@
 import { ApiError, apiUpload as uploadForm, authenticatedFetch } from './client'
 import type { UploadOptions } from './client'
+import { retryRequest } from '../utils/retry'
+import type { RetryStatus } from '../utils/retry'
 import type { AgentRunStatus, AssistantTurnBlock, ChangeSummary, ChatContextCompactResult, ChatContextStats, ChatHistoryArchive, ChatImageAttachment, ChatMessageItem, ChatSessionItem, ChatUserQuestion, ContextCompaction, LayoutReferenceImitationStrength, ReadRange, ReasoningTrace, SelectedElementContext, ToolActivity, ToolExecution } from '../types'
 
 export const MAX_CHAT_IMAGES_PER_MESSAGE = 100
@@ -7,13 +9,17 @@ import { sanitizeSelectedElements } from '../utils/selectedElements'
 
 const API_BASE = '/api'
 const STREAM_CONNECT_TIMEOUT_MS = 20_000
-const START_RUN_TIMEOUT_MS = 20_000
+// Creating a run includes resource preparation and context preflight. Give
+// that work its own deadline instead of the short status/SSE connect timeout.
+const START_RUN_TIMEOUT_MS = 3 * 60_000
+const QUESTION_ANSWER_TIMEOUT_MS = 20_000
 // The backend emits a transport heartbeat every 10 seconds. Keep this as a
 // long silent-connection guard, not a limit on model/tool generation time.
 const STREAM_INACTIVITY_TIMEOUT_MS = 5 * 60_000
 const CANCEL_REQUEST_TIMEOUT_MS = 10_000
 
 export type ChatStreamEvent =
+  | { event: 'retry_status'; data: RetryStatus }
   | { event: 'text_delta'; data: { text: string; _transient?: boolean } }
   | { event: 'reasoning_delta'; data: { text: string; _transient?: boolean } }
   | { event: 'tool_call'; data: { id?: string; replaces_id?: string; name: string; arguments: ToolExecution['arguments']; preparing?: boolean; argument_tokens?: number } }
@@ -191,10 +197,19 @@ export async function startChatRun(
   reaskFromMessageId?: number,
   reaskConflictResolution?: ReaskConflictResolution,
   signal?: AbortSignal,
+  onRetry?: (status: RetryStatus) => void,
+  textAttachmentIds: string[] = [],
 ): Promise<AgentRunInfo> {
-  let lastError: unknown
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
+  let confirmBeforeRetry = false
+  return retryRequest(async () => {
+      if (confirmBeforeRetry) {
+        // A lost response can hide a successful creation. Read its durable
+        // result before replaying the POST, using the same idempotency key.
+        const existing = await chatApi.getRunByClientRequest(documentId, clientRequestId, signal)
+        if (existing) return existing
+      }
+      signal?.throwIfAborted()
+      confirmBeforeRetry = true
       const res = await fetchWithTimeout(
         `${API_BASE}/documents/${documentId}/chat`,
         {
@@ -212,6 +227,7 @@ export async function startChatRun(
             selected_elements: sanitizeSelectedElements(selectedElements ?? []),
             ...(templateIds !== undefined ? { template_ids: templateIds.slice(0, 6) } : {}),
             image_attachment_ids: imageAttachmentIds,
+            text_attachment_ids: textAttachmentIds,
             ...(layoutReferenceId ? { layout_reference_id: layoutReferenceId } : {}),
             ...(layoutReferenceId ? { layout_reference_assets_confirmed: Boolean(layoutReferenceAssetsConfirmed) } : {}),
             ...(layoutReferenceId ? { layout_reference_selected_asset_ids: layoutReferenceSelectedAssetIds } : {}),
@@ -236,23 +252,13 @@ export async function startChatRun(
         } catch {
           // Ignore a malformed error payload.
         }
-        throw new ApiError(res.status, detail)
+        throw new ApiError(res.status, detail, res.headers)
       }
       return await res.json() as AgentRunInfo
-    } catch (err) {
-      lastError = err
-      if (signal?.aborted) throw err
-      // The client request ID makes a retry idempotent. A cold/restarting
-      // backend can briefly answer 408/429/5xx before the run is committed;
-      // retry those transport failures, while surfacing validation, access,
-      // capacity, and conflict responses immediately.
-      const retryableApiError = err instanceof ApiError
-        && (err.status === 408 || err.status === 429 || err.status >= 500)
-      if ((err instanceof ApiError && !retryableApiError) || attempt === 2) throw err
-      await delay(300 * (attempt + 1))
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error('无法创建 Agent 运行')
+  }, {
+    scope: 'start', signal, onRetry, maxAttempts: 3, maxElapsedMs: 10 * 60_000,
+    baseMs: 10_000, maxDelayMs: 60_000,
+  })
 }
 
 export async function* streamChatRunEvents(
@@ -275,7 +281,7 @@ export async function* streamChatRunEvents(
     } catch {
       // Ignore a malformed error payload.
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
 
   const reader = res.body?.getReader()
@@ -313,7 +319,9 @@ export async function* streamChatRunEvents(
   }
 }
 
-export async function cancelChatRun(documentId: number, runId: string): Promise<AgentRunInfo> {
+export async function cancelChatRun(documentId: number, runId: string,
+  onRetry?: (status: RetryStatus) => void): Promise<AgentRunInfo> {
+  return retryRequest(async () => {
   const res = await fetchWithTimeout(
     `${API_BASE}/documents/${documentId}/chat-runs/${runId}/cancel`,
     {
@@ -330,9 +338,10 @@ export async function cancelChatRun(documentId: number, runId: string): Promise<
     } catch {
       // Ignore a malformed error payload.
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   return await res.json() as AgentRunInfo
+  }, { scope: 'cancel', onRetry, maxElapsedMs: 35_000, maxDelayMs: 5000 })
 }
 
 export async function answerChatUserQuestion(
@@ -341,16 +350,19 @@ export async function answerChatUserQuestion(
   questionId: string,
   answer: UserQuestionAnswer,
   clientRequestId: string,
+  onRetry?: (status: RetryStatus) => void,
 ): Promise<AgentRunInfo> {
   const body = answer.action === 'select'
     ? { action: answer.action, option_ids: answer.optionIds, client_request_id: clientRequestId }
     : answer.action === 'custom'
       ? { action: answer.action, custom_requirement: answer.customRequirement, client_request_id: clientRequestId }
       : { action: answer.action, client_request_id: clientRequestId }
-  return apiPost<AgentRunInfo>(
+  return retryRequest(() => apiPost<AgentRunInfo>(
     `/documents/${documentId}/chat-runs/${encodeURIComponent(runId)}/questions/${encodeURIComponent(questionId)}/answer`,
     body,
-  )
+    undefined,
+    QUESTION_ANSWER_TIMEOUT_MS,
+  ), { scope: 'question', onRetry, maxElapsedMs: 90_000 })
 }
 
 export async function recordChatUserQuestionActivity(
@@ -396,15 +408,22 @@ export const chatApi = {
   listHistoryArchiveMessages: (documentId: number, sessionId: number, archiveId: number) => apiGet<ChatMessageItem[]>(
     `/documents/${documentId}/chat-sessions/${sessionId}/history-archives/${archiveId}/messages`,
   ),
-  getActiveRun: (documentId: number) => apiGet<AgentRunInfo | null>(`/documents/${documentId}/chat-runs/active`),
-  getRunByClientRequest: (documentId: number, clientRequestId: string) => apiGet<AgentRunInfo | null>(
-    `/documents/${documentId}/chat-runs/by-client-request/${encodeURIComponent(clientRequestId)}`,
+  getActiveRun: (documentId: number, signal?: AbortSignal, onRetry?: (status: RetryStatus) => void) => retryRequest(
+    () => apiGet<AgentRunInfo | null>(`/documents/${documentId}/chat-runs/active`, signal),
+    { scope: 'stream', signal, onRetry },
   ),
-  getRun: (documentId: number, runId: string) => apiGet<AgentRunInfo>(`/documents/${documentId}/chat-runs/${runId}`),
+  getRunByClientRequest: (documentId: number, clientRequestId: string, signal?: AbortSignal) => apiGet<AgentRunInfo | null>(
+    `/documents/${documentId}/chat-runs/by-client-request/${encodeURIComponent(clientRequestId)}`,
+    signal,
+  ),
+  getRun: (documentId: number, runId: string, signal?: AbortSignal) => retryRequest(
+    () => apiGet<AgentRunInfo>(`/documents/${documentId}/chat-runs/${runId}`, signal),
+    { scope: 'stream', signal },
+  ),
   answerUserQuestion: answerChatUserQuestion,
   recordUserQuestionActivity: recordChatUserQuestionActivity,
   getContext: (documentId: number, modelId: number, sessionId: number) => apiGet<ChatContextStats>(`/documents/${documentId}/chat-context?model_id=${encodeURIComponent(modelId)}&session_id=${encodeURIComponent(sessionId)}`),
-  previewContext: (documentId: number, modelId: number, sessionId: number, message: string, selectedElements: SelectedElementContext[], imageAttachmentIds: string[] = [], templateIds: number[] = [], signal?: AbortSignal) => apiPost<ChatContextStats>(
+  previewContext: (documentId: number, modelId: number, sessionId: number, message: string, selectedElements: SelectedElementContext[], imageAttachmentIds: string[] = [], templateIds: number[] = [], signal?: AbortSignal, textAttachmentIds: string[] = []) => apiPost<ChatContextStats>(
     `/documents/${documentId}/chat-context/preview`,
     {
       model_id: modelId,
@@ -412,14 +431,12 @@ export const chatApi = {
       message,
       selected_elements: sanitizeSelectedElements(selectedElements),
       image_attachment_ids: imageAttachmentIds,
+      text_attachment_ids: textAttachmentIds,
       template_ids: templateIds.slice(0, 6),
     },
     signal,
   ),
-  compactContext: (documentId: number, modelId: number, sessionId: number, rebuild = false) => apiPost<ChatContextCompactResult>(
-    `/documents/${documentId}/chat-context/compact`,
-    { model_id: modelId, session_id: sessionId, rebuild },
-  ),
+  compactContext: compactChatContext,
   uploadImage: (documentId: number, file: File, options?: UploadOptions) => apiUpload<ChatImageAttachment>(`/documents/${documentId}/chat-images`, file, options),
   duplicateImage: (documentId: number, attachmentId: string) => apiPost<ChatImageAttachment>(
     `/documents/${documentId}/chat-images/${encodeURIComponent(attachmentId)}/duplicate`,
@@ -438,7 +455,7 @@ async function fetchWithTimeout(
   const onAbort = () => controller.abort(init.signal?.reason)
   if (init.signal?.aborted) onAbort()
   else init.signal?.addEventListener('abort', onAbort, { once: true })
-  const timer = window.setTimeout(
+  const timer = globalThis.setTimeout(
     () => controller.abort(new StreamInactivityError(timeoutMessage)),
     timeoutMs,
   )
@@ -448,7 +465,7 @@ async function fetchWithTimeout(
     if (controller.signal.reason instanceof StreamInactivityError) throw controller.signal.reason
     throw error
   } finally {
-    window.clearTimeout(timer)
+    globalThis.clearTimeout(timer)
     init.signal?.removeEventListener('abort', onAbort)
   }
 }
@@ -462,12 +479,12 @@ async function readWithInactivityTimeout(
     const finish = (callback: () => void) => {
       if (settled) return
       settled = true
-      window.clearTimeout(timer)
+      globalThis.clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
       callback()
     }
     const onAbort = () => finish(() => reject(signal?.reason ?? new DOMException('请求已取消', 'AbortError')))
-    const timer = window.setTimeout(() => {
+    const timer = globalThis.setTimeout(() => {
       void reader.cancel().catch(() => undefined)
       finish(() => reject(new StreamInactivityError('实时连接长时间没有数据，正在重新连接')))
     }, STREAM_INACTIVITY_TIMEOUT_MS)
@@ -484,8 +501,8 @@ async function readWithInactivityTimeout(
   })
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  const res = await authenticatedFetch(`${API_BASE}${path}`)
+async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetchWithTimeout(`${API_BASE}${path}`, { signal }, STREAM_CONNECT_TIMEOUT_MS, '读取任务状态超时')
   if (!res.ok) {
     let detail: unknown = res.statusText
     try {
@@ -494,20 +511,23 @@ async function apiGet<T>(path: string): Promise<T> {
     } catch {
       // ignore
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   return (await res.json()) as T
 }
 
-async function apiPost<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await authenticatedFetch(`${API_BASE}${path}`, {
+async function apiPost<T>(path: string, body: unknown, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+  const init: RequestInit = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
     signal,
-  })
+  }
+  const res = timeoutMs
+    ? await fetchWithTimeout(`${API_BASE}${path}`, init, timeoutMs, '提交确认结果超时，正在确认请求状态')
+    : await authenticatedFetch(`${API_BASE}${path}`, init)
   if (!res.ok) {
     let detail: unknown = res.statusText
     try {
@@ -516,7 +536,7 @@ async function apiPost<T>(path: string, body: unknown, signal?: AbortSignal): Pr
     } catch {
       // ignore
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   return (await res.json()) as T
 }
@@ -537,7 +557,7 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
     } catch {
       // ignore
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   return (await res.json()) as T
 }
@@ -558,7 +578,7 @@ async function apiPut<T>(path: string, body: unknown): Promise<T> {
     } catch {
       // ignore
     }
-    throw new ApiError(res.status, detail)
+    throw new ApiError(res.status, detail, res.headers)
   }
   return (await res.json()) as T
 }
@@ -586,9 +606,39 @@ async function toApiError(res: Response): Promise<ApiError> {
   } catch {
     // Use the transport status when the server did not return JSON.
   }
-  return new ApiError(res.status, detail)
+  return new ApiError(res.status, detail, res.headers)
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+
+async function compactChatContext(documentId: number, modelId: number, sessionId: number, rebuild = false,
+  onRetry?: (status: RetryStatus) => void, signal?: AbortSignal): Promise<ChatContextCompactResult> {
+  // The backend owns compaction retries. Replaying this POST after a lost
+  // response could create another snapshot, so only reconnect normal runs.
+  const res = await fetchWithTimeout(`${API_BASE}/documents/${documentId}/chat-context/compact?stream=true`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model_id: modelId, session_id: sessionId, rebuild }), signal,
+  }, STREAM_CONNECT_TIMEOUT_MS, '建立压缩进度连接超时')
+  if (!res.ok) throw await toApiError(res)
+  if (!res.headers.get('content-type')?.includes('text/event-stream')) return await res.json()
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error('浏览器不支持流式响应')
+  let buffer = ''
+  const decoder = new TextDecoder()
+  try {
+    while (true) {
+      const { done, value } = await readWithInactivityTimeout(reader, signal)
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
+      const parsed = parseSseChunk(buffer + (done ? '\n\n' : ''))
+      buffer = parsed.rest
+      for (const event of parsed.events) {
+        if (event.event === 'retry_status') onRetry?.(event.data)
+        if (event.event === 'error') throw new ApiError(('status' in event.data ? Number(event.data.status) : 502), event.data.message)
+        if (event.event === 'context_stats') return event.data as ChatContextCompactResult
+      }
+      if (done) throw new Error('压缩进度连接中断，请刷新上下文状态后再试')
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+  }
 }

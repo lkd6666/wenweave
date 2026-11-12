@@ -7,6 +7,7 @@ import { Button, Image, Modal, Tooltip } from 'antd'
 import { CloseOutlined } from '@ant-design/icons'
 import type { ChatImageAttachment, SelectedElementContext, TemplateItem } from '../types'
 import ElementRenderPreview from './ElementRenderPreview'
+import { shouldAttachPastedText } from '../utils/textAttachments'
 
 export interface PromptComposerHandle {
   getPayload: () => { message: string; references: SelectedElementContext[]; templateIds: number[]; imageIds: string[] }
@@ -29,6 +30,8 @@ interface PromptComposerProps {
   onMoveImage?: (fromIndex: number, toIndex: number) => void
   acceptImages?: boolean
   onPasteImages?: (files: File[]) => void
+  onPasteText?: (text: string) => void
+  maxInlineTextTokens?: number
 }
 
 const PLACEHOLDER = '输入排版指令…（Shift+Enter 换行，Enter 发送）'
@@ -84,7 +87,7 @@ export function resolveOutgoingReferences(
 
 /** 文本、元素和组件模板共用同一行流；令牌本身不可编辑，但可拖拽和移除。 */
 const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(function PromptComposer(
-  { value, references, templates, images = EMPTY_IMAGES, disabled, onChange, onSubmit, onRemoveReference, onDuplicateReference, onMoveReference, onRemoveTemplate, onRemoveImage, onMoveImage, acceptImages = false, onPasteImages },
+  { value, references, templates, images = EMPTY_IMAGES, disabled, onChange, onSubmit, onRemoveReference, onDuplicateReference, onMoveReference, onRemoveTemplate, onRemoveImage, onMoveImage, acceptImages = false, onPasteImages, onPasteText, maxInlineTextTokens },
   ref,
 ) {
   const editorRef = useRef<HTMLDivElement>(null)
@@ -92,6 +95,7 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
   const draggingTokenRef = useRef<HTMLElement | null>(null)
   const caretRef = useRef<Range | null>(null)
   const removedImageIdsRef = useRef(new Set<string>())
+  const removedTemplateIdsRef = useRef(new Set<number>())
   const composingRef = useRef(false)
   const previewCloseTimerRef = useRef<number | null>(null)
   const previewRef = useRef<HTMLDivElement>(null)
@@ -429,6 +433,13 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     refreshLabels()
     saveCaret()
     const current = payload()
+    const presentTemplateIds = new Set(current.templateIds)
+    templates.forEach((template) => {
+      if (!presentTemplateIds.has(template.id) && !removedTemplateIdsRef.current.has(template.id)) {
+        removedTemplateIdsRef.current.add(template.id)
+        onRemoveTemplate(template.id)
+      }
+    })
     const presentImageIds = new Set(current.imageIds)
     images.forEach((image) => {
       if (!presentImageIds.has(image.id) && !removedImageIdsRef.current.has(image.id)) {
@@ -475,10 +486,13 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     const templateIds = new Set(templates.map((template) => template.id))
     templateTokenNodes().forEach((token) => {
       const template = templateFromToken(token)
-      if (!template || !templateIds.has(template.id)) token.remove()
+      if (!template || !templateIds.has(template.id) || removedTemplateIdsRef.current.has(template.id)) token.remove()
     })
+    for (const id of removedTemplateIdsRef.current) {
+      if (!templateIds.has(id)) removedTemplateIdsRef.current.delete(id)
+    }
     const presentTemplates = new Set(templateTokenNodes().map(templateFromToken).flatMap((template) => template ? [template.id] : []))
-    templates.filter((template) => !presentTemplates.has(template.id)).forEach((template) => appendTokenAtCaret(createTemplateToken(template)))
+    templates.filter((template) => !presentTemplates.has(template.id) && !removedTemplateIdsRef.current.has(template.id)).forEach((template) => appendTokenAtCaret(createTemplateToken(template)))
     const imageIds = new Set(images.map((image) => image.id))
     imageTokenNodes().forEach((token) => {
       const image = images.find((image) => image.id === token.dataset.imageToken)
@@ -575,7 +589,6 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
       if (!template) return
       templateToken.remove()
       refreshLabels()
-      onRemoveTemplate(template.id)
       emitChange()
     }
   }
@@ -640,7 +653,13 @@ const PromptComposer = forwardRef<PromptComposerHandle, PromptComposerProps>(fun
     if (imageFiles.length > 0 && acceptImages) {
       onPasteImages?.(imageFiles)
     }
-    insertPlainTextAtCaret(event.clipboardData.getData('text/plain'))
+    const text = event.clipboardData.getData('text/plain')
+    if (onPasteText && shouldAttachPastedText(text, maxInlineTextTokens)) {
+      onPasteText(text)
+      saveCaret()
+      return
+    }
+    insertPlainTextAtCaret(text)
     saveCaret()
     emitChange()
   }

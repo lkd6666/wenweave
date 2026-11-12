@@ -7,6 +7,7 @@ from app.core.config import get_settings
 from app.models.document import DocumentSourceType
 from app.models.document_version import DocumentVersionSource
 from app.schemas.wechat import WeChatArticleMetadata
+from app.schemas.html_validation import HtmlValidationReportRead
 
 
 class UserReference(BaseModel):
@@ -67,6 +68,7 @@ class DocumentAiEditingStatus(BaseModel):
 class DocumentDetail(DocumentSummary):
     current_html: str
     wechat_metadata: WeChatArticleMetadata
+    html_validation: HtmlValidationReportRead | None = None
 
 
 class DocumentSourceAccess(BaseModel):
@@ -253,6 +255,7 @@ class DocumentHtmlPatch(BaseModel):
 class DocumentImageLocalizationResult(BaseModel):
     html: str
     localized_count: int
+    html_validation: HtmlValidationReportRead | None = None
 
 
 class DocumentShareCreate(BaseModel):

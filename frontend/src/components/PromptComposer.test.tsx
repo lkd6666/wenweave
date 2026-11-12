@@ -117,6 +117,39 @@ describe('inline image references', () => {
     expect(composer.current!.getPayload().message).toBe(message)
   })
 
+  it.each(['button', 'keyboard', 'select-all'])('allows referencing a template again after %s removal without resurrecting it on rerender', async (action) => {
+    await render({ value: '说明@组件1', templates: [template] })
+    const editor = container.querySelector<HTMLElement>('[role="textbox"]')!
+    await act(async () => {
+      if (action === 'button') container.querySelector<HTMLButtonElement>('[data-template-action="remove"]')!.click()
+      else {
+        if (action === 'keyboard') container.querySelector('[data-template-token]')!.remove()
+        else editor.replaceChildren(document.createTextNode('说明'))
+        editor.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(props.onRemoveTemplate).toHaveBeenCalledExactlyOnceWith(template.id)
+    expect(composer.current!.getPayload()).toMatchObject({ message: '说明', templateIds: [] })
+    await render({ value: '说明' })
+    expect(container.querySelector('[data-template-token]')).toBeNull()
+    await render({ templates: [] })
+    await render({ templates: [template] })
+    expect(composer.current!.getPayload().templateIds).toEqual([template.id])
+    expect(container.querySelectorAll('[data-template-token]')).toHaveLength(1)
+  })
+
+  it('renumbers remaining templates after native deletion and keeps their identity', async () => {
+    const footer = { id: 20, name: '排版尾' } as TemplateItem
+    await render({ value: '@组件1@组件2保留', templates: [template, footer] })
+    await act(async () => {
+      container.querySelector('[data-template-token]')!.remove()
+      container.querySelector('[role="textbox"]')!.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(props.onRemoveTemplate).toHaveBeenCalledExactlyOnceWith(template.id)
+    expect(composer.current!.getPayload()).toMatchObject({ message: '@组件1保留', templateIds: [footer.id] })
+  })
+
   it('serializes all one hundred image references without losing their mixed order', async () => {
     const images = Array.from({ length: 100 }, (_, i) => photo(`photo-${i}`))
     const value = images.map((_, i) => `第${i + 1}张@图片${i + 1}`).join('，') + '替换@元素1，按@组件1排版'

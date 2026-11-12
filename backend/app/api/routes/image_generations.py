@@ -59,7 +59,7 @@ ACTIVE_AGENT_STATUSES = {
 def _document_or_404(db: Session, document_id: int, user: User, *, lock: bool = False) -> Document:
     query = db.query(Document).filter(Document.id == document_id)
     if lock:
-        query = query.with_for_update()
+        query = query.populate_existing().with_for_update()
     document = query.first()
     if not document or not can_access_document(user, document):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
@@ -80,7 +80,11 @@ def _generation_or_404(db: Session, document_id: int, generation_id: str, user: 
 
 
 def _require_idle_document(db: Session, document_id: int) -> None:
-    if db.query(AgentRun.id).filter(AgentRun.document_id == document_id, AgentRun.status.in_(ACTIVE_AGENT_STATUSES)).first():
+    # Callers hold the document lock. Use a current read even if permission
+    # checks or an awaited image download already opened a MySQL snapshot.
+    if db.query(AgentRun.id).filter(
+        AgentRun.document_id == document_id, AgentRun.status.in_(ACTIVE_AGENT_STATUSES),
+    ).with_for_update().first() is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前推文正在由 AI 编辑，请完成或停止后再应用图片")
 
 

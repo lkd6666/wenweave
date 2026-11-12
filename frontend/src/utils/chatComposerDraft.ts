@@ -1,3 +1,6 @@
+import type { ChatTextAttachment } from '../types'
+import type { TemplateReference } from './templateReferences'
+
 export type ChatComposerDraftPhase = 'editing' | 'starting' | 'running' | 'retry'
 
 export interface ChatComposerDraft {
@@ -6,12 +9,32 @@ export interface ChatComposerDraft {
   phase: ChatComposerDraftPhase
   clientRequestId?: string
   runId?: string
+  textAttachments?: ChatTextAttachment[]
+  templateRefs?: TemplateReference[]
 }
 
 const STORAGE_PREFIX = 'yibanpaiban-chat-composer-draft:v1'
 
 function storageKey(documentId: number, sessionId: number): string {
   return `${STORAGE_PREFIX}:${documentId}:${sessionId}`
+}
+
+function safeAttachments(value: unknown): ChatTextAttachment[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is ChatTextAttachment => Boolean(item && typeof item.id === 'string'
+    && Number.isSafeInteger(item.document_id) && Number.isSafeInteger(item.session_id)
+    && (item.message_id === null || Number.isSafeInteger(item.message_id)) && typeof item.filename === 'string'
+    && Number.isFinite(item.size) && Number.isFinite(item.characters) && Number.isFinite(item.lines)
+    && typeof item.sha256 === 'string' && item.status !== 'uploading' && item.status !== 'error'))
+    .slice(0, 8).map(({ id, document_id, session_id, message_id, filename, size, characters, lines, sha256 }) =>
+      ({ id, document_id, session_id, message_id, filename, size, characters, lines, sha256 }))
+}
+
+function safeTemplateReferences(value: unknown): TemplateReference[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is TemplateReference => Boolean(item
+    && Number.isSafeInteger(item.id) && item.id > 0 && typeof item.name === 'string'))
+    .slice(0, 6).map(({ id, name }) => ({ id, name }))
 }
 
 function isDraft(value: unknown): value is ChatComposerDraft {
@@ -29,7 +52,7 @@ export function readChatComposerDraft(documentId: number, sessionId: number): Ch
     const raw = window.sessionStorage.getItem(storageKey(documentId, sessionId))
     if (!raw) return null
     const parsed: unknown = JSON.parse(raw)
-    return isDraft(parsed) ? parsed : null
+    return isDraft(parsed) ? { ...parsed, templateRefs: safeTemplateReferences(parsed.templateRefs), textAttachments: safeAttachments(parsed.textAttachments).filter(item => item.document_id === documentId && item.session_id === sessionId) } : null
   } catch {
     return null
   }
@@ -37,7 +60,7 @@ export function readChatComposerDraft(documentId: number, sessionId: number): Ch
 
 export function writeChatComposerDraft(documentId: number, sessionId: number, draft: ChatComposerDraft): void {
   try {
-    window.sessionStorage.setItem(storageKey(documentId, sessionId), JSON.stringify(draft))
+    window.sessionStorage.setItem(storageKey(documentId, sessionId), JSON.stringify({ ...draft, templateRefs: safeTemplateReferences(draft.templateRefs), textAttachments: safeAttachments(draft.textAttachments) }))
   } catch {
     // The in-memory composer stays usable when browser storage is unavailable.
   }

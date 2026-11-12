@@ -62,4 +62,21 @@ describe('chat composer draft storage', () => {
     expect(clearChatComposerDraftForRequest(8, 2, 'completed-request')).toBe(true)
     expect(readChatComposerDraft(8, 2)).toBeNull()
   })
+  it('persists only attachment metadata even when the caller supplies upload state', () => {
+    const file = { id: 'text-1', document_id: 12, session_id: 4, message_id: null,
+      filename: 'text.txt', size: 100, characters: 100, lines: 1, sha256: 'abc',
+      status: 'ready', pendingText: 'PRIVATE_BODY', content: 'PRIVATE_BODY' }
+    writeChatComposerDraft(12, 4, { message: '', reaskFromMessageId: null, phase: 'retry', textAttachments: [file] })
+    expect([...values.values()].join('')).not.toContain('PRIVATE_BODY')
+    expect(readChatComposerDraft(12, 4)?.textAttachments?.[0]?.id).toBe('text-1')
+    expect(readChatComposerDraft(12, 5)).toBeNull()
+  })
+
+  it('preserves component IDs and order in retry drafts without storing their source', () => {
+    writeChatComposerDraft(12, 4, { message: '@组件1 不要改动', reaskFromMessageId: null, phase: 'retry',
+      templateRefs: [{ id: 20, name: '排版尾', html: 'PRIVATE_TEMPLATE_SOURCE' } as { id: number; name: string }] })
+    expect(readChatComposerDraft(12, 4)?.templateRefs).toEqual([{ id: 20, name: '排版尾' }])
+    expect([...values.values()].join('')).not.toContain('PRIVATE_TEMPLATE_SOURCE')
+  })
+
 })

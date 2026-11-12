@@ -26,7 +26,7 @@ from app.models.chat_context_event import ChatContextEvent, ContextEventKind
 from app.models.chat_context_snapshot import ChatContextSnapshot
 from app.models.chat_session import ChatSession, ChatSessionMemory
 from app.db.base import Base
-from app.services.agent_context import AgentContextBuilder, COMPACTION_TARGET_TOKENS, ContextBudgetError, ContextRecord, context_prefix_hash
+from app.services.agent_context import AgentContextBuilder, ContextBudgetError, ContextRecord, context_prefix_hash
 from app.services.chat_agent import _runtime_context_stats_for_messages, context_budget_prompt, runtime_context_budget_factory
 from app.services.html_workspace import HtmlWorkspace
 from app.schemas.ai_provider import ModelCreate
@@ -132,21 +132,21 @@ class AgentContextBuilderTests(unittest.TestCase):
         self.assertEqual(prepared.stats["state"], "ready")
         self.assertIsNone(self.db.query(ChatSessionMemory).first())
 
-    def test_large_input_window_compacts_back_to_twenty_thousand_tokens(self) -> None:
+    def test_empty_large_window_has_no_fixed_compaction_target(self) -> None:
         self.model.context_window_tokens = 258_000
         self.model.context_compaction_threshold_tokens = 176_000
         self.model.max_output_tokens = 82_000
 
         stats = self.builder([]).snapshot()
 
-        self.assertEqual(stats["compaction_target_tokens"], COMPACTION_TARGET_TOKENS)
+        self.assertEqual(stats["compaction_target_tokens"], stats["active_context_threshold_tokens"])
 
     def test_automatic_compaction_starts_at_configured_threshold(self) -> None:
         self.model.context_window_tokens = 200_000
         self.model.context_compaction_threshold_tokens = 100_000
         rows = [self.add_turn(f"任务 {index} " + "内容" * 600, MessageRole.USER) for index in range(30)]
         measured = self.builder(rows).snapshot()["used_tokens"]
-        self.assertGreater(measured, COMPACTION_TARGET_TOKENS)
+        self.assertGreater(measured, 0)
 
         self.model.context_compaction_threshold_tokens = measured + 1
         below = self.builder(rows).snapshot()
@@ -159,7 +159,7 @@ class AgentContextBuilderTests(unittest.TestCase):
         self.assertEqual(at_threshold["usage_percent"], 100)
         self.assertTrue(at_threshold["requires_compaction"])
 
-    def test_compaction_can_exceed_the_soft_target_to_keep_the_newest_complete_turn(self) -> None:
+    def test_large_window_keeps_history_until_trigger_then_replaces_it_with_memory(self) -> None:
         self.model.context_window_tokens = 258_000
         self.model.context_compaction_threshold_tokens = 176_000
         self.model.max_output_tokens = 82_000
@@ -171,10 +171,49 @@ class AgentContextBuilderTests(unittest.TestCase):
         builder = self.builder(rows)
         records = builder._source_records()
 
+        before = asyncio.run(builder.prepare())
+        self.assertEqual(len(before.history), len(records))
+
         older, retained = builder._partition_for_compaction(records, {})
 
-        self.assertEqual(older, records[:2])
-        self.assertEqual(retained, records[2:])
+        self.assertEqual(older, records)
+        self.assertFalse(retained)
+        prepared = asyncio.run(builder.prepare(self._Compactor(), force_compaction=True))
+        self.assertFalse(prepared.history)
+        self.assertLess(prepared.stats["used_tokens"], before.stats["used_tokens"])
+
+    def test_compaction_rebuilds_task_memory_without_retaining_consumed_history(self) -> None:
+        rows = [self.add_turn(f"任务 {index} " + "内容" * 600, MessageRole.USER) for index in range(30)]
+        builder = self.builder(rows)
+        prepared = asyncio.run(builder.prepare(self._Compactor()))
+
+        self.assertFalse(prepared.history)
+        self.assertLessEqual(prepared.stats["used_tokens"], builder.target_budget)
+        self.assertTrue(prepared.memory["objective"])
+        self.assertFalse(self.builder(rows).snapshot()["requires_compaction"])
+
+    def test_large_newest_history_turn_cannot_fill_the_trigger_budget_after_compaction(self) -> None:
+        self.model.context_window_tokens = 100_000
+        self.model.context_compaction_threshold_tokens = 80_000
+        rows = [
+            self.add_turn("早期任务 " + "earlier " * 20_000, MessageRole.USER),
+            self.add_turn("最近任务 " + "recent " * 40_000, MessageRole.USER),
+        ]
+        builder = self.builder(rows)
+        prepared = asyncio.run(builder.prepare(self._Compactor()))
+
+        self.assertFalse(prepared.history)
+        self.assertLess(prepared.stats["used_tokens"], builder.trigger_budget)
+
+    def test_retry_compaction_target_uses_reduced_trigger(self) -> None:
+        rows = [self.add_turn("内容" * 600, MessageRole.USER) for _ in range(20)]
+        builder = AgentContextBuilder(
+            self.db, 1, self.session.id, self.model, HtmlWorkspace("<p>正文</p>"), rows, "规则",
+            budget_multiplier=0.5,
+        )
+        prepared = asyncio.run(builder.prepare(self._Compactor()))
+        self.assertLess(prepared.stats["used_tokens"], builder.trigger_budget)
+        self.assertLess(builder.target_budget, builder.trigger_budget)
 
     def test_migration_prefix_hash_matches_live_enum_value(self) -> None:
         event = ChatContextEvent(
@@ -233,8 +272,7 @@ class AgentContextBuilderTests(unittest.TestCase):
         prepared = asyncio.run(builder.prepare(self._Compactor()))
 
         self.assertEqual(prepared.stats["state"], "compacted")
-        # New policy retains complete recent turns when they fit the input
-        # budget, even when that means slightly exceeding the soft 20K target.
+        # Historical turns become working memory once compaction is triggered.
         self.assertLess(len(prepared.history), len(rows))
         self.assertEqual(prepared.stats["conversation_message_count"], len(rows))
         self.assertEqual(prepared.stats["conversation_tokens"], before["conversation_tokens"])
@@ -295,14 +333,55 @@ class AgentContextBuilderTests(unittest.TestCase):
             async def ainvoke(self, messages):
                 calls.append(messages[-1].content)
                 if len(calls) > 1:
-                    raise RuntimeError("later batch unavailable")
+                    raise ConnectionError("later batch unavailable")
                 return await delegate.ainvoke(messages)
 
         with self.assertRaisesRegex(Exception, "later batch unavailable"):
             asyncio.run(builder.prepare(FailingCompactor(), force_compaction=True))
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[1], calls[2])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[1:], [calls[1]] * 3)
         self.assertIsNone(self.db.query(ChatContextSnapshot).first())
+
+    def test_large_history_source_reaches_compactor_in_full_with_current_request(self) -> None:
+        source = "开始事实 " + "正文内容 " * 1800 + "中间约束 " + "其他内容 " * 1800 + "尾部约束：禁止修改署名"
+        rows = [self.add_turn(source, MessageRole.USER)]
+        builder = self.builder(rows)
+        builder.current_request = "只调整标题，不改署名"
+        builder.compaction_source_budget = 2500
+        prompts = []
+        delegate = self._Compactor()
+
+        class RecordingCompactor:
+            async def ainvoke(self, messages):
+                prompts.append(messages[-1].content)
+                return await delegate.ainvoke(messages)
+
+        prepared = asyncio.run(builder.prepare(RecordingCompactor(), force_compaction=True))
+        delivered = "".join(prompt.split("待压缩事件：\n", 1)[-1] for prompt in prompts)
+        self.assertIn(source, delivered)
+        self.assertGreater(len(prompts), 1)
+        self.assertTrue(all(builder.current_request in prompt for prompt in prompts))
+        self.assertFalse(prepared.history)
+        self.assertEqual(self.db.query(ChatContextSnapshot).count(), 1)
+
+    def test_compaction_source_keeps_tool_arguments_and_result_tail(self) -> None:
+        record = ContextRecord(1, 1, ContextEventKind.ASSISTANT.value, {
+            "content": "已读取正文",
+            "tool_calls": [{"id": "call-1", "name": "edit_file", "args": {"new_text": "必须保留署名"}}],
+        })
+        result = ContextRecord(2, 1, ContextEventKind.TOOL.value, {
+            "name": "edit_file", "tool_call_id": "call-1", "content": "结果 " * 500 + "文档已保存",
+        })
+        self.assertIn("必须保留署名", record.compact_line())
+        self.assertIn("文档已保存", result.compact_line())
+
+    def test_unusable_compacted_context_does_not_advance_snapshot(self) -> None:
+        self.model.context_compaction_threshold_tokens = 1000
+        rows = [self.add_turn("历史任务", MessageRole.USER)]
+        builder = self.builder(rows, "固定规则" * 1500)
+        with self.assertRaises(ContextBudgetError):
+            asyncio.run(builder.prepare(self._Compactor(), force_compaction=True))
+        self.assertEqual(self.db.query(ChatContextSnapshot).count(), 0)
 
     def test_compaction_rejects_budget_that_cannot_fit_one_complete_event(self) -> None:
         builder = self.builder([self.add_turn("保留这个约束", MessageRole.USER)])

@@ -21,7 +21,7 @@ import type { InvalidNode } from './types.js';
 
 const commentRegex = /<!--[\s\S]*?-->/g;
 // Pre-filter: skip paragraphs whose HTML has no rule-relevant token.
-const quickRegex = /\b(?:font-family|caret-color|opacity|line-height|text-align|width|height|animate)\b|<pre[\s>]/i;
+const quickRegex = /\b(?:font-family|caret-color|opacity|line-height|text-align|width|height|animate(?:Transform|Motion)?)\b|<pre[\s>]/i;
 
 function toArray(maybeList: any): any[] {
   if (!maybeList) return [];
@@ -119,6 +119,23 @@ function collectViolationsInParagraph(paragraphNode: any, paragraphIndex: number
   return allResults;
 }
 
+// 无条件给段落子树盖 data-blockidx 定位章。定位与违规检查是两个职责：
+// quickRegex 跳过的段落（如无任何样式关键词的 ul 列表块）不收集违规，
+// 但 darkmode / nestNodes 的段号反查依然依赖章。此前盖牌写在检查函数
+// 内部，跳过检查 = 没章，反查会穿透到外层共享容器拿到错误的早期段号。
+function stampParagraphSubtree(paragraphNode: any, paragraphIndex: number): void {
+  if (!paragraphNode || typeof paragraphNode.setAttribute !== 'function') return;
+  const q: any[] = [paragraphNode];
+  while (q.length) {
+    const n = q.shift();
+    if (n && typeof n.setAttribute === 'function') {
+      n.setAttribute('data-blockidx', String(paragraphIndex));
+    }
+    const children = toArray(n.children || n.childNodes);
+    for (let i = 0; i < children.length; i++) q.push(children[i]);
+  }
+}
+
 function getInvalidNodes(paragraphList: any[]): { isValid: boolean; invalidNodes: InvalidNode[] } {
   const invalid: InvalidNode[] = [];
 
@@ -139,6 +156,10 @@ function getInvalidNodes(paragraphList: any[]): { isValid: boolean; invalidNodes
 
   paragraphList.forEach((pNode, idx) => {
     if (!pNode) return;
+
+    // 定位章与 quickRegex 解耦：先盖章，再谈要不要检查。
+    stampParagraphSubtree(pNode, idx);
+
     let htmlStr = '';
     if (typeof pNode.outerHTML === 'string') {
       htmlStr = pNode.outerHTML.replace(commentRegex, '');

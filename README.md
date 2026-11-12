@@ -28,23 +28,73 @@
 
 ## 界面预览
 
-以下为项目主要功能页面截图。
+以下截图来自实际前端界面，使用同一组「秋日城市漫游」示例串联创作流程。文章、插画、账号、模型配置、工具调用记录及统计数值均为演示数据，不代表真实模型调用或公众号推送结果。点击图片可查看原图。
 
-### 工作台
+### Agent 运行中的工具调用
 
-![推文工作台](docs/images/workbench.png)
+左侧实时展示读取文章、搜索源码、局部修改与合规检查的执行状态，中间预览文章，右侧提供可复用组件。示例中 `read_file`、`search_files`、`edit_file` 已完成，`check_compliance` 正在执行。
 
-### AI 排版编辑器
+![Agent 运行中：工具执行状态、文章预览与组件库](docs/images/agent-tools.png)
 
-![AI 排版编辑器](docs/images/editor.png)
+### 从文章整理到公众号草稿
 
-### 图片库与搜图
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/workbench.png"><img src="docs/images/workbench.png" alt="推文工作台：分组、文章列表与编辑状态" width="100%" /></a>
+      <br /><b>推文工作台</b><br />按分组整理文章，查看编辑状态，继续已有创作。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/editor.png"><img src="docs/images/editor.png" alt="AI 排版编辑器：对话、文章预览与组件模板" width="100%" /></a>
+      <br /><b>对话式排版编辑器</b><br />通过自然语言调整文章，同时查看预览与组件模板。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/themes.png"><img src="docs/images/themes.png" alt="主题模板：风格预览、套用强度与组件配方" width="100%" /></a>
+      <br /><b>整篇主题与组件配方</b><br />预览主题风格，选择套用强度、核心组件与可选点缀。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/image-library.png"><img src="docs/images/image-library.png" alt="编辑器图片库：素材浏览、搜索与引用" width="100%" /></a>
+      <br /><b>编辑器图片库</b><br />在文章旁浏览和搜索素材，将图片加入当前创作。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/version-history.png"><img src="docs/images/version-history.png" alt="版本历史：版本列表与文章快照预览" width="100%" /></a>
+      <br /><b>版本历史与快照</b><br />回看每次修改及对应文章快照，按需比较或恢复版本。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/wechat-draft.png"><img src="docs/images/wechat-draft.png" alt="公众号草稿：目标账号、文章信息与封面裁剪" width="100%" /></a>
+      <br /><b>公众号草稿同步</b><br />选择目标账号，确认标题、摘要与封面裁剪后创建或更新草稿。
+    </td>
+  </tr>
+</table>
 
-![图片库与搜图](docs/images/image-library.png)
+### 工作看板与管理后台
 
-### 公众号草稿同步
-
-![公众号草稿同步](docs/images/wechat-draft.png)
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/workboard.png"><img src="docs/images/workboard.png" alt="工作看板：模型用量、调用排行与创作活动" width="100%" /></a>
+      <br /><b>调用与创作看板</b><br />查看模型用量、缓存命中、用户调用排行与推文创作活动。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/models.png"><img src="docs/images/models.png" alt="模型管理：Provider、模型能力与可用时段" width="100%" /></a>
+      <br /><b>AI 模型管理</b><br />统一管理 Provider、默认模型、模型能力与可用时段。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/images/users.png"><img src="docs/images/users.png" alt="用户管理：编辑账号、角色与启用状态" width="100%" /></a>
+      <br /><b>用户管理</b><br />维护编辑账号、管理员角色与账号启用状态。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/images/admin-image-library.png"><img src="docs/images/admin-image-library.png" alt="图片库设置：个人图库、全员共享与素材选择" width="100%" /></a>
+      <br /><b>共享素材管理</b><br />设置个人或共享图库，统一选择可供团队复用的素材。
+    </td>
+  </tr>
+</table>
 
 ## 技术栈
 
